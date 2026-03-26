@@ -1,0 +1,19 @@
+FROM stain/jena-fuseki:5.3.0
+
+USER root
+
+# Install mc (Minio client)
+RUN curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc \
+    && chmod +x /usr/local/bin/mc
+
+# Copy config and entrypoint
+COPY config.ttl /fuseki/config.ttl
+COPY entrypoint.sh /fuseki/entrypoint.sh
+RUN chmod +x /fuseki/entrypoint.sh
+
+# TDB2 data volume (populated by init container or entrypoint)
+VOLUME /data/tdb2
+
+EXPOSE 3030
+
+ENTRYPOINT ["/fuseki/entrypoint.sh"]
