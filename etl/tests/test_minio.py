@@ -202,20 +202,12 @@ class TestDownloadLatest:
         assert result == tmp_path / "tdb2.tar.gz"
 
         # Verify mc cat was called to read the latest pointer
-        cat_calls = [
-            c
-            for c in mock_run.call_args_list
-            if "cat" in " ".join(c.args[0])
-        ]
+        cat_calls = [c for c in mock_run.call_args_list if "cat" in " ".join(c.args[0])]
         assert len(cat_calls) == 1
         assert "tdb2/latest" in " ".join(cat_calls[0].args[0])
 
         # Verify mc cp was called with the content hash in the source path
-        cp_calls = [
-            c
-            for c in mock_run.call_args_list
-            if "cp" in " ".join(c.args[0])
-        ]
+        cp_calls = [c for c in mock_run.call_args_list if "cp" in " ".join(c.args[0])]
         assert len(cp_calls) == 1
         cp_cmd = " ".join(cp_calls[0].args[0])
         assert expected_hash in cp_cmd

@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from collections import defaultdict
 import click
 
+
 class Profiler:
     """Simple profiler for tracking timing of operations."""
 
@@ -53,9 +54,9 @@ class Profiler:
         if not self.enabled or not self.timings:
             return
 
-        click.echo("\n" + "="*50, err=True)
+        click.echo("\n" + "=" * 50, err=True)
         click.echo("⏱️  PROFILING SUMMARY", err=True)
-        click.echo("="*50, err=True)
+        click.echo("=" * 50, err=True)
 
         total_time = 0
         for step_name, times in self.timings.items():
@@ -66,21 +67,27 @@ class Profiler:
             total_time += step_total
 
             if step_count > 1:
-                click.echo(f"{step_name:30s}: {step_total:8.2f}s total ({step_count}x, avg: {step_avg:.2f}s)", err=True)
+                click.echo(
+                    f"{step_name:30s}: {step_total:8.2f}s total ({step_count}x, avg: {step_avg:.2f}s)",
+                    err=True,
+                )
             else:
                 click.echo(f"{step_name:30s}: {step_total:8.2f}s", err=True)
 
         click.echo("-" * 50, err=True)
         click.echo(f"{'TOTAL':30s}: {total_time:8.2f}s", err=True)
-        click.echo("="*50 + "\n", err=True)
+        click.echo("=" * 50 + "\n", err=True)
+
 
 # Global profiler instance
 profiler = Profiler()
+
 
 def enable_profiling():
     """Enable profiling globally."""
     global profiler
     profiler.enabled = True
+
 
 def disable_profiling():
     """Disable profiling globally."""
