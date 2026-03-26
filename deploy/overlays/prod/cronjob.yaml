@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etl-scheduled
+  namespace: packagegraph
+  labels:
+    app: etl
+    app.kubernetes.io/name: etl
+    app.kubernetes.io/part-of: packagegraph
+spec:
+  schedule: "0 2 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: etl
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: etl
+              image: packagegraph/etl:latest
+              envFrom:
+                - secretRef:
+                    name: minio-credentials
+              env:
+                - name: REPO_URL
+                  value: "http://deb.debian.org/debian"
+                - name: REPO_TYPE
+                  value: "debian"
+                - name: COLLECT_ARGS
+                  value: "--distribution stable --component main --parallel --workers 4"
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 2Gi
+                limits:
+                  cpu: "4"
+                  memory: 4Gi
