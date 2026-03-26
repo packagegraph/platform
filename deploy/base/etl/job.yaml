@@ -1,0 +1,37 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: etl-collect
+  namespace: packagegraph
+  labels:
+    app: etl
+    app.kubernetes.io/name: etl
+    app.kubernetes.io/part-of: packagegraph
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: etl
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: etl
+          image: packagegraph/etl:latest
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          env:
+            - name: REPO_URL
+              value: "http://deb.debian.org/debian"
+            - name: REPO_TYPE
+              value: "debian"
+            - name: COLLECT_ARGS
+              value: "--distribution stable --component main"
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi

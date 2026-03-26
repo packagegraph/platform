@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fuseki
+  namespace: packagegraph
+  labels:
+    app: fuseki
+    app.kubernetes.io/name: fuseki
+    app.kubernetes.io/part-of: packagegraph
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fuseki
+  template:
+    metadata:
+      labels:
+        app: fuseki
+    spec:
+      initContainers:
+        - name: load-tdb2
+          image: packagegraph/fuseki:latest
+          command: ["/fuseki/entrypoint.sh"]
+          args: ["--init-only"]
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          volumeMounts:
+            - name: tdb2-data
+              mountPath: /data
+      containers:
+        - name: fuseki
+          image: stain/jena-fuseki:5.3.0
+          args:
+            - --config
+            - /fuseki/config.ttl
+            - --port
+            - "3030"
+          ports:
+            - containerPort: 3030
+              name: http
+          volumeMounts:
+            - name: tdb2-data
+              mountPath: /data
+            - name: fuseki-config
+              mountPath: /fuseki/config.ttl
+              subPath: config.ttl
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          livenessProbe:
+            httpGet:
+              path: /$/ping
+              port: 3030
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /$/ping
+              port: 3030
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: tdb2-data
+          emptyDir:
+            sizeLimit: 100Gi
+        - name: fuseki-config
+          configMap:
+            name: fuseki-config

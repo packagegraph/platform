@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: packagegraph
+
+resources:
+  - namespace.yaml
+  - minio/secret.yaml
+  - fuseki/configmap.yaml
+  - fuseki/deployment.yaml
+  - fuseki/service.yaml
+  - fuseki/route.yaml
+  - etl/job.yaml
