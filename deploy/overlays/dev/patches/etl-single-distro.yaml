@@ -1,0 +1,20 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: etl-collect
+  namespace: packagegraph
+spec:
+  template:
+    spec:
+      containers:
+        - name: etl
+          env:
+            - name: COLLECT_ARGS
+              value: "--distribution stable --component main --arch binary-amd64 --no-parallel"
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
