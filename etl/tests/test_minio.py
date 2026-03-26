@@ -117,6 +117,70 @@ class TestUploadSnapshot:
         hex_part = result[len("sha256-") :]
         assert len(hex_part) == 64
 
+    def test_upload_snapshot_raises_on_cp_failure(self, store, fake_tar):
+        """upload_snapshot should raise RuntimeError when mc cp fails."""
+
+        def run_side_effect(cmd, **kwargs):
+            cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+            if "stat" in cmd_str:
+                return MagicMock(returncode=1)  # not found
+            if "cp" in cmd_str:
+                return MagicMock(returncode=1, stderr="upload error")
+            return MagicMock(returncode=0)
+
+        with patch("packagegraph.minio.subprocess.run", side_effect=run_side_effect):
+            with pytest.raises(RuntimeError, match="Failed to upload snapshot"):
+                store.upload_snapshot(fake_tar)
+
+    def test_upload_snapshot_raises_on_update_latest_failure(self, store, fake_tar):
+        """upload_snapshot should raise RuntimeError when _update_latest (mc pipe) fails."""
+
+        def run_side_effect(cmd, **kwargs):
+            cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+            if "stat" in cmd_str:
+                return MagicMock(returncode=1)  # not found
+            if "cp" in cmd_str:
+                return MagicMock(returncode=0)
+            if "pipe" in cmd_str:
+                return MagicMock(returncode=1, stderr="pipe error")
+            return MagicMock(returncode=0)
+
+        with patch("packagegraph.minio.subprocess.run", side_effect=run_side_effect):
+            with pytest.raises(RuntimeError, match="Failed to update latest pointer"):
+                store.upload_snapshot(fake_tar)
+
+
+class TestInit:
+    def test_https_endpoint_embeds_credentials(self):
+        """MC_HOST should embed credentials in https URL."""
+        store = MinioStore(
+            endpoint="https://minio.example.com",
+            bucket="b",
+            access_key="AK",
+            secret_key="SK",
+        )
+        assert store._env["MC_HOST_pgraph"] == "https://AK:SK@minio.example.com"
+
+    def test_http_endpoint_embeds_credentials(self):
+        """MC_HOST should embed credentials in http URL."""
+        store = MinioStore(
+            endpoint="http://localhost:9000",
+            bucket="b",
+            access_key="AK",
+            secret_key="SK",
+        )
+        assert store._env["MC_HOST_pgraph"] == "http://AK:SK@localhost:9000"
+
+    def test_bare_hostname_assumes_https(self):
+        """Bare hostname should produce https MC_HOST with credentials."""
+        store = MinioStore(
+            endpoint="minio.internal:9000",
+            bucket="b",
+            access_key="AK",
+            secret_key="SK",
+        )
+        assert store._env["MC_HOST_pgraph"] == "https://AK:SK@minio.internal:9000"
+
 
 class TestDownloadLatest:
     def test_download_latest_reads_pointer_and_downloads(self, store, tmp_path):
@@ -129,7 +193,54 @@ class TestDownloadLatest:
                 return MagicMock(returncode=0, stdout=expected_hash)
             return MagicMock(returncode=0)
 
-        with patch("packagegraph.minio.subprocess.run", side_effect=run_side_effect):
+        with patch(
+            "packagegraph.minio.subprocess.run", side_effect=run_side_effect
+        ) as mock_run:
             result = store.download_latest(tmp_path)
 
         assert isinstance(result, Path)
+        assert result == tmp_path / "tdb2.tar.gz"
+
+        # Verify mc cat was called to read the latest pointer
+        cat_calls = [
+            c
+            for c in mock_run.call_args_list
+            if "cat" in " ".join(c.args[0])
+        ]
+        assert len(cat_calls) == 1
+        assert "tdb2/latest" in " ".join(cat_calls[0].args[0])
+
+        # Verify mc cp was called with the content hash in the source path
+        cp_calls = [
+            c
+            for c in mock_run.call_args_list
+            if "cp" in " ".join(c.args[0])
+        ]
+        assert len(cp_calls) == 1
+        cp_cmd = " ".join(cp_calls[0].args[0])
+        assert expected_hash in cp_cmd
+        assert str(tmp_path / "tdb2.tar.gz") in cp_cmd
+
+    def test_download_latest_raises_on_cat_failure(self, store, tmp_path):
+        """download_latest should raise RuntimeError when mc cat fails."""
+        mock_result = MagicMock(returncode=1, stderr="no such object")
+
+        with patch("packagegraph.minio.subprocess.run", return_value=mock_result):
+            with pytest.raises(RuntimeError, match="Failed to read latest pointer"):
+                store.download_latest(tmp_path)
+
+    def test_download_latest_raises_on_cp_failure(self, store, tmp_path):
+        """download_latest should raise RuntimeError when mc cp fails."""
+        expected_hash = "sha256-abc123def456"
+
+        def run_side_effect(cmd, **kwargs):
+            cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+            if "cat" in cmd_str:
+                return MagicMock(returncode=0, stdout=expected_hash)
+            if "cp" in cmd_str:
+                return MagicMock(returncode=1, stderr="download failed")
+            return MagicMock(returncode=0)
+
+        with patch("packagegraph.minio.subprocess.run", side_effect=run_side_effect):
+            with pytest.raises(RuntimeError, match="Failed to download snapshot"):
+                store.download_latest(tmp_path)

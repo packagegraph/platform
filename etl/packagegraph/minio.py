@@ -22,17 +22,23 @@ class MinioStore:
         self.access_key = access_key
         self.secret_key = secret_key
         self.alias = alias
+        # Build MC_HOST value with embedded credentials
+        if endpoint.startswith("https://"):
+            mc_host = endpoint.rstrip("/").replace(
+                "https://", f"https://{access_key}:{secret_key}@", 1
+            )
+        elif endpoint.startswith("http://"):
+            mc_host = endpoint.rstrip("/").replace(
+                "http://", f"http://{access_key}:{secret_key}@", 1
+            )
+        else:
+            # Bare hostname — assume https
+            mc_host = f"https://{access_key}:{secret_key}@{endpoint.rstrip('/')}"
+
         self._env = {
             **os.environ,
-            f"MC_HOST_{alias}": f"{endpoint}",
+            f"MC_HOST_{alias}": mc_host,
         }
-        # If endpoint doesn't already contain credentials, build the full MC_HOST value
-        if not endpoint.startswith("http"):
-            self._env[f"MC_HOST_{alias}"] = endpoint
-        else:
-            self._env[f"MC_HOST_{alias}"] = f"{endpoint.rstrip('/')}".replace(
-                "https://", f"https://{access_key}:{secret_key}@"
-            ).replace("http://", f"http://{access_key}:{secret_key}@")
 
     def _hash_file(self, path: Path) -> str:
         """Compute SHA-256 hash of a file."""
@@ -42,11 +48,13 @@ class MinioStore:
                 sha256.update(chunk)
         return sha256.hexdigest()
 
-    def _mc(self, *args: str, check: bool = False) -> subprocess.CompletedProcess:
+    def _mc(
+        self, *args: str, check: bool = False, **kwargs
+    ) -> subprocess.CompletedProcess:
         """Run an mc command."""
         cmd = ["mc", *args]
         return subprocess.run(
-            cmd, env=self._env, capture_output=True, text=True, check=check
+            cmd, env=self._env, capture_output=True, text=True, check=check, **kwargs
         )
 
     def upload_snapshot(self, tar_path: Path) -> str:
@@ -67,7 +75,11 @@ class MinioStore:
             return content_hash
 
         # Upload the tar file
-        self._mc("cp", str(tar_path), object_path, check=False)
+        result = self._mc("cp", str(tar_path), object_path)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to upload snapshot to {object_path}: {result.stderr}"
+            )
 
         # Update the latest pointer
         self._update_latest(content_hash)
@@ -77,13 +89,11 @@ class MinioStore:
     def _update_latest(self, content_hash: str) -> None:
         """Update the tdb2/latest pointer file in Minio."""
         latest_path = f"{self.alias}/{self.bucket}/tdb2/latest"
-        subprocess.run(
-            ["mc", "pipe", latest_path],
-            input=content_hash,
-            env=self._env,
-            capture_output=True,
-            text=True,
-        )
+        result = self._mc("pipe", latest_path, input=content_hash)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to update latest pointer at {latest_path}: {result.stderr}"
+            )
 
     def download_latest(self, dest_dir: Path) -> Path:
         """Download the latest TDB2 snapshot.
@@ -95,11 +105,19 @@ class MinioStore:
 
         # Read the latest pointer
         result = self._mc("cat", latest_path)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to read latest pointer at {latest_path}: {result.stderr}"
+            )
         content_hash = result.stdout.strip()
 
         # Download the snapshot
         object_path = f"{self.alias}/{self.bucket}/tdb2/{content_hash}/tdb2.tar.gz"
         local_path = dest_dir / "tdb2.tar.gz"
-        self._mc("cp", object_path, str(local_path))
+        result = self._mc("cp", object_path, str(local_path))
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to download snapshot from {object_path}: {result.stderr}"
+            )
 
         return local_path
