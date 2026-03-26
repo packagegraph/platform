@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+.ruff_cache/
+*.ttl.zst
+*.tar.gz
+output/
+dead_letters/
