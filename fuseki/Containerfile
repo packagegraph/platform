@@ -1,10 +1,12 @@
-FROM stain/jena-fuseki:5.1.0
+FROM ghcr.io/packagegraph/fuseki:5.3.0
 
 USER root
 
-# Install mc (Minio client)
-RUN curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc \
-    && chmod +x /usr/local/bin/mc
+# Install mc (Minio client) — official image is Alpine-based
+RUN apk add --no-cache curl \
+    && curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc \
+    && chmod +x /usr/local/bin/mc \
+    && apk del curl
 
 # Copy config and entrypoint
 COPY config.ttl /fuseki/config.ttl

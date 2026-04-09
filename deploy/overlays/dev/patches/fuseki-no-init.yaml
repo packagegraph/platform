@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fuseki
+  namespace: packagegraph
+spec:
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers: []
+      containers:
+        - name: fuseki
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          image: ghcr.io/packagegraph/fuseki:5.3.0
+          args:
+            - --config
+            - /fuseki/config.ttl
+            - --port
+            - "3030"
+          ports:
+            - containerPort: 3030
+              name: http
+          volumeMounts:
+            - name: tdb2-data
+              mountPath: /data
+            - name: fuseki-run
+              mountPath: /fuseki/run
+            - name: fuseki-config
+              mountPath: /fuseki/config.ttl
+              subPath: config.ttl
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /$/ping
+              port: 3030
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /$/ping
+              port: 3030
+            initialDelaySeconds: 10
+            periodSeconds: 10

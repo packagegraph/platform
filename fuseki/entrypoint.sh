@@ -1,5 +1,5 @@
-#!/bin/bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
 TDB2_DIR="/data/tdb2"
 MINIO_ALIAS="pgraph"
@@ -40,6 +40,6 @@ if [ "${1:-}" = "--init-only" ]; then
 fi
 
 echo "=== Starting Fuseki ==="
-exec /docker-entrypoint.sh /jena-fuseki/fuseki-server \
+exec "$JAVA_HOME/bin/java" $JAVA_OPTIONS -jar "${FUSEKI_DIR}/${FUSEKI_JAR}" \
     --config /fuseki/config.ttl \
     --port 3030

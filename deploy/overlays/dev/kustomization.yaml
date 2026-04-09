@@ -6,4 +6,16 @@ resources:
 
 patches:
   - path: patches/fuseki-resources.yaml
+  - path: patches/fuseki-no-init.yaml
+  - target:
+      kind: Deployment
+      name: fuseki
+    patch: |
+      - op: remove
+        path: /spec/template/spec/initContainers
+      - op: add
+        path: /spec/template/spec/volumes/-
+        value:
+          name: fuseki-run
+          emptyDir: {}
   - path: patches/etl-single-distro.yaml
