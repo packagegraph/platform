@@ -17,11 +17,13 @@ spec:
       restartPolicy: Never
       containers:
         - name: etl
-          image: packagegraph/etl:latest
+          image: ghcr.io/packagegraph/etl:5.3.0
           envFrom:
             - secretRef:
                 name: minio-credentials
           env:
+            - name: HOME
+              value: /tmp
             - name: REPO_URL
               value: "http://deb.debian.org/debian"
             - name: REPO_TYPE

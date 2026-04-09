@@ -9,3 +9,6 @@ build/
 *.tar.gz
 output/
 dead_letters/
+
+# Ontology TTLs copied at build time from ontology repo
+etl/ontology/
