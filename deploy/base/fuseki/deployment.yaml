@@ -30,7 +30,7 @@ spec:
               mountPath: /data
       containers:
         - name: fuseki
-          image: stain/jena-fuseki:5.3.0
+          image: ghcr.io/packagegraph/fuseki:5.3.0
           args:
             - --config
             - /fuseki/config.ttl
