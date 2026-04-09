@@ -6,6 +6,9 @@ namespace: packagegraph
 resources:
   - namespace.yaml
   - minio/secret.yaml
+  - minio/pvc.yaml
+  - minio/deployment.yaml
+  - minio/service.yaml
   - fuseki/configmap.yaml
   - fuseki/deployment.yaml
   - fuseki/service.yaml
