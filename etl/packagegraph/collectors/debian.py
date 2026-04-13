@@ -6,7 +6,8 @@ import requests
 import gzip
 import re
 import tempfile
-from rdflib import Graph
+from rdflib import Graph, Literal
+from rdflib.namespace import RDF
 from ..collector import BaseCollector
 from ..profiler import profiler
 from ..graph_builder import GraphBuilder
@@ -277,25 +278,22 @@ class DebianCollector(BaseCollector):
                 dependencies = self._parse_dependency_string(pkg_data[field])
 
                 for dep_name, version_constraint in dependencies:
-                    # Build target package URI
-                    # We don't know the exact version, so use a generic URI
-                    # In practice, we'd need to resolve this from the graph or use a different pattern
-                    # For now, we'll create a simple reference
                     dep_uri = package_uri("debian", codename, arch_name, dep_name, "unknown")
 
                     if field == "Provides":
-                        # Provides creates a directlyProvides link
+                        builder.graph.add((dep_uri, RDF.type, PKG.BinaryPackage))
+                        builder.graph.add((dep_uri, PKG.packageName, Literal(dep_name)))
                         builder.graph.add((pkg_uri, PKG.directlyProvides, dep_uri))
                         if distro_prop:
                             builder.graph.add((pkg_uri, distro_prop, dep_uri))
                     else:
-                        # Parse version constraint
                         constraint_op, constraint_val = self._parse_version_constraint(version_constraint)
 
                         builder.add_dependency(
                             package_uri=pkg_uri,
                             target_uri=dep_uri,
                             dep_type=dep_type,
+                            target_name=dep_name,
                             distro_property=distro_prop,
                             constraint_op=constraint_op,
                             constraint_val=constraint_val

@@ -1,7 +1,7 @@
 """GraphBuilder - Shared ontology-aligned triple emission logic."""
 
 from rdflib import Graph, URIRef, Literal, BNode
-from rdflib.namespace import RDF
+from rdflib.namespace import RDF, XSD
 from .namespaces import (
     PKG, SEC, VCS, DATA, DEB, RPM, FOAF, PROV,
     package_uri, source_uri, version_uri, maintainer_uri,
@@ -148,9 +148,9 @@ class GraphBuilder:
         if homepage:
             self.graph.add((pkg_uri, PKG.homepage, Literal(homepage)))
         if install_size is not None:
-            self.graph.add((pkg_uri, PKG.installSize, Literal(install_size)))
+            self.graph.add((pkg_uri, PKG.installSize, Literal(install_size, datatype=XSD.integer)))
         if package_size is not None:
-            self.graph.add((pkg_uri, PKG.packageSize, Literal(package_size)))
+            self.graph.add((pkg_uri, PKG.packageSize, Literal(package_size, datatype=XSD.integer)))
         if checksum:
             self.graph.add((pkg_uri, PKG.checksum, Literal(checksum)))
 
@@ -167,6 +167,7 @@ class GraphBuilder:
         package_uri: URIRef,
         target_uri: URIRef,
         dep_type: str,
+        target_name: str | None = None,
         distro_property: URIRef | None = None,
         constraint_op: str | None = None,
         constraint_val: str | None = None
@@ -177,10 +178,19 @@ class GraphBuilder:
             package_uri: The package that has the dependency
             target_uri: The package being depended on
             dep_type: "runtime", "recommends", "suggests", "conflicts", etc.
+            target_name: Package name for the dependency target stub
             distro_property: Additional distro-specific property (e.g., PKG.debDepends)
             constraint_op: Version constraint operator (e.g., "≥", "=", "<")
             constraint_val: Version constraint value (e.g., "2.36")
         """
+        # Ensure dependency target stub has basic properties for graph traversal.
+        # Targets are version-agnostic stubs (version=unknown) — without at least
+        # pkg:packageName and rdf:type, they are invisible to typed queries and
+        # name-based joins, breaking transitive dependency traversal.
+        if target_name:
+            self.graph.add((target_uri, RDF.type, PKG.BinaryPackage))
+            self.graph.add((target_uri, PKG.packageName, Literal(target_name)))
+
         # Emit generic property based on dep_type
         if dep_type in ["conflicts", "breaks"]:
             self.graph.add((package_uri, PKG.directlyConflictsWith, target_uri))
@@ -277,9 +287,9 @@ class GraphBuilder:
         if description:
             self.graph.add((r_uri, VCS.repositoryDescription, Literal(description)))
         if stars is not None:
-            self.graph.add((r_uri, VCS.starCount, Literal(stars)))
+            self.graph.add((r_uri, VCS.starCount, Literal(stars, datatype=XSD.integer)))
         if forks is not None:
-            self.graph.add((r_uri, VCS.forkCount, Literal(forks)))
+            self.graph.add((r_uri, VCS.forkCount, Literal(forks, datatype=XSD.integer)))
 
         return r_uri
 
