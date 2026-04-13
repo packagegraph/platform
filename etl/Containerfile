@@ -1,25 +1,13 @@
-# Stage 1: Rust builder with cargo-chef for dependency caching
-FROM docker.io/rust:1.88-slim AS rust-chef
+# Stage 1: Rust builder
+FROM docker.io/rust:1.86-slim AS rust-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
-RUN cargo install cargo-chef
 WORKDIR /app
-
-FROM rust-chef AS rust-planner
-COPY pg-collect/ .
-RUN cargo chef prepare --recipe-path recipe.json
-
-FROM rust-chef AS rust-builder
-COPY --from=rust-planner /app/recipe.json recipe.json
-# Build dependencies - this layer is cached
-RUN cargo chef cook --release --recipe-path recipe.json
-
-# Copy source and build application
 COPY pg-collect/ .
 RUN cargo build --release
 
-# Stage 2: Python application with Rust binary
+# Stage 2: Python application
 FROM docker.io/python:3.12-slim AS base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
