@@ -245,26 +245,26 @@ def build(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Gather input files
-    input_files = sorted(input_dir.glob("*.nt")) + sorted(input_dir.glob("*.ttl"))
-    input_files += sorted(ontology_dir.glob("*.nt")) + sorted(
+    # Gather input files (data and ontology separately)
+    data_files = sorted(input_dir.glob("*.nt")) + sorted(input_dir.glob("*.ttl"))
+    ontology_files = sorted(ontology_dir.glob("*.nt")) + sorted(
         ontology_dir.glob("*.ttl")
     )
 
-    if not input_files:
+    if not data_files and not ontology_files:
         click.echo("No .nt or .ttl files found in input-dir or ontology-dir.", err=True)
         sys.exit(1)
 
-    click.echo(f"Found {len(input_files)} input files.")
+    click.echo(f"Found {len(data_files)} data files, {len(ontology_files)} ontology files.")
 
-    # Build TDB2 index
+    # Build TDB2 index (ontology in named graph, data in default graph)
     tdb_dir = output_dir / "tdb2"
     tdb_dir.mkdir(parents=True, exist_ok=True)
 
     builder = TDB2Builder(jena_home=jena_home)
     try:
         click.echo("Building TDB2 index...")
-        builder.build(input_files, tdb_dir)
+        builder.build(data_files, tdb_dir, ontology_files=ontology_files)
         click.echo("TDB2 index built successfully.")
     except RuntimeError as e:
         click.echo(f"TDB2 build failed: {e}", err=True)

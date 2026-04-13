@@ -10,5 +10,10 @@
     fuseki:endpoint [ fuseki:operation fuseki:gsp-r ; fuseki:name "get" ] ;
     fuseki:dataset <#dataset> .
 
+# Ontology TBox is loaded into a named graph by the ETL pipeline
+# (https://packagegraph.github.io/ontology) to keep class/property
+# definitions out of the instance data default graph.
+# unionDefaultGraph makes queries see both graphs transparently.
 <#dataset> rdf:type tdb2:DatasetTDB2 ;
-    tdb2:location "/data/tdb2" .
+    tdb2:location "/data/tdb2" ;
+    tdb2:unionDefaultGraph true .
