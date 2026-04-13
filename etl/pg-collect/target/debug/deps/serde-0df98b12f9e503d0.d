@@ -1,0 +1,12 @@
+/Users/bharrington/Projects/packagegraph/platform/etl/pg-collect/target/debug/deps/serde-0df98b12f9e503d0.d: /Users/bharrington/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/bharrington/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/bharrington/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/bharrington/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/bharrington/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/bharrington/Projects/packagegraph/platform/etl/pg-collect/target/debug/build/serde-f10b00d2303b7b4f/out/private.rs
+
+/Users/bharrington/Projects/packagegraph/platform/etl/pg-collect/target/debug/deps/libserde-0df98b12f9e503d0.rmeta: /Users/bharrington/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/bharrington/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/bharrington/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/bharrington/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/bharrington/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/bharrington/Projects/packagegraph/platform/etl/pg-collect/target/debug/build/serde-f10b00d2303b7b4f/out/private.rs
+
+/Users/bharrington/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/bharrington/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/bharrington/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/bharrington/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/bharrington/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/bharrington/Projects/packagegraph/platform/etl/pg-collect/target/debug/build/serde-f10b00d2303b7b4f/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/bharrington/Projects/packagegraph/platform/etl/pg-collect/target/debug/build/serde-f10b00d2303b7b4f/out
