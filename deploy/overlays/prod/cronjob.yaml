@@ -21,19 +21,33 @@ spec:
             app: etl
         spec:
           restartPolicy: Never
+          imagePullSecrets:
+            - name: ghcr-pull-secret
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
           containers:
             - name: etl
-              image: packagegraph/etl:latest
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
               envFrom:
                 - secretRef:
                     name: minio-credentials
               env:
+                - name: HOME
+                  value: /tmp
                 - name: REPO_URL
                   value: "http://deb.debian.org/debian"
                 - name: REPO_TYPE
                   value: "debian"
                 - name: COLLECT_ARGS
-                  value: "--distribution stable --component main --parallel --workers 4"
+                  value: "--dist stable --component main"
               resources:
                 requests:
                   cpu: "2"

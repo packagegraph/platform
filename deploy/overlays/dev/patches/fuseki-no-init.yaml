@@ -12,7 +12,42 @@ spec:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
-      initContainers: []
+      initContainers:
+        - name: load-tdb2
+          image: ghcr.io/packagegraph/etl:latest
+          imagePullPolicy: Always
+          command: ["sh", "-c"]
+          args:
+            - |
+              mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 &&
+              CONTENT_HASH=$(mc cat pgraph/${MINIO_BUCKET}/tdb2/latest) &&
+              echo "Latest snapshot: ${CONTENT_HASH}" &&
+              HASH_FILE="/data/.content-hash" &&
+              if [ -f "$HASH_FILE" ] && [ "$(cat "$HASH_FILE")" = "$CONTENT_HASH" ]; then
+                echo "TDB2 already loaded, skipping download."
+              else
+                echo "Downloading tdb2/${CONTENT_HASH}/tdb2.tar.gz..." &&
+                mc cp "pgraph/${MINIO_BUCKET}/tdb2/${CONTENT_HASH}/tdb2.tar.gz" /tmp/tdb2.tar.gz &&
+                rm -rf /data/tdb2 && mkdir -p /data/tdb2 &&
+                tar -xzf /tmp/tdb2.tar.gz -C /data/ &&
+                rm /tmp/tdb2.tar.gz &&
+                echo "$CONTENT_HASH" > "$HASH_FILE"
+              fi &&
+              echo "TDB2 ready."
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: HOME
+              value: /tmp
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          volumeMounts:
+            - name: tdb2-data
+              mountPath: /data
       containers:
         - name: fuseki
           securityContext:
@@ -44,7 +79,7 @@ spec:
               memory: 512Mi
             limits:
               cpu: "1"
-              memory: 1Gi
+              memory: 2Gi
           livenessProbe:
             httpGet:
               path: /$/ping
