@@ -8,11 +8,8 @@ MINIO_ALIAS="pgraph"
 if [ -n "${MINIO_ACCESS_KEY:-}" ]; then
     echo "=== Fuseki: Loading TDB2 from Minio ==="
 
-    # Configure mc
-    # MC_HOST format: scheme://accesskey:secretkey@host:port
-    # MINIO_ENDPOINT includes the scheme (http:// or https://)
-    MC_HOST=$(echo "${MINIO_ENDPOINT}" | sed "s|://|://${MINIO_ACCESS_KEY}:${MINIO_SECRET_KEY}@|")
-    export MC_HOST_${MINIO_ALIAS}="$MC_HOST"
+    # Configure mc alias
+    mc alias set "${MINIO_ALIAS}" "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 >/dev/null 2>&1
 
     # Read latest pointer
     CONTENT_HASH=$(mc cat "${MINIO_ALIAS}/${MINIO_BUCKET}/tdb2/latest")
