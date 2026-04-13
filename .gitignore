@@ -10,5 +10,8 @@ build/
 output/
 dead_letters/
 
+# Rust build artifacts
+target/
+
 # Ontology TTLs copied at build time from ontology repo
 etl/ontology/
