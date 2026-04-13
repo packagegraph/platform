@@ -84,11 +84,12 @@ spec:
             httpGet:
               path: /$/ping
               port: 3030
-            initialDelaySeconds: 30
+            initialDelaySeconds: 60
             periodSeconds: 30
+            failureThreshold: 5
           readinessProbe:
             httpGet:
               path: /$/ping
               port: 3030
-            initialDelaySeconds: 10
+            initialDelaySeconds: 15
             periodSeconds: 10
