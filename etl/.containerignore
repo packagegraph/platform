@@ -1,0 +1,8 @@
+pg-collect/target/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+tests/
+pg-collect/tests/
+.venv/
