@@ -43,50 +43,50 @@ SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }
 
 ### Q2: Binary Package Count
 ```sparql
-PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
 SELECT (COUNT(?p) AS ?count) WHERE { ?p a pkg:BinaryPackage }
 ```
 **Result:** 68,757 | **Time:** 2,565ms
 
 ### Q3: Source Package Count
 ```sparql
-PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
 SELECT (COUNT(?p) AS ?count) WHERE { ?p a pkg:SourcePackage }
 ```
 **Result:** 37,478 | **Time:** 1,027ms
 
 ### Q4: Dependency Link Count
 ```sparql
-PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
 SELECT (COUNT(*) AS ?count) WHERE { ?p pkg:directlyDependsOn ?dep }
 ```
 **Result:** 357,516 | **Time:** 193ms
 
 ### Q5: Unique Maintainer Count
 ```sparql
-PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
 SELECT (COUNT(DISTINCT ?m) AS ?count) WHERE { ?p pkg:maintainedBy ?m }
 ```
 **Result:** 1,982 | **Time:** 425ms
 
 ### Q6: Source-Binary Link Count
 ```sparql
-PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
 SELECT (COUNT(*) AS ?count) WHERE { ?bin pkg:builtFromSource ?src }
 ```
 **Result:** 68,757 | **Time:** 42ms
 
 ### Q7: Dual-Typed Packages (pkg:BinaryPackage AND deb:BinaryPackage)
 ```sparql
-PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
-PREFIX deb: <https://packagegraph.github.io/ontology/debian#>
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+PREFIX deb: <https://purl.org/packagegraph/ontology/debian#>
 SELECT (COUNT(?p) AS ?count) WHERE { ?p a pkg:BinaryPackage . ?p a deb:BinaryPackage }
 ```
 **Result:** 68,757 | **Time:** 1,045ms
 
 ### Q8: Top 15 Most-Depended-On Packages
 ```sparql
-PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
 SELECT ?depName (COUNT(DISTINCT ?pkg) AS ?rdepends)
 WHERE {
   ?pkg pkg:directlyDependsOn ?dep .
@@ -117,7 +117,7 @@ GROUP BY ?depName ORDER BY DESC(?rdepends) LIMIT 15
 
 ### Q9: Top 10 Maintainers by Package Count
 ```sparql
-PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
 PREFIX foaf: <http://xmlns.com/foaf/0.1/>
 SELECT ?name (COUNT(DISTINCT ?p) AS ?pkg_count)
 WHERE { ?p pkg:maintainedBy ?m . ?m foaf:name ?name . }
@@ -178,7 +178,7 @@ SELECT ?p (COUNT(*) AS ?count) WHERE { ?s ?p ?o } GROUP BY ?p ORDER BY DESC(?cou
 
 ### Q12: Architecture Distribution
 ```sparql
-PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
 SELECT ?arch (COUNT(?p) AS ?pkg_count)
 WHERE { ?p pkg:targetArchitecture ?a . ?a pkg:architectureName ?arch . }
 GROUP BY ?arch ORDER BY DESC(?pkg_count)
@@ -187,7 +187,7 @@ GROUP BY ?arch ORDER BY DESC(?pkg_count)
 
 ### Q13: Dependencies with Version Constraints
 ```sparql
-PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
 SELECT (COUNT(DISTINCT ?dep) AS ?count)
 WHERE { ?dep a pkg:Dependency . ?dep pkg:hasVersionConstraint ?vc . }
 ```
@@ -195,7 +195,7 @@ WHERE { ?dep a pkg:Dependency . ?dep pkg:hasVersionConstraint ?vc . }
 
 ### Q14: Sample Package Detail (bash)
 ```sparql
-PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
 SELECT ?prop ?value
 WHERE { ?p pkg:packageName "bash" . ?p a pkg:BinaryPackage . ?p ?prop ?value . }
 ```
@@ -205,10 +205,10 @@ WHERE { ?p pkg:packageName "bash" . ?p a pkg:BinaryPackage . ?p ?prop ?value . }
 |----------|-------|
 | rdf:type | pkg:BinaryPackage, deb:BinaryPackage |
 | pkg:packageName | bash |
-| pkg:hasVersion | data:version/debian/trixie/bash/5.2.37-2+b8 |
-| pkg:targetArchitecture | data:arch/amd64 |
-| pkg:partOfDistribution | data:distro/debian |
-| pkg:partOfRelease | data:release/debian/trixie |
+| pkg:hasVersion | d/ver/debian/trixie/bash/5.2.37-2+b8 |
+| pkg:targetArchitecture | d/arch/amd64 |
+| pkg:partOfDistribution | d/distro/debian |
+| pkg:partOfRelease | d/release/debian/trixie |
 | pkg:description | GNU Bourne Again SHell |
 | pkg:homepage | http://tiswww.case.edu/php/chet/bash/bashtop.html |
 | pkg:installSize | 7368704 |
@@ -216,13 +216,13 @@ WHERE { ?p pkg:packageName "bash" . ?p a pkg:BinaryPackage . ?p ?prop ?value . }
 | pkg:checksum | f8d1a71e... |
 | deb:inSuite | stable |
 | deb:inComponent | main |
-| pkg:maintainedBy | data:maintainer/doko@debian.org |
-| pkg:builtFromSource | data:source/debian/trixie/bash/5.2.37-2 |
+| pkg:maintainedBy | d/maintainer/doko@debian.org |
+| pkg:builtFromSource | d/src/debian/trixie/bash/5.2.37-2 |
 | pkg:directlyDependsOn | libc6, libtinfo6, debianutils |
 
 ### Q15: Direct Reverse Dependencies of libc6
 ```sparql
-PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
 SELECT ?name WHERE {
   ?pkg pkg:directlyDependsOn ?dep .
   FILTER(CONTAINS(STR(?dep), "/libc6/"))
@@ -249,7 +249,7 @@ Slow queries are aggregate scans over the full 4.3M triple dataset. Point lookup
 
 ## Known Limitations
 
-1. **Dependency target stubs:** `directlyDependsOn` targets use stub URIs with `version=unknown` (e.g., `data:package/debian/trixie/amd64/libc6/unknown`). These stubs lack `pkg:packageName` and `rdf:type`, preventing direct joins. Reverse dependency queries require URI string parsing (REPLACE/CONTAINS). Transitive dependency traversal by name join times out on 68K packages.
+1. **Dependency target stubs:** `directlyDependsOn` targets use stub URIs with `version=unknown` (e.g., `d/pkg/debian/trixie/amd64/libc6/unknown`). These stubs lack `pkg:packageName` and `rdf:type`, preventing direct joins. Reverse dependency queries require URI string parsing (REPLACE/CONTAINS). Transitive dependency traversal by name join times out on 68K packages.
 
 2. **Single architecture:** Only amd64 collected. Multi-arch collection available via `--arch` flag.
 

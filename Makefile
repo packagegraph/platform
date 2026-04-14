@@ -1,6 +1,6 @@
 .PHONY: build-etl build-fuseki push-etl push-fuseki deploy-dev deploy-prod
 
-REGISTRY ?= quay.io/packagegraph
+REGISTRY ?= ghcr.io/packagegraph
 ETL_IMAGE = $(REGISTRY)/etl
 FUSEKI_IMAGE = $(REGISTRY)/fuseki
 TAG ?= latest
