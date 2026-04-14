@@ -3,6 +3,12 @@ kind: Kustomization
 
 resources:
   - ../../base
+  - jobs/collect-debian-trixie.yaml
+  - jobs/collect-fedora-43.yaml
+  - jobs/collect-fedora-rawhide.yaml
+  - jobs/collect-centos-stream-9.yaml
+  - jobs/collect-centos-stream-10.yaml
+  - jobs/collect-opensuse-tw.yaml
 
 patches:
   - path: patches/fuseki-resources.yaml

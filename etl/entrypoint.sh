@@ -9,6 +9,8 @@ set -euo pipefail
 COLLECT_ARGS="${COLLECT_ARGS:-}"
 COLLECT_ARCHES="${COLLECT_ARCHES:-binary-amd64}"
 OUTPUT_DIR="${OUTPUT_DIR:-/tmp/output}"
+GRAPH_URI="${GRAPH_URI:-}"
+FUSEKI_ENDPOINT="${FUSEKI_ENDPOINT:-}"
 TDB2_DIR="${TDB2_DIR:-/tmp/tdb2}"
 ONTOLOGY_DIR="${ONTOLOGY_DIR:-/app/ontology}"
 
@@ -65,12 +67,26 @@ elif [ -n "${REPO_URL:-}" ]; then
     fi
 fi
 
-# Step 2: Build TDB2 and upload to Minio
-echo "Building TDB2 index..."
-packagegraph build \
-    --input-dir "$OUTPUT_DIR" \
-    --ontology-dir "$ONTOLOGY_DIR" \
-    --output-dir "$TDB2_DIR" \
-    --jena-home "$JENA_HOME"
+# Step 2: Load into Fuseki or build TDB2
+if [ -n "$FUSEKI_ENDPOINT" ] && [ -n "$GRAPH_URI" ]; then
+    echo "Loading via SPARQL Update into graph <$GRAPH_URI>..."
+
+    # Drop existing graph
+    pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+
+    # Load all .nt files
+    for f in "$OUTPUT_DIR"/*.nt; do
+        [ -f "$f" ] && pg-collect load "$f" --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+    done
+
+    echo "SPARQL load complete."
+else
+    echo "Building TDB2 index..."
+    packagegraph build \
+        --input-dir "$OUTPUT_DIR" \
+        --ontology-dir "$ONTOLOGY_DIR" \
+        --output-dir "$TDB2_DIR" \
+        --jena-home "$JENA_HOME"
+fi
 
 echo "=== ETL Pipeline Complete ==="
