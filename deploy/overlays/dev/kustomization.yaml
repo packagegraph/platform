@@ -9,6 +9,9 @@ resources:
   - jobs/collect-centos-stream-9.yaml
   - jobs/collect-centos-stream-10.yaml
   - jobs/collect-opensuse-tw.yaml
+  - jobs/collect-alpine-v320.yaml
+  - jobs/collect-homebrew.yaml
+  - jobs/collect-arch.yaml
   - jobs/snapshot-tdb2.yaml
   - jobs/enrich-github-vcs.yaml
   - jobs/enrich-license.yaml
