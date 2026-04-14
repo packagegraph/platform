@@ -47,3 +47,68 @@ class SparqlQueryClient:
         """
         bindings = self.query(sparql)
         return [(b["pkg"]["value"], b["homepage"]["value"]) for b in bindings]
+
+    def query_packages_with_source_repos(self) -> list[tuple[str, str, str]]:
+        """Get (pkg_uri, pkg_name, repo_url) for packages with upstream repos.
+
+        Returns packages linked to source packages with upstream repositories.
+        """
+        sparql = """
+        PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+        SELECT DISTINCT ?pkg ?name ?repo WHERE {
+            ?pkg a pkg:BinaryPackage .
+            ?pkg pkg:packageName ?name .
+            ?pkg pkg:builtFromSource ?src .
+            ?src pkg:upstreamRepository ?repo .
+        }
+        """
+        bindings = self.query(sparql)
+        return [
+            (b["pkg"]["value"], b["name"]["value"], b["repo"]["value"])
+            for b in bindings
+        ]
+
+    def query_packages_for_ecosystem(self, ecosystem: str) -> list[tuple[str, str]]:
+        """Get (package_name, version_string) for packages in ecosystem.
+
+        Currently supports: Debian, Fedora, CentOS, etc.
+        """
+        sparql = """
+        PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+        PREFIX deb: <https://purl.org/packagegraph/ontology/debian#>
+        PREFIX rpm: <https://purl.org/packagegraph/ontology/rpm#>
+        SELECT DISTINCT ?name ?version WHERE {
+            ?p pkg:packageName ?name .
+            ?p pkg:hasVersion ?v .
+            ?v pkg:versionString ?version .
+            # Filter by ecosystem - both Debian and RPM packages
+            {
+                {?p a deb:BinaryPackage}
+                UNION
+                {?p a rpm:BinaryRPM}
+            }
+        }
+        """
+        bindings = self.query(sparql)
+        return [(b["name"]["value"], b["version"]["value"]) for b in bindings]
+
+    def query_enrichment_snapshots(self) -> list[dict[str, str]]:
+        """Get list of existing enrichment snapshots with metadata."""
+        sparql = """
+        PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+        SELECT ?snapshot ?enricher ?timestamp WHERE {
+            ?snapshot a pkg:DataSnapshot .
+            ?snapshot pkg:snapshotSource ?enricher .
+            ?snapshot pkg:snapshotTimestamp ?timestamp .
+        }
+        ORDER BY DESC(?timestamp)
+        """
+        bindings = self.query(sparql)
+        return [
+            {
+                "snapshot": b["snapshot"]["value"],
+                "enricher": b["enricher"]["value"],
+                "timestamp": b["timestamp"]["value"],
+            }
+            for b in bindings
+        ]

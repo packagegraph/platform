@@ -68,3 +68,69 @@ class TestSparqlQueryClient:
             assert results == [
                 ("https://example.org/pkg1", "https://github.com/owner/repo")
             ]
+
+    def test_query_packages_with_source_repos_returns_tuples(self):
+        client = SparqlQueryClient("http://fuseki:3030/packagegraph")
+        data = {
+            "results": {
+                "bindings": [
+                    {
+                        "pkg": {"type": "uri", "value": "https://example.org/pkg1"},
+                        "name": {"type": "literal", "value": "bash"},
+                        "repo": {"type": "uri", "value": "https://github.com/repo"},
+                    },
+                ]
+            }
+        }
+        with patch(
+            "packagegraph.sparql_client.requests.post",
+            return_value=_mock_response(data),
+        ):
+            results = client.query_packages_with_source_repos()
+            assert len(results) == 1
+            assert results[0] == (
+                "https://example.org/pkg1",
+                "bash",
+                "https://github.com/repo",
+            )
+
+    def test_query_packages_for_ecosystem_returns_tuples(self):
+        client = SparqlQueryClient("http://fuseki:3030/packagegraph")
+        data = {
+            "results": {
+                "bindings": [
+                    {
+                        "name": {"type": "literal", "value": "bash"},
+                        "version": {"type": "literal", "value": "5.2"},
+                    },
+                ]
+            }
+        }
+        with patch(
+            "packagegraph.sparql_client.requests.post",
+            return_value=_mock_response(data),
+        ):
+            results = client.query_packages_for_ecosystem("Debian")
+            assert results == [("bash", "5.2")]
+
+    def test_query_enrichment_snapshots_returns_list(self):
+        client = SparqlQueryClient("http://fuseki:3030/packagegraph")
+        data = {
+            "results": {
+                "bindings": [
+                    {
+                        "snapshot": {"type": "uri", "value": "https://example.org/snap1"},
+                        "enricher": {"type": "literal", "value": "github"},
+                        "timestamp": {"type": "literal", "value": "2026-04-13T10:00:00"},
+                    },
+                ]
+            }
+        }
+        with patch(
+            "packagegraph.sparql_client.requests.post",
+            return_value=_mock_response(data),
+        ):
+            results = client.query_enrichment_snapshots()
+            assert len(results) == 1
+            assert results[0]["enricher"] == "github"
+            assert results[0]["timestamp"] == "2026-04-13T10:00:00"

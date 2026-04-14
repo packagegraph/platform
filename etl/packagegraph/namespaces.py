@@ -27,6 +27,7 @@ PKG = Namespace("https://purl.org/packagegraph/ontology/core#")
 SEC = Namespace("https://purl.org/packagegraph/ontology/security#")
 VCS = Namespace("https://purl.org/packagegraph/ontology/vcs#")
 SLSA = Namespace("https://purl.org/packagegraph/ontology/slsa#")
+MET = Namespace("https://purl.org/packagegraph/ontology/metrics#")
 
 # Distribution-specific ontology extensions
 DEB = Namespace("https://purl.org/packagegraph/ontology/debian#")
@@ -128,3 +129,32 @@ def builder_uri(builder_id: str) -> str:
 def build_env_uri(distro: str, release: str, name: str, version: str) -> str:
     """Build a SLSA BuildEnvironment URI."""
     return DATA[f"buildenv/{_encode(distro)}/{_encode(release)}/{_encode(name)}/{_encode(version)}"]
+
+
+def claim_uri(enricher: str, subject_hash: str, timestamp: str) -> str:
+    """Build a claim URI for attributed enricher data.
+
+    Format: d/claim/{enricher}/{timestamp_hash}/{subject_hash}
+    """
+    import hashlib
+    ts_hash = hashlib.sha256(timestamp.encode()).hexdigest()[:8]
+    return str(DATA[f"claim/{_encode(enricher)}/{ts_hash}/{subject_hash}"])
+
+
+def snapshot_uri(enricher: str, timestamp: str) -> str:
+    """Build a DataSnapshot URI for an enrichment run.
+
+    Format: d/snapshot/{enricher}/{iso_timestamp}
+    """
+    # Use timestamp as-is for readability (ISO format is URI-safe)
+    return str(DATA[f"snapshot/{_encode(enricher)}/{timestamp}"])
+
+
+def license_uri(spdx_id: str) -> str:
+    """Build a License URI from SPDX identifier."""
+    return str(DATA[f"license/{_encode(spdx_id)}"])
+
+
+def language_uri(language_name: str) -> str:
+    """Build a ProgrammingLanguage URI."""
+    return str(DATA[f"language/{_encode(language_name)}"])
