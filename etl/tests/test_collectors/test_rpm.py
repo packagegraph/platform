@@ -7,7 +7,7 @@ from packagegraph.collectors.rpm import RpmCollector
 
 
 @pytest.mark.unit
-@patch('packagegraph.collectors.rpm.requests.get')
+@patch("packagegraph.collectors.rpm.requests.get")
 def test_rpm_dual_typing(mock_get):
     """RPM collector should emit both pkg:BinaryPackage and rpm:BinaryRPM."""
     # Mock repomd.xml
@@ -50,11 +50,11 @@ def test_rpm_dual_typing(mock_get):
         repo_url="https://dl.fedoraproject.org/pub/fedora/linux/releases/41/Everything/x86_64/os",
         distro_name="fedora",
         release_name="41",
-        parallel=False
+        parallel=False,
     )
 
-    with patch('packagegraph.collectors.rpm.gzip.decompress', return_value=primary_xml):
-        with patch('packagegraph.collectors.rpm.click.echo'):
+    with patch("packagegraph.collectors.rpm.gzip.decompress", return_value=primary_xml):
+        with patch("packagegraph.collectors.rpm.click.echo"):
             collector.collect()
 
     # Check dual typing
@@ -67,7 +67,7 @@ def test_rpm_dual_typing(mock_get):
 
 
 @pytest.mark.unit
-@patch('packagegraph.collectors.rpm.requests.get')
+@patch("packagegraph.collectors.rpm.requests.get")
 def test_multi_release_rpm_collection(mock_get):
     """Multi-release RPM collection should create distinct packages per release."""
     # Mock responses for Fedora 41
@@ -131,11 +131,11 @@ def test_multi_release_rpm_collection(mock_get):
         repo_url="https://dl.fedoraproject.org/pub/fedora/linux/releases/41/Everything/x86_64/os",
         distro_name="fedora",
         release_name="41",
-        parallel=False
+        parallel=False,
     )
 
-    with patch('packagegraph.collectors.rpm.gzip.decompress', return_value=primary_41):
-        with patch('packagegraph.collectors.rpm.click.echo'):
+    with patch("packagegraph.collectors.rpm.gzip.decompress", return_value=primary_41):
+        with patch("packagegraph.collectors.rpm.click.echo"):
             collector_41.collect()
 
     # Collect from Fedora 42
@@ -144,11 +144,11 @@ def test_multi_release_rpm_collection(mock_get):
         repo_url="https://dl.fedoraproject.org/pub/fedora/linux/releases/42/Everything/x86_64/os",
         distro_name="fedora",
         release_name="42",
-        parallel=False
+        parallel=False,
     )
 
-    with patch('packagegraph.collectors.rpm.gzip.decompress', return_value=primary_42):
-        with patch('packagegraph.collectors.rpm.click.echo'):
+    with patch("packagegraph.collectors.rpm.gzip.decompress", return_value=primary_42):
+        with patch("packagegraph.collectors.rpm.click.echo"):
             collector_42.collect()
 
     # Check that we have two distinct packages (different versions/releases)

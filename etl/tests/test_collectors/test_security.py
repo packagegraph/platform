@@ -7,8 +7,8 @@ from packagegraph.collectors.security import SecurityEnricher
 
 
 @pytest.mark.unit
-@patch('packagegraph.collectors.security.requests.get')
-@patch('packagegraph.collectors.security.time.sleep')
+@patch("packagegraph.collectors.security.requests.get")
+@patch("packagegraph.collectors.security.time.sleep")
 def test_security_enrichment(mock_sleep, mock_get):
     """SecurityEnricher should create sec:Vulnerability and link to versions."""
     g = Graph()
@@ -38,14 +38,11 @@ def test_security_enrichment(mock_sleep, mock_get):
                         "ranges": [
                             {
                                 "type": "ECOSYSTEM",
-                                "events": [
-                                    {"introduced": "7.0.0"},
-                                    {"fixed": "8.5.0"}
-                                ]
+                                "events": [{"introduced": "7.0.0"}, {"fixed": "8.5.0"}],
                             }
-                        ]
+                        ],
                     }
-                ]
+                ],
             }
         ]
     }
@@ -55,7 +52,7 @@ def test_security_enrichment(mock_sleep, mock_get):
     mock_get.return_value = osv_response
 
     enricher = SecurityEnricher(g, cache_dir=None)
-    with patch('packagegraph.collectors.security.click.echo'):
+    with patch("packagegraph.collectors.security.click.echo"):
         enricher.enrich()
 
     # Verify vulnerability was created
@@ -72,8 +69,8 @@ def test_security_enrichment(mock_sleep, mock_get):
 
 
 @pytest.mark.unit
-@patch('packagegraph.collectors.security.requests.get')
-@patch('packagegraph.collectors.security.time.sleep')
+@patch("packagegraph.collectors.security.requests.get")
+@patch("packagegraph.collectors.security.time.sleep")
 def test_security_no_vulns(mock_sleep, mock_get):
     """SecurityEnricher should handle packages with no vulnerabilities."""
     g = Graph()
@@ -92,7 +89,7 @@ def test_security_no_vulns(mock_sleep, mock_get):
     mock_get.return_value = osv_response
 
     enricher = SecurityEnricher(g, cache_dir=None)
-    with patch('packagegraph.collectors.security.click.echo'):
+    with patch("packagegraph.collectors.security.click.echo"):
         enricher.enrich()
 
     vuln_triples = list(g.triples((None, RDF.type, SEC.Vulnerability)))

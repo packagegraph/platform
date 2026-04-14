@@ -13,7 +13,10 @@ from .security import SecurityEnricher
 from .koji import KojiEnricher
 
 __all__ = [
-    "DebianCollector", "RpmCollector",
-    "RepologyEnricher", "GitHubEnricher",
-    "SecurityEnricher", "KojiEnricher",
+    "DebianCollector",
+    "RpmCollector",
+    "RepologyEnricher",
+    "GitHubEnricher",
+    "SecurityEnricher",
+    "KojiEnricher",
 ]

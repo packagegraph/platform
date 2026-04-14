@@ -22,7 +22,7 @@ class GitHubEnricher:
         graph: Graph,
         github_token: str | None = None,
         cache_dir: str | None = None,
-        cache_ttl_hours: int = 24
+        cache_ttl_hours: int = 24,
     ):
         self.graph = graph
         self.builder = GraphBuilder(graph)
@@ -57,7 +57,9 @@ class GitHubEnricher:
     def _discover_github_repos(self) -> list[tuple[URIRef, str, str]]:
         """Find packages with GitHub homepage URLs."""
         results = []
-        github_pattern = re.compile(r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$")
+        github_pattern = re.compile(
+            r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$"
+        )
 
         for pkg_uri, _, homepage in self.graph.triples((None, PKG.homepage, None)):
             match = github_pattern.match(str(homepage))
@@ -74,7 +76,9 @@ class GitHubEnricher:
             cache_key = endpoint.replace("/", "_")
             cache_file = self.cache_dir / f"{cache_key}.json"
             if cache_file.exists():
-                age = datetime.now() - datetime.fromtimestamp(cache_file.stat().st_mtime)
+                age = datetime.now() - datetime.fromtimestamp(
+                    cache_file.stat().st_mtime
+                )
                 if age < self.cache_ttl:
                     with open(cache_file) as f:
                         return json.load(f)
@@ -123,7 +127,7 @@ class GitHubEnricher:
             default_branch=repo_data.get("default_branch"),
             description=repo_data.get("description"),
             stars=repo_data.get("stargazers_count"),
-            forks=repo_data.get("forks_count")
+            forks=repo_data.get("forks_count"),
         )
 
         # Link upstream: resolve BinaryPackage → SourcePackage first (domain constraint)
@@ -149,5 +153,5 @@ class GitHubEnricher:
                     author_name=author_info.get("name"),
                     author_email=author_info.get("email"),
                     timestamp=author_info.get("date"),
-                    message=commit_info.get("message")
+                    message=commit_info.get("message"),
                 )

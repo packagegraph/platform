@@ -1,4 +1,5 @@
 """Security vulnerability enricher — queries Fuseki, calls OSV.dev, writes N-Triples."""
+
 import json
 import time
 from pathlib import Path
@@ -9,8 +10,13 @@ from ..namespaces import SEC, cve_uri, version_uri
 
 
 class SecurityEnricher:
-    def __init__(self, sparql_client: SparqlQueryClient, output_path: str,
-                 cache_dir: str | None = None, cache_ttl_hours: int = 24):
+    def __init__(
+        self,
+        sparql_client: SparqlQueryClient,
+        output_path: str,
+        cache_dir: str | None = None,
+        cache_ttl_hours: int = 24,
+    ):
         self.client = sparql_client
         self.output_path = output_path
         self.cache_dir = Path(cache_dir) if cache_dir else None
@@ -46,7 +52,9 @@ class SecurityEnricher:
         if self.cache_dir:
             cache_file = self.cache_dir / f"{package_name}.json"
             if cache_file.exists():
-                age = datetime.now() - datetime.fromtimestamp(cache_file.stat().st_mtime)
+                age = datetime.now() - datetime.fromtimestamp(
+                    cache_file.stat().st_mtime
+                )
                 if age < self.cache_ttl:
                     with open(cache_file) as f:
                         return json.load(f).get("vulns", [])
@@ -77,21 +85,34 @@ class SecurityEnricher:
             f.write(f"<{v_uri}> <{RDF_TYPE}> <{SEC}Vulnerability> .\n")
             _write_lit(f, v_uri, f"{SEC}cveId", vuln_id)
             if vuln.get("summary"):
-                _write_lit(f, v_uri, f"{SEC}vulnerabilityDescription", vuln["summary"][:1000])
+                _write_lit(
+                    f, v_uri, f"{SEC}vulnerabilityDescription", vuln["summary"][:1000]
+                )
             for sev in vuln.get("severity", []):
                 if sev.get("type") == "CVSS_V3":
                     _write_lit(f, v_uri, f"{SEC}severity", sev["score"])
             if vuln.get("published"):
                 _write_lit(f, v_uri, f"{SEC}publishedDate", vuln["published"])
             for affected in vuln.get("affected", []):
-                if affected.get("package", {}).get("name", "").lower() == pkg_name.lower():
-                    ver_uri = str(version_uri("debian", "trixie", pkg_name, version_str))
+                if (
+                    affected.get("package", {}).get("name", "").lower()
+                    == pkg_name.lower()
+                ):
+                    ver_uri = str(
+                        version_uri("debian", "trixie", pkg_name, version_str)
+                    )
                     f.write(f"<{v_uri}> <{SEC}affectsVersion> <{ver_uri}> .\n")
                     break
 
 
 def _escape_nt(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    return (
+        s.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
 
 
 def _write_lit(f, subj, pred, val):

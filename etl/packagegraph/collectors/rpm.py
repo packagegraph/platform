@@ -101,7 +101,9 @@ class RpmCollector(BaseCollector):
             pkg_data = {
                 "name": pkg.find("common:name", ns).text,
                 "arch": pkg.find("common:arch", ns).text,
-                "checksum": pkg.find("common:checksum", ns).text if pkg.find("common:checksum", ns) is not None else "",
+                "checksum": pkg.find("common:checksum", ns).text
+                if pkg.find("common:checksum", ns) is not None
+                else "",
             }
 
             version_info = pkg.find("common:version", ns)
@@ -158,7 +160,7 @@ class RpmCollector(BaseCollector):
             description=pkg_data.get("description") or pkg_data.get("summary"),
             distro_type="rpm",
             epoch=epoch,
-            release_num=rel
+            release_num=rel,
         )
 
         # Add RPM-specific properties

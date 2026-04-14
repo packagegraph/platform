@@ -14,7 +14,9 @@ from ..namespaces import PKG
 class RepologyEnricher:
     """Enriches package graph with cross-distribution equivalence links from repology.org."""
 
-    def __init__(self, graph: Graph, cache_dir: str | None = None, cache_ttl_days: int = 7):
+    def __init__(
+        self, graph: Graph, cache_dir: str | None = None, cache_ttl_days: int = 7
+    ):
         """Initialize RepologyEnricher.
 
         Args:
@@ -53,7 +55,9 @@ class RepologyEnricher:
 
         # Query repology for each package
         for idx, pkg_name in enumerate(package_names, 1):
-            click.echo(f"[{idx}/{len(package_names)}] Querying repology for: {pkg_name}")
+            click.echo(
+                f"[{idx}/{len(package_names)}] Querying repology for: {pkg_name}"
+            )
 
             repology_data = self._query_repology(pkg_name)
             if repology_data is None:
@@ -82,7 +86,9 @@ class RepologyEnricher:
         if self.cache_dir:
             cache_file = self.cache_dir / f"{project_name}.json"
             if cache_file.exists():
-                cache_age = datetime.now() - datetime.fromtimestamp(cache_file.stat().st_mtime)
+                cache_age = datetime.now() - datetime.fromtimestamp(
+                    cache_file.stat().st_mtime
+                )
                 if cache_age < self.cache_ttl:
                     click.echo(f"  Using cached response for {project_name}")
                     with open(cache_file) as f:
@@ -137,7 +143,7 @@ class RepologyEnricher:
         # Create links between all pairs (symmetric)
         repos = list(distro_packages.keys())
         for i, repo1 in enumerate(repos):
-            for repo2 in repos[i + 1:]:
+            for repo2 in repos[i + 1 :]:
                 pkg1 = distro_packages[repo1]
                 pkg2 = distro_packages[repo2]
 
@@ -147,7 +153,9 @@ class RepologyEnricher:
 
                 click.echo(f"  Linked {repo1} ↔ {repo2}")
 
-    def _find_package_in_graph(self, distro: str, release: str, name: str, version: str | None = None):
+    def _find_package_in_graph(
+        self, distro: str, release: str, name: str, version: str | None = None
+    ):
         """Find a package URI in the graph matching distro/release/name.
 
         Returns first match if version is None, otherwise tries to match version too.

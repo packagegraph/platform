@@ -7,8 +7,8 @@ from packagegraph.collectors.github import GitHubEnricher
 
 
 @pytest.mark.unit
-@patch('packagegraph.collectors.github.requests.get')
-@patch('packagegraph.collectors.github.time.sleep')
+@patch("packagegraph.collectors.github.requests.get")
+@patch("packagegraph.collectors.github.time.sleep")
 def test_github_enrichment(mock_sleep, mock_get):
     """GitHubEnricher should create vcs:Repository and link to SourcePackage."""
     g = Graph()
@@ -33,7 +33,7 @@ def test_github_enrichment(mock_sleep, mock_get):
         "description": "A command line tool for transferring data",
         "stargazers_count": 35000,
         "forks_count": 6000,
-        "html_url": "https://github.com/curl/curl"
+        "html_url": "https://github.com/curl/curl",
     }
     repo_response.raise_for_status = Mock()
     repo_response.headers = {"X-RateLimit-Remaining": "4999"}
@@ -46,10 +46,10 @@ def test_github_enrichment(mock_sleep, mock_get):
                 "author": {
                     "name": "Daniel Stenberg",
                     "email": "daniel@haxx.se",
-                    "date": "2024-01-15T10:30:00Z"
+                    "date": "2024-01-15T10:30:00Z",
                 },
-                "message": "curl: fix URL parsing"
-            }
+                "message": "curl: fix URL parsing",
+            },
         }
     ]
     commits_response.raise_for_status = Mock()
@@ -58,7 +58,7 @@ def test_github_enrichment(mock_sleep, mock_get):
     mock_get.side_effect = [repo_response, commits_response]
 
     enricher = GitHubEnricher(g, github_token="fake-token", cache_dir=None)
-    with patch('packagegraph.collectors.github.click.echo'):
+    with patch("packagegraph.collectors.github.click.echo"):
         enricher.enrich()
 
     # Verify repository was created
@@ -83,8 +83,8 @@ def test_github_enrichment(mock_sleep, mock_get):
 
 
 @pytest.mark.unit
-@patch('packagegraph.collectors.github.requests.get')
-@patch('packagegraph.collectors.github.time.sleep')
+@patch("packagegraph.collectors.github.requests.get")
+@patch("packagegraph.collectors.github.time.sleep")
 def test_github_skips_non_github_urls(mock_sleep, mock_get):
     """GitHubEnricher should skip packages without GitHub homepage."""
     g = Graph()
@@ -96,7 +96,7 @@ def test_github_skips_non_github_urls(mock_sleep, mock_get):
     g.add((pkg_uri, PKG.homepage, Literal("https://nginx.org")))
 
     enricher = GitHubEnricher(g, github_token="fake-token", cache_dir=None)
-    with patch('packagegraph.collectors.github.click.echo'):
+    with patch("packagegraph.collectors.github.click.echo"):
         enricher.enrich()
 
     # No API calls should be made

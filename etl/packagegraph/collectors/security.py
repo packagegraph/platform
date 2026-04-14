@@ -22,10 +22,7 @@ class SecurityEnricher:
     """
 
     def __init__(
-        self,
-        graph: Graph,
-        cache_dir: str | None = None,
-        cache_ttl_hours: int = 24
+        self, graph: Graph, cache_dir: str | None = None, cache_ttl_hours: int = 24
     ):
         self.graph = graph
         self.builder = GraphBuilder(graph)
@@ -86,7 +83,9 @@ class SecurityEnricher:
         if self.cache_dir:
             cache_file = self.cache_dir / f"{package_name}.json"
             if cache_file.exists():
-                age = datetime.now() - datetime.fromtimestamp(cache_file.stat().st_mtime)
+                age = datetime.now() - datetime.fromtimestamp(
+                    cache_file.stat().st_mtime
+                )
                 if age < self.cache_ttl:
                     with open(cache_file) as f:
                         data = json.load(f)
@@ -95,9 +94,7 @@ class SecurityEnricher:
         try:
             url = f"{self.osv_api}/query"
             response = requests.get(
-                url,
-                params={"package_name": package_name},
-                timeout=30
+                url, params={"package_name": package_name}, timeout=30
             )
             response.raise_for_status()
             data = response.json()
@@ -117,11 +114,7 @@ class SecurityEnricher:
             return None
 
     def _process_vulns(
-        self,
-        pkg_name: str,
-        version_str: str,
-        version_uri: URIRef,
-        vulns: list[dict]
+        self, pkg_name: str, version_str: str, version_uri: URIRef, vulns: list[dict]
     ):
         """Process vulnerability entries and create graph resources."""
         for vuln in vulns:
@@ -141,7 +134,7 @@ class SecurityEnricher:
                 description=vuln.get("summary"),
                 severity=severity,
                 published=vuln.get("published"),
-                modified=vuln.get("modified")
+                modified=vuln.get("modified"),
             )
 
             # Link to affected version
@@ -158,5 +151,7 @@ class SecurityEnricher:
                     for range_entry in affected.get("ranges", []):
                         for event in range_entry.get("events", []):
                             if "fixed" in event:
-                                click.echo(f"  {vuln_id} affects {pkg_name}, fixed in {event['fixed']}")
+                                click.echo(
+                                    f"  {vuln_id} affects {pkg_name}, fixed in {event['fixed']}"
+                                )
                     break

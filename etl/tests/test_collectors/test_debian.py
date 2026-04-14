@@ -8,7 +8,7 @@ from packagegraph.collectors.debian import DebianCollector
 
 
 @pytest.mark.unit
-@patch('packagegraph.collectors.debian.requests.get')
+@patch("packagegraph.collectors.debian.requests.get")
 def test_maintainer_parsing(mock_get):
     """Refactored collector should parse Maintainer field into pkg:Maintainer."""
     # Mock Release file
@@ -28,7 +28,11 @@ Description: command line tool
     packages_response.raise_for_status = Mock()
 
     # Mock Contents file - raise HTTPError to simulate 404
-    mock_get.side_effect = [release_response, packages_response, requests.exceptions.HTTPError("404")]
+    mock_get.side_effect = [
+        release_response,
+        packages_response,
+        requests.exceptions.HTTPError("404"),
+    ]
 
     g = Graph()
     collector = DebianCollector(
@@ -37,11 +41,16 @@ Description: command line tool
         distribution="stable",
         component="main",
         arch="binary-amd64",
-        parallel=False
+        parallel=False,
     )
 
-    with patch('packagegraph.collectors.debian.gzip.decompress', return_value=packages_gz_content):
-        with patch('packagegraph.collectors.debian.click.echo'):  # Suppress warning output
+    with patch(
+        "packagegraph.collectors.debian.gzip.decompress",
+        return_value=packages_gz_content,
+    ):
+        with patch(
+            "packagegraph.collectors.debian.click.echo"
+        ):  # Suppress warning output
             collector.collect()
 
     # Check maintainer was created
@@ -56,7 +65,7 @@ Description: command line tool
 
 
 @pytest.mark.unit
-@patch('packagegraph.collectors.debian.requests.get')
+@patch("packagegraph.collectors.debian.requests.get")
 def test_source_package_linking(mock_get):
     """Refactored collector should parse Source field and create SourcePackage."""
     release_response = Mock()
@@ -75,7 +84,11 @@ Description: library
     packages_response.raise_for_status = Mock()
 
     # Mock Contents file - raise HTTPError to simulate 404
-    mock_get.side_effect = [release_response, packages_response, requests.exceptions.HTTPError("404")]
+    mock_get.side_effect = [
+        release_response,
+        packages_response,
+        requests.exceptions.HTTPError("404"),
+    ]
 
     g = Graph()
     collector = DebianCollector(
@@ -84,11 +97,16 @@ Description: library
         distribution="stable",
         component="main",
         arch="binary-amd64",
-        parallel=False
+        parallel=False,
     )
 
-    with patch('packagegraph.collectors.debian.gzip.decompress', return_value=packages_gz_content):
-        with patch('packagegraph.collectors.debian.click.echo'):  # Suppress warning output
+    with patch(
+        "packagegraph.collectors.debian.gzip.decompress",
+        return_value=packages_gz_content,
+    ):
+        with patch(
+            "packagegraph.collectors.debian.click.echo"
+        ):  # Suppress warning output
             collector.collect()
 
     # Check source package was created
@@ -102,7 +120,7 @@ Description: library
 
 
 @pytest.mark.unit
-@patch('packagegraph.collectors.debian.requests.get')
+@patch("packagegraph.collectors.debian.requests.get")
 def test_dual_typing(mock_get):
     """Refactored collector should emit both pkg:BinaryPackage and deb:BinaryPackage."""
     release_response = Mock()
@@ -120,7 +138,11 @@ Description: tool
     packages_response.raise_for_status = Mock()
 
     # Mock Contents file - raise HTTPError to simulate 404
-    mock_get.side_effect = [release_response, packages_response, requests.exceptions.HTTPError("404")]
+    mock_get.side_effect = [
+        release_response,
+        packages_response,
+        requests.exceptions.HTTPError("404"),
+    ]
 
     g = Graph()
     collector = DebianCollector(
@@ -129,11 +151,16 @@ Description: tool
         distribution="stable",
         component="main",
         arch="binary-amd64",
-        parallel=False
+        parallel=False,
     )
 
-    with patch('packagegraph.collectors.debian.gzip.decompress', return_value=packages_gz_content):
-        with patch('packagegraph.collectors.debian.click.echo'):  # Suppress warning output
+    with patch(
+        "packagegraph.collectors.debian.gzip.decompress",
+        return_value=packages_gz_content,
+    ):
+        with patch(
+            "packagegraph.collectors.debian.click.echo"
+        ):  # Suppress warning output
             collector.collect()
 
     # Check dual typing
@@ -145,7 +172,7 @@ Description: tool
 
 
 @pytest.mark.unit
-@patch('packagegraph.collectors.debian.requests.get')
+@patch("packagegraph.collectors.debian.requests.get")
 def test_multi_arch_collection(mock_get):
     """Refactored collector should handle multiple architectures."""
     release_response = Mock()
@@ -192,13 +219,13 @@ Description: curl for arm64
         distribution="stable",
         component="main",
         arch=["binary-amd64", "binary-arm64"],  # Multiple architectures
-        parallel=False
+        parallel=False,
     )
 
-    with patch('packagegraph.collectors.debian.gzip.decompress') as mock_decompress:
+    with patch("packagegraph.collectors.debian.gzip.decompress") as mock_decompress:
         # Return appropriate content based on call count
         mock_decompress.side_effect = [packages_amd64, packages_arm64]
-        with patch('packagegraph.collectors.debian.click.echo'):
+        with patch("packagegraph.collectors.debian.click.echo"):
             collector.collect()
 
     # Check that packages for both architectures were created

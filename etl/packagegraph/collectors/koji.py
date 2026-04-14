@@ -13,7 +13,7 @@ from rdflib import Graph, URIRef
 from rdflib.namespace import RDF
 
 from ..graph_builder import GraphBuilder
-from ..namespaces import PKG, RPM, package_uri as make_package_uri
+from ..namespaces import PKG, RPM, SLSA, package_uri as make_package_uri
 
 
 class KojiEnricher:
@@ -26,7 +26,7 @@ class KojiEnricher:
         distro_name: str = "fedora",
         release_name: str = "",
         cache_dir: str | None = None,
-        cache_ttl_days: int = 30
+        cache_ttl_days: int = 30,
     ):
         self.graph = graph
         self.builder = GraphBuilder(graph)
@@ -80,8 +80,12 @@ class KojiEnricher:
 
                 # Get version string
                 ver_str = ""
-                for _, _, ver_uri in self.graph.triples((pkg_uri, PKG.hasVersion, None)):
-                    for _, _, vs in self.graph.triples((ver_uri, PKG.versionString, None)):
+                for _, _, ver_uri in self.graph.triples(
+                    (pkg_uri, PKG.hasVersion, None)
+                ):
+                    for _, _, vs in self.graph.triples(
+                        (ver_uri, PKG.versionString, None)
+                    ):
                         ver_str = str(vs)
                         break
                     break
@@ -99,7 +103,14 @@ class KojiEnricher:
         """
         # Strip arch suffix if present
         parts = version_str.rsplit(".", 1)
-        if len(parts) == 2 and parts[1] in ("x86_64", "i686", "noarch", "aarch64", "s390x", "ppc64le"):
+        if len(parts) == 2 and parts[1] in (
+            "x86_64",
+            "i686",
+            "noarch",
+            "aarch64",
+            "s390x",
+            "ppc64le",
+        ):
             version_str = parts[0]
 
         if not version_str:
@@ -113,7 +124,9 @@ class KojiEnricher:
         if self.cache_dir:
             cache_file = self.cache_dir / f"{nvr}.json"
             if cache_file.exists():
-                age = datetime.now() - datetime.fromtimestamp(cache_file.stat().st_mtime)
+                age = datetime.now() - datetime.fromtimestamp(
+                    cache_file.stat().st_mtime
+                )
                 if age < self.cache_ttl:
                     with open(cache_file) as f:
                         return json.load(f)
@@ -134,7 +147,9 @@ class KojiEnricher:
             click.echo(f"  Koji error for {nvr}: {e}", err=True)
             return None
 
-    def _process_build(self, pkg_uri: URIRef, pkg_name: str, ver_str: str, build_data: dict):
+    def _process_build(
+        self, pkg_uri: URIRef, pkg_name: str, ver_str: str, build_data: dict
+    ):
         """Create BuildActivity and link dependencies."""
         build_uri = self.builder.add_build_activity(
             distro=self.distro_name,
@@ -144,7 +159,7 @@ class KojiEnricher:
             owner=build_data.get("owner_name"),
             start_time=str(build_data.get("start_time", "")),
             end_time=str(build_data.get("completion_time", "")),
-            build_system="koji"
+            build_system="koji",
         )
 
         # Link package to build
@@ -154,6 +169,9 @@ class KojiEnricher:
         build_id = build_data.get("build_id")
         if build_id:
             self._add_build_deps(build_uri, build_id)
+
+        # Emit SLSA L2 provenance attestation
+        self._add_slsa_attestation(pkg_uri, pkg_name, ver_str, build_data, build_uri)
 
     def _add_build_deps(self, build_uri: URIRef, build_id: int):
         """Query koji for build dependencies and add to graph."""
@@ -171,10 +189,76 @@ class KojiEnricher:
                 if dep_name:
                     dep_version_str = f"{dep_ver}-{dep_rel}.{dep_arch}"
                     dep_uri = make_package_uri(
-                        self.distro_name, self.release_name,
-                        dep_arch, dep_name, dep_version_str
+                        self.distro_name,
+                        self.release_name,
+                        dep_arch,
+                        dep_name,
+                        dep_version_str,
                     )
                     self.builder.link_build_dependency(build_uri, dep_uri)
 
         except Exception as e:
             click.echo(f"  Error fetching build deps: {e}", err=True)
+
+    def _add_slsa_attestation(
+        self,
+        pkg_uri: URIRef,
+        pkg_name: str,
+        ver_str: str,
+        build_data: dict,
+        build_uri: URIRef,
+    ):
+        """Emit SLSA L2 provenance attestation for Koji build."""
+        # Create Builder resource
+        builder_uri = self.builder.add_slsa_builder(builder_id=self.koji_hub)
+
+        # Try to get task info for build environment details
+        task_id = build_data.get("task_id")
+        build_env_uri = None
+        if task_id:
+            try:
+                task_info = self.proxy.getTaskInfo(task_id)
+                if task_info:
+                    # Extract build environment details
+                    method = task_info.get("method", "")
+
+                    # Koji mock builds are ephemeral and isolated
+                    build_env_uri = self.builder.add_slsa_build_environment(
+                        distro=self.distro_name,
+                        release=self.release_name,
+                        name=pkg_name,
+                        version=ver_str,
+                        image=f"koji-mock-{method}" if method else None,
+                        ephemeral=True,
+                        isolated=True,
+                    )
+            except Exception as e:
+                # Task info may not be available on all koji hubs
+                click.echo(f"  Could not fetch task info: {e}", err=True)
+
+        # Create provenance attestation
+        # Use completion time as attestation timestamp
+        completion = build_data.get("completion_time", "")
+        timestamp = str(completion) if completion else datetime.now().isoformat()
+
+        # Construct digest from NVR (simplified - real implementation would hash artifact)
+        nvr = build_data.get("nvr", f"{pkg_name}-{ver_str}")
+        digest = f"sha256:koji-nvr-{nvr}"
+
+        attestation_uri = self.builder.add_slsa_attestation(
+            distro=self.distro_name,
+            release=self.release_name,
+            name=pkg_name,
+            version=ver_str,
+            build_level=SLSA.L2,
+            timestamp=timestamp,
+            digest=digest,
+            builder_uri_ref=builder_uri,
+            build_activity_uri=build_uri,
+            build_env_uri_ref=build_env_uri,
+            predicate_type="https://slsa.dev/provenance/v1",
+            verification_status="unverified",
+        )
+
+        # Link attestation to package
+        self.builder.link_attestation_to_package(attestation_uri, pkg_uri)

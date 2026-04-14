@@ -37,22 +37,20 @@ def cli():
     "--arch",
     multiple=True,
     default=["binary-amd64"],
-    help="[Debian] The architecture(s) to collect. Can be specified multiple times."
+    help="[Debian] The architecture(s) to collect. Can be specified multiple times.",
 )
 @click.option(
     "--distro-name",
     default="fedora",
-    help="[RPM] Distribution name (e.g., fedora, centos)."
+    help="[RPM] Distribution name (e.g., fedora, centos).",
 )
 @click.option(
-    "--release-name",
-    default="",
-    help="[RPM] Release name/version (e.g., 41, 42)."
+    "--release-name", default="", help="[RPM] Release name/version (e.g., 41, 42)."
 )
 @click.option(
     "--rpm-repo",
     multiple=True,
-    help="[RPM Multi-Release] Repo in format 'name:release:url'. Can be specified multiple times."
+    help="[RPM Multi-Release] Repo in format 'name:release:url'. Can be specified multiple times.",
 )
 @click.option("--output-file", "-o", help="Path to save the graph to.")
 @click.option("--input-file", "-i", help="Path to an existing graph to load.")
@@ -93,7 +91,9 @@ def collect(
     if repo_type == "rpm" and rpm_repo:
         # Multi-repo RPM mode - repo_url is ignored
         if repo_url:
-            click.echo("Warning: repo_url argument ignored when using --rpm-repo", err=True)
+            click.echo(
+                "Warning: repo_url argument ignored when using --rpm-repo", err=True
+            )
     elif not repo_url:
         click.echo("Error: repo_url is required unless using --rpm-repo", err=True)
         sys.exit(1)
@@ -136,7 +136,7 @@ def collect(
                             click.echo(
                                 f"Error: Invalid --rpm-repo format: {repo_spec}. "
                                 f"Expected 'name:release:url'",
-                                err=True
+                                err=True,
                             )
                             sys.exit(1)
 
@@ -154,7 +154,9 @@ def collect(
                             )
                             parsed_count = collector.collect()
                             total_parsed += parsed_count
-                            click.echo(f"Processed {parsed_count} packages from {rpm_distro}/{rpm_release}.")
+                            click.echo(
+                                f"Processed {parsed_count} packages from {rpm_distro}/{rpm_release}."
+                            )
                 else:
                     # Single-repo RPM collection
                     with profiler.step("Initialize RPM Collector"):
@@ -255,7 +257,9 @@ def build(
         click.echo("No .nt or .ttl files found in input-dir or ontology-dir.", err=True)
         sys.exit(1)
 
-    click.echo(f"Found {len(data_files)} data files, {len(ontology_files)} ontology files.")
+    click.echo(
+        f"Found {len(data_files)} data files, {len(ontology_files)} ontology files."
+    )
 
     # Build TDB2 index (ontology in named graph, data in default graph)
     tdb_dir = output_dir / "tdb2"
@@ -297,19 +301,19 @@ def build(
     "-i",
     required=True,
     type=click.Path(exists=True),
-    help="Path to existing package graph (.ttl file)."
+    help="Path to existing package graph (.ttl file).",
 )
 @click.option(
     "--output-file",
     "-o",
     required=True,
     type=click.Path(),
-    help="Path to save enriched graph."
+    help="Path to save enriched graph.",
 )
 @click.option(
     "--cache-dir",
     default=None,
-    help="Directory for caching repology API responses (default: ~/.cache/packagegraph/repology)."
+    help="Directory for caching repology API responses (default: ~/.cache/packagegraph/repology).",
 )
 def enrich_repology(input_file, output_file, cache_dir):
     """Enrich package graph with cross-distribution equivalences from repology.org."""
@@ -333,20 +337,37 @@ def enrich_repology(input_file, output_file, cache_dir):
 
 
 @cli.command()
-@click.option("--input-file", "-i", required=True, type=click.Path(exists=True),
-              help="Path to existing package graph (.ttl file).")
-@click.option("--output-file", "-o", required=True, type=click.Path(),
-              help="Path to save enriched graph.")
-@click.option("--github-token", envvar="GITHUB_TOKEN", default=None,
-              help="GitHub API token (or set GITHUB_TOKEN env var).")
-@click.option("--cache-dir", default=None,
-              help="Directory for caching GitHub API responses.")
+@click.option(
+    "--input-file",
+    "-i",
+    required=True,
+    type=click.Path(exists=True),
+    help="Path to existing package graph (.ttl file).",
+)
+@click.option(
+    "--output-file",
+    "-o",
+    required=True,
+    type=click.Path(),
+    help="Path to save enriched graph.",
+)
+@click.option(
+    "--github-token",
+    envvar="GITHUB_TOKEN",
+    default=None,
+    help="GitHub API token (or set GITHUB_TOKEN env var).",
+)
+@click.option(
+    "--cache-dir", default=None, help="Directory for caching GitHub API responses."
+)
 def enrich_github(input_file, output_file, github_token, cache_dir):
     """Enrich package graph with GitHub VCS metadata."""
     from packagegraph.collectors.github import GitHubEnricher
 
     if not github_token:
-        click.echo("Warning: No GITHUB_TOKEN set. API rate limit will be 60 req/hr.", err=True)
+        click.echo(
+            "Warning: No GITHUB_TOKEN set. API rate limit will be 60 req/hr.", err=True
+        )
 
     if cache_dir is None:
         cache_dir = Path.home() / ".cache" / "packagegraph" / "github"
@@ -364,12 +385,23 @@ def enrich_github(input_file, output_file, github_token, cache_dir):
 
 
 @cli.command()
-@click.option("--input-file", "-i", required=True, type=click.Path(exists=True),
-              help="Path to existing package graph (.ttl file).")
-@click.option("--output-file", "-o", required=True, type=click.Path(),
-              help="Path to save enriched graph.")
-@click.option("--cache-dir", default=None,
-              help="Directory for caching OSV API responses.")
+@click.option(
+    "--input-file",
+    "-i",
+    required=True,
+    type=click.Path(exists=True),
+    help="Path to existing package graph (.ttl file).",
+)
+@click.option(
+    "--output-file",
+    "-o",
+    required=True,
+    type=click.Path(),
+    help="Path to save enriched graph.",
+)
+@click.option(
+    "--cache-dir", default=None, help="Directory for caching OSV API responses."
+)
 def enrich_security(input_file, output_file, cache_dir):
     """Enrich package graph with vulnerability data from OSV.dev."""
     from packagegraph.collectors.security import SecurityEnricher
@@ -390,17 +422,33 @@ def enrich_security(input_file, output_file, cache_dir):
 
 
 @cli.command()
-@click.option("--input-file", "-i", required=True, type=click.Path(exists=True),
-              help="Path to existing package graph (.ttl file).")
-@click.option("--output-file", "-o", required=True, type=click.Path(),
-              help="Path to save enriched graph.")
-@click.option("--koji-hub", default="https://koji.fedoraproject.org/kojihub",
-              help="Koji hub XML-RPC endpoint.")
+@click.option(
+    "--input-file",
+    "-i",
+    required=True,
+    type=click.Path(exists=True),
+    help="Path to existing package graph (.ttl file).",
+)
+@click.option(
+    "--output-file",
+    "-o",
+    required=True,
+    type=click.Path(),
+    help="Path to save enriched graph.",
+)
+@click.option(
+    "--koji-hub",
+    default="https://koji.fedoraproject.org/kojihub",
+    help="Koji hub XML-RPC endpoint.",
+)
 @click.option("--distro-name", default="fedora", help="Distribution name.")
 @click.option("--release-name", default="", help="Release name/version.")
-@click.option("--cache-dir", default=None,
-              help="Directory for caching koji API responses.")
-def enrich_koji(input_file, output_file, koji_hub, distro_name, release_name, cache_dir):
+@click.option(
+    "--cache-dir", default=None, help="Directory for caching koji API responses."
+)
+def enrich_koji(
+    input_file, output_file, koji_hub, distro_name, release_name, cache_dir
+):
     """Enrich RPM package graph with build metadata from Koji."""
     from packagegraph.collectors.koji import KojiEnricher
 
@@ -413,8 +461,11 @@ def enrich_koji(input_file, output_file, koji_hub, distro_name, release_name, ca
     click.echo(f"Loaded {len(g)} triples.")
 
     enricher = KojiEnricher(
-        g, koji_hub=koji_hub, distro_name=distro_name,
-        release_name=release_name, cache_dir=str(cache_dir)
+        g,
+        koji_hub=koji_hub,
+        distro_name=distro_name,
+        release_name=release_name,
+        cache_dir=str(cache_dir),
     )
     enricher.enrich()
 
