@@ -170,17 +170,18 @@ impl RpmCollector {
 
         loop {
             match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) => {
+                Ok(Event::Start(ref e) | Event::Empty(ref e)) => {
                     let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                     if name == "package" {
                         in_package = true;
                         current_pkg = HashMap::new();
                     } else if in_package {
                         current_text.clear();
-                        if name == "version" {
-                            for attr in e.attributes().flatten() {
-                                let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                                let value = String::from_utf8_lossy(&attr.value).to_string();
+                        // version, location, and other self-closing elements
+                        for attr in e.attributes().flatten() {
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let value = String::from_utf8_lossy(&attr.value).to_string();
+                            if name == "version" || name == "location" || name == "size" || name == "time" {
                                 current_pkg.insert(key, value);
                             }
                         }
