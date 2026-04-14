@@ -513,7 +513,6 @@ def enrich_github_vcs(
     GitHub cache used by enrich-license, enrich-metrics, and enrich-vcs-activity.
     """
     from packagegraph.sparql_client import SparqlQueryClient
-    from packagegraph.enrichers.cache import CacheManager
     from packagegraph.enrichers.github import GitHubEnricher
 
     if cache_dir is None:
@@ -524,24 +523,12 @@ def enrich_github_vcs(
     output_file = output_dir / "github_vcs.nt"
 
     client = SparqlQueryClient(fuseki_endpoint)
-    cache_mgr = CacheManager(
-        cache_dir=str(cache_dir),
-        enricher_name='github',
-        minio_endpoint=minio_endpoint,
-        minio_bucket=minio_bucket,
-        minio_access_key=minio_access_key,
-        minio_secret_key=minio_secret_key,
-    )
 
     enricher = GitHubEnricher(
         sparql_client=client,
         output_path=str(output_file),
         github_token=github_token,
         cache_dir=str(cache_dir),
-        minio_endpoint=minio_endpoint,
-        minio_bucket=minio_bucket,
-        minio_access_key=minio_access_key,
-        minio_secret_key=minio_secret_key,
     )
     enricher.enrich()
     click.echo(f"GitHub VCS enrichment complete. Output: {output_file}")
@@ -928,6 +915,167 @@ def query_raw(sparql_query, fuseki_endpoint):
 
     client = SparqlQueryClient(fuseki_endpoint)
     click.echo(_query_to_json(client, sparql_query))
+
+
+# ─── Seed Commands ────────────────────────────────────────────────────────────
+
+def _seed_from_homepage(client, pattern: str, extract_fn) -> list[str]:
+    """Query Fuseki for package names matching a homepage pattern, then extract language names."""
+    sparql = f"""
+    PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+    SELECT DISTINCT ?name ?homepage WHERE {{
+      ?p a pkg:BinaryPackage ;
+         pkg:packageName ?name ;
+         pkg:homepage ?homepage .
+      FILTER(CONTAINS(LCASE(STR(?homepage)), "{pattern}"))
+    }}
+    """
+    bindings = client.query(sparql)
+    names = set()
+    for b in bindings:
+        extracted = extract_fn(b["name"]["value"], b["homepage"]["value"])
+        if extracted:
+            names.add(extracted)
+    return sorted(names)
+
+
+def _seed_from_names(client, prefix: str) -> list[str]:
+    """Query Fuseki for binary packages with a prefix and extract language package names."""
+    sparql = f"""
+    PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+    SELECT DISTINCT ?name WHERE {{
+      ?p a pkg:BinaryPackage ;
+         pkg:packageName ?name .
+      FILTER(STRSTARTS(?name, "{prefix}"))
+    }}
+    """
+    bindings = client.query(sparql)
+    names = set()
+    for b in bindings:
+        full_name = b["name"]["value"]
+        lang_name = full_name[len(prefix):]
+        if lang_name:
+            names.add(lang_name)
+    return sorted(names)
+
+
+@cli.command()
+@click.option("--fuseki-endpoint", required=True, envvar="FUSEKI_ENDPOINT")
+@click.option("-o", "--output", required=True, type=click.Path())
+@click.option("--from-names", is_flag=True, help="Also extract from node-* package names")
+def seed_npm(fuseki_endpoint, output, from_names):
+    """Generate NPM seed file from binary package graph."""
+    from packagegraph.sparql_client import SparqlQueryClient
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    names = set()
+
+    # From homepage URLs
+    def extract_npm(pkg_name, homepage):
+        import re
+        m = re.search(r'npmjs\.com/package/(.+?)(?:/|$)', homepage)
+        return m.group(1) if m else None
+
+    for n in _seed_from_homepage(client, "npmjs.com", extract_npm):
+        names.add(n)
+
+    # From binary package names
+    if from_names:
+        for n in _seed_from_names(client, "node-"):
+            names.add(n)
+
+    Path(output).write_text("\n".join(sorted(names)) + "\n")
+    click.echo(f"Wrote {len(names)} NPM package names to {output}")
+
+
+@cli.command()
+@click.option("--fuseki-endpoint", required=True, envvar="FUSEKI_ENDPOINT")
+@click.option("-o", "--output", required=True, type=click.Path())
+@click.option("--from-names", is_flag=True, help="Also extract from python3-* package names")
+def seed_pypi(fuseki_endpoint, output, from_names):
+    """Generate PyPI seed file from binary package graph."""
+    from packagegraph.sparql_client import SparqlQueryClient
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    names = set()
+
+    def extract_pypi(pkg_name, homepage):
+        import re
+        m = re.search(r'pypi\.org/project/(.+?)(?:/|$)', homepage)
+        return m.group(1) if m else None
+
+    for n in _seed_from_homepage(client, "pypi.org", extract_pypi):
+        names.add(n)
+
+    if from_names:
+        for n in _seed_from_names(client, "python3-"):
+            names.add(n)
+        for n in _seed_from_names(client, "python-"):
+            names.add(n)
+
+    Path(output).write_text("\n".join(sorted(names)) + "\n")
+    click.echo(f"Wrote {len(names)} PyPI package names to {output}")
+
+
+@cli.command()
+@click.option("--fuseki-endpoint", required=True, envvar="FUSEKI_ENDPOINT")
+@click.option("-o", "--output", required=True, type=click.Path())
+@click.option("--from-names", is_flag=True, help="Also extract from rust-* package names")
+def seed_cargo(fuseki_endpoint, output, from_names):
+    """Generate Cargo seed file from binary package graph."""
+    from packagegraph.sparql_client import SparqlQueryClient
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    names = set()
+
+    def extract_cargo(pkg_name, homepage):
+        import re
+        m = re.search(r'crates\.io/crates/(.+?)(?:/|$)', homepage)
+        return m.group(1) if m else None
+
+    for n in _seed_from_homepage(client, "crates.io", extract_cargo):
+        names.add(n)
+
+    if from_names:
+        for n in _seed_from_names(client, "rust-"):
+            names.add(n)
+
+    Path(output).write_text("\n".join(sorted(names)) + "\n")
+    click.echo(f"Wrote {len(names)} Cargo crate names to {output}")
+
+
+@cli.command()
+@click.option("--fuseki-endpoint", required=True, envvar="FUSEKI_ENDPOINT")
+@click.option("-o", "--output", required=True, type=click.Path())
+@click.option("--from-names", is_flag=True, help="Also extract from golang-* package names")
+def seed_gomod(fuseki_endpoint, output, from_names):
+    """Generate Go modules seed file from binary package graph."""
+    from packagegraph.sparql_client import SparqlQueryClient
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    names = set()
+
+    def extract_gomod(pkg_name, homepage):
+        import re
+        m = re.search(r'pkg\.go\.dev/(.+?)(?:\?|$)', homepage)
+        if m:
+            return m.group(1)
+        m = re.search(r'github\.com/([^/]+/[^/]+)', homepage)
+        return m.group(0) if m else None
+
+    for n in _seed_from_homepage(client, "pkg.go.dev", extract_gomod):
+        names.add(n)
+
+    if from_names:
+        for n in _seed_from_names(client, "golang-"):
+            # golang-github-foo-bar → github.com/foo/bar
+            parts = n.split("-", 2)
+            if len(parts) >= 3 and parts[0] in ("github", "gitlab", "golang"):
+                host = parts[0] + ".com" if parts[0] != "golang" else "golang.org"
+                names.add(f"{host}/{'/'.join(parts[1:])}")
+
+    Path(output).write_text("\n".join(sorted(names)) + "\n")
+    click.echo(f"Wrote {len(names)} Go module paths to {output}")
 
 
 if __name__ == "__main__":
