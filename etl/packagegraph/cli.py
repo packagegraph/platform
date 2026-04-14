@@ -473,5 +473,458 @@ def enrich_koji(
     click.echo(f"Enriched graph saved to {output_file}. Total triples: {len(g)}")
 
 
+@cli.command()
+@click.option(
+    "--fuseki-endpoint",
+    required=True,
+    envvar="FUSEKI_ENDPOINT",
+    help="Fuseki SPARQL endpoint URL.",
+)
+@click.option(
+    "--output-dir",
+    required=True,
+    type=click.Path(),
+    help="Directory for enrichment output (.nt files).",
+)
+@click.option(
+    "--cache-dir",
+    default=None,
+    help="Directory for caching GitHub API responses.",
+)
+@click.option("--github-token", envvar="GITHUB_TOKEN", help="GitHub API token.")
+@click.option("--minio-endpoint", envvar="MINIO_ENDPOINT", help="Minio endpoint URL.")
+@click.option("--minio-bucket", default="packagegraph", envvar="MINIO_BUCKET", help="Minio bucket.")
+@click.option("--minio-access-key", envvar="MINIO_ACCESS_KEY", help="Minio access key.")
+@click.option("--minio-secret-key", envvar="MINIO_SECRET_KEY", help="Minio secret key.")
+def enrich_github_vcs(
+    fuseki_endpoint,
+    output_dir,
+    cache_dir,
+    github_token,
+    minio_endpoint,
+    minio_bucket,
+    minio_access_key,
+    minio_secret_key,
+):
+    """Enrich package graph with GitHub VCS metadata (Fuseki-aware).
+
+    Queries Fuseki for packages with GitHub homepages, fetches repo metadata
+    from the GitHub API, and writes VCS triples. Also populates the shared
+    GitHub cache used by enrich-license, enrich-metrics, and enrich-vcs-activity.
+    """
+    from packagegraph.sparql_client import SparqlQueryClient
+    from packagegraph.enrichers.cache import CacheManager
+    from packagegraph.enrichers.github import GitHubEnricher
+
+    if cache_dir is None:
+        cache_dir = Path.home() / ".cache" / "packagegraph" / "github"
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / "github_vcs.nt"
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    cache_mgr = CacheManager(
+        cache_dir=str(cache_dir),
+        enricher_name='github',
+        minio_endpoint=minio_endpoint,
+        minio_bucket=minio_bucket,
+        minio_access_key=minio_access_key,
+        minio_secret_key=minio_secret_key,
+    )
+
+    enricher = GitHubEnricher(
+        sparql_client=client,
+        output_path=str(output_file),
+        github_token=github_token,
+        cache_dir=str(cache_dir),
+    )
+    enricher.enrich()
+    click.echo(f"GitHub VCS enrichment complete. Output: {output_file}")
+
+
+@cli.command()
+@click.option(
+    "--fuseki-endpoint",
+    required=True,
+    envvar="FUSEKI_ENDPOINT",
+    help="Fuseki SPARQL endpoint URL (e.g., http://fuseki:3030/packagegraph).",
+)
+@click.option(
+    "--output-dir",
+    required=True,
+    type=click.Path(),
+    help="Directory for enrichment output (.nt files).",
+)
+@click.option(
+    "--cache-dir",
+    default=None,
+    help="Directory for caching API responses.",
+)
+@click.option("--github-token", envvar="GITHUB_TOKEN", help="GitHub API token.")
+@click.option("--minio-endpoint", envvar="MINIO_ENDPOINT", help="Minio endpoint URL.")
+@click.option("--minio-bucket", default="packagegraph", envvar="MINIO_BUCKET", help="Minio bucket.")
+@click.option("--minio-access-key", envvar="MINIO_ACCESS_KEY", help="Minio access key.")
+@click.option("--minio-secret-key", envvar="MINIO_SECRET_KEY", help="Minio secret key.")
+def enrich_license(
+    fuseki_endpoint,
+    output_dir,
+    cache_dir,
+    github_token,
+    minio_endpoint,
+    minio_bucket,
+    minio_access_key,
+    minio_secret_key,
+):
+    """Enrich package graph with license claims from GitHub API."""
+    from packagegraph.sparql_client import SparqlQueryClient
+    from packagegraph.enrichers.cache import CacheManager
+    from packagegraph.enrichers.license import LicenseEnricher
+
+    if cache_dir is None:
+        cache_dir = Path.home() / ".cache" / "packagegraph" / "license"
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / "licenses.nt"
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    cache_mgr = CacheManager(
+        cache_dir=str(cache_dir),
+        enricher_name='github',  # Shared GitHub cache
+        minio_endpoint=minio_endpoint,
+        minio_bucket=minio_bucket,
+        minio_access_key=minio_access_key,
+        minio_secret_key=minio_secret_key,
+    )
+
+    enricher = LicenseEnricher(
+        sparql_client=client,
+        output_path=str(output_file),
+        cache_manager=cache_mgr,
+        enricher_version='1.0.0',
+        github_token=github_token,
+    )
+    enricher.enrich()
+    click.echo(f"License enrichment complete. Output: {output_file}")
+
+
+@cli.command()
+@click.option(
+    "--fuseki-endpoint",
+    required=True,
+    envvar="FUSEKI_ENDPOINT",
+    help="Fuseki SPARQL endpoint URL.",
+)
+@click.option(
+    "--output-dir",
+    required=True,
+    type=click.Path(),
+    help="Directory for enrichment output (.nt files).",
+)
+@click.option("--cache-dir", default=None, help="Directory for caching API responses.")
+@click.option("--github-token", envvar="GITHUB_TOKEN", help="GitHub API token.")
+@click.option("--minio-endpoint", envvar="MINIO_ENDPOINT", help="Minio endpoint URL.")
+@click.option("--minio-bucket", default="packagegraph", help="Minio bucket.")
+@click.option("--minio-access-key", envvar="MINIO_ACCESS_KEY", help="Minio access key.")
+@click.option("--minio-secret-key", envvar="MINIO_SECRET_KEY", help="Minio secret key.")
+def enrich_metrics(
+    fuseki_endpoint,
+    output_dir,
+    cache_dir,
+    github_token,
+    minio_endpoint,
+    minio_bucket,
+    minio_access_key,
+    minio_secret_key,
+):
+    """Enrich package graph with language metrics claims from GitHub API."""
+    from packagegraph.sparql_client import SparqlQueryClient
+    from packagegraph.enrichers.cache import CacheManager
+    from packagegraph.enrichers.metrics import MetricsEnricher
+
+    if cache_dir is None:
+        cache_dir = Path.home() / ".cache" / "packagegraph" / "metrics"
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / "metrics.nt"
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    cache_mgr = CacheManager(
+        cache_dir=str(cache_dir),
+        enricher_name='github',  # Shared GitHub cache
+        minio_endpoint=minio_endpoint,
+        minio_bucket=minio_bucket,
+        minio_access_key=minio_access_key,
+        minio_secret_key=minio_secret_key,
+    )
+
+    enricher = MetricsEnricher(
+        sparql_client=client,
+        output_path=str(output_file),
+        cache_manager=cache_mgr,
+        enricher_version='1.0.0',
+        github_token=github_token,
+    )
+    enricher.enrich()
+    click.echo(f"Metrics enrichment complete. Output: {output_file}")
+
+
+@cli.command()
+@click.option(
+    "--fuseki-endpoint",
+    required=True,
+    envvar="FUSEKI_ENDPOINT",
+    help="Fuseki SPARQL endpoint URL.",
+)
+@click.option(
+    "--output-dir",
+    required=True,
+    type=click.Path(),
+    help="Directory for enrichment output (.nt files).",
+)
+@click.option("--cache-dir", default=None, help="Directory for caching API responses.")
+@click.option("--github-token", envvar="GITHUB_TOKEN", help="GitHub API token.")
+@click.option("--minio-endpoint", envvar="MINIO_ENDPOINT", help="Minio endpoint URL.")
+@click.option("--minio-bucket", default="packagegraph", help="Minio bucket.")
+@click.option("--minio-access-key", envvar="MINIO_ACCESS_KEY", help="Minio access key.")
+@click.option("--minio-secret-key", envvar="MINIO_SECRET_KEY", help="Minio secret key.")
+def enrich_vcs_activity(
+    fuseki_endpoint,
+    output_dir,
+    cache_dir,
+    github_token,
+    minio_endpoint,
+    minio_bucket,
+    minio_access_key,
+    minio_secret_key,
+):
+    """Enrich package graph with VCS activity claims from GitHub API."""
+    from packagegraph.sparql_client import SparqlQueryClient
+    from packagegraph.enrichers.cache import CacheManager
+    from packagegraph.enrichers.vcs_activity import VCSActivityEnricher
+
+    if cache_dir is None:
+        cache_dir = Path.home() / ".cache" / "packagegraph" / "vcs_activity"
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / "vcs_activity.nt"
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    cache_mgr = CacheManager(
+        cache_dir=str(cache_dir),
+        enricher_name='github',  # Shared GitHub cache
+        minio_endpoint=minio_endpoint,
+        minio_bucket=minio_bucket,
+        minio_access_key=minio_access_key,
+        minio_secret_key=minio_secret_key,
+    )
+
+    enricher = VCSActivityEnricher(
+        sparql_client=client,
+        output_path=str(output_file),
+        cache_manager=cache_mgr,
+        enricher_version='1.0.0',
+        github_token=github_token,
+    )
+    enricher.enrich()
+    click.echo(f"VCS activity enrichment complete. Output: {output_file}")
+
+
+# ─── Canned Query Commands ────────────────────────────────────────────────────
+
+def _query_to_json(client, sparql: str) -> str:
+    """Execute SPARQL query and return results as JSON string."""
+    import json
+    bindings = client.query(sparql)
+    rows = [{k: v["value"] for k, v in b.items()} for b in bindings]
+    return json.dumps(rows, indent=2)
+
+
+@cli.command()
+@click.option(
+    "--fuseki-endpoint",
+    required=True,
+    envvar="FUSEKI_ENDPOINT",
+    help="Fuseki SPARQL endpoint URL.",
+)
+def query_stats(fuseki_endpoint):
+    """Distribution statistics — package and version counts per distro."""
+    from packagegraph.sparql_client import SparqlQueryClient
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    sparql = """
+    PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    SELECT ?distro (COUNT(DISTINCT ?p) AS ?packages) (COUNT(DISTINCT ?v) AS ?versions) WHERE {
+      ?p a pkg:BinaryPackage ;
+         pkg:partOfDistribution ?d ;
+         pkg:hasVersion ?v .
+      ?d rdfs:label ?distro .
+    }
+    GROUP BY ?distro
+    ORDER BY DESC(?packages)
+    """
+    click.echo(_query_to_json(client, sparql))
+
+
+@cli.command()
+@click.argument("name")
+@click.option(
+    "--fuseki-endpoint",
+    required=True,
+    envvar="FUSEKI_ENDPOINT",
+    help="Fuseki SPARQL endpoint URL.",
+)
+@click.option("--limit", default=50, help="Max results.")
+def query_search(name, fuseki_endpoint, limit):
+    """Search packages by name across all distributions."""
+    from packagegraph.sparql_client import SparqlQueryClient
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    # Escape the search term for SPARQL
+    safe_name = name.replace('"', '\\"')
+    sparql = f"""
+    PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    SELECT ?name ?version ?distro WHERE {{
+      ?p a pkg:BinaryPackage ;
+         pkg:packageName ?name ;
+         pkg:hasVersion ?v ;
+         pkg:partOfDistribution ?d .
+      ?v pkg:versionString ?version .
+      ?d rdfs:label ?distro .
+      FILTER(CONTAINS(LCASE(?name), LCASE("{safe_name}")))
+    }}
+    ORDER BY ?name ?distro
+    LIMIT {limit}
+    """
+    click.echo(_query_to_json(client, sparql))
+
+
+@cli.command()
+@click.argument("name")
+@click.option(
+    "--fuseki-endpoint",
+    required=True,
+    envvar="FUSEKI_ENDPOINT",
+    help="Fuseki SPARQL endpoint URL.",
+)
+@click.option("--reverse", is_flag=True, help="Show reverse dependencies (who depends on this).")
+def query_deps(name, fuseki_endpoint, reverse):
+    """Query dependencies of a package (or reverse with --reverse)."""
+    from packagegraph.sparql_client import SparqlQueryClient
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    safe_name = name.replace('"', '\\"')
+
+    if reverse:
+        sparql = f"""
+        PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+        SELECT ?pkg_name ?dep_type WHERE {{
+          ?target pkg:packageName "{safe_name}" .
+          ?dep pkg:dependencyTarget ?target ;
+               pkg:dependencyType ?dep_type .
+          ?p pkg:hasDependency ?dep ;
+             pkg:packageName ?pkg_name .
+        }}
+        ORDER BY ?dep_type ?pkg_name
+        LIMIT 100
+        """
+    else:
+        sparql = f"""
+        PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+        SELECT ?dep_name ?dep_type WHERE {{
+          ?p a pkg:BinaryPackage ;
+             pkg:packageName "{safe_name}" ;
+             pkg:hasDependency ?dep .
+          ?dep pkg:dependencyTarget ?target ;
+               pkg:dependencyType ?dep_type .
+          ?target pkg:packageName ?dep_name .
+        }}
+        ORDER BY ?dep_type ?dep_name
+        LIMIT 100
+        """
+    click.echo(_query_to_json(client, sparql))
+
+
+@cli.command()
+@click.option(
+    "--fuseki-endpoint",
+    required=True,
+    envvar="FUSEKI_ENDPOINT",
+    help="Fuseki SPARQL endpoint URL.",
+)
+@click.option("--package", default=None, help="Filter to a specific package name.")
+@click.option("--limit", default=50, help="Max results.")
+def query_vulns(fuseki_endpoint, package, limit):
+    """Query packages with known vulnerabilities."""
+    from packagegraph.sparql_client import SparqlQueryClient
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    pkg_filter = ""
+    if package:
+        safe_name = package.replace('"', '\\"')
+        pkg_filter = f'FILTER(?pkg_name = "{safe_name}")'
+
+    sparql = f"""
+    PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+    PREFIX sec: <https://purl.org/packagegraph/ontology/security#>
+    SELECT ?pkg_name ?cve_id ?severity ?published WHERE {{
+      ?vuln a sec:Vulnerability ;
+            sec:cveId ?cve_id ;
+            sec:affectsVersion ?ver .
+      ?pkg pkg:hasVersion ?ver ;
+           pkg:packageName ?pkg_name .
+      OPTIONAL {{ ?vuln sec:severity ?severity }}
+      OPTIONAL {{ ?vuln sec:publishedDate ?published }}
+      {pkg_filter}
+    }}
+    ORDER BY DESC(?published)
+    LIMIT {limit}
+    """
+    click.echo(_query_to_json(client, sparql))
+
+
+@cli.command()
+@click.option(
+    "--fuseki-endpoint",
+    required=True,
+    envvar="FUSEKI_ENDPOINT",
+    help="Fuseki SPARQL endpoint URL.",
+)
+def query_graphs(fuseki_endpoint):
+    """List named graphs and their triple counts."""
+    from packagegraph.sparql_client import SparqlQueryClient
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    sparql = """
+    SELECT ?graph (COUNT(*) AS ?triples) WHERE {
+      GRAPH ?graph { ?s ?p ?o }
+    }
+    GROUP BY ?graph
+    ORDER BY DESC(?triples)
+    """
+    click.echo(_query_to_json(client, sparql))
+
+
+@cli.command()
+@click.argument("sparql_query")
+@click.option(
+    "--fuseki-endpoint",
+    required=True,
+    envvar="FUSEKI_ENDPOINT",
+    help="Fuseki SPARQL endpoint URL.",
+)
+def query_raw(sparql_query, fuseki_endpoint):
+    """Execute a raw SPARQL query. Pass the query string as an argument."""
+    from packagegraph.sparql_client import SparqlQueryClient
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    click.echo(_query_to_json(client, sparql_query))
+
+
 if __name__ == "__main__":
     cli()
