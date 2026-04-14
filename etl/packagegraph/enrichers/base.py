@@ -5,6 +5,7 @@ from typing import Any, TextIO
 from datetime import datetime
 import hashlib
 import json
+import os
 from pathlib import Path
 from packagegraph.sparql_client import SparqlQueryClient
 from packagegraph.namespaces import PROV, PKG, DATA, snapshot_uri
@@ -163,6 +164,17 @@ class BaseEnricher(ABC):
         with open(manifest_path, 'w') as f:
             json.dump(manifest, f, indent=2)
 
+    def _sync_cache_to_minio(self) -> None:
+        """Sync cache to Minio if a CacheManager with Minio is available.
+
+        Looks for a 'cache' attribute on the subclass (GitHubEnricher has one).
+        """
+        cache = getattr(self, 'cache', None)
+        if cache and hasattr(cache, 'sync_to_minio'):
+            count = cache.sync_to_minio()
+            if count > 0:
+                print(f"  [cache synced: {count} entries to Minio]")
+
     def _preflight_check(self) -> None:
         """Optional preflight check before processing items.
 
@@ -189,11 +201,23 @@ class BaseEnricher(ABC):
         items = self._query_packages()
         print(f"Processing {len(items)} items...")
 
+        # Cache sync interval — sync to Minio every N items (0 = disabled)
+        cache_disabled = os.environ.get('ENRICHER_CACHE_DISABLED', '0') == '1'
+        sync_interval = int(os.environ.get('ENRICHER_CACHE_SYNC_INTERVAL', '500'))
+
         # Process each item
         for idx, item in enumerate(items, 1):
             if idx % 100 == 0:
                 print(f"  [{idx}/{len(items)}]")
             self._process_item(item)
+
+            # Periodic cache sync to Minio
+            if not cache_disabled and sync_interval > 0 and idx % sync_interval == 0:
+                self._sync_cache_to_minio()
+
+        # Final cache sync
+        if not cache_disabled:
+            self._sync_cache_to_minio()
 
         # Record provenance (before writing, so it's included in output)
         self.end_time = datetime.now()

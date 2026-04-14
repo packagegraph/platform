@@ -237,6 +237,52 @@ class CacheManager:
             'entries': self.list_entries(),
         }
 
+    def sync_to_minio(self) -> int:
+        """Upload all local cache entries to Minio nearline storage.
+
+        Returns the number of entries synced. Uses mc mirror for efficiency.
+        """
+        if not self._minio_env:
+            return 0
+
+        minio_path = f"{self.minio_alias}/{self.minio_bucket}/enricher-cache/{self.enricher_name}/"
+        result = subprocess.run(
+            ['mc', 'mirror', '--overwrite', str(self.cache_dir) + '/', minio_path],
+            env=self._minio_env,
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            print(f"Warning: cache sync to Minio failed: {result.stderr[:200]}")
+            return 0
+
+        count = sum(1 for _ in self.cache_dir.rglob('*.json') if _.name != 'manifest.json')
+        return count
+
+    def sync_from_minio(self) -> int:
+        """Download cache entries from Minio to local disk.
+
+        Returns the number of entries synced.
+        """
+        if not self._minio_env:
+            return 0
+
+        minio_path = f"{self.minio_alias}/{self.minio_bucket}/enricher-cache/{self.enricher_name}/"
+        result = subprocess.run(
+            ['mc', 'mirror', '--overwrite', minio_path, str(self.cache_dir) + '/'],
+            env=self._minio_env,
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            # Not an error — Minio path may not exist yet
+            return 0
+
+        count = sum(1 for _ in self.cache_dir.rglob('*.json') if _.name != 'manifest.json')
+        return count
+
     def purge_expired(self) -> int:
         """Remove expired entries from local disk.
 

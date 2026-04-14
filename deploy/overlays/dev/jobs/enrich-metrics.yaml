@@ -32,10 +32,22 @@ spec:
               command: ["/bin/sh", "-c"]
               args:
                 - |
+                  set -eu
+                  CACHE_DIR=/tmp/cache/github
+                  MINIO_CACHE="pgraph/${MINIO_BUCKET}/enricher-cache/github"
+
+                  mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
+
+                  if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
+                    echo "Syncing GitHub cache from Minio..."
+                    mc mirror --overwrite "${MINIO_CACHE}/" "${CACHE_DIR}/" 2>/dev/null || true
+                    echo "Cache warmed: $(find "${CACHE_DIR}" -name '*.json' 2>/dev/null | wc -l) entries"
+                  fi
+
                   packagegraph enrich-metrics \
                     --fuseki-endpoint "$FUSEKI_ENDPOINT" \
                     --output-dir /tmp/enrichment \
-                    --cache-dir /tmp/cache/metrics && \
+                    --cache-dir "${CACHE_DIR}" && \
                   pg-collect drop \
                     --graph "https://packagegraph.github.io/graph/enrichment/metrics" \
                     --endpoint "$FUSEKI_ENDPOINT" && \

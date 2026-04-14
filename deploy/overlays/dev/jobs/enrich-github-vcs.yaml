@@ -32,14 +32,40 @@ spec:
               command: ["/bin/sh", "-c"]
               args:
                 - |
+                  set -eu
+                  CACHE_DIR=/tmp/cache/github
+                  MINIO_CACHE="pgraph/${MINIO_BUCKET}/enricher-cache/github"
+                  mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
+
+                  # Warm cache from Minio (unless disabled)
+                  if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
+                    echo "Syncing cache from Minio..."
+                    mc mirror --overwrite "${MINIO_CACHE}/" "${CACHE_DIR}/" 2>/dev/null || true
+                    echo "Cache warmed: $(find "${CACHE_DIR}" -name '*.json' 2>/dev/null | wc -l) entries"
+                  else
+                    echo "Cache disabled (ENRICHER_CACHE_DISABLED=1)"
+                  fi
+
+                  # Run enricher (may exit non-zero on partial completion)
                   packagegraph enrich-github-vcs \
                     --fuseki-endpoint "$FUSEKI_ENDPOINT" \
                     --output-dir /tmp/enrichment \
-                    --cache-dir /tmp/cache/github && \
-                  pg-collect drop \
-                    --graph "https://packagegraph.github.io/graph/enrichment/github-vcs" \
-                    --endpoint "$FUSEKI_ENDPOINT" && \
-                  pg-collect load /tmp/enrichment/github_vcs.nt \
-                    --graph "https://packagegraph.github.io/graph/enrichment/github-vcs" \
-                    --endpoint "$FUSEKI_ENDPOINT"
+                    --cache-dir "${CACHE_DIR}" || true
+
+                  # Always sync cache back — even on partial runs
+                  if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
+                    echo "Syncing cache to Minio..."
+                    mc mirror --overwrite "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
+                    echo "Cache synced: $(find "${CACHE_DIR}" -name '*.json' 2>/dev/null | wc -l) entries"
+                  fi
+
+                  # Load triples if output exists
+                  if [ -f /tmp/enrichment/github_vcs.nt ]; then
+                    pg-collect drop \
+                      --graph "https://packagegraph.github.io/graph/enrichment/github-vcs" \
+                      --endpoint "$FUSEKI_ENDPOINT" && \
+                    pg-collect load /tmp/enrichment/github_vcs.nt \
+                      --graph "https://packagegraph.github.io/graph/enrichment/github-vcs" \
+                      --endpoint "$FUSEKI_ENDPOINT"
+                  fi
               resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 1Gi}}
