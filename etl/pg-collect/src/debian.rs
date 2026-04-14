@@ -484,6 +484,13 @@ impl DebianCollector {
                 // Build target package URI (version is unknown)
                 let dep_uri = package_uri("debian", codename, arch_name, dep_name, "unknown");
 
+                // Ensure dependency target stub has basic properties for graph traversal.
+                // Without pkg:packageName and rdf:type, stubs are invisible to typed queries
+                // and name-based joins, breaking transitive dependency traversal.
+                writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}BinaryPackage"))?;
+                writer.write_literal(&dep_uri, &format!("{PKG}packageName"), dep_name)?;
+                triples += 2;
+
                 // Emit generic property based on dep_type
                 if dep_type == "conflicts" || dep_type == "breaks" {
                     writer.write_triple(pkg_uri, &format!("{PKG}directlyConflictsWith"), &dep_uri)?;
