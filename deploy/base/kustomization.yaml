@@ -10,7 +10,8 @@ resources:
   - minio/deployment.yaml
   - minio/service.yaml
   - fuseki/configmap.yaml
+  - fuseki/pvc.yaml
   - fuseki/deployment.yaml
   - fuseki/service.yaml
   - fuseki/route.yaml
-  - etl/job.yaml
+  - fuseki/read-replica.yaml

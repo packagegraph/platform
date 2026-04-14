@@ -9,6 +9,7 @@
     fuseki:endpoint [ fuseki:operation fuseki:query ; fuseki:name "query" ] ;
     fuseki:endpoint [ fuseki:operation fuseki:update ; fuseki:name "update" ] ;
     fuseki:endpoint [ fuseki:operation fuseki:gsp-r ; fuseki:name "get" ] ;
+    fuseki:endpoint [ fuseki:operation fuseki:gsp-rw ; fuseki:name "data" ] ;
     fuseki:dataset <#dataset> .
 
 # Ontology TBox is loaded into a named graph by the ETL pipeline
@@ -17,4 +18,9 @@
 # unionDefaultGraph makes queries see both graphs transparently.
 <#dataset> rdf:type tdb2:DatasetTDB2 ;
     tdb2:location "/data/tdb2" ;
-    tdb2:unionDefaultGraph true .
+    tdb2:unionDefaultGraph true ;
+    ## Query timeout: first value = initial timeout (ms), second = hard limit (ms)
+    ## Protects against runaway queries from YASGUI or query-raw.
+    ## 30s soft timeout (query can be interrupted), 120s hard kill.
+    ## See: https://jena.apache.org/documentation/fuseki2/fuseki-configuration.html
+    ja:context [ ja:cxtName "arq:queryTimeout" ;  ja:cxtValue "30000,120000" ] .

@@ -16,10 +16,10 @@ data:
         fuseki:endpoint [ fuseki:operation fuseki:query ; fuseki:name "query" ] ;
         fuseki:endpoint [ fuseki:operation fuseki:update ; fuseki:name "update" ] ;
         fuseki:endpoint [ fuseki:operation fuseki:gsp-r ; fuseki:name "get" ] ;
+        fuseki:endpoint [ fuseki:operation fuseki:gsp-rw ; fuseki:name "data" ] ;
         fuseki:dataset <#dataset> .
 
-    # NOTE: unionDefaultGraph should be enabled when all data is in named graphs
-    # (via pg-collect load). Disabled while data is still loaded into default graph
-    # via tdb2.tdbloader. Enable with: tdb2:unionDefaultGraph true
     <#dataset> rdf:type tdb2:DatasetTDB2 ;
-        tdb2:location "/data/tdb2" .
+        tdb2:location "/data/tdb2" ;
+        tdb2:unionDefaultGraph true ;
+        ja:context [ ja:cxtName "arq:queryTimeout" ;  ja:cxtValue "30000,120000" ] .

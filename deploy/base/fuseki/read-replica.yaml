@@ -1,0 +1,134 @@
+## Fuseki Read Replica — scales horizontally for query workloads.
+##
+## Each replica loads the same TDB2 snapshot from Minio independently.
+## Read-only: no SPARQL UPDATE or Graph Store write endpoints.
+## Scale with: oc scale deployment/fuseki-reader --replicas=N
+##
+## Architecture:
+##   ┌── fuseki (writer, replicas=1) ← ETL CronJobs write here
+##   │
+##   └── fuseki-reader (read replicas, replicas=N) ← user queries go here
+##       Load balanced by fuseki-reader Service.
+##
+## See: https://github.com/apache/jena/discussions/2099
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fuseki-reader-config
+  namespace: packagegraph
+data:
+  config.ttl: |
+    @prefix fuseki:  <http://jena.apache.org/fuseki#> .
+    @prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+    @prefix ja:      <http://jena.hpl.hp.com/2005/11/Assembler#> .
+    @prefix tdb2:    <http://jena.apache.org/2016/tdb#> .
+
+    <#service> rdf:type fuseki:Service ;
+        fuseki:name "packagegraph" ;
+        ## Read-only: query endpoints only, no update or graph store write.
+        fuseki:endpoint [ fuseki:operation fuseki:query ; fuseki:name "sparql" ] ;
+        fuseki:endpoint [ fuseki:operation fuseki:query ; fuseki:name "query" ] ;
+        fuseki:endpoint [ fuseki:operation fuseki:gsp-r ; fuseki:name "get" ] ;
+        fuseki:dataset <#dataset> .
+
+    <#dataset> rdf:type tdb2:DatasetTDB2 ;
+        tdb2:location "/data/tdb2" ;
+        tdb2:unionDefaultGraph true ;
+        ja:context [ ja:cxtName "arq:queryTimeout" ;  ja:cxtValue "30000,120000" ] .
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fuseki-reader
+  namespace: packagegraph
+  labels:
+    app: fuseki-reader
+    app.kubernetes.io/name: fuseki-reader
+    app.kubernetes.io/part-of: packagegraph
+    packagegraph/role: reader
+spec:
+  replicas: 0  # Scale up when needed: oc scale deployment/fuseki-reader --replicas=N
+  selector:
+    matchLabels:
+      app: fuseki-reader
+  template:
+    metadata:
+      labels:
+        app: fuseki-reader
+        packagegraph/role: reader
+    spec:
+      initContainers:
+        - name: load-tdb2
+          image: packagegraph/fuseki:latest
+          command: ["/fuseki/entrypoint.sh"]
+          args: ["--init-only"]
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          volumeMounts:
+            - name: tdb2-data
+              mountPath: /data
+      containers:
+        - name: fuseki
+          image: ghcr.io/packagegraph/fuseki:5.3.0
+          env:
+            - name: JAVA_OPTIONS
+              value: "-Xmx1536m"
+          args:
+            - --config
+            - /fuseki/config.ttl
+            - --port
+            - "3030"
+          ports:
+            - containerPort: 3030
+              name: http
+          volumeMounts:
+            - name: tdb2-data
+              mountPath: /data
+            - name: fuseki-config
+              mountPath: /fuseki/config.ttl
+              subPath: config.ttl
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          livenessProbe:
+            httpGet:
+              path: /$/ping
+              port: 3030
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /$/ping
+              port: 3030
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: tdb2-data
+          emptyDir: {}  # Each replica loads its own copy from Minio
+        - name: fuseki-config
+          configMap:
+            name: fuseki-reader-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fuseki-reader
+  namespace: packagegraph
+  labels:
+    app: fuseki-reader
+spec:
+  selector:
+    app: fuseki-reader
+  ports:
+    - port: 3030
+      targetPort: 3030
+      name: http
