@@ -5,4 +5,8 @@ pub mod rpm;
 pub mod alpine;
 pub mod homebrew;
 pub mod arch;
+pub mod npm;
+pub mod pypi;
+pub mod cargo_collect;
+pub mod gomod;
 pub mod sparql;

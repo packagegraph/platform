@@ -120,6 +120,54 @@ enum Commands {
         output: String,
     },
 
+    /// Collect NPM packages from registry.npmjs.org
+    Npm {
+        /// Seed file with NPM package names (one per line)
+        #[arg(long, required = true)]
+        packages_file: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
+    /// Collect Python packages from pypi.org
+    Pypi {
+        /// Seed file with PyPI package names (one per line)
+        #[arg(long, required = true)]
+        packages_file: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
+    /// Collect Rust crates from crates.io
+    Cargo {
+        /// Seed file with crate names (one per line)
+        #[arg(long, required = true)]
+        packages_file: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
+    /// Collect Go modules from proxy.golang.org
+    Gomod {
+        /// Seed file with Go module paths (one per line)
+        #[arg(long, required = true)]
+        packages_file: String,
+
+        /// Go module proxy URL
+        #[arg(long, default_value = "https://proxy.golang.org")]
+        proxy: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
     /// Load N-Triples file into a Fuseki named graph via SPARQL Update
     Load {
         /// N-Triples file to load
@@ -288,6 +336,47 @@ fn main() {
 
             let collector = ArchCollector::new(mirror, repos, include_aur);
             collector.collect(&output)
+        }
+
+        Commands::Npm { packages_file, output } => {
+            eprintln!("=== PackageGraph NPM Collector ===");
+            eprintln!("Seed: {}", packages_file);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let collector = pg_collect::npm::NpmCollector::new("https://registry.npmjs.org".into());
+            collector.collect(&packages_file, &output)
+        }
+
+        Commands::Pypi { packages_file, output } => {
+            eprintln!("=== PackageGraph PyPI Collector ===");
+            eprintln!("Seed: {}", packages_file);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let collector = pg_collect::pypi::PypiCollector::new();
+            collector.collect(&packages_file, &output)
+        }
+
+        Commands::Cargo { packages_file, output } => {
+            eprintln!("=== PackageGraph Cargo Collector ===");
+            eprintln!("Seed: {}", packages_file);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let collector = pg_collect::cargo_collect::CargoCollector::new();
+            collector.collect(&packages_file, &output)
+        }
+
+        Commands::Gomod { packages_file, proxy, output } => {
+            eprintln!("=== PackageGraph Go Modules Collector ===");
+            eprintln!("Seed: {}", packages_file);
+            eprintln!("Proxy: {}", proxy);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let collector = pg_collect::gomod::GoModCollector::new(proxy);
+            collector.collect(&packages_file, &output)
         }
 
         Commands::Load { file, graph, endpoint, batch_size } => {
