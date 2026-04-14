@@ -9,6 +9,11 @@ resources:
   - jobs/collect-centos-stream-9.yaml
   - jobs/collect-centos-stream-10.yaml
   - jobs/collect-opensuse-tw.yaml
+  - jobs/snapshot-tdb2.yaml
+  - jobs/enrich-github-vcs.yaml
+  - jobs/enrich-license.yaml
+  - jobs/enrich-metrics.yaml
+  - jobs/enrich-vcs-activity.yaml
 
 patches:
   - path: patches/fuseki-resources.yaml
@@ -22,4 +27,3 @@ patches:
         value:
           name: fuseki-run
           emptyDir: {}
-  - path: patches/etl-single-distro.yaml

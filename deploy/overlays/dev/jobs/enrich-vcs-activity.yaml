@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: enrich-vcs-activity
+  namespace: packagegraph
+spec:
+  schedule: "0 7 * * 1"  # Weekly on Monday at 7am
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: enricher
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom:
+                - secretRef: {name: minio-credentials}
+                - secretRef: {name: github-token}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: PYTHONUNBUFFERED, value: "1"}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  packagegraph enrich-vcs-activity \
+                    --fuseki-endpoint "$FUSEKI_ENDPOINT" \
+                    --output-dir /tmp/enrichment \
+                    --cache-dir /tmp/cache/vcs-activity && \
+                  pg-collect drop \
+                    --graph "https://packagegraph.github.io/graph/enrichment/vcs-activity" \
+                    --endpoint "$FUSEKI_ENDPOINT" && \
+                  pg-collect load /tmp/enrichment/vcs_activity.nt \
+                    --graph "https://packagegraph.github.io/graph/enrichment/vcs-activity" \
+                    --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 1Gi}}
