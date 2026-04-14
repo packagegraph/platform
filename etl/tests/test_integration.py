@@ -86,46 +86,53 @@ Description: library for URL transfers
     rpm_primary_response.content = rpm_primary_xml
     rpm_primary_response.raise_for_status = Mock()
 
-    with patch('packagegraph.collectors.debian.requests.get') as debian_mock:
+    with patch("packagegraph.collectors.debian.requests.get") as debian_mock:
         # Debian: Release, Packages, Contents (404)
         import requests
+
         debian_mock.side_effect = [
             debian_release_response,
             debian_packages_response,
-            requests.exceptions.HTTPError("404")
+            requests.exceptions.HTTPError("404"),
         ]
 
-        with patch('packagegraph.collectors.debian.gzip.decompress', return_value=debian_packages):
-            with patch('packagegraph.collectors.debian.click.echo'):
+        with patch(
+            "packagegraph.collectors.debian.gzip.decompress",
+            return_value=debian_packages,
+        ):
+            with patch("packagegraph.collectors.debian.click.echo"):
                 debian_collector = DebianCollector(
                     g,
                     "http://deb.debian.org/debian",
                     distribution="stable",
                     component="main",
                     arch=["binary-amd64"],
-                    parallel=False
+                    parallel=False,
                 )
                 debian_collector.collect()
 
-    with patch('packagegraph.collectors.rpm.requests.get') as rpm_mock:
+    with patch("packagegraph.collectors.rpm.requests.get") as rpm_mock:
         rpm_mock.side_effect = [rpm_repomd_response, rpm_primary_response]
 
-        with patch('packagegraph.collectors.rpm.gzip.decompress', return_value=rpm_primary_xml):
-            with patch('packagegraph.collectors.rpm.click.echo'):
+        with patch(
+            "packagegraph.collectors.rpm.gzip.decompress", return_value=rpm_primary_xml
+        ):
+            with patch("packagegraph.collectors.rpm.click.echo"):
                 rpm_collector = RpmCollector(
                     g,
                     "https://dl.fedoraproject.org/pub/fedora/linux/releases/41/Everything/x86_64/os",
                     distro_name="fedora",
                     release_name="41",
-                    parallel=False
+                    parallel=False,
                 )
                 rpm_collector.collect()
 
     # === SPARQL Verification ===
 
-    # Query 1: Count all BinaryPackages (should be 4: 2 Debian + 2 RPM)
+    # Query 1: Count all BinaryPackages (should be 6: 2 Debian main + 2 dep stubs + 2 RPM)
+    # Note: add_dependency creates BinaryPackage-typed stubs for dependency targets
     query1 = """
-        PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+        PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
         SELECT (COUNT(?p) as ?count) WHERE {
             ?p a pkg:BinaryPackage .
         }
@@ -134,13 +141,15 @@ Description: library for URL transfers
     result_list = list(results)
     assert len(result_list) == 1
     count = int(result_list[0][0])
-    assert count == 4, f"Expected 4 BinaryPackages, got {count}"
+    assert count == 6, (
+        f"Expected 6 BinaryPackages (2 Debian main + 2 dep stubs + 2 RPM), got {count}"
+    )
 
     # Query 2: Check dependency links (Debian curl → libc6, libcurl4)
     # NOTE: Dependency processing is implemented but may create named nodes for deps
     # that don't exist in the fixture. Just verify the relationship exists.
     query2 = """
-        PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+        PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
         SELECT (COUNT(?dep) as ?count) WHERE {
             ?p pkg:packageName "curl" .
             ?p pkg:directlyDependsOn ?dep .
@@ -153,7 +162,7 @@ Description: library for URL transfers
 
     # Query 3: Check maintainer aggregation (Alice should maintain 2 Debian packages)
     query3 = """
-        PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+        PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
         PREFIX foaf: <http://xmlns.com/foaf/0.1/>
         SELECT ?name (COUNT(DISTINCT ?p) as ?count) WHERE {
             ?p pkg:maintainedBy ?m .
@@ -170,7 +179,7 @@ Description: library for URL transfers
 
     # Query 4: Check source→binary links
     query4 = """
-        PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+        PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
         SELECT ?bin_name ?src_name WHERE {
             ?bin pkg:builtFromSource ?src .
             ?bin pkg:packageName ?bin_name .
@@ -184,7 +193,7 @@ Description: library for URL transfers
 
     # Query 5: Verify dual typing - Debian packages
     query5 = """
-        PREFIX deb: <https://packagegraph.github.io/ontology/debian#>
+        PREFIX deb: <https://purl.org/packagegraph/ontology/debian#>
         SELECT (COUNT(?p) as ?count) WHERE {
             ?p a deb:BinaryPackage .
         }
@@ -196,7 +205,7 @@ Description: library for URL transfers
 
     # Query 6: Verify dual typing - RPM packages
     query6 = """
-        PREFIX rpm: <https://packagegraph.github.io/ontology/rpm#>
+        PREFIX rpm: <https://purl.org/packagegraph/ontology/rpm#>
         SELECT (COUNT(?p) as ?count) WHERE {
             ?p a rpm:BinaryRPM .
         }
@@ -206,13 +215,15 @@ Description: library for URL transfers
     rpm_count = int(result_list[0][0])
     assert rpm_count == 2, f"Should have 2 rpm:BinaryRPM, got {rpm_count}"
 
-    # Query 7: Verify all BinaryPackages also have distro-specific type
+    # Query 7: Verify main packages have distro-specific types
+    # Main packages have descriptions; dependency stubs may be generic
     query7 = """
-        PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
-        PREFIX deb: <https://packagegraph.github.io/ontology/debian#>
-        PREFIX rpm: <https://packagegraph.github.io/ontology/rpm#>
+        PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+        PREFIX deb: <https://purl.org/packagegraph/ontology/debian#>
+        PREFIX rpm: <https://purl.org/packagegraph/ontology/rpm#>
         SELECT (COUNT(?p) as ?count) WHERE {
-            ?p a pkg:BinaryPackage .
+            ?p a pkg:BinaryPackage ;
+               pkg:description ?desc .
             FILTER NOT EXISTS {
                 { ?p a deb:BinaryPackage } UNION { ?p a rpm:BinaryRPM }
             }
@@ -221,7 +232,9 @@ Description: library for URL transfers
     results = g.query(query7)
     result_list = list(results)
     untyped_count = int(result_list[0][0])
-    assert untyped_count == 0, f"All BinaryPackages should have distro-specific type, {untyped_count} don't"
+    assert untyped_count == 0, (
+        f"Main packages (with description) should have distro-specific type, {untyped_count} don't"
+    )
 
     print(f"\n✅ Integration test passed - verified {len(g)} triples via SPARQL")
 
@@ -259,7 +272,8 @@ Description: GNU C compiler
     packages_arm64_response.raise_for_status = Mock()
 
     import requests
-    with patch('packagegraph.collectors.debian.requests.get') as mock_get:
+
+    with patch("packagegraph.collectors.debian.requests.get") as mock_get:
         mock_get.side_effect = [
             debian_release_response,
             packages_amd64_response,
@@ -268,22 +282,22 @@ Description: GNU C compiler
             requests.exceptions.HTTPError("404"),  # Contents-arm64
         ]
 
-        with patch('packagegraph.collectors.debian.gzip.decompress') as mock_decompress:
+        with patch("packagegraph.collectors.debian.gzip.decompress") as mock_decompress:
             mock_decompress.side_effect = [packages_amd64, packages_arm64]
-            with patch('packagegraph.collectors.debian.click.echo'):
+            with patch("packagegraph.collectors.debian.click.echo"):
                 collector = DebianCollector(
                     g,
                     "http://deb.debian.org/debian",
                     distribution="stable",
                     component="main",
                     arch=["binary-amd64", "binary-arm64"],
-                    parallel=False
+                    parallel=False,
                 )
                 collector.collect()
 
     # SPARQL: Verify distinct packages per architecture
     query = """
-        PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+        PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
         PREFIX data: <https://packagegraph.github.io/data/>
         SELECT ?arch (COUNT(?p) as ?count) WHERE {
             ?p pkg:packageName "gcc" .

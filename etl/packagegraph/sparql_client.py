@@ -1,4 +1,5 @@
 """Thin client for querying Fuseki SPARQL endpoint."""
+
 import requests
 
 
@@ -23,7 +24,7 @@ class SparqlQueryClient:
     def query_package_names_and_versions(self) -> list[tuple[str, str]]:
         """Get unique (package_name, version_string) pairs."""
         sparql = """
-        PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+        PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
         SELECT DISTINCT ?name ?version WHERE {
             ?p a pkg:BinaryPackage .
             ?p pkg:packageName ?name .
@@ -37,7 +38,7 @@ class SparqlQueryClient:
     def query_github_homepages(self) -> list[tuple[str, str]]:
         """Get (package_uri, homepage_url) for packages with GitHub homepages."""
         sparql = """
-        PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+        PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
         SELECT DISTINCT ?pkg ?homepage WHERE {
             ?pkg a pkg:BinaryPackage .
             ?pkg pkg:homepage ?homepage .

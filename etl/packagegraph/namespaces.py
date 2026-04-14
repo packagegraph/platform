@@ -1,7 +1,7 @@
 """Ontology and data namespace definitions for PackageGraph.
 
 URI Design (v0.5.0):
-  Ontology: https://packagegraph.github.io/ontology/{module}#
+  Ontology: https://purl.org/packagegraph/ontology/{module}#
   Data:     https://packagegraph.github.io/d/{type}/{path...}
 
 Data URI paths:
@@ -23,14 +23,14 @@ from rdflib import Namespace
 
 
 # Ontology namespaces (classes + properties)
-PKG = Namespace("https://packagegraph.github.io/ontology/core#")
-SEC = Namespace("https://packagegraph.github.io/ontology/security#")
-VCS = Namespace("https://packagegraph.github.io/ontology/vcs#")
-SLSA = Namespace("https://packagegraph.github.io/ontology/slsa#")
+PKG = Namespace("https://purl.org/packagegraph/ontology/core#")
+SEC = Namespace("https://purl.org/packagegraph/ontology/security#")
+VCS = Namespace("https://purl.org/packagegraph/ontology/vcs#")
+SLSA = Namespace("https://purl.org/packagegraph/ontology/slsa#")
 
 # Distribution-specific ontology extensions
-DEB = Namespace("https://packagegraph.github.io/ontology/debian#")
-RPM = Namespace("https://packagegraph.github.io/ontology/rpm#")
+DEB = Namespace("https://purl.org/packagegraph/ontology/debian#")
+RPM = Namespace("https://purl.org/packagegraph/ontology/rpm#")
 
 # External vocabularies
 FOAF = Namespace("http://xmlns.com/foaf/0.1/")

@@ -13,7 +13,9 @@ def test_rust_ntriples_parseable_by_rdflib():
     rust_binary = Path("../pg-collect/target/release/pg-collect")
 
     if not rust_binary.exists():
-        pytest.skip("Rust binary not built (run: cd ../pg-collect && cargo build --release)")
+        pytest.skip(
+            "Rust binary not built (run: cd ../pg-collect && cargo build --release)"
+        )
 
     # We can't run a full collector test without a real or mock HTTP server
     # For now, just verify the binary exists and has correct help output
@@ -39,28 +41,31 @@ def test_ntriples_format_structure():
 
     # Sample N-Triples (matching what the Rust collector outputs)
     sample_nt = """
-<https://packagegraph.github.io/data/package/debian/trixie/amd64/libc6/2.36-1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://packagegraph.github.io/ontology/core#BinaryPackage> .
-<https://packagegraph.github.io/data/package/debian/trixie/amd64/libc6/2.36-1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://packagegraph.github.io/ontology/debian#BinaryPackage> .
-<https://packagegraph.github.io/data/package/debian/trixie/amd64/libc6/2.36-1> <https://packagegraph.github.io/ontology/core#packageName> "libc6" .
+<https://packagegraph.github.io/data/package/debian/trixie/amd64/libc6/2.36-1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#BinaryPackage> .
+<https://packagegraph.github.io/data/package/debian/trixie/amd64/libc6/2.36-1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/debian#BinaryPackage> .
+<https://packagegraph.github.io/data/package/debian/trixie/amd64/libc6/2.36-1> <https://purl.org/packagegraph/ontology/core#packageName> "libc6" .
 """.strip()
 
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.nt', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".nt", delete=False) as f:
         f.write(sample_nt)
         temp_path = f.name
 
     try:
         g = Graph()
-        g.parse(temp_path, format='nt')
+        g.parse(temp_path, format="nt")
 
         # Verify we loaded triples
         assert len(g) == 3
 
         # Verify dual typing is present
         from rdflib import URIRef, Namespace
-        PKG = Namespace("https://packagegraph.github.io/ontology/core#")
-        DEB = Namespace("https://packagegraph.github.io/ontology/debian#")
 
-        pkg_uri = URIRef("https://packagegraph.github.io/data/package/debian/trixie/amd64/libc6/2.36-1")
+        PKG = Namespace("https://purl.org/packagegraph/ontology/core#")
+        DEB = Namespace("https://purl.org/packagegraph/ontology/debian#")
+
+        pkg_uri = URIRef(
+            "https://packagegraph.github.io/data/package/debian/trixie/amd64/libc6/2.36-1"
+        )
         from rdflib.namespace import RDF
 
         assert (pkg_uri, RDF.type, PKG.BinaryPackage) in g
@@ -72,23 +77,24 @@ def test_ntriples_format_structure():
 def test_escaped_literals_parseable():
     """Verify that escaped N-Triples literals (newlines, quotes) parse correctly."""
     # Rust escapes: \\ \" \n \r \t
-    sample_nt = r'''
+    sample_nt = r"""
 <https://example.org/pkg/test> <https://example.org/description> "Line 1\nLine 2\tTabbed" .
 <https://example.org/pkg/test> <https://example.org/quoted> "He said \"hello\"" .
-'''.strip()
+""".strip()
 
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.nt', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".nt", delete=False) as f:
         f.write(sample_nt)
         temp_path = f.name
 
     try:
         g = Graph()
-        g.parse(temp_path, format='nt')
+        g.parse(temp_path, format="nt")
 
         assert len(g) == 2
 
         # Verify escaped content is correctly decoded
         from rdflib import URIRef
+
         pkg_uri = URIRef("https://example.org/pkg/test")
         desc_pred = URIRef("https://example.org/description")
 

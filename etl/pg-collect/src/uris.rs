@@ -1,14 +1,14 @@
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
 // Namespace constants (must match Python exactly)
-pub const PKG: &str = "https://packagegraph.github.io/ontology/core#";
-pub const SEC: &str = "https://packagegraph.github.io/ontology/security#";
-pub const VCS: &str = "https://packagegraph.github.io/ontology/vcs#";
-pub const DEB: &str = "https://packagegraph.github.io/ontology/debian#";
-pub const RPM: &str = "https://packagegraph.github.io/ontology/rpm#";
+pub const PKG: &str = "https://purl.org/packagegraph/ontology/core#";
+pub const SEC: &str = "https://purl.org/packagegraph/ontology/security#";
+pub const VCS: &str = "https://purl.org/packagegraph/ontology/vcs#";
+pub const DEB: &str = "https://purl.org/packagegraph/ontology/debian#";
+pub const RPM: &str = "https://purl.org/packagegraph/ontology/rpm#";
 pub const FOAF: &str = "http://xmlns.com/foaf/0.1/";
 pub const PROV: &str = "http://www.w3.org/ns/prov#";
-pub const SLSA: &str = "https://packagegraph.github.io/ontology/slsa#";
+pub const SLSA: &str = "https://purl.org/packagegraph/ontology/slsa#";
 pub const DATA: &str = "https://packagegraph.github.io/d/";
 pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 pub const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
