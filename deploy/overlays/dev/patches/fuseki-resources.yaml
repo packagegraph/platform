@@ -10,8 +10,8 @@ spec:
         - name: fuseki
           resources:
             requests:
-              cpu: 250m
-              memory: 512Mi
+              cpu: 500m
+              memory: 3Gi
             limits:
-              cpu: "1"
-              memory: 2Gi
+              cpu: "2"
+              memory: 6Gi

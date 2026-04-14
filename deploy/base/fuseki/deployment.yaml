@@ -9,6 +9,8 @@ metadata:
     app.kubernetes.io/part-of: packagegraph
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: fuseki
@@ -31,6 +33,13 @@ spec:
       containers:
         - name: fuseki
           image: ghcr.io/packagegraph/fuseki:5.3.0
+          env:
+            - name: JAVA_OPTIONS
+              # TDB2 uses memory-mapped files — keep JVM heap low, leave
+              # the rest for OS file cache. See:
+              # https://github.com/apache/jena/discussions/2099
+              # Container limit 4Gi → JVM 1.5Gi + OS cache ~2.5Gi
+              value: "-Xmx1536m"
           args:
             - --config
             - /fuseki/config.ttl
@@ -66,8 +75,8 @@ spec:
             periodSeconds: 10
       volumes:
         - name: tdb2-data
-          emptyDir:
-            sizeLimit: 100Gi
+          persistentVolumeClaim:
+            claimName: fuseki-tdb2
         - name: fuseki-config
           configMap:
             name: fuseki-config

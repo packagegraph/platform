@@ -8,6 +8,11 @@ spec:
     spec:
       containers:
         - name: fuseki
+          env:
+            - name: JAVA_OPTIONS
+              # TDB2 memory-mapped files need OS cache space.
+              # 4Gi container → 1.5Gi JVM + 2.5Gi OS cache.
+              value: "-Xmx1536m"
           resources:
             requests:
               cpu: "1"

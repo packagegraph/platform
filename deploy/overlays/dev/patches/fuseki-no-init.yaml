@@ -57,6 +57,9 @@ spec:
                 - ALL
           image: ghcr.io/packagegraph/fuseki:5.3.0
           imagePullPolicy: Always
+          env:
+            - name: JAVA_OPTIONS
+              value: "-Xmx2g"
           args:
             - --config
             - /fuseki/config.ttl
@@ -73,13 +76,8 @@ spec:
             - name: fuseki-config
               mountPath: /fuseki/config.ttl
               subPath: config.ttl
-          resources:
-            requests:
-              cpu: 250m
-              memory: 512Mi
-            limits:
-              cpu: "1"
-              memory: 2Gi
+          # Resources set by fuseki-resources.yaml patch (6Gi limit)
+          # JVM heap (-Xmx2g) leaves 4Gi for TDB2 memory-mapped file cache
           livenessProbe:
             httpGet:
               path: /$/ping
