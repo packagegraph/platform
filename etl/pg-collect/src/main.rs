@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
+use pg_collect::alpine::AlpineCollector;
+use pg_collect::arch::ArchCollector;
 use pg_collect::debian::DebianCollector;
+use pg_collect::homebrew::HomebrewCollector;
 use pg_collect::rpm::RpmCollector;
 use std::time::Instant;
 
@@ -58,6 +61,59 @@ enum Commands {
         /// Release name
         #[arg(long, default_value = "")]
         release_name: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
+    /// Collect from Alpine APK repository
+    Alpine {
+        /// Mirror URL (e.g., https://dl-cdn.alpinelinux.org/alpine)
+        #[arg(long, default_value = "https://dl-cdn.alpinelinux.org/alpine")]
+        mirror: String,
+
+        /// Alpine branch (e.g., v3.20, edge)
+        #[arg(long, default_value = "v3.20")]
+        branch: String,
+
+        /// Repository names (main, community, testing)
+        #[arg(long = "repo", default_values = ["main", "community"])]
+        repos: Vec<String>,
+
+        /// Architecture
+        #[arg(long, default_value = "x86_64")]
+        arch: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
+    /// Collect from Homebrew formulae.brew.sh API
+    Homebrew {
+        /// API base URL
+        #[arg(long, default_value = "https://formulae.brew.sh/api")]
+        api_base: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
+    /// Collect from Arch Linux repositories
+    Arch {
+        /// Mirror URL (e.g., https://archive.archlinux.org/repos/last)
+        #[arg(long, default_value = "https://archive.archlinux.org/repos/last")]
+        mirror: String,
+
+        /// Repository names (core, extra, multilib)
+        #[arg(long = "repo", default_values = ["core", "extra"])]
+        repos: Vec<String>,
+
+        /// Include AUR packages
+        #[arg(long)]
+        include_aur: bool,
 
         /// Output file path
         #[arg(short, long, required = true)]
@@ -186,6 +242,52 @@ fn main() {
                 eprintln!("Error: Either --repo or --rpm-repo must be specified");
                 std::process::exit(1);
             }
+        }
+
+        Commands::Alpine {
+            mirror,
+            branch,
+            repos,
+            arch,
+            output,
+        } => {
+            eprintln!("=== PackageGraph Alpine Collector ===");
+            eprintln!("Mirror: {}", mirror);
+            eprintln!("Branch: {}", branch);
+            eprintln!("Repos: {:?}", repos);
+            eprintln!("Arch: {}", arch);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let collector = AlpineCollector::new(mirror, branch, repos, arch);
+            collector.collect(&output)
+        }
+
+        Commands::Homebrew { api_base, output } => {
+            eprintln!("=== PackageGraph Homebrew Collector ===");
+            eprintln!("API: {}", api_base);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let collector = HomebrewCollector::new(api_base);
+            collector.collect(&output)
+        }
+
+        Commands::Arch {
+            mirror,
+            repos,
+            include_aur,
+            output,
+        } => {
+            eprintln!("=== PackageGraph Arch Linux Collector ===");
+            eprintln!("Mirror: {}", mirror);
+            eprintln!("Repos: {:?}", repos);
+            eprintln!("Include AUR: {}", include_aur);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let collector = ArchCollector::new(mirror, repos, include_aur);
+            collector.collect(&output)
         }
 
         Commands::Load { file, graph, endpoint, batch_size } => {
