@@ -19,7 +19,7 @@ impl SparqlClient {
 
         Self {
             client,
-            endpoint: endpoint.to_string(),
+            endpoint: endpoint.trim_end_matches('/').to_string(),
         }
     }
 
@@ -50,6 +50,7 @@ impl SparqlClient {
     /// Drop a named graph from the triplestore.
     /// Uses DROP SILENT GRAPH so it doesn't error if the graph doesn't exist.
     pub fn drop_graph(&self, graph_uri: &str) -> Result<()> {
+        eprintln!("Dropping graph <{}>...", graph_uri);
         let sparql = format!("DROP SILENT GRAPH <{}>", graph_uri);
         self.update(&sparql)
     }
@@ -86,7 +87,7 @@ impl SparqlClient {
 
                 let elapsed = start.elapsed().as_secs_f64();
                 let rate = total as f64 / elapsed;
-                println!("Loaded {} triples ({:.0} triples/sec)", total, rate);
+                eprintln!("Loaded {} triples ({:.0} triples/sec)", total, rate);
 
                 batch.clear();
             }
