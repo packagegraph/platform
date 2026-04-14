@@ -12,6 +12,10 @@ resources:
   - jobs/collect-alpine-v320.yaml
   - jobs/collect-homebrew.yaml
   - jobs/collect-arch.yaml
+  - jobs/collect-npm.yaml
+  - jobs/collect-pypi.yaml
+  - jobs/collect-cargo.yaml
+  - jobs/collect-gomod.yaml
   - jobs/snapshot-tdb2.yaml
   - jobs/enrich-github-vcs.yaml
   - jobs/enrich-license.yaml
