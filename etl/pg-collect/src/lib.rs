@@ -10,4 +10,5 @@ pub mod pypi;
 pub mod cargo_collect;
 pub mod gomod;
 pub mod conda;
+pub mod snap;
 pub mod sparql;
