@@ -68,4 +68,4 @@ spec:
                       --graph "https://packagegraph.github.io/graph/enrichment/github-vcs" \
                       --endpoint "$FUSEKI_ENDPOINT"
                   fi
-              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 1Gi}}
+              resources: {requests: {cpu: 250m, memory: 1Gi}, limits: {cpu: "1", memory: 2Gi}}

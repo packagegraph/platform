@@ -538,6 +538,10 @@ def enrich_github_vcs(
         output_path=str(output_file),
         github_token=github_token,
         cache_dir=str(cache_dir),
+        minio_endpoint=minio_endpoint,
+        minio_bucket=minio_bucket,
+        minio_access_key=minio_access_key,
+        minio_secret_key=minio_secret_key,
     )
     enricher.enrich()
     click.echo(f"GitHub VCS enrichment complete. Output: {output_file}")

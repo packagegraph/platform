@@ -17,6 +17,7 @@ resources:
   - jobs/enrich-license.yaml
   - jobs/enrich-metrics.yaml
   - jobs/enrich-vcs-activity.yaml
+  - jobs/validate-data.yaml
 
 patches:
   - path: patches/fuseki-resources.yaml

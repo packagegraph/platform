@@ -1,0 +1,81 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: validate-data
+  namespace: packagegraph
+spec:
+  schedule: "0 14 * * 0"  # Weekly on Sunday at 2pm (after snapshot)
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: validator
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: PYTHONUNBUFFERED, value: "1"}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  ENDPOINT="${FUSEKI_ENDPOINT}/sparql"
+                  ISSUES=0
+
+                  run_check() {
+                    local name="$1"
+                    local query="$2"
+                    echo "=== CHECK: ${name} ==="
+                    RESULT=$(wget -qO- --post-data="query=${query}" "${ENDPOINT}" 2>&1) || { echo "  QUERY FAILED"; return; }
+                    COUNT=$(echo "$RESULT" | grep -o '<literal[^>]*>[0-9]*</literal>' | grep -o '[0-9]*' | head -1)
+                    if [ "${COUNT:-0}" -gt 0 ]; then
+                      echo "  FOUND: ${COUNT} issues"
+                      echo "$RESULT" | grep -o '<literal>[^<]*</literal>' | head -20
+                      ISSUES=$((ISSUES + COUNT))
+                    else
+                      echo "  OK"
+                    fi
+                  }
+
+                  echo "=== PackageGraph Data Validation ==="
+                  echo ""
+
+                  run_check "Homepage set to 'None'" \
+                    "PREFIX pkg: <https://purl.org/packagegraph/ontology/core%23> SELECT (COUNT(*) AS ?c) ?val WHERE { ?s pkg:homepage ?val . FILTER(?val = \"None\") } GROUP BY ?val"
+
+                  run_check "Non-HTTP homepages (FTP, etc)" \
+                    "PREFIX pkg: <https://purl.org/packagegraph/ontology/core%23> SELECT (COUNT(*) AS ?c) WHERE { ?s pkg:homepage ?val . FILTER(!STRSTARTS(?val, \"http\")) }"
+
+                  run_check "Package names with spaces" \
+                    "PREFIX pkg: <https://purl.org/packagegraph/ontology/core%23> SELECT (COUNT(*) AS ?c) WHERE { ?s pkg:packageName ?val . FILTER(CONTAINS(?val, \" \")) }"
+
+                  run_check "Empty version strings" \
+                    "PREFIX pkg: <https://purl.org/packagegraph/ontology/core%23> SELECT (COUNT(*) AS ?c) WHERE { ?s pkg:versionString ?val . FILTER(?val = \"\") }"
+
+                  run_check "Packages without versions" \
+                    "PREFIX pkg: <https://purl.org/packagegraph/ontology/core%23> SELECT (COUNT(*) AS ?c) WHERE { ?p a pkg:BinaryPackage . FILTER NOT EXISTS { ?p pkg:hasVersion ?v } }"
+
+                  run_check "Dead upstream repos (404)" \
+                    "PREFIX vcs: <https://purl.org/packagegraph/ontology/vcs%23> SELECT (COUNT(*) AS ?c) WHERE { ?r vcs:repositoryStatus \"not-found\" }"
+
+                  run_check "Duplicate package identities" \
+                    "PREFIX pkg: <https://purl.org/packagegraph/ontology/core%23> SELECT (COUNT(*) AS ?c) WHERE { SELECT ?name (COUNT(DISTINCT ?id) AS ?cnt) WHERE { ?id a pkg:PackageIdentity . ?id pkg:packageName ?name } GROUP BY ?name HAVING(?cnt > 100) }"
+
+                  echo ""
+                  echo "=== Graph Statistics ==="
+                  wget -qO- --post-data="query=SELECT ?g (COUNT(*) AS ?c) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g ORDER BY DESC(?c)" "${ENDPOINT}" 2>&1 | grep -o '<uri>[^<]*</uri>\|<literal[^>]*>[^<]*</literal>' | paste - -
+
+                  echo ""
+                  echo "=== Validation Complete: ${ISSUES} total issues ==="
+              resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: 500m, memory: 512Mi}}

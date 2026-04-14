@@ -27,6 +27,10 @@ class GitHubEnricher(BaseEnricher):
         github_token: str | None = None,
         cache_dir: str | None = None,
         cache_ttl_hours: int = 24,
+        minio_endpoint: str | None = None,
+        minio_bucket: str = 'packagegraph',
+        minio_access_key: str | None = None,
+        minio_secret_key: str | None = None,
     ):
         super().__init__(
             sparql_client=sparql_client,
@@ -37,12 +41,14 @@ class GitHubEnricher(BaseEnricher):
         self.token = github_token
         self.api_base = "https://api.github.com"
 
-        # Create CacheManager with backward-compatible TTL
         if cache_dir:
             self.cache: CacheManager | None = CacheManager(
                 cache_dir=cache_dir,
                 enricher_name='github',
-                minio_endpoint=None  # Minio integration deferred for backward compat
+                minio_endpoint=minio_endpoint,
+                minio_bucket=minio_bucket,
+                minio_access_key=minio_access_key,
+                minio_secret_key=minio_secret_key,
             )
             self.cache_ttl_hours: int = cache_ttl_hours
         else:
@@ -53,8 +59,47 @@ class GitHubEnricher(BaseEnricher):
         self._processed_repos: set[str] = set()
 
     def _query_packages(self):
-        """Query Fuseki for packages with GitHub homepages."""
-        return self.client.query_github_homepages()
+        """Query Fuseki for packages with GitHub homepages, deduplicated.
+
+        Returns only unique (owner/repo) entries, and pre-seeds _processed_repos
+        with repos already in the enrichment graph to skip reprocessing.
+        """
+        # Pre-seed with repos already enriched in a prior run
+        try:
+            existing = self.client.query("""
+                PREFIX vcs: <https://purl.org/packagegraph/ontology/vcs#>
+                SELECT ?url WHERE {
+                  GRAPH <https://packagegraph.github.io/graph/enrichment/github-vcs> {
+                    ?r a vcs:Repository .
+                    ?r vcs:repositoryURL ?url .
+                  }
+                }
+            """)
+            github_re = re.compile(r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$")
+            for b in existing:
+                m = github_re.match(b["url"]["value"])
+                if m:
+                    self._processed_repos.add(f"{m.group(1)}/{m.group(2)}")
+            if self._processed_repos:
+                print(f"Skipping {len(self._processed_repos)} repos already in enrichment graph")
+        except Exception as e:
+            print(f"Warning: could not query existing enrichment graph: {e}")
+
+        # Get all packages with GitHub homepages, deduplicate by repo
+        all_items = self.client.query_github_homepages()
+        seen = set()
+        unique_items = []
+        for pkg_uri, homepage in all_items:
+            m = github_re.match(homepage)
+            if not m:
+                continue
+            repo_key = f"{m.group(1)}/{m.group(2)}"
+            if repo_key not in seen and repo_key not in self._processed_repos:
+                seen.add(repo_key)
+                unique_items.append((pkg_uri, homepage))
+
+        print(f"Found {len(all_items)} packages, {len(seen) + len(self._processed_repos)} unique repos, {len(unique_items)} to process")
+        return unique_items
 
     def _process_item(self, item):
         """Process one package-homepage pair."""
