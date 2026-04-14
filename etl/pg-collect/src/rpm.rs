@@ -403,6 +403,21 @@ impl RpmCollector {
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 
+        // Packaging repository (dist-git — derivable from distro + package name)
+        let distgit_uri = fedora_distgit_uri(&self.distro_name, name);
+        writer.write_triple(&identity_uri, &format!("{PKG}packagingRepository"), &distgit_uri)?;
+        writer.write_triple(&distgit_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
+        triples += 2;
+
+        // Upstream repository (from Homepage/URL if it matches a forge)
+        if let Some(url) = fields.get("url") {
+            if let Some(upstream_uri) = normalize_forge_url(url) {
+                writer.write_triple(&identity_uri, &format!("{PKG}upstreamRepository"), &upstream_uri)?;
+                writer.write_triple(&upstream_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
+                triples += 2;
+            }
+        }
+
         // Core properties
         writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), name)?;
         triples += 1;

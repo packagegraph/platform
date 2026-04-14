@@ -356,6 +356,25 @@ impl DebianCollector {
         // Source package
         triples += self.emit_source_package_triples(writer, &pkg_uri, pkg_data, codename, pkg_name, pkg_version)?;
 
+        // VCS repository links on the identity URI
+        if let Some(homepage) = pkg_data.get("Homepage") {
+            if let Some(repo_uri) = normalize_forge_url(homepage) {
+                writer.write_triple(&identity_uri, &format!("{PKG}upstreamRepository"), &repo_uri)?;
+                writer.write_triple(&repo_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
+                triples += 2;
+            }
+        }
+        // Debian packaging repo from Vcs-Git field
+        if let Some(vcs_git) = pkg_data.get("Vcs-Git") {
+            // Vcs-Git can have " -b branch" suffix — strip it
+            let vcs_url = vcs_git.split_whitespace().next().unwrap_or(vcs_git);
+            if let Some(pkg_repo_uri) = normalize_forge_url(vcs_url) {
+                writer.write_triple(&identity_uri, &format!("{PKG}packagingRepository"), &pkg_repo_uri)?;
+                writer.write_triple(&pkg_repo_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
+                triples += 2;
+            }
+        }
+
         // Dependencies
         triples += self.emit_dependency_triples(writer, &pkg_uri, pkg_data, codename, arch_name)?;
 
