@@ -17,6 +17,7 @@ RUN apk add --no-cache curl \
 # Copy config and entrypoint
 COPY config.ttl /fuseki/config.ttl
 COPY entrypoint.sh /fuseki/entrypoint.sh
+COPY catalog.html /fuseki/webapp/catalog.html
 RUN chmod +x /fuseki/entrypoint.sh
 
 # TDB2 data volume (populated by init container or entrypoint)

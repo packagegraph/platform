@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PackageGraph Query Catalog</title>
+    <link href="https://unpkg.com/@triply/yasgui/build/yasgui.min.css" rel="stylesheet" />
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+        #sidebar {
+            width: 280px;
+            background: #2c3e50;
+            color: #ecf0f1;
+            overflow-y: auto;
+            padding: 20px;
+            flex-shrink: 0;
+        }
+        #sidebar h1 {
+            font-size: 1.3rem;
+            margin-bottom: 20px;
+            color: #3498db;
+        }
+        .category {
+            margin-bottom: 20px;
+        }
+        .category h2 {
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            color: #95a5a6;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+        .query-link {
+            display: block;
+            padding: 6px 10px;
+            margin-bottom: 4px;
+            color: #ecf0f1;
+            text-decoration: none;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .query-link:hover {
+            background: #34495e;
+        }
+        #main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        #yasgui {
+            flex: 1;
+        }
+    </style>
+</head>
+<body>
+    <div id="sidebar">
+        <h1>PackageGraph Query Catalog</h1>
+
+        <div class="category">
+            <h2>Overview</h2>
+            <a class="query-link" data-query="total-triples">Total Triple Count</a>
+            <a class="query-link" data-query="class-dist">Class Distribution</a>
+            <a class="query-link" data-query="predicate-usage">Predicate Usage (Top 20)</a>
+            <a class="query-link" data-query="graphs">Named Graph Inventory</a>
+        </div>
+
+        <div class="category">
+            <h2>Packages</h2>
+            <a class="query-link" data-query="pkg-detail">Package Detail</a>
+            <a class="query-link" data-query="pkg-count">Binary Package Count</a>
+            <a class="query-link" data-query="src-bin">Source-Binary Mapping (Top 10)</a>
+            <a class="query-link" data-query="arch-breakdown">Architecture Breakdown</a>
+        </div>
+
+        <div class="category">
+            <h2>Dependencies</h2>
+            <a class="query-link" data-query="most-depended">Most Depended-On (Top 15)</a>
+            <a class="query-link" data-query="libc6-rdeps">Reverse Deps of libc6</a>
+            <a class="query-link" data-query="version-constraints">Version Constraints Count</a>
+        </div>
+
+        <div class="category">
+            <h2>Maintainers</h2>
+            <a class="query-link" data-query="top-maintainers">Top 10 Maintainers</a>
+        </div>
+
+        <div class="category">
+            <h2>Cross-Distro</h2>
+            <a class="query-link" data-query="pkg-by-dist">Packages by Distribution</a>
+            <a class="query-link" data-query="shared-names">Shared Package Names</a>
+        </div>
+
+        <div class="category">
+            <h2>Security (post-enrichment)</h2>
+            <a class="query-link" data-query="cve-severity">CVEs by Severity</a>
+        </div>
+
+        <div class="category">
+            <h2>VCS (post-enrichment)</h2>
+            <a class="query-link" data-query="repos-stars">Repos by Stars</a>
+        </div>
+    </div>
+
+    <div id="main">
+        <div id="yasgui"></div>
+    </div>
+
+    <script src="https://unpkg.com/@triply/yasgui/build/yasgui.min.js"></script>
+    <script>
+        const prefixes = `PREFIX pkg: <https://packagegraph.github.io/ontology/core#>
+PREFIX deb: <https://packagegraph.github.io/ontology/debian#>
+PREFIX rpm: <https://packagegraph.github.io/ontology/rpm#>
+PREFIX sec: <https://packagegraph.github.io/ontology/security#>
+PREFIX vcs: <https://packagegraph.github.io/ontology/vcs#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX data: <https://packagegraph.github.io/data/>
+
+`;
+
+        const queries = {
+            'total-triples': 'SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }',
+            'class-dist': 'SELECT ?type (COUNT(?s) AS ?count) WHERE { ?s a ?type } GROUP BY ?type ORDER BY DESC(?count)',
+            'predicate-usage': 'SELECT ?p (COUNT(*) AS ?count) WHERE { ?s ?p ?o } GROUP BY ?p ORDER BY DESC(?count) LIMIT 20',
+            'graphs': 'SELECT ?g (COUNT(*) AS ?triples) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g ORDER BY DESC(?triples)',
+            'pkg-detail': 'PREFIX pkg: <https://packagegraph.github.io/ontology/core#>\nSELECT ?prop ?value WHERE {\n  ?p pkg:packageName "bash" .\n  ?p a pkg:BinaryPackage .\n  ?p ?prop ?value .\n} LIMIT 30',
+            'pkg-count': 'PREFIX pkg: <https://packagegraph.github.io/ontology/core#>\nSELECT (COUNT(?p) AS ?count) WHERE { ?p a pkg:BinaryPackage }',
+            'src-bin': 'PREFIX pkg: <https://packagegraph.github.io/ontology/core#>\nSELECT ?srcName (COUNT(?bin) AS ?binary_count) WHERE {\n  ?bin pkg:builtFromSource ?src .\n  ?src pkg:packageName ?srcName .\n} GROUP BY ?srcName ORDER BY DESC(?binary_count) LIMIT 10',
+            'arch-breakdown': 'PREFIX pkg: <https://packagegraph.github.io/ontology/core#>\nSELECT ?arch (COUNT(?p) AS ?pkg_count) WHERE {\n  ?p pkg:targetArchitecture ?a .\n  ?a pkg:architectureName ?arch .\n} GROUP BY ?arch ORDER BY DESC(?pkg_count)',
+            'most-depended': 'PREFIX pkg: <https://packagegraph.github.io/ontology/core#>\nSELECT ?name (COUNT(DISTINCT ?depender) AS ?rdepends) WHERE {\n  ?depender pkg:directlyDependsOn ?target .\n  ?target pkg:packageName ?name .\n} GROUP BY ?name ORDER BY DESC(?rdepends) LIMIT 15',
+            'libc6-rdeps': 'PREFIX pkg: <https://packagegraph.github.io/ontology/core#>\nSELECT ?name WHERE {\n  ?pkg pkg:directlyDependsOn ?dep .\n  ?dep pkg:packageName "libc6" .\n  ?pkg pkg:packageName ?name .\n} ORDER BY ?name LIMIT 30',
+            'version-constraints': 'PREFIX pkg: <https://packagegraph.github.io/ontology/core#>\nSELECT (COUNT(DISTINCT ?dep) AS ?count) WHERE {\n  ?dep a pkg:Dependency .\n  ?dep pkg:hasVersionConstraint ?vc .\n}',
+            'top-maintainers': 'PREFIX pkg: <https://packagegraph.github.io/ontology/core#>\nPREFIX foaf: <http://xmlns.com/foaf/0.1/>\nSELECT ?name (COUNT(DISTINCT ?p) AS ?pkg_count) WHERE {\n  ?p pkg:maintainedBy ?m .\n  ?m foaf:name ?name .\n} GROUP BY ?name ORDER BY DESC(?pkg_count) LIMIT 10',
+            'pkg-by-dist': 'PREFIX pkg: <https://packagegraph.github.io/ontology/core#>\nSELECT ?distName (COUNT(?p) AS ?pkg_count) WHERE {\n  ?p a pkg:BinaryPackage .\n  ?p pkg:partOfDistribution ?d .\n  ?d pkg:distributionName ?distName .\n} GROUP BY ?distName ORDER BY DESC(?pkg_count)',
+            'shared-names': 'PREFIX pkg: <https://packagegraph.github.io/ontology/core#>\nSELECT ?name (COUNT(DISTINCT ?dist) AS ?distros) WHERE {\n  ?p pkg:packageName ?name .\n  ?p pkg:partOfDistribution ?dist\n} GROUP BY ?name HAVING(COUNT(DISTINCT ?dist) > 1) ORDER BY DESC(?distros) LIMIT 20',
+            'cve-severity': 'PREFIX sec: <https://packagegraph.github.io/ontology/security#>\nSELECT ?severity (COUNT(?v) AS ?count) WHERE {\n  ?v a sec:Vulnerability .\n  ?v sec:severity ?severity .\n} GROUP BY ?severity ORDER BY DESC(?count)',
+            'repos-stars': 'PREFIX vcs: <https://packagegraph.github.io/ontology/vcs#>\nSELECT ?url ?stars WHERE {\n  ?r a vcs:Repository .\n  ?r vcs:repositoryURL ?url .\n  ?r vcs:starCount ?stars .\n} ORDER BY DESC(?stars) LIMIT 20'
+        };
+
+        // Initialize YASGUI
+        const yasgui = new Yasgui(document.getElementById("yasgui"), {
+            requestConfig: { endpoint: '../sparql' },
+            copyEndpointOnNewTab: true
+        });
+
+        // Load default query with prefixes
+        const defaultQuery = prefixes + queries['total-triples'];
+        yasgui.getTab().setQuery(defaultQuery);
+
+        // Handle query link clicks
+        document.querySelectorAll('.query-link').forEach(link => {
+            link.addEventListener('click', (e) => {
+                e.preventDefault();
+                const queryKey = e.target.getAttribute('data-query');
+                const query = prefixes + queries[queryKey];
+                yasgui.getTab().setQuery(query);
+            });
+        });
+    </script>
+</body>
+</html>
