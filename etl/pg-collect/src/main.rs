@@ -130,31 +130,62 @@ fn main() {
         } => {
             eprintln!("=== PackageGraph RPM Collector ===");
 
-            // Handle either --repo or --rpm-repo flags
-            let repo_url = if let Some(url) = repo {
-                url
+            if let Some(url) = repo {
+                // Single --repo mode
+                eprintln!("Repository: {}", url);
+                eprintln!("Distribution: {}", distro_name);
+                eprintln!("Release: {}", release_name);
+                eprintln!("Output: {}", output);
+                eprintln!();
+                let collector = RpmCollector::new(url, distro_name, release_name);
+                collector.collect(&output)
             } else if !rpm_repos.is_empty() {
-                // Parse first rpm-repo spec: name:release:url
-                let parts: Vec<&str> = rpm_repos[0].split(':').collect();
-                if parts.len() >= 3 {
-                    parts[2..].join(":")
-                } else {
-                    eprintln!("Error: --rpm-repo format is name:release:url");
-                    std::process::exit(1);
+                // Multi --rpm-repo mode: iterate ALL specs
+                let mut total_packages = 0;
+                let mut total_triples = 0;
+
+                for (idx, repo_spec) in rpm_repos.iter().enumerate() {
+                    let parts: Vec<&str> = repo_spec.splitn(3, ':').collect();
+                    if parts.len() < 3 {
+                        eprintln!("Error: --rpm-repo format is name:release:url, got: {}", repo_spec);
+                        std::process::exit(1);
+                    }
+                    let rpm_distro = parts[0];
+                    let rpm_release = parts[1];
+                    let rpm_url = parts[2];
+
+                    eprintln!("\n--- [{}/{}] {}/{} ---", idx + 1, rpm_repos.len(), rpm_distro, rpm_release);
+                    eprintln!("Repository: {}", rpm_url);
+
+                    // Each repo gets its own output file
+                    let repo_output = if rpm_repos.len() == 1 {
+                        output.clone()
+                    } else {
+                        let base = output.trim_end_matches(".nt");
+                        format!("{}-{}-{}.nt", base, rpm_distro, rpm_release)
+                    };
+
+                    let collector = RpmCollector::new(
+                        rpm_url.to_string(),
+                        rpm_distro.to_string(),
+                        rpm_release.to_string(),
+                    );
+                    match collector.collect(&repo_output) {
+                        Ok((pkgs, triples)) => {
+                            total_packages += pkgs;
+                            total_triples += triples;
+                        }
+                        Err(e) => {
+                            eprintln!("Error collecting {}/{}: {}", rpm_distro, rpm_release, e);
+                            // Continue with other repos
+                        }
+                    }
                 }
+                Ok((total_packages, total_triples))
             } else {
                 eprintln!("Error: Either --repo or --rpm-repo must be specified");
                 std::process::exit(1);
-            };
-
-            eprintln!("Repository: {}", repo_url);
-            eprintln!("Distribution: {}", distro_name);
-            eprintln!("Release: {}", release_name);
-            eprintln!("Output: {}", output);
-            eprintln!();
-
-            let collector = RpmCollector::new(repo_url, distro_name, release_name);
-            collector.collect(&output)
+            }
         }
 
         Commands::Load { file, graph, endpoint, batch_size } => {
