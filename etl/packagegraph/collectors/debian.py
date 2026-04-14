@@ -11,7 +11,7 @@ from rdflib.namespace import RDF
 from ..collector import BaseCollector
 from ..profiler import profiler
 from ..graph_builder import GraphBuilder
-from ..namespaces import PKG, package_uri
+from ..namespaces import PKG, package_uri, package_identity_uri
 
 
 class DebianCollector(BaseCollector):
@@ -86,7 +86,10 @@ class DebianCollector(BaseCollector):
                 else:
                     # Parallel processing with chunks
                     processed_count = self.collect_parallel(
-                        [(pkg_data, codename, suite, arch_name) for pkg_data in packages_data],
+                        [
+                            (pkg_data, codename, suite, arch_name)
+                            for pkg_data in packages_data
+                        ],
                         DebianCollector._process_package_chunk_wrapper,
                     )
 
@@ -174,7 +177,9 @@ class DebianCollector(BaseCollector):
             pkg_map[pkg_name] = pkg_uri
         return pkg_map
 
-    def _process_packages_single_threaded(self, packages_data, codename, suite, arch_name):
+    def _process_packages_single_threaded(
+        self, packages_data, codename, suite, arch_name
+    ):
         """Process packages directly into main graph (single-threaded)."""
         builder = GraphBuilder(self.g)
 
@@ -189,7 +194,9 @@ class DebianCollector(BaseCollector):
         pkg_version = pkg_data["Version"]
 
         # Parse maintainer
-        maintainer_name, maintainer_email = self._parse_maintainer(pkg_data.get("Maintainer", ""))
+        maintainer_name, maintainer_email = self._parse_maintainer(
+            pkg_data.get("Maintainer", "")
+        )
 
         # Create package
         pkg_uri = builder.add_package(
@@ -200,12 +207,14 @@ class DebianCollector(BaseCollector):
             version=pkg_version,
             description=pkg_data.get("Description"),
             homepage=pkg_data.get("Homepage"),
-            install_size=int(pkg_data["Installed-Size"]) * 1024 if "Installed-Size" in pkg_data else None,  # KB to bytes
+            install_size=int(pkg_data["Installed-Size"]) * 1024
+            if "Installed-Size" in pkg_data
+            else None,  # KB to bytes
             package_size=int(pkg_data["Size"]) if "Size" in pkg_data else None,
             checksum=pkg_data.get("SHA256"),
             suite=suite,
             component=self.component,
-            distro_type="deb"
+            distro_type="deb",
         )
 
         # Add maintainer if parsed
@@ -224,7 +233,7 @@ class DebianCollector(BaseCollector):
             return None, None
 
         # Match "Name <email>"
-        match = re.match(r'^(.+?)\s*<(.+?)>$', maintainer_str)
+        match = re.match(r"^(.+?)\s*<(.+?)>$", maintainer_str)
         if match:
             return match.group(1).strip(), match.group(2).strip()
 
@@ -239,7 +248,7 @@ class DebianCollector(BaseCollector):
 
         if source_str:
             # Format can be "sourcename" or "sourcename (version)"
-            match = re.match(r'^([^\s]+)(?:\s+\(([^)]+)\))?$', source_str)
+            match = re.match(r"^([^\s]+)(?:\s+\(([^)]+)\))?$", source_str)
             if match:
                 source_name = match.group(1)
                 source_version = match.group(2) if match.group(2) else pkg_version
@@ -256,7 +265,7 @@ class DebianCollector(BaseCollector):
             distro="debian",
             release=codename,
             source_name=source_name,
-            source_version=source_version
+            source_version=source_version,
         )
 
     def _process_dependencies(self, builder, pkg_uri, pkg_data, codename, arch_name):
@@ -278,16 +287,20 @@ class DebianCollector(BaseCollector):
                 dependencies = self._parse_dependency_string(pkg_data[field])
 
                 for dep_name, version_constraint in dependencies:
-                    dep_uri = package_uri("debian", codename, arch_name, dep_name, "unknown")
+                    dep_uri = package_identity_uri(
+                        "debian", codename, arch_name, dep_name
+                    )
 
                     if field == "Provides":
-                        builder.graph.add((dep_uri, RDF.type, PKG.BinaryPackage))
+                        builder.graph.add((dep_uri, RDF.type, PKG.PackageIdentity))
                         builder.graph.add((dep_uri, PKG.packageName, Literal(dep_name)))
                         builder.graph.add((pkg_uri, PKG.directlyProvides, dep_uri))
                         if distro_prop:
                             builder.graph.add((pkg_uri, distro_prop, dep_uri))
                     else:
-                        constraint_op, constraint_val = self._parse_version_constraint(version_constraint)
+                        constraint_op, constraint_val = self._parse_version_constraint(
+                            version_constraint
+                        )
 
                         builder.add_dependency(
                             package_uri=pkg_uri,
@@ -296,7 +309,7 @@ class DebianCollector(BaseCollector):
                             target_name=dep_name,
                             distro_property=distro_prop,
                             constraint_op=constraint_op,
-                            constraint_val=constraint_val
+                            constraint_val=constraint_val,
                         )
 
     def _parse_dependency_string(self, dep_string):
@@ -318,19 +331,13 @@ class DebianCollector(BaseCollector):
             return None, None
 
         # Match operator and version
-        match = re.match(r'^\s*([<>=]+)\s*(.+)$', constraint_str)
+        match = re.match(r"^\s*([<>=]+)\s*(.+)$", constraint_str)
         if match:
             op_str = match.group(1)
             value = match.group(2).strip()
 
             # Map Debian operators to symbols
-            op_map = {
-                "<<": "<",
-                "<=": "≤",
-                "=": "=",
-                ">=": "≥",
-                ">>": ">"
-            }
+            op_map = {"<<": "<", "<=": "≤", "=": "=", ">=": "≥", ">>": ">"}
             operator = op_map.get(op_str, op_str)
 
             return operator, value
@@ -373,7 +380,9 @@ class DebianCollector(BaseCollector):
                     for pkg_name in pkg_names_str.split(","):
                         clean_pkg_name = pkg_name.split("/")[-1]
                         if clean_pkg_name in pkg_map:
-                            builder.add_installed_file(pkg_map[clean_pkg_name], file_path)
+                            builder.add_installed_file(
+                                pkg_map[clean_pkg_name], file_path
+                            )
 
         except requests.exceptions.HTTPError as e:
             click.echo(
@@ -385,7 +394,11 @@ class DebianCollector(BaseCollector):
     def _process_package_chunk_wrapper(data_chunk, chunk_id):
         """Wrapper for parallel processing of package chunks."""
         packages_data = [item[0] for item in data_chunk]
-        codename, suite, arch_name = data_chunk[0][1], data_chunk[0][2], data_chunk[0][3]
+        codename, suite, arch_name = (
+            data_chunk[0][1],
+            data_chunk[0][2],
+            data_chunk[0][3],
+        )
         return DebianCollector._process_package_chunk(
             packages_data, chunk_id, codename, suite, arch_name
         )
@@ -402,7 +415,7 @@ class DebianCollector(BaseCollector):
         def parse_maintainer(maintainer_str):
             if not maintainer_str:
                 return None, None
-            match = re.match(r'^(.+?)\s*<(.+?)>$', maintainer_str)
+            match = re.match(r"^(.+?)\s*<(.+?)>$", maintainer_str)
             if match:
                 return match.group(1).strip(), match.group(2).strip()
             return None, None
@@ -410,9 +423,11 @@ class DebianCollector(BaseCollector):
         def parse_source_field(pkg_data, pkg_name, pkg_version):
             source_str = pkg_data.get("Source")
             if source_str:
-                match = re.match(r'^([^\s]+)(?:\s+\(([^)]+)\))?$', source_str)
+                match = re.match(r"^([^\s]+)(?:\s+\(([^)]+)\))?$", source_str)
                 if match:
-                    return match.group(1), match.group(2) if match.group(2) else pkg_version
+                    return match.group(1), match.group(2) if match.group(
+                        2
+                    ) else pkg_version
                 return source_str, pkg_version
             return pkg_name, pkg_version
 
@@ -420,7 +435,9 @@ class DebianCollector(BaseCollector):
             pkg_name = pkg_data["Package"]
             pkg_version = pkg_data["Version"]
 
-            maintainer_name, maintainer_email = parse_maintainer(pkg_data.get("Maintainer", ""))
+            maintainer_name, maintainer_email = parse_maintainer(
+                pkg_data.get("Maintainer", "")
+            )
 
             pkg_uri = builder.add_package(
                 distro="debian",
@@ -430,19 +447,27 @@ class DebianCollector(BaseCollector):
                 version=pkg_version,
                 description=pkg_data.get("Description"),
                 homepage=pkg_data.get("Homepage"),
-                install_size=int(pkg_data["Installed-Size"]) * 1024 if "Installed-Size" in pkg_data else None,
+                install_size=int(pkg_data["Installed-Size"]) * 1024
+                if "Installed-Size" in pkg_data
+                else None,
                 package_size=int(pkg_data["Size"]) if "Size" in pkg_data else None,
                 checksum=pkg_data.get("SHA256"),
                 suite=suite,
-                component=pkg_data.get("Section", "").split("/")[0] if "/" in pkg_data.get("Section", "") else "main",
-                distro_type="deb"
+                component=pkg_data.get("Section", "").split("/")[0]
+                if "/" in pkg_data.get("Section", "")
+                else "main",
+                distro_type="deb",
             )
 
             if maintainer_name and maintainer_email:
                 builder.add_maintainer(pkg_uri, maintainer_name, maintainer_email)
 
-            source_name, source_version = parse_source_field(pkg_data, pkg_name, pkg_version)
-            builder.add_source_package(pkg_uri, "debian", codename, source_name, source_version)
+            source_name, source_version = parse_source_field(
+                pkg_data, pkg_name, pkg_version
+            )
+            builder.add_source_package(
+                pkg_uri, "debian", codename, source_name, source_version
+            )
 
         # Save to temp file
         temp_file = tempfile.NamedTemporaryFile(

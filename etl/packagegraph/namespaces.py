@@ -1,4 +1,22 @@
-"""Ontology and data namespace definitions for PackageGraph."""
+"""Ontology and data namespace definitions for PackageGraph.
+
+URI Design (v0.5.0):
+  Ontology: https://packagegraph.github.io/ontology/{module}#
+  Data:     https://packagegraph.github.io/d/{type}/{path...}
+
+Data URI paths:
+  d/pkg/{distro}/{release}/{arch}/{name}              ← PackageIdentity (version-agnostic)
+  d/pkg/{distro}/{release}/{arch}/{name}/{version}    ← BinaryPackage (versioned)
+  d/src/{distro}/{release}/{name}/{version}            ← SourcePackage
+  d/ver/{distro}/{release}/{name}/{version}            ← Version
+  d/distro/{name}                                      ← Distribution
+  d/release/{distro}/{codename}                        ← DistributionRelease
+  d/arch/{name}                                        ← Architecture
+  d/maintainer/{email}                                 ← Maintainer
+  d/cve/{id}                                           ← Vulnerability
+  d/repo/{host/path}                                   ← VCS Repository
+  d/commit/{sha12}                                     ← Commit
+"""
 
 from urllib.parse import quote
 from rdflib import Namespace
@@ -8,6 +26,7 @@ from rdflib import Namespace
 PKG = Namespace("https://packagegraph.github.io/ontology/core#")
 SEC = Namespace("https://packagegraph.github.io/ontology/security#")
 VCS = Namespace("https://packagegraph.github.io/ontology/vcs#")
+SLSA = Namespace("https://packagegraph.github.io/ontology/slsa#")
 
 # Distribution-specific ontology extensions
 DEB = Namespace("https://packagegraph.github.io/ontology/debian#")
@@ -17,8 +36,8 @@ RPM = Namespace("https://packagegraph.github.io/ontology/rpm#")
 FOAF = Namespace("http://xmlns.com/foaf/0.1/")
 PROV = Namespace("http://www.w3.org/ns/prov#")
 
-# Data namespace (instances)
-DATA = Namespace("https://packagegraph.github.io/data/")
+# Data namespace (instances) — shortened from /data/ to /d/
+DATA = Namespace("https://packagegraph.github.io/d/")
 
 
 def _encode(component: str) -> str:
@@ -26,26 +45,31 @@ def _encode(component: str) -> str:
     return quote(component, safe="")
 
 
+def package_identity_uri(distro: str, release: str, arch: str, name: str) -> str:
+    """Build a version-agnostic PackageIdentity URI.
+
+    Used as the target of dependency links instead of versioned URIs.
+    """
+    return DATA[f"pkg/{_encode(distro)}/{_encode(release)}/{_encode(arch)}/{_encode(name)}"]
+
+
 def package_uri(distro: str, release: str, arch: str, name: str, version: str) -> str:
-    """Build a BinaryPackage URI. Architecture is required."""
-    return DATA[f"package/{_encode(distro)}/{_encode(release)}/{_encode(arch)}/{_encode(name)}/{_encode(version)}"]
+    """Build a versioned BinaryPackage URI."""
+    return DATA[f"pkg/{_encode(distro)}/{_encode(release)}/{_encode(arch)}/{_encode(name)}/{_encode(version)}"]
 
 
 def source_uri(distro: str, release: str, name: str, version: str) -> str:
     """Build a SourcePackage URI."""
-    return DATA[f"source/{_encode(distro)}/{_encode(release)}/{_encode(name)}/{_encode(version)}"]
+    return DATA[f"src/{_encode(distro)}/{_encode(release)}/{_encode(name)}/{_encode(version)}"]
 
 
 def version_uri(distro: str, release: str, name: str, version: str) -> str:
     """Build a Version URI."""
-    return DATA[f"version/{_encode(distro)}/{_encode(release)}/{_encode(name)}/{_encode(version)}"]
+    return DATA[f"ver/{_encode(distro)}/{_encode(release)}/{_encode(name)}/{_encode(version)}"]
 
 
 def maintainer_uri(email: str) -> str:
-    """Build a Maintainer URI from email address.
-
-    Email addresses are used as-is since @ and . are valid in URIs.
-    """
+    """Build a Maintainer URI from email address."""
     return DATA[f"maintainer/{email}"]
 
 
@@ -76,7 +100,6 @@ def cve_uri(cve_id: str) -> str:
 
 def repo_uri(url: str) -> str:
     """Build a VCS Repository URI from repository URL."""
-    # Strip protocol and trailing slashes for URI
     cleaned = url.replace("https://", "").replace("http://", "").rstrip("/")
     return DATA[f"repo/{_encode(cleaned)}"]
 
@@ -89,3 +112,19 @@ def advisory_uri(advisory_id: str) -> str:
 def build_uri(distro: str, release: str, name: str, version: str) -> str:
     """Build a BuildActivity URI."""
     return DATA[f"build/{_encode(distro)}/{_encode(release)}/{_encode(name)}/{_encode(version)}"]
+
+
+def attestation_uri(distro: str, release: str, name: str, version: str) -> str:
+    """Build a SLSA ProvenanceAttestation URI."""
+    return DATA[f"attestation/{_encode(distro)}/{_encode(release)}/{_encode(name)}/{_encode(version)}"]
+
+
+def builder_uri(builder_id: str) -> str:
+    """Build a SLSA Builder URI from builder ID."""
+    cleaned = builder_id.replace("https://", "").replace("http://", "").rstrip("/")
+    return DATA[f"builder/{_encode(cleaned)}"]
+
+
+def build_env_uri(distro: str, release: str, name: str, version: str) -> str:
+    """Build a SLSA BuildEnvironment URI."""
+    return DATA[f"buildenv/{_encode(distro)}/{_encode(release)}/{_encode(name)}/{_encode(version)}"]

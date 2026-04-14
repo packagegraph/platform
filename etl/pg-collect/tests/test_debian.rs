@@ -143,7 +143,7 @@ fn test_emit_package_with_source_field() -> std::io::Result<()> {
     assert!(lines.iter().any(|l| l.contains("builtFromSource")),
             "Should have builtFromSource link");
 
-    assert!(lines.iter().any(|l| l.contains("source/debian/trixie/testpkg/")),
+    assert!(lines.iter().any(|l| l.contains("src/debian/trixie/testpkg/")),
             "Should reference correct source package URI");
 
     Ok(())

@@ -280,12 +280,19 @@ impl DebianCollector {
         let pkg_version = pkg_data.get("Version").unwrap();
 
         let pkg_uri = package_uri("debian", codename, arch_name, pkg_name, pkg_version);
+        let identity_uri = package_identity_uri("debian", codename, arch_name, pkg_name);
         let mut triples = 0;
 
         // Dual typing
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{PKG}BinaryPackage"))?;
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{DEB}BinaryPackage"))?;
         triples += 2;
+
+        // Link to canonical identity
+        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
+        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), pkg_name)?;
+        writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
+        triples += 3;
 
         // Core properties
         writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), pkg_name)?;
@@ -481,13 +488,12 @@ impl DebianCollector {
                 let dep_name = caps.get(1).unwrap().as_str();
                 let version_constraint = caps.get(2).map(|m| m.as_str());
 
-                // Build target package URI (version is unknown)
-                let dep_uri = package_uri("debian", codename, arch_name, dep_name, "unknown");
+                // Dependency targets point to the canonical identity URI (no version).
+                // This enables direct name-based joins without URI parsing.
+                let dep_uri = package_identity_uri("debian", codename, arch_name, dep_name);
 
-                // Ensure dependency target stub has basic properties for graph traversal.
-                // Without pkg:packageName and rdf:type, stubs are invisible to typed queries
-                // and name-based joins, breaking transitive dependency traversal.
-                writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}BinaryPackage"))?;
+                // Ensure identity has basic properties for graph traversal
+                writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
                 writer.write_literal(&dep_uri, &format!("{PKG}packageName"), dep_name)?;
                 triples += 2;
 

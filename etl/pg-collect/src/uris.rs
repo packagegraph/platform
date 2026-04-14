@@ -8,8 +8,10 @@ pub const DEB: &str = "https://packagegraph.github.io/ontology/debian#";
 pub const RPM: &str = "https://packagegraph.github.io/ontology/rpm#";
 pub const FOAF: &str = "http://xmlns.com/foaf/0.1/";
 pub const PROV: &str = "http://www.w3.org/ns/prov#";
-pub const DATA: &str = "https://packagegraph.github.io/data/";
+pub const SLSA: &str = "https://packagegraph.github.io/ontology/slsa#";
+pub const DATA: &str = "https://packagegraph.github.io/d/";
 pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+pub const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
 // Define encoding set: encode everything except unreserved characters
 // Unreserved: A-Z a-z 0-9 - _ . ~
@@ -49,10 +51,22 @@ fn encode(component: &str) -> String {
     utf8_percent_encode(component, ENCODE_SET).to_string()
 }
 
-/// Build a BinaryPackage URI. Architecture is required.
+/// Build a version-agnostic PackageIdentity URI.
+/// Used as the target of dependency links (instead of versioned URIs).
+pub fn package_identity_uri(distro: &str, release: &str, arch: &str, name: &str) -> String {
+    format!(
+        "{DATA}pkg/{}/{}/{}/{}",
+        encode(distro),
+        encode(release),
+        encode(arch),
+        encode(name)
+    )
+}
+
+/// Build a versioned BinaryPackage URI. Architecture is required.
 pub fn package_uri(distro: &str, release: &str, arch: &str, name: &str, version: &str) -> String {
     format!(
-        "{DATA}package/{}/{}/{}/{}/{}",
+        "{DATA}pkg/{}/{}/{}/{}/{}",
         encode(distro),
         encode(release),
         encode(arch),
@@ -64,7 +78,7 @@ pub fn package_uri(distro: &str, release: &str, arch: &str, name: &str, version:
 /// Build a SourcePackage URI.
 pub fn source_uri(distro: &str, release: &str, name: &str, version: &str) -> String {
     format!(
-        "{DATA}source/{}/{}/{}/{}",
+        "{DATA}src/{}/{}/{}/{}",
         encode(distro),
         encode(release),
         encode(name),
@@ -75,7 +89,7 @@ pub fn source_uri(distro: &str, release: &str, name: &str, version: &str) -> Str
 /// Build a Version URI.
 pub fn version_uri(distro: &str, release: &str, name: &str, version: &str) -> String {
     format!(
-        "{DATA}version/{}/{}/{}/{}",
+        "{DATA}ver/{}/{}/{}/{}",
         encode(distro),
         encode(release),
         encode(name),
@@ -143,6 +157,41 @@ pub fn build_uri(distro: &str, release: &str, name: &str, version: &str) -> Stri
     )
 }
 
+/// Build a SLSA ProvenanceAttestation URI.
+pub fn attestation_uri(distro: &str, release: &str, name: &str, version: &str) -> String {
+    format!(
+        "{DATA}attestation/{}/{}/{}/{}",
+        encode(distro),
+        encode(release),
+        encode(name),
+        encode(version)
+    )
+}
+
+/// Build a SLSA Builder URI from builder ID.
+///
+/// builder_id is typically a URL like https://koji.fedoraproject.org.
+/// Strips protocol and trailing slashes.
+pub fn builder_uri(builder_id: &str) -> String {
+    let cleaned = builder_id
+        .replace("https://", "")
+        .replace("http://", "")
+        .trim_end_matches('/')
+        .to_string();
+    format!("{DATA}builder/{}", encode(&cleaned))
+}
+
+/// Build a SLSA BuildEnvironment URI.
+pub fn build_env_uri(distro: &str, release: &str, name: &str, version: &str) -> String {
+    format!(
+        "{DATA}buildenv/{}/{}/{}/{}",
+        encode(distro),
+        encode(release),
+        encode(name),
+        encode(version)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,11 +212,20 @@ mod tests {
     }
 
     #[test]
+    fn test_package_identity_uri() {
+        let uri = package_identity_uri("debian", "trixie", "amd64", "libc6");
+        assert_eq!(
+            uri,
+            "https://packagegraph.github.io/d/pkg/debian/trixie/amd64/libc6"
+        );
+    }
+
+    #[test]
     fn test_package_uri() {
         let uri = package_uri("debian", "trixie", "amd64", "libc6", "2.36-1");
         assert_eq!(
             uri,
-            "https://packagegraph.github.io/data/package/debian/trixie/amd64/libc6/2.36-1"
+            "https://packagegraph.github.io/d/pkg/debian/trixie/amd64/libc6/2.36-1"
         );
     }
 
@@ -183,21 +241,21 @@ mod tests {
         let uri = maintainer_uri("john@example.com");
         assert_eq!(
             uri,
-            "https://packagegraph.github.io/data/maintainer/john@example.com"
+            "https://packagegraph.github.io/d/maintainer/john@example.com"
         );
         assert!(!uri.contains("%40")); // @ must NOT be encoded
     }
 
     #[test]
     fn test_arch_uri() {
-        assert_eq!(arch_uri("amd64"), "https://packagegraph.github.io/data/arch/amd64");
+        assert_eq!(arch_uri("amd64"), "https://packagegraph.github.io/d/arch/amd64");
     }
 
     #[test]
     fn test_distro_uri() {
         assert_eq!(
             distro_uri("debian"),
-            "https://packagegraph.github.io/data/distro/debian"
+            "https://packagegraph.github.io/d/distro/debian"
         );
     }
 
@@ -205,7 +263,7 @@ mod tests {
     fn test_release_uri() {
         assert_eq!(
             release_uri("debian", "trixie"),
-            "https://packagegraph.github.io/data/release/debian/trixie"
+            "https://packagegraph.github.io/d/release/debian/trixie"
         );
     }
 
@@ -214,7 +272,7 @@ mod tests {
         let uri = source_uri("debian", "trixie", "glibc", "2.36-1");
         assert_eq!(
             uri,
-            "https://packagegraph.github.io/data/source/debian/trixie/glibc/2.36-1"
+            "https://packagegraph.github.io/d/src/debian/trixie/glibc/2.36-1"
         );
     }
 
@@ -223,7 +281,7 @@ mod tests {
         let uri = version_uri("debian", "trixie", "libc6", "2.36-1");
         assert_eq!(
             uri,
-            "https://packagegraph.github.io/data/version/debian/trixie/libc6/2.36-1"
+            "https://packagegraph.github.io/d/ver/debian/trixie/libc6/2.36-1"
         );
     }
 
@@ -232,7 +290,34 @@ mod tests {
         let uri = repo_uri("https://github.com/packagegraph/ontology/");
         assert_eq!(
             uri,
-            "https://packagegraph.github.io/data/repo/github.com%2Fpackagegraph%2Fontology"
+            "https://packagegraph.github.io/d/repo/github.com%2Fpackagegraph%2Fontology"
+        );
+    }
+
+    #[test]
+    fn test_attestation_uri() {
+        let uri = attestation_uri("fedora", "41", "gcc", "14.0.1-1.fc41");
+        assert_eq!(
+            uri,
+            "https://packagegraph.github.io/d/attestation/fedora/41/gcc/14.0.1-1.fc41"
+        );
+    }
+
+    #[test]
+    fn test_builder_uri() {
+        let uri = builder_uri("https://koji.fedoraproject.org");
+        assert_eq!(
+            uri,
+            "https://packagegraph.github.io/d/builder/koji.fedoraproject.org"
+        );
+    }
+
+    #[test]
+    fn test_build_env_uri() {
+        let uri = build_env_uri("fedora", "41", "gcc", "14.0.1-1.fc41");
+        assert_eq!(
+            uri,
+            "https://packagegraph.github.io/d/buildenv/fedora/41/gcc/14.0.1-1.fc41"
         );
     }
 }

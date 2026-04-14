@@ -52,6 +52,24 @@ impl NTriplesWriter {
         )
     }
 
+    /// Write a boolean literal with xsd:boolean datatype.
+    pub fn write_boolean(&mut self, subject: &str, predicate: &str, value: bool) -> Result<()> {
+        let bool_str = if value { "true" } else { "false" };
+        writeln!(
+            self.writer,
+            "<{subject}> <{predicate}> \"{bool_str}\"^^<http://www.w3.org/2001/XMLSchema#boolean> ."
+        )
+    }
+
+    /// Write a dateTime literal with xsd:dateTime datatype.
+    pub fn write_datetime(&mut self, subject: &str, predicate: &str, value: &str) -> Result<()> {
+        let escaped = escape_literal(value);
+        writeln!(
+            self.writer,
+            "<{subject}> <{predicate}> \"{escaped}\"^^<http://www.w3.org/2001/XMLSchema#dateTime> ."
+        )
+    }
+
     /// Write a blank node triple: `<subject> <predicate> _:bnode .\n`
     pub fn write_bnode_object(&mut self, subject: &str, predicate: &str, bnode: &str) -> Result<()> {
         writeln!(self.writer, "<{subject}> <{predicate}> _:{bnode} .")
@@ -259,5 +277,49 @@ mod tests {
 
         let id3 = bnode_id("dep", "gcc");
         assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn test_write_boolean() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut writer = NTriplesWriter::new(temp_file.reopen()?);
+
+        writer.write_boolean(
+            "https://example.org/env",
+            "https://example.org/isEphemeral",
+            true,
+        )?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        temp_file.reopen()?.read_to_string(&mut content)?;
+        assert_eq!(
+            content,
+            "<https://example.org/env> <https://example.org/isEphemeral> \"true\"^^<http://www.w3.org/2001/XMLSchema#boolean> .\n"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_datetime() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut writer = NTriplesWriter::new(temp_file.reopen()?);
+
+        writer.write_datetime(
+            "https://example.org/att",
+            "https://example.org/timestamp",
+            "2026-04-13T10:00:00Z",
+        )?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        temp_file.reopen()?.read_to_string(&mut content)?;
+        assert_eq!(
+            content,
+            "<https://example.org/att> <https://example.org/timestamp> \"2026-04-13T10:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime> .\n"
+        );
+
+        Ok(())
     }
 }

@@ -1,13 +1,33 @@
-use crate::ntriples::NTriplesWriter;
+use crate::ntriples::{NTriplesWriter, bnode_id};
 use crate::uris::*;
 use flate2::read::GzDecoder;
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use regex::Regex;
 use reqwest::blocking::Client;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Result};
 use std::time::Duration;
+
+/// A parsed RPM dependency entry from primary.xml.
+#[derive(Debug, Clone)]
+pub struct RpmDep {
+    pub name: String,
+    pub flags: Option<String>,
+    pub epoch: Option<String>,
+    pub ver: Option<String>,
+    pub rel: Option<String>,
+    /// "requires", "provides", "conflicts", "obsoletes"
+    pub dep_type: String,
+}
+
+/// Parsed RPM package data including structured dependencies.
+#[derive(Debug)]
+pub struct RpmPackageData {
+    pub fields: HashMap<String, String>,
+    pub deps: Vec<RpmDep>,
+}
 
 pub struct RpmCollector {
     client: Client,
@@ -61,23 +81,38 @@ impl RpmCollector {
         Ok((packages_data.len(), total_triples))
     }
 
-    fn client_get_with_retry(&self, url: &str, max_retries: u32) -> Result<reqwest::blocking::Response> {
+    fn client_get_with_retry(
+        &self,
+        url: &str,
+        max_retries: u32,
+    ) -> Result<reqwest::blocking::Response> {
         let mut retries = 0;
         loop {
             match self.client.get(url).send() {
                 Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response) if response.status().is_server_error() && retries < max_retries => {
-                    eprintln!("Server error {}, retrying... ({}/{})", response.status(), retries + 1, max_retries);
+                    eprintln!(
+                        "Server error {}, retrying... ({}/{})",
+                        response.status(),
+                        retries + 1,
+                        max_retries
+                    );
                     retries += 1;
                     std::thread::sleep(Duration::from_millis(1000 * (1 << retries)));
                 }
                 Ok(response) => {
-                    return Err(std::io::Error::other(
-                        format!("HTTP error: {}", response.status()),
-                    ));
+                    return Err(std::io::Error::other(format!(
+                        "HTTP error: {}",
+                        response.status()
+                    )));
                 }
                 Err(e) if retries < max_retries => {
-                    eprintln!("Network error: {}, retrying... ({}/{})", e, retries + 1, max_retries);
+                    eprintln!(
+                        "Network error: {}, retrying... ({}/{})",
+                        e,
+                        retries + 1,
+                        max_retries
+                    );
                     retries += 1;
                     std::thread::sleep(Duration::from_millis(1000 * (1 << retries)));
                 }
@@ -89,11 +124,16 @@ impl RpmCollector {
     }
 
     fn get_metadata_url(&self, metadata_type: &str) -> Result<String> {
-        let repomd_url = format!("{}/repodata/repomd.xml", self.repo_url.trim_end_matches('/'));
+        let repomd_url = format!(
+            "{}/repodata/repomd.xml",
+            self.repo_url.trim_end_matches('/')
+        );
         eprintln!("Fetching repomd.xml from {}", repomd_url);
 
         let response = self.client_get_with_retry(&repomd_url, 3)?;
-        let content = response.bytes().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let content = response
+            .bytes()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let mut reader = Reader::from_reader(&content[..]);
         reader.config_mut().trim_text(true);
@@ -104,19 +144,26 @@ impl RpmCollector {
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) if e.name().as_ref() == b"data" => {
-                    // Check if this is the correct metadata type
                     for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"type" && attr.value.as_ref() == metadata_type.as_bytes() {
+                        if attr.key.as_ref() == b"type"
+                            && attr.value.as_ref() == metadata_type.as_bytes()
+                        {
                             in_correct_data = true;
                             break;
                         }
                     }
                 }
-                Ok(Event::Start(ref e) | Event::Empty(ref e)) if in_correct_data && e.name().as_ref() == b"location" => {
+                Ok(Event::Start(ref e) | Event::Empty(ref e))
+                    if in_correct_data && e.name().as_ref() == b"location" =>
+                {
                     for attr in e.attributes().flatten() {
                         if attr.key.as_ref() == b"href" {
                             let href = String::from_utf8_lossy(&attr.value).to_string();
-                            return Ok(format!("{}/{}", self.repo_url.trim_end_matches('/'), href));
+                            return Ok(format!(
+                                "{}/{}",
+                                self.repo_url.trim_end_matches('/'),
+                                href
+                            ));
                         }
                     }
                 }
@@ -124,7 +171,9 @@ impl RpmCollector {
                     in_correct_data = false;
                 }
                 Ok(Event::Eof) => break,
-                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                Err(e) => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                }
                 _ => {}
             }
             buf.clear();
@@ -132,7 +181,10 @@ impl RpmCollector {
 
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("Metadata type '{}' not found in repomd.xml", metadata_type),
+            format!(
+                "Metadata type '{}' not found in repomd.xml",
+                metadata_type
+            ),
         ))
     }
 
@@ -140,7 +192,9 @@ impl RpmCollector {
         eprintln!("Downloading {}", url);
         let response = self.client_get_with_retry(url, 3)?;
 
-        let content = response.bytes().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let content = response
+            .bytes()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         if url.ends_with(".gz") {
             let mut decoder = GzDecoder::new(&content[..]);
@@ -156,17 +210,20 @@ impl RpmCollector {
         }
     }
 
-    fn parse_primary_metadata(&self, primary_url: &str) -> Result<Vec<HashMap<String, String>>> {
+    fn parse_primary_metadata(&self, primary_url: &str) -> Result<Vec<RpmPackageData>> {
         let content = self.download_and_decompress(primary_url)?;
 
         let mut reader = Reader::from_reader(BufReader::new(&content[..]));
         reader.config_mut().trim_text(true);
 
         let mut packages = Vec::new();
-        let mut current_pkg: HashMap<String, String> = HashMap::new();
+        let mut current_fields: HashMap<String, String> = HashMap::new();
+        let mut current_deps: Vec<RpmDep> = Vec::new();
         let mut buf = Vec::new();
         let mut current_text = String::new();
         let mut in_package = false;
+        // Track which dependency section we're in (if any)
+        let mut current_dep_section: Option<String> = None;
 
         loop {
             match reader.read_event_into(&mut buf) {
@@ -174,15 +231,72 @@ impl RpmCollector {
                     let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                     if name == "package" {
                         in_package = true;
-                        current_pkg = HashMap::new();
+                        current_fields = HashMap::new();
+                        current_deps = Vec::new();
+                        current_dep_section = None;
                     } else if in_package {
                         current_text.clear();
-                        // version, location, and other self-closing elements
-                        for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                            let value = String::from_utf8_lossy(&attr.value).to_string();
-                            if name == "version" || name == "location" || name == "size" || name == "time" {
-                                current_pkg.insert(key, value);
+
+                        // Check for dependency section start
+                        match name.as_str() {
+                            "rpm:requires" | "rpm:provides" | "rpm:conflicts"
+                            | "rpm:obsoletes" => {
+                                // Map XML element name to our dep_type label
+                                let dep_type = name
+                                    .strip_prefix("rpm:")
+                                    .unwrap_or(&name)
+                                    .to_string();
+                                current_dep_section = Some(dep_type);
+                            }
+                            "rpm:entry" => {
+                                // Extract dependency entry attributes
+                                if let Some(ref dep_type) = current_dep_section {
+                                    let mut dep = RpmDep {
+                                        name: String::new(),
+                                        flags: None,
+                                        epoch: None,
+                                        ver: None,
+                                        rel: None,
+                                        dep_type: dep_type.clone(),
+                                    };
+                                    for attr in e.attributes().flatten() {
+                                        let key = String::from_utf8_lossy(attr.key.as_ref())
+                                            .to_string();
+                                        let value =
+                                            String::from_utf8_lossy(&attr.value).to_string();
+                                        match key.as_str() {
+                                            "name" => dep.name = value,
+                                            "flags" => dep.flags = Some(value),
+                                            "epoch" => dep.epoch = Some(value),
+                                            "ver" => dep.ver = Some(value),
+                                            "rel" => dep.rel = Some(value),
+                                            _ => {}
+                                        }
+                                    }
+                                    if !dep.name.is_empty() {
+                                        current_deps.push(dep);
+                                    }
+                                }
+                            }
+                            _ => {
+                                // version, location, size, time — capture attributes
+                                for attr in e.attributes().flatten() {
+                                    let key = String::from_utf8_lossy(attr.key.as_ref())
+                                        .to_string();
+                                    let value =
+                                        String::from_utf8_lossy(&attr.value).to_string();
+                                    if name == "version"
+                                        || name == "location"
+                                        || name == "size"
+                                        || name == "time"
+                                    {
+                                        current_fields.insert(key.clone(), value.clone());
+                                    }
+                                    if name == "checksum" && key == "type" {
+                                        current_fields
+                                            .insert("checksum_type".to_string(), value);
+                                    }
+                                }
                             }
                         }
                     }
@@ -193,17 +307,27 @@ impl RpmCollector {
                 Ok(Event::End(ref e)) => {
                     let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                     if name == "package" {
-                        if !current_pkg.is_empty() {
-                            packages.push(current_pkg.clone());
+                        if !current_fields.is_empty() {
+                            packages.push(RpmPackageData {
+                                fields: current_fields.clone(),
+                                deps: current_deps.clone(),
+                            });
                         }
                         in_package = false;
+                    } else if matches!(
+                        name.as_str(),
+                        "rpm:requires" | "rpm:provides" | "rpm:conflicts" | "rpm:obsoletes"
+                    ) {
+                        current_dep_section = None;
                     } else if in_package && !current_text.is_empty() {
-                        current_pkg.insert(name, current_text.trim().to_string());
+                        current_fields.insert(name, current_text.trim().to_string());
                         current_text.clear();
                     }
                 }
                 Ok(Event::Eof) => break,
-                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                Err(e) => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                }
                 _ => {}
             }
             buf.clear();
@@ -215,36 +339,54 @@ impl RpmCollector {
     fn emit_distribution_metadata(&self, writer: &mut NTriplesWriter) -> Result<()> {
         let dist_uri = distro_uri(&self.distro_name);
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
-        writer.write_literal(&dist_uri, &format!("{PKG}distributionName"), &self.distro_name)?;
+        writer.write_literal(
+            &dist_uri,
+            &format!("{PKG}distributionName"),
+            &self.distro_name,
+        )?;
 
         if !self.release_name.is_empty() {
             let rel_uri = release_uri(&self.distro_name, &self.release_name);
             writer.write_triple(&rel_uri, RDF_TYPE, &format!("{PKG}DistributionRelease"))?;
-            writer.write_literal(&rel_uri, &format!("{PKG}releaseCodename"), &self.release_name)?;
+            writer.write_literal(
+                &rel_uri,
+                &format!("{PKG}releaseCodename"),
+                &self.release_name,
+            )?;
             writer.write_triple(&rel_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         }
 
         Ok(())
     }
 
-    pub fn emit_package_triples(&self, writer: &mut NTriplesWriter, pkg_data: &HashMap<String, String>) -> Result<usize> {
-        let name = pkg_data.get("name").ok_or_else(|| {
+    pub fn emit_package_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        pkg_data: &RpmPackageData,
+    ) -> Result<usize> {
+        let fields = &pkg_data.fields;
+
+        let name = fields.get("name").ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing package name")
         })?;
-        let arch = pkg_data.get("arch").ok_or_else(|| {
+        let arch = fields.get("arch").ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing arch")
         })?;
-        let ver = pkg_data.get("ver").ok_or_else(|| {
+        let ver = fields.get("ver").ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing version")
         })?;
-        let rel = pkg_data.get("rel").ok_or_else(|| {
+        let rel = fields.get("rel").ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing release")
         })?;
 
-        let epoch = pkg_data.get("epoch").map(|s| s.as_str()).unwrap_or("0");
+        let epoch = fields.get("epoch").map(|s| s.as_str()).unwrap_or("0");
         let version_str = format!("{}-{}.{}", ver, rel, arch);
 
-        let release_name = if self.release_name.is_empty() { "unknown" } else { &self.release_name };
+        let release_name = if self.release_name.is_empty() {
+            "unknown"
+        } else {
+            &self.release_name
+        };
 
         let pkg_uri = package_uri(&self.distro_name, release_name, arch, name, &version_str);
         let mut triples = 0;
@@ -253,6 +395,13 @@ impl RpmCollector {
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{PKG}BinaryPackage"))?;
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{RPM}BinaryRPM"))?;
         triples += 2;
+
+        // Link to canonical identity
+        let identity_uri = package_identity_uri(&self.distro_name, release_name, arch, name);
+        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
+        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), name)?;
+        writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
+        triples += 3;
 
         // Core properties
         writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), name)?;
@@ -290,18 +439,22 @@ impl RpmCollector {
         }
 
         // Description
-        if let Some(desc) = pkg_data.get("description").or_else(|| pkg_data.get("summary")) {
+        if let Some(desc) = fields
+            .get("description")
+            .or_else(|| fields.get("summary"))
+        {
             writer.write_literal(&pkg_uri, &format!("{PKG}description"), desc)?;
             triples += 1;
         }
 
         // RPM-specific properties
-        if let Some(sourcerpm) = pkg_data.get("sourcerpm") {
+        if let Some(sourcerpm) = fields.get("rpm:sourcerpm").or_else(|| fields.get("sourcerpm")) {
             writer.write_literal(&pkg_uri, &format!("{RPM}sourceRPM"), sourcerpm)?;
             triples += 1;
+            triples += self.emit_source_package_triples(writer, &pkg_uri, sourcerpm)?;
         }
 
-        if let Some(group) = pkg_data.get("group") {
+        if let Some(group) = fields.get("rpm:group").or_else(|| fields.get("group")) {
             writer.write_literal(&pkg_uri, &format!("{RPM}RPMGroup"), group)?;
             triples += 1;
         }
@@ -311,6 +464,270 @@ impl RpmCollector {
                 writer.write_integer(&pkg_uri, &format!("{RPM}epoch"), epoch_int)?;
                 triples += 1;
             }
+        }
+
+        // Maintainer
+        if let Some(packager) = fields.get("packager") {
+            triples += self.emit_maintainer_triples(writer, &pkg_uri, packager)?;
+        }
+
+        // Homepage
+        if let Some(url) = fields.get("url") {
+            writer.write_literal(&pkg_uri, &format!("{PKG}homepage"), url)?;
+            triples += 1;
+        }
+
+        // License
+        if let Some(license) = fields.get("rpm:license") {
+            writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
+            triples += 1;
+        }
+
+        // Checksum
+        if let Some(checksum) = fields.get("checksum") {
+            writer.write_literal(&pkg_uri, &format!("{PKG}checksum"), checksum)?;
+            triples += 1;
+        }
+
+        // Package size
+        if let Some(pkg_size) = fields.get("package") {
+            if let Ok(size_val) = pkg_size.parse::<i64>() {
+                writer.write_integer(&pkg_uri, &format!("{PKG}packageSize"), size_val)?;
+                triples += 1;
+            }
+        }
+
+        // Installed size
+        if let Some(inst_size) = fields.get("installed") {
+            if let Ok(size_val) = inst_size.parse::<i64>() {
+                writer.write_integer(&pkg_uri, &format!("{PKG}installSize"), size_val)?;
+                triples += 1;
+            }
+        }
+
+        // Dependencies
+        triples +=
+            self.emit_dependency_triples(writer, &pkg_uri, &pkg_data.deps, release_name, arch)?;
+
+        Ok(triples)
+    }
+
+    fn emit_maintainer_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        pkg_uri: &str,
+        packager: &str,
+    ) -> Result<usize> {
+        let re = Regex::new(r"^(.+?)\s*<(.+?)>$").unwrap();
+        if let Some(caps) = re.captures(packager) {
+            let name = caps.get(1).unwrap().as_str().trim();
+            let email = caps.get(2).unwrap().as_str().trim();
+
+            let maint_uri = maintainer_uri(email);
+
+            writer.write_triple(&maint_uri, RDF_TYPE, &format!("{PKG}Maintainer"))?;
+            writer.write_literal(&maint_uri, &format!("{FOAF}name"), name)?;
+            writer.write_triple(
+                &maint_uri,
+                &format!("{FOAF}mbox"),
+                &format!("mailto:{email}"),
+            )?;
+            writer.write_triple(pkg_uri, &format!("{PKG}maintainedBy"), &maint_uri)?;
+
+            return Ok(4);
+        }
+
+        Ok(0)
+    }
+
+    fn emit_source_package_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        pkg_uri: &str,
+        sourcerpm: &str,
+    ) -> Result<usize> {
+        let srpm = sourcerpm
+            .trim_end_matches(".src.rpm")
+            .trim_end_matches(".rpm");
+        if srpm.is_empty() {
+            return Ok(0);
+        }
+
+        // Split NVR: find last two hyphens to separate name-version-release
+        let parts: Vec<&str> = srpm.rsplitn(3, '-').collect();
+        if parts.len() < 3 {
+            return Ok(0);
+        }
+
+        let source_name = parts[2];
+        let source_version = format!("{}-{}", parts[1], parts[0]);
+
+        let release_name = if self.release_name.is_empty() {
+            "unknown"
+        } else {
+            &self.release_name
+        };
+
+        let src_uri =
+            source_uri(&self.distro_name, release_name, source_name, &source_version);
+
+        writer.write_triple(&src_uri, RDF_TYPE, &format!("{PKG}SourcePackage"))?;
+        writer.write_triple(&src_uri, RDF_TYPE, &format!("{RPM}SourceRPM"))?;
+        writer.write_literal(&src_uri, &format!("{PKG}packageName"), source_name)?;
+
+        let src_ver_uri = version_uri(
+            &self.distro_name,
+            release_name,
+            source_name,
+            &source_version,
+        );
+        writer.write_triple(&src_ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
+        writer.write_literal(
+            &src_ver_uri,
+            &format!("{PKG}versionString"),
+            &source_version,
+        )?;
+        writer.write_triple(&src_uri, &format!("{PKG}hasVersion"), &src_ver_uri)?;
+
+        writer.write_triple(pkg_uri, &format!("{PKG}builtFromSource"), &src_uri)?;
+
+        Ok(7)
+    }
+
+    fn emit_dependency_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        pkg_uri: &str,
+        deps: &[RpmDep],
+        release_name: &str,
+        arch: &str,
+    ) -> Result<usize> {
+        let mut triples = 0;
+
+        // Only emit "requires" dependencies (provides/obsoletes are metadata, not graph edges)
+        let requires: Vec<&RpmDep> = deps.iter().filter(|d| d.dep_type == "requires").collect();
+
+        for dep in &requires {
+            // Skip rpmlib() and config() virtual deps — these are RPM internals
+            if dep.name.starts_with("rpmlib(")
+                || dep.name.starts_with("config(")
+                || dep.name.starts_with("rtld(")
+            {
+                continue;
+            }
+
+            // Dependency targets point to canonical identity URI (no version)
+            let dep_uri = package_identity_uri(
+                &self.distro_name,
+                release_name,
+                arch,
+                &dep.name,
+            );
+
+            // Identity properties for graph traversal
+            writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
+            writer.write_literal(&dep_uri, &format!("{PKG}packageName"), &dep.name)?;
+            triples += 2;
+
+            // Generic dependency link
+            writer.write_triple(pkg_uri, &format!("{PKG}directlyDependsOn"), &dep_uri)?;
+            // RPM-specific property
+            writer.write_triple(pkg_uri, &format!("{RPM}rpmRequires"), &dep_uri)?;
+            triples += 2;
+
+            // Reified Dependency
+            let dep_bnode = bnode_id("dep", &format!("{pkg_uri}_{}", dep.name));
+
+            writer.write_bnode_subject(&dep_bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
+            writer.write_bnode_subject(
+                &dep_bnode,
+                &format!("{PKG}dependencyTarget"),
+                &dep_uri,
+            )?;
+            writer.write_bnode_literal(&dep_bnode, &format!("{PKG}dependencyType"), "runtime")?;
+            writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &dep_bnode)?;
+            triples += 4;
+
+            // Version constraint if flags are present
+            if let Some(ref flags) = dep.flags {
+                if let Some(ref ver) = dep.ver {
+                    let operator = match flags.as_str() {
+                        "EQ" => "=",
+                        "GE" => "≥",
+                        "GT" => ">",
+                        "LE" => "≤",
+                        "LT" => "<",
+                        _ => flags.as_str(),
+                    };
+
+                    let mut constraint_val = ver.clone();
+                    if let Some(ref rel) = dep.rel {
+                        constraint_val = format!("{}-{}", ver, rel);
+                    }
+
+                    let constraint_bnode =
+                        bnode_id("constraint", &format!("{dep_bnode}_{constraint_val}"));
+
+                    writer.write_bnode_subject(
+                        &constraint_bnode,
+                        RDF_TYPE,
+                        &format!("{PKG}VersionConstraint"),
+                    )?;
+                    writer.write_bnode_literal(
+                        &constraint_bnode,
+                        &format!("{PKG}versionConstraintOperator"),
+                        operator,
+                    )?;
+                    writer.write_bnode_literal(
+                        &constraint_bnode,
+                        &format!("{PKG}versionConstraintValue"),
+                        &constraint_val,
+                    )?;
+                    writer.write_bnode_subject(
+                        &dep_bnode,
+                        &format!("{PKG}hasVersionConstraint"),
+                        &format!("_{constraint_bnode}"),
+                    )?;
+                    triples += 4;
+                }
+            }
+        }
+
+        // Emit conflicts
+        let conflicts: Vec<&RpmDep> = deps.iter().filter(|d| d.dep_type == "conflicts").collect();
+        for dep in &conflicts {
+            let dep_uri = package_identity_uri(
+                &self.distro_name,
+                release_name,
+                arch,
+                &dep.name,
+            );
+
+            writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
+            writer.write_literal(&dep_uri, &format!("{PKG}packageName"), &dep.name)?;
+            writer.write_triple(
+                pkg_uri,
+                &format!("{PKG}directlyConflictsWith"),
+                &dep_uri,
+            )?;
+            writer.write_triple(pkg_uri, &format!("{RPM}rpmConflicts"), &dep_uri)?;
+            triples += 4;
+        }
+
+        // Emit obsoletes
+        let obsoletes: Vec<&RpmDep> = deps.iter().filter(|d| d.dep_type == "obsoletes").collect();
+        for dep in &obsoletes {
+            let dep_uri = package_identity_uri(
+                &self.distro_name,
+                release_name,
+                arch,
+                &dep.name,
+            );
+
+            writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
+            writer.write_literal(&dep_uri, &format!("{PKG}packageName"), &dep.name)?;
+            writer.write_triple(pkg_uri, &format!("{RPM}rpmObsoletes"), &dep_uri)?;
+            triples += 3;
         }
 
         Ok(triples)

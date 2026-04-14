@@ -1,10 +1,18 @@
 // RPM collector unit tests
 
-use pg_collect::rpm::RpmCollector;
+use pg_collect::rpm::{RpmCollector, RpmDep, RpmPackageData};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use pg_collect::ntriples::NTriplesWriter;
 use tempfile::NamedTempFile;
+
+fn make_pkg_data(fields: Vec<(&str, &str)>, deps: Vec<RpmDep>) -> RpmPackageData {
+    let mut map = HashMap::new();
+    for (k, v) in fields {
+        map.insert(k.to_string(), v.to_string());
+    }
+    RpmPackageData { fields: map, deps }
+}
 
 #[test]
 fn test_emit_package_triples_basic() -> std::io::Result<()> {
@@ -17,13 +25,14 @@ fn test_emit_package_triples_basic() -> std::io::Result<()> {
     let temp_file = NamedTempFile::new()?;
     let mut writer = NTriplesWriter::new(temp_file.reopen()?);
 
-    let mut pkg_data = HashMap::new();
-    pkg_data.insert("name".to_string(), "bash".to_string());
-    pkg_data.insert("arch".to_string(), "x86_64".to_string());
-    pkg_data.insert("ver".to_string(), "5.2.15".to_string());
-    pkg_data.insert("rel".to_string(), "1.fc39".to_string());
-    pkg_data.insert("epoch".to_string(), "0".to_string());
-    pkg_data.insert("summary".to_string(), "The GNU Bourne Again shell".to_string());
+    let pkg_data = make_pkg_data(vec![
+        ("name", "bash"),
+        ("arch", "x86_64"),
+        ("ver", "5.2.15"),
+        ("rel", "1.fc39"),
+        ("epoch", "0"),
+        ("summary", "The GNU Bourne Again shell"),
+    ], vec![]);
 
     let triple_count = collector.emit_package_triples(&mut writer, &pkg_data)?;
 
@@ -36,11 +45,8 @@ fn test_emit_package_triples_basic() -> std::io::Result<()> {
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
     // Check for dual typing
-    let rpm_type_count = lines.iter().filter(|l| l.contains("BinaryRPM")).count();
-    assert!(rpm_type_count >= 1, "Should have rpm:BinaryRPM type");
-
-    let pkg_type_count = lines.iter().filter(|l| l.contains("BinaryPackage")).count();
-    assert!(pkg_type_count >= 1, "Should have pkg:BinaryPackage type");
+    assert!(lines.iter().any(|l| l.contains("BinaryRPM")), "Should have rpm:BinaryRPM type");
+    assert!(lines.iter().any(|l| l.contains("BinaryPackage")), "Should have pkg:BinaryPackage type");
 
     // Check for package name
     assert!(lines.iter().any(|l| l.contains("packageName") && l.contains("bash")),
@@ -64,14 +70,15 @@ fn test_emit_package_with_rpm_specific_properties() -> std::io::Result<()> {
     let temp_file = NamedTempFile::new()?;
     let mut writer = NTriplesWriter::new(temp_file.reopen()?);
 
-    let mut pkg_data = HashMap::new();
-    pkg_data.insert("name".to_string(), "kernel".to_string());
-    pkg_data.insert("arch".to_string(), "x86_64".to_string());
-    pkg_data.insert("ver".to_string(), "6.5.6".to_string());
-    pkg_data.insert("rel".to_string(), "300.fc39".to_string());
-    pkg_data.insert("epoch".to_string(), "1".to_string());
-    pkg_data.insert("sourcerpm".to_string(), "kernel-6.5.6-300.fc39.src.rpm".to_string());
-    pkg_data.insert("group".to_string(), "System Environment/Kernel".to_string());
+    let pkg_data = make_pkg_data(vec![
+        ("name", "kernel"),
+        ("arch", "x86_64"),
+        ("ver", "6.5.6"),
+        ("rel", "300.fc39"),
+        ("epoch", "1"),
+        ("sourcerpm", "kernel-6.5.6-300.fc39.src.rpm"),
+        ("group", "System Environment/Kernel"),
+    ], vec![]);
 
     collector.emit_package_triples(&mut writer, &pkg_data)?;
 
@@ -93,6 +100,12 @@ fn test_emit_package_with_rpm_specific_properties() -> std::io::Result<()> {
     assert!(lines.iter().any(|l| l.contains("epoch")),
             "Should have epoch property");
 
+    // Check for SourcePackage entity from sourcerpm
+    assert!(lines.iter().any(|l| l.contains("SourcePackage")),
+            "Should create SourcePackage entity from sourcerpm");
+    assert!(lines.iter().any(|l| l.contains("builtFromSource")),
+            "Should link binary to source via builtFromSource");
+
     Ok(())
 }
 
@@ -107,11 +120,12 @@ fn test_version_string_format() -> std::io::Result<()> {
     let temp_file = NamedTempFile::new()?;
     let mut writer = NTriplesWriter::new(temp_file.reopen()?);
 
-    let mut pkg_data = HashMap::new();
-    pkg_data.insert("name".to_string(), "test".to_string());
-    pkg_data.insert("arch".to_string(), "x86_64".to_string());
-    pkg_data.insert("ver".to_string(), "1.0".to_string());
-    pkg_data.insert("rel".to_string(), "1.fc39".to_string());
+    let pkg_data = make_pkg_data(vec![
+        ("name", "test"),
+        ("arch", "x86_64"),
+        ("ver", "1.0"),
+        ("rel", "1.fc39"),
+    ], vec![]);
 
     collector.emit_package_triples(&mut writer, &pkg_data)?;
 
@@ -128,5 +142,141 @@ fn test_version_string_format() -> std::io::Result<()> {
     Ok(())
 }
 
-// Note: Dependency parsing (requires, provides, conflicts) is noted in plan but not in current Python implementation.
-// It's in the DoD but will need to be added. For now, tests verify the core functionality works.
+#[test]
+fn test_emit_package_with_dependencies() -> std::io::Result<()> {
+    let collector = RpmCollector::new(
+        "http://example.com".to_string(),
+        "fedora".to_string(),
+        "41".to_string(),
+    );
+
+    let temp_file = NamedTempFile::new()?;
+    let mut writer = NTriplesWriter::new(temp_file.reopen()?);
+
+    let deps = vec![
+        RpmDep {
+            name: "glibc".to_string(),
+            flags: Some("GE".to_string()),
+            epoch: Some("0".to_string()),
+            ver: Some("2.17".to_string()),
+            rel: None,
+            dep_type: "requires".to_string(),
+        },
+        RpmDep {
+            name: "libreadline.so.8()(64bit)".to_string(),
+            flags: None,
+            epoch: None,
+            ver: None,
+            rel: None,
+            dep_type: "requires".to_string(),
+        },
+        RpmDep {
+            name: "rpmlib(CompressedFileNames)".to_string(),
+            flags: Some("LE".to_string()),
+            epoch: None,
+            ver: Some("3.0.4".to_string()),
+            rel: Some("1".to_string()),
+            dep_type: "requires".to_string(),
+        },
+        RpmDep {
+            name: "old-bash".to_string(),
+            flags: None,
+            epoch: None,
+            ver: None,
+            rel: None,
+            dep_type: "conflicts".to_string(),
+        },
+    ];
+
+    let pkg_data = make_pkg_data(vec![
+        ("name", "bash"),
+        ("arch", "x86_64"),
+        ("ver", "5.2.15"),
+        ("rel", "1.fc41"),
+        ("epoch", "0"),
+    ], deps);
+
+    let triple_count = collector.emit_package_triples(&mut writer, &pkg_data)?;
+
+    writer.flush()?;
+
+    assert!(triple_count > 0);
+
+    let output_file = temp_file.reopen()?;
+    let reader = BufReader::new(output_file);
+    let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
+
+    // Should have directlyDependsOn for glibc (requires)
+    assert!(lines.iter().any(|l| l.contains("directlyDependsOn")),
+            "Should emit directlyDependsOn for requires");
+
+    // Should have rpmRequires
+    assert!(lines.iter().any(|l| l.contains("rpmRequires")),
+            "Should emit rpmRequires property");
+
+    // Should NOT emit rpmlib() virtual deps
+    assert!(!lines.iter().any(|l| l.contains("rpmlib(") && l.contains("packageName")),
+            "Should skip rpmlib() virtual dependencies");
+
+    // Should have Dependency bnode
+    assert!(lines.iter().any(|l| l.contains("Dependency")),
+            "Should create reified Dependency");
+
+    // Should have VersionConstraint for glibc (has flags GE + ver)
+    assert!(lines.iter().any(|l| l.contains("VersionConstraint")),
+            "Should create VersionConstraint for versioned deps");
+    assert!(lines.iter().any(|l| l.contains("versionConstraintOperator")),
+            "Should emit version constraint operator");
+
+    // Should have directlyConflictsWith for old-bash
+    assert!(lines.iter().any(|l| l.contains("directlyConflictsWith")),
+            "Should emit directlyConflictsWith for conflicts");
+
+    // Should have rpmConflicts
+    assert!(lines.iter().any(|l| l.contains("rpmConflicts")),
+            "Should emit rpmConflicts property");
+
+    Ok(())
+}
+
+#[test]
+fn test_emit_maintainer_triples() -> std::io::Result<()> {
+    let collector = RpmCollector::new(
+        "http://example.com".to_string(),
+        "fedora".to_string(),
+        "41".to_string(),
+    );
+
+    let temp_file = NamedTempFile::new()?;
+    let mut writer = NTriplesWriter::new(temp_file.reopen()?);
+
+    let pkg_data = make_pkg_data(vec![
+        ("name", "bash"),
+        ("arch", "x86_64"),
+        ("ver", "5.2.15"),
+        ("rel", "1.fc41"),
+        ("packager", "Fedora Project <packager@fedoraproject.org>"),
+    ], vec![]);
+
+    collector.emit_package_triples(&mut writer, &pkg_data)?;
+
+    writer.flush()?;
+
+    let output_file = temp_file.reopen()?;
+    let reader = BufReader::new(output_file);
+    let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
+
+    // Should emit Maintainer type
+    assert!(lines.iter().any(|l| l.contains("Maintainer")),
+            "Should create Maintainer resource");
+
+    // Should emit maintainedBy link
+    assert!(lines.iter().any(|l| l.contains("maintainedBy")),
+            "Should link package to maintainer");
+
+    // Should emit foaf:name
+    assert!(lines.iter().any(|l| l.contains("foaf") && l.contains("name") && l.contains("Fedora Project")),
+            "Should emit maintainer name");
+
+    Ok(())
+}

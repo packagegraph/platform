@@ -3,10 +3,30 @@
 from rdflib import Graph, URIRef, Literal, BNode
 from rdflib.namespace import RDF, XSD
 from .namespaces import (
-    PKG, SEC, VCS, DATA, DEB, RPM, FOAF, PROV,
-    package_uri, source_uri, version_uri, maintainer_uri,
-    arch_uri, distro_uri, release_uri, upstream_uri,
-    repo_uri, cve_uri, build_uri
+    PKG,
+    SEC,
+    VCS,
+    DATA,
+    DEB,
+    RPM,
+    FOAF,
+    PROV,
+    SLSA,
+    package_uri,
+    package_identity_uri,
+    source_uri,
+    version_uri,
+    maintainer_uri,
+    arch_uri,
+    distro_uri,
+    release_uri,
+    upstream_uri,
+    repo_uri,
+    cve_uri,
+    build_uri,
+    attestation_uri,
+    builder_uri,
+    build_env_uri,
 )
 
 
@@ -31,6 +51,7 @@ class GraphBuilder:
         self.graph.bind("rpm", RPM)
         self.graph.bind("foaf", FOAF)
         self.graph.bind("prov", PROV)
+        self.graph.bind("slsa", SLSA)
 
     def add_distribution(self, name: str) -> URIRef:
         """Create a pkg:Distribution resource."""
@@ -39,7 +60,13 @@ class GraphBuilder:
         self.graph.add((dist_uri, PKG.distributionName, Literal(name)))
         return dist_uri
 
-    def add_release(self, distro: str, codename: str, suite: str | None = None, origin: str | None = None) -> URIRef:
+    def add_release(
+        self,
+        distro: str,
+        codename: str,
+        suite: str | None = None,
+        origin: str | None = None,
+    ) -> URIRef:
         """Create a pkg:DistributionRelease resource."""
         release_uri_ref = release_uri(distro, codename)
         self.graph.add((release_uri_ref, RDF.type, PKG.DistributionRelease))
@@ -71,7 +98,7 @@ class GraphBuilder:
         version: str,
         epoch: str | None = None,
         release_num: str | None = None,
-        revision: str | None = None
+        revision: str | None = None,
     ) -> URIRef:
         """Create a separate pkg:Version resource.
 
@@ -107,7 +134,7 @@ class GraphBuilder:
         component: str | None = None,
         distro_type: str | None = None,
         epoch: str | None = None,
-        release_num: str | None = None
+        release_num: str | None = None,
     ) -> URIRef:
         """Create a pkg:BinaryPackage with all properties.
 
@@ -115,6 +142,7 @@ class GraphBuilder:
             distro_type: "deb" or "rpm" for dual typing
         """
         pkg_uri = package_uri(distro, release, arch, name, version)
+        identity = package_identity_uri(distro, release, arch, name)
 
         # Dual typing: always emit pkg:BinaryPackage
         self.graph.add((pkg_uri, RDF.type, PKG.BinaryPackage))
@@ -124,6 +152,11 @@ class GraphBuilder:
             self.graph.add((pkg_uri, RDF.type, DEB.BinaryPackage))
         elif distro_type == "rpm":
             self.graph.add((pkg_uri, RDF.type, RPM.BinaryRPM))
+
+        # Link to canonical identity (version-agnostic)
+        self.graph.add((identity, RDF.type, PKG.PackageIdentity))
+        self.graph.add((identity, PKG.packageName, Literal(name)))
+        self.graph.add((pkg_uri, PKG.isVersionOf, identity))
 
         # Core properties
         self.graph.add((pkg_uri, PKG.packageName, Literal(name)))
@@ -148,9 +181,13 @@ class GraphBuilder:
         if homepage:
             self.graph.add((pkg_uri, PKG.homepage, Literal(homepage)))
         if install_size is not None:
-            self.graph.add((pkg_uri, PKG.installSize, Literal(install_size, datatype=XSD.integer)))
+            self.graph.add(
+                (pkg_uri, PKG.installSize, Literal(install_size, datatype=XSD.integer))
+            )
         if package_size is not None:
-            self.graph.add((pkg_uri, PKG.packageSize, Literal(package_size, datatype=XSD.integer)))
+            self.graph.add(
+                (pkg_uri, PKG.packageSize, Literal(package_size, datatype=XSD.integer))
+            )
         if checksum:
             self.graph.add((pkg_uri, PKG.checksum, Literal(checksum)))
 
@@ -170,7 +207,7 @@ class GraphBuilder:
         target_name: str | None = None,
         distro_property: URIRef | None = None,
         constraint_op: str | None = None,
-        constraint_val: str | None = None
+        constraint_val: str | None = None,
     ):
         """Create a dependency link with optional version constraint.
 
@@ -183,12 +220,10 @@ class GraphBuilder:
             constraint_op: Version constraint operator (e.g., "≥", "=", "<")
             constraint_val: Version constraint value (e.g., "2.36")
         """
-        # Ensure dependency target stub has basic properties for graph traversal.
-        # Targets are version-agnostic stubs (version=unknown) — without at least
-        # pkg:packageName and rdf:type, they are invisible to typed queries and
-        # name-based joins, breaking transitive dependency traversal.
+        # Dependency targets should be PackageIdentity URIs (version-agnostic).
+        # Ensure the identity has basic properties for graph traversal.
         if target_name:
-            self.graph.add((target_uri, RDF.type, PKG.BinaryPackage))
+            self.graph.add((target_uri, RDF.type, PKG.PackageIdentity))
             self.graph.add((target_uri, PKG.packageName, Literal(target_name)))
 
         # Emit generic property based on dep_type
@@ -212,16 +247,15 @@ class GraphBuilder:
         if constraint_op and constraint_val:
             constraint_node = BNode()
             self.graph.add((constraint_node, RDF.type, PKG.VersionConstraint))
-            self.graph.add((constraint_node, PKG.versionConstraintOperator, Literal(constraint_op)))
-            self.graph.add((constraint_node, PKG.versionConstraintValue, Literal(constraint_val)))
+            self.graph.add(
+                (constraint_node, PKG.versionConstraintOperator, Literal(constraint_op))
+            )
+            self.graph.add(
+                (constraint_node, PKG.versionConstraintValue, Literal(constraint_val))
+            )
             self.graph.add((dep_node, PKG.hasVersionConstraint, constraint_node))
 
-    def add_maintainer(
-        self,
-        package_uri: URIRef,
-        name: str,
-        email: str
-    ) -> URIRef:
+    def add_maintainer(self, package_uri: URIRef, name: str, email: str) -> URIRef:
         """Create a pkg:Maintainer and link via maintainedBy."""
         maint_uri = maintainer_uri(email)
 
@@ -239,7 +273,7 @@ class GraphBuilder:
         distro: str,
         release: str,
         source_name: str,
-        source_version: str
+        source_version: str,
     ) -> URIRef:
         """Create a pkg:SourcePackage and link via builtFromSource."""
         src_uri = source_uri(distro, release, source_name, source_version)
@@ -256,11 +290,7 @@ class GraphBuilder:
 
         return src_uri
 
-    def add_installed_file(
-        self,
-        package_uri: URIRef,
-        file_path: str
-    ):
+    def add_installed_file(self, package_uri: URIRef, file_path: str):
         """Create a pkg:InstalledFile and link via installsFile."""
         file_node = BNode()
         self.graph.add((file_node, RDF.type, PKG.InstalledFile))
@@ -275,7 +305,7 @@ class GraphBuilder:
         default_branch: str | None = None,
         description: str | None = None,
         stars: int | None = None,
-        forks: int | None = None
+        forks: int | None = None,
     ) -> URIRef:
         """Create a vcs:Repository resource."""
         r_uri = repo_uri(url)
@@ -300,7 +330,7 @@ class GraphBuilder:
         author_name: str | None = None,
         author_email: str | None = None,
         timestamp: str | None = None,
-        message: str | None = None
+        message: str | None = None,
     ) -> URIRef:
         """Create a vcs:Commit resource and link to repository."""
         commit_uri = DATA[f"commit/{sha[:12]}"]
@@ -325,10 +355,7 @@ class GraphBuilder:
         return commit_uri
 
     def link_upstream(
-        self,
-        source_package_uri: URIRef,
-        project_name: str,
-        repository_uri: URIRef
+        self, source_package_uri: URIRef, project_name: str, repository_uri: URIRef
     ):
         """Link SourcePackage → UpstreamProject → Repository.
 
@@ -354,7 +381,7 @@ class GraphBuilder:
         description: str | None = None,
         severity: str | None = None,
         published: str | None = None,
-        modified: str | None = None
+        modified: str | None = None,
     ) -> URIRef:
         """Create a sec:Vulnerability resource."""
         vuln_uri = cve_uri(cve_id)
@@ -362,7 +389,9 @@ class GraphBuilder:
         self.graph.add((vuln_uri, SEC.cveId, Literal(cve_id)))
 
         if description:
-            self.graph.add((vuln_uri, SEC.vulnerabilityDescription, Literal(description[:1000])))
+            self.graph.add(
+                (vuln_uri, SEC.vulnerabilityDescription, Literal(description[:1000]))
+            )
         if severity:
             self.graph.add((vuln_uri, SEC.severity, Literal(severity)))
         if published:
@@ -373,10 +402,7 @@ class GraphBuilder:
         return vuln_uri
 
     def link_vulnerability_to_version(
-        self,
-        vuln_uri: URIRef,
-        version_uri_ref: URIRef,
-        relation: str = "affects"
+        self, vuln_uri: URIRef, version_uri_ref: URIRef, relation: str = "affects"
     ):
         """Link vulnerability to version (affects or fixed).
 
@@ -399,12 +425,11 @@ class GraphBuilder:
         owner: str | None = None,
         start_time: str | None = None,
         end_time: str | None = None,
-        build_system: str | None = None
+        build_system: str | None = None,
     ) -> URIRef:
         """Create a pkg:BuildActivity (subclass of prov:Activity)."""
         b_uri = build_uri(distro, release, name, version)
         self.graph.add((b_uri, RDF.type, PKG.BuildActivity))
-        self.graph.add((b_uri, RDF.type, PROV.Activity))
 
         if owner:
             self.graph.add((b_uri, PKG.wasBuiltBy, Literal(owner)))
@@ -424,3 +449,125 @@ class GraphBuilder:
     def link_build_dependency(self, build_uri_ref: URIRef, dep_package_uri: URIRef):
         """Record that a build used a specific dependency package."""
         self.graph.add((build_uri_ref, PKG.usedDependency, dep_package_uri))
+
+    # --- SLSA provenance methods ---
+
+    def add_slsa_builder(self, builder_id: str, version: str | None = None) -> URIRef:
+        """Create a slsa:Builder resource.
+
+        Args:
+            builder_id: URI identifying the build platform (e.g., https://koji.fedoraproject.org)
+            version: Optional version of the build platform
+        """
+        b_uri = builder_uri(builder_id)
+        self.graph.add((b_uri, RDF.type, SLSA.Builder))
+        self.graph.add((b_uri, SLSA.builderId, URIRef(builder_id)))
+
+        if version:
+            self.graph.add((b_uri, SLSA.builderVersion, Literal(version)))
+
+        return b_uri
+
+    def add_slsa_build_environment(
+        self,
+        distro: str,
+        release: str,
+        name: str,
+        version: str,
+        image: str | None = None,
+        image_digest: str | None = None,
+        ephemeral: bool | None = None,
+        isolated: bool | None = None,
+    ) -> URIRef:
+        """Create a slsa:BuildEnvironment resource.
+
+        Args:
+            distro: Distribution name
+            release: Release name
+            name: Package name
+            version: Package version
+            image: Container image or base system used for the build
+            image_digest: Cryptographic digest of the build image
+            ephemeral: Whether the environment was ephemeral (destroyed after use)
+            isolated: Whether the environment was isolated from other tenants
+        """
+        env_uri = build_env_uri(distro, release, name, version)
+        self.graph.add((env_uri, RDF.type, SLSA.BuildEnvironment))
+
+        if image:
+            self.graph.add((env_uri, SLSA.buildImage, Literal(image)))
+        if image_digest:
+            self.graph.add((env_uri, SLSA.buildImageDigest, Literal(image_digest)))
+        if ephemeral is not None:
+            self.graph.add(
+                (env_uri, SLSA.isEphemeral, Literal(ephemeral, datatype=XSD.boolean))
+            )
+        if isolated is not None:
+            self.graph.add(
+                (env_uri, SLSA.isIsolated, Literal(isolated, datatype=XSD.boolean))
+            )
+
+        return env_uri
+
+    def add_slsa_attestation(
+        self,
+        distro: str,
+        release: str,
+        name: str,
+        version: str,
+        build_level: URIRef,
+        timestamp: str,
+        digest: str,
+        builder_uri_ref: URIRef,
+        build_activity_uri: URIRef | None = None,
+        build_env_uri_ref: URIRef | None = None,
+        predicate_type: str | None = None,
+        verification_status: str | None = None,
+    ) -> URIRef:
+        """Create a slsa:ProvenanceAttestation resource.
+
+        Args:
+            distro: Distribution name
+            release: Release name
+            name: Package name
+            version: Package version
+            build_level: SLSA build level individual (e.g., SLSA.L2)
+            timestamp: When the attestation was created (ISO 8601)
+            digest: Cryptographic digest of the attested artifact
+            builder_uri_ref: URI of the slsa:Builder
+            build_activity_uri: Optional URI of the pkg:BuildActivity
+            build_env_uri_ref: Optional URI of the slsa:BuildEnvironment
+            predicate_type: Optional in-toto predicate type URI
+            verification_status: Optional verification status (verified/unverified/failed)
+        """
+        att_uri = attestation_uri(distro, release, name, version)
+        self.graph.add((att_uri, RDF.type, SLSA.ProvenanceAttestation))
+        self.graph.add((att_uri, SLSA.attestsBuildLevel, build_level))
+        self.graph.add(
+            (
+                att_uri,
+                SLSA.attestationTimestamp,
+                Literal(timestamp, datatype=XSD.dateTime),
+            )
+        )
+        self.graph.add((att_uri, SLSA.attestationDigest, Literal(digest)))
+
+        if predicate_type:
+            self.graph.add((att_uri, SLSA.predicateType, URIRef(predicate_type)))
+        if verification_status:
+            self.graph.add(
+                (att_uri, SLSA.verificationStatus, Literal(verification_status))
+            )
+        if build_activity_uri:
+            self.graph.add((att_uri, SLSA.attestsBuildActivity, build_activity_uri))
+        if build_env_uri_ref:
+            self.graph.add((att_uri, SLSA.usedBuildEnvironment, build_env_uri_ref))
+
+        # Link to builder
+        self.graph.add((att_uri, SLSA.builtBy, builder_uri_ref))
+
+        return att_uri
+
+    def link_attestation_to_package(self, attestation_uri: URIRef, package_uri: URIRef):
+        """Link a SLSA attestation to the package it attests."""
+        self.graph.add((package_uri, SLSA.hasProvenance, attestation_uri))

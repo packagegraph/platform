@@ -113,7 +113,7 @@ fn test_special_characters_encoding() {
 
     // Maintainer email with @ - must NOT be encoded
     let uri = maintainer_uri("maintainer@debian.org");
-    assert_eq!(uri, "https://packagegraph.github.io/data/maintainer/maintainer@debian.org");
+    assert_eq!(uri, "https://packagegraph.github.io/d/maintainer/maintainer@debian.org");
     assert!(!uri.contains("%40"), "@ in maintainer_uri must NOT be encoded");
     assert!(!uri.contains("%2E"), ". in maintainer_uri must NOT be encoded");
 }
