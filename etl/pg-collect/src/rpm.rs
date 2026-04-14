@@ -112,7 +112,7 @@ impl RpmCollector {
                         }
                     }
                 }
-                Ok(Event::Start(ref e)) if in_correct_data && e.name().as_ref() == b"location" => {
+                Ok(Event::Start(ref e) | Event::Empty(ref e)) if in_correct_data && e.name().as_ref() == b"location" => {
                     for attr in e.attributes().flatten() {
                         if attr.key.as_ref() == b"href" {
                             let href = String::from_utf8_lossy(&attr.value).to_string();
