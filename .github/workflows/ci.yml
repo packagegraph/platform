@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-ontology:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv pip install rdflib --system
+      - name: Validate ontology TTL files
+        run: |
+          for f in etl/ontology/*.ttl; do
+            echo "Checking $f..."
+            python -c "import rdflib; g = rdflib.Graph(); g.parse('$f', format='turtle'); print(f'  OK: {len(g)} triples')"
+          done
+
+  test-etl:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: etl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync --frozen
+      - run: uv run pytest -q --tb=short
+
+  build-etl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ETL image
+        uses: docker/build-push-action@v6
+        with:
+          context: etl
+          file: etl/Containerfile
+          push: false
+          tags: ghcr.io/packagegraph/etl:ci
+
+  build-fuseki:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build Fuseki image
+        uses: docker/build-push-action@v6
+        with:
+          context: fuseki
+          file: fuseki/Containerfile
+          push: false
+          tags: ghcr.io/packagegraph/fuseki:ci
