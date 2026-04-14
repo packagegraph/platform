@@ -63,6 +63,36 @@ enum Commands {
         #[arg(short, long, required = true)]
         output: String,
     },
+
+    /// Load N-Triples file into a Fuseki named graph via SPARQL Update
+    Load {
+        /// N-Triples file to load
+        #[arg(required = true)]
+        file: String,
+
+        /// Named graph URI (e.g., https://packagegraph.github.io/graph/debian/trixie)
+        #[arg(long, required = true)]
+        graph: String,
+
+        /// Fuseki SPARQL endpoint base URL (e.g., http://fuseki:3030/packagegraph)
+        #[arg(long, required = true)]
+        endpoint: String,
+
+        /// Number of triples per INSERT DATA batch
+        #[arg(long, default_value = "10000")]
+        batch_size: usize,
+    },
+
+    /// Drop a named graph from Fuseki
+    Drop {
+        /// Named graph URI to drop
+        #[arg(long, required = true)]
+        graph: String,
+
+        /// Fuseki SPARQL endpoint base URL
+        #[arg(long, required = true)]
+        endpoint: String,
+    },
 }
 
 fn main() {
@@ -125,6 +155,30 @@ fn main() {
 
             let collector = RpmCollector::new(repo_url, distro_name, release_name);
             collector.collect(&output)
+        }
+
+        Commands::Load { file, graph, endpoint, batch_size } => {
+            eprintln!("=== PackageGraph SPARQL Loader ===");
+            eprintln!("File: {}", file);
+            eprintln!("Graph: {}", graph);
+            eprintln!("Endpoint: {}", endpoint);
+            eprintln!("Batch size: {}", batch_size);
+            eprintln!();
+
+            let client = pg_collect::sparql::SparqlClient::new(&endpoint);
+            client.load_file(&file, &graph, batch_size)
+                .map(|count| (count, count))
+        }
+
+        Commands::Drop { graph, endpoint } => {
+            eprintln!("=== PackageGraph Graph Drop ===");
+            eprintln!("Graph: {}", graph);
+            eprintln!("Endpoint: {}", endpoint);
+            eprintln!();
+
+            let client = pg_collect::sparql::SparqlClient::new(&endpoint);
+            client.drop_graph(&graph)
+                .map(|_| (0, 0))
         }
     };
 
