@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PackageGraph SPARQL Explorer</title>
+  <link rel="stylesheet" href="https://unpkg.com/@triply/yasgui/build/yasgui.min.css" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; }
+    header { background: #1a1a2e; color: #eee; padding: 1rem 2rem; display: flex; align-items: center; gap: 1rem; }
+    header h1 { font-size: 1.4rem; font-weight: 600; }
+    header span { font-size: 0.85rem; color: #aaa; }
+    .endpoint-bar { background: #16213e; color: #ccc; padding: 0.5rem 2rem; font-size: 0.8rem; display: flex; align-items: center; gap: 1rem; }
+    .endpoint-bar label { font-weight: 600; }
+    .endpoint-bar input {
+      background: #0f3460; color: #eee; border: 1px solid #444; padding: 0.3rem 0.6rem;
+      border-radius: 4px; font-family: monospace; font-size: 0.85rem; width: 500px;
+    }
+    .endpoint-bar button {
+      background: #e94560; color: white; border: none; padding: 0.3rem 1rem;
+      border-radius: 4px; cursor: pointer; font-size: 0.8rem;
+    }
+    .endpoint-bar button:hover { background: #c73e54; }
+    #yasgui { padding: 1rem 2rem; }
+    .examples { background: #fff; margin: 0 2rem 1rem; padding: 1rem; border-radius: 6px; border: 1px solid #ddd; }
+    .examples h3 { font-size: 0.9rem; margin-bottom: 0.5rem; color: #333; }
+    .examples button {
+      background: #f0f0f0; border: 1px solid #ccc; padding: 0.3rem 0.8rem;
+      border-radius: 4px; cursor: pointer; font-size: 0.8rem; margin: 0.2rem;
+    }
+    .examples button:hover { background: #e0e0e0; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>PackageGraph SPARQL Explorer</h1>
+    <span>Query 7M+ triples across 6 Linux distributions and 286K packages</span>
+  </header>
+
+  <div class="endpoint-bar">
+    <label>Endpoint:</label>
+    <input type="text" id="endpoint-input" value="http://localhost:3030/packagegraph/sparql" />
+    <button onclick="updateEndpoint()">Update</button>
+    <span style="margin-left: auto;">Tip: <code>oc port-forward svc/fuseki 3030:3030 -n packagegraph</code></span>
+  </div>
+
+  <div class="examples">
+    <h3>Example Queries (click to load):</h3>
+    <button onclick="loadQuery('top_packages')">Top packages by version count</button>
+    <button onclick="loadQuery('distro_stats')">Distribution statistics</button>
+    <button onclick="loadQuery('deps_of')">Dependencies of a package</button>
+    <button onclick="loadQuery('vuln_packages')">Vulnerable packages</button>
+    <button onclick="loadQuery('cross_distro')">Cross-distro equivalences</button>
+    <button onclick="loadQuery('maintainers')">Most active maintainers</button>
+    <button onclick="loadQuery('github_repos')">Packages with GitHub repos</button>
+    <button onclick="loadQuery('source_packages')">Source → binary relationships</button>
+  </div>
+
+  <div id="yasgui"></div>
+
+  <script src="https://unpkg.com/@triply/yasgui/build/yasgui.min.js"></script>
+  <script>
+    // PackageGraph namespace prefixes
+    const PG_PREFIXES = `PREFIX pkg:  <https://purl.org/packagegraph/ontology/core#>
+PREFIX sec:  <https://purl.org/packagegraph/ontology/security#>
+PREFIX vcs:  <https://purl.org/packagegraph/ontology/vcs#>
+PREFIX slsa: <https://purl.org/packagegraph/ontology/slsa#>
+PREFIX met:  <https://purl.org/packagegraph/ontology/metrics#>
+PREFIX deb:  <https://purl.org/packagegraph/ontology/debian#>
+PREFIX rpm:  <https://purl.org/packagegraph/ontology/rpm#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX owl:  <http://www.w3.org/2002/07/owl#>
+PREFIX xsd:  <http://www.w3.org/2001/XMLSchema#>
+`;
+
+    const EXAMPLE_QUERIES = {
+      top_packages: `${PG_PREFIXES}
+# Top 20 packages by number of versions across all distributions
+SELECT ?name (COUNT(DISTINCT ?v) AS ?versions) ?distro WHERE {
+  ?p a pkg:BinaryPackage ;
+     pkg:packageName ?name ;
+     pkg:hasVersion ?v ;
+     pkg:partOfDistribution ?d .
+  ?d rdfs:label ?distro .
+}
+GROUP BY ?name ?distro
+ORDER BY DESC(?versions)
+LIMIT 20`,
+
+      distro_stats: `${PG_PREFIXES}
+# Package counts per distribution
+SELECT ?distro (COUNT(DISTINCT ?p) AS ?packages) (COUNT(DISTINCT ?v) AS ?versions) WHERE {
+  ?p a pkg:BinaryPackage ;
+     pkg:partOfDistribution ?d ;
+     pkg:hasVersion ?v .
+  ?d rdfs:label ?distro .
+}
+GROUP BY ?distro
+ORDER BY DESC(?packages)`,
+
+      deps_of: `${PG_PREFIXES}
+# Dependencies of a specific package (change 'curl' to your package)
+SELECT ?dep_name ?dep_type WHERE {
+  ?p a pkg:BinaryPackage ;
+     pkg:packageName "curl" ;
+     pkg:hasDependency ?dep .
+  ?dep pkg:dependencyTarget ?target ;
+       pkg:dependencyType ?dep_type .
+  ?target pkg:packageName ?dep_name .
+}
+ORDER BY ?dep_type ?dep_name
+LIMIT 50`,
+
+      vuln_packages: `${PG_PREFIXES}
+# Packages with known vulnerabilities
+SELECT ?pkg_name ?cve_id ?severity ?published WHERE {
+  ?vuln a sec:Vulnerability ;
+        sec:cveId ?cve_id ;
+        sec:affectsVersion ?ver .
+  ?pkg pkg:hasVersion ?ver ;
+       pkg:packageName ?pkg_name .
+  OPTIONAL { ?vuln sec:severity ?severity }
+  OPTIONAL { ?vuln sec:publishedDate ?published }
+}
+ORDER BY DESC(?published)
+LIMIT 50`,
+
+      cross_distro: `${PG_PREFIXES}
+# Cross-distribution package equivalences (from Repology)
+SELECT ?name1 ?distro1 ?name2 ?distro2 WHERE {
+  ?p1 pkg:equivalentInDistribution ?p2 ;
+      pkg:packageName ?name1 ;
+      pkg:partOfDistribution ?d1 .
+  ?p2 pkg:packageName ?name2 ;
+      pkg:partOfDistribution ?d2 .
+  ?d1 rdfs:label ?distro1 .
+  ?d2 rdfs:label ?distro2 .
+  FILTER(?distro1 < ?distro2)
+}
+LIMIT 50`,
+
+      maintainers: `${PG_PREFIXES}
+# Maintainers with most packages
+SELECT ?name ?email (COUNT(DISTINCT ?p) AS ?packages) WHERE {
+  ?p a pkg:BinaryPackage ;
+     pkg:maintainedBy ?m .
+  ?m foaf:name ?name .
+  OPTIONAL { ?m foaf:mbox ?email }
+}
+GROUP BY ?name ?email
+ORDER BY DESC(?packages)
+LIMIT 30`,
+
+      github_repos: `${PG_PREFIXES}
+# Packages with linked GitHub repositories
+SELECT ?pkg_name ?repo_url ?stars ?forks WHERE {
+  ?pkg a pkg:BinaryPackage ;
+       pkg:packageName ?pkg_name ;
+       pkg:homepage ?homepage .
+  FILTER(CONTAINS(STR(?homepage), "github.com"))
+  OPTIONAL {
+    ?repo a vcs:Repository ;
+          vcs:stargazerCount ?stars ;
+          vcs:forkCount ?forks .
+    FILTER(CONTAINS(STR(?repo), REPLACE(STR(?homepage), "https://github.com/", "")))
+  }
+}
+ORDER BY DESC(?stars)
+LIMIT 30`,
+
+      source_packages: `${PG_PREFIXES}
+# Source packages and their binary outputs
+SELECT ?src_name ?bin_name ?arch WHERE {
+  ?bin a pkg:BinaryPackage ;
+       pkg:packageName ?bin_name ;
+       pkg:builtFromSource ?src ;
+       pkg:targetArchitecture ?a .
+  ?src pkg:packageName ?src_name .
+  ?a rdfs:label ?arch .
+}
+ORDER BY ?src_name ?bin_name
+LIMIT 50`
+    };
+
+    // Initialize YASGUI
+    const endpointUrl = document.getElementById('endpoint-input').value;
+
+    const yasgui = new Yasgui(document.getElementById("yasgui"), {
+      requestConfig: { endpoint: endpointUrl },
+      yasqe: {
+        value: `${PG_PREFIXES}
+# Explore PackageGraph — edit this query or click an example above
+SELECT ?type (COUNT(?s) AS ?count) WHERE {
+  ?s rdf:type ?type .
+}
+GROUP BY ?type
+ORDER BY DESC(?count)
+LIMIT 25`
+      }
+    });
+
+    function updateEndpoint() {
+      const url = document.getElementById('endpoint-input').value;
+      const tab = yasgui.getTab();
+      if (tab) {
+        tab.setRequestConfig({ endpoint: url });
+      }
+    }
+
+    function loadQuery(name) {
+      const query = EXAMPLE_QUERIES[name];
+      if (query) {
+        const tab = yasgui.getTab();
+        if (tab && tab.yasqe) {
+          tab.yasqe.setValue(query);
+        }
+      }
+    }
+  </script>
+</body>
+</html>
