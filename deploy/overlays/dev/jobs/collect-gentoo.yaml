@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-gentoo
+  namespace: packagegraph
+spec:
+  schedule: "0 5 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 900
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: PYTHONUNBUFFERED, value: "1"}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  echo "=== Downloading Gentoo repo tarball ==="
+                  curl -fsSL https://github.com/gentoo/gentoo/archive/refs/heads/master.tar.gz \
+                    -o /tmp/gentoo.tar.gz
+                  echo "Extracting..."
+                  mkdir -p /tmp/gentoo-repo
+                  tar -xzf /tmp/gentoo.tar.gz -C /tmp/gentoo-repo --strip-components=1
+                  rm /tmp/gentoo.tar.gz
+                  echo "Repo extracted to /tmp/gentoo-repo"
+
+                  pg-collect gentoo \
+                    --repo-path /tmp/gentoo-repo \
+                    --output /tmp/gentoo.nt && \
+                  if [ "${COLLECTOR_FULL_RELOAD:-0}" = "1" ]; then
+                    pg-collect drop --graph "https://packagegraph.github.io/graph/gentoo" --endpoint "$FUSEKI_ENDPOINT"
+                  fi
+                  pg-collect load /tmp/gentoo.nt \
+                    --graph "https://packagegraph.github.io/graph/gentoo" \
+                    --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "2", memory: 4Gi}}

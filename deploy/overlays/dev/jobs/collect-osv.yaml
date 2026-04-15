@@ -1,0 +1,447 @@
+# OSV Security Vulnerability Collectors
+# Downloads bulk vulnerability data from OSV GCS bucket for all supported ecosystems.
+# All ecosystems load into a single shared graph: graph/security/osv
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-osv-npm
+  namespace: packagegraph
+spec:
+  schedule: "0 9 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  pg-collect osv --ecosystem npm -o /tmp/osv-npm.nt && \
+                  pg-collect load /tmp/osv-npm.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-osv-pypi
+  namespace: packagegraph
+spec:
+  schedule: "0 10 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  pg-collect osv --ecosystem PyPI -o /tmp/osv-pypi.nt && \
+                  pg-collect load /tmp/osv-pypi.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-osv-cargo
+  namespace: packagegraph
+spec:
+  schedule: "0 11 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  pg-collect osv --ecosystem crates.io -o /tmp/osv-cargo.nt && \
+                  pg-collect load /tmp/osv-cargo.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-osv-go
+  namespace: packagegraph
+spec:
+  schedule: "0 12 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  pg-collect osv --ecosystem Go -o /tmp/osv-go.nt && \
+                  pg-collect load /tmp/osv-go.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-osv-maven
+  namespace: packagegraph
+spec:
+  schedule: "0 13 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  pg-collect osv --ecosystem Maven -o /tmp/osv-maven.nt && \
+                  pg-collect load /tmp/osv-maven.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-osv-nuget
+  namespace: packagegraph
+spec:
+  schedule: "0 14 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  pg-collect osv --ecosystem NuGet -o /tmp/osv-nuget.nt && \
+                  pg-collect load /tmp/osv-nuget.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-osv-packagist
+  namespace: packagegraph
+spec:
+  schedule: "0 15 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  pg-collect osv --ecosystem Packagist -o /tmp/osv-packagist.nt && \
+                  pg-collect load /tmp/osv-packagist.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-osv-rubygems
+  namespace: packagegraph
+spec:
+  schedule: "0 16 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  pg-collect osv --ecosystem RubyGems -o /tmp/osv-rubygems.nt && \
+                  pg-collect load /tmp/osv-rubygems.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-osv-hex
+  namespace: packagegraph
+spec:
+  schedule: "0 17 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  pg-collect osv --ecosystem Hex -o /tmp/osv-hex.nt && \
+                  pg-collect load /tmp/osv-hex.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-osv-pub
+  namespace: packagegraph
+spec:
+  schedule: "0 18 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  pg-collect osv --ecosystem Pub -o /tmp/osv-pub.nt && \
+                  pg-collect load /tmp/osv-pub.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-osv-hackage
+  namespace: packagegraph
+spec:
+  schedule: "0 19 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  pg-collect osv --ecosystem Hackage -o /tmp/osv-hackage.nt && \
+                  pg-collect load /tmp/osv-hackage.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-osv-swifturl
+  namespace: packagegraph
+spec:
+  schedule: "0 20 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  pg-collect osv --ecosystem SwiftURL -o /tmp/osv-swift.nt && \
+                  pg-collect load /tmp/osv-swift.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}

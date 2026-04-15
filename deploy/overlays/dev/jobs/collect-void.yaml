@@ -1,0 +1,50 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-void
+  namespace: packagegraph
+spec:
+  schedule: "0 6 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 900
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: PYTHONUNBUFFERED, value: "1"}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/void"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  echo "Downloading Void packages repo..."
+                  curl -fsSL https://github.com/void-linux/void-packages/archive/refs/heads/master.tar.gz \
+                    -o /tmp/void.tar.gz
+                  mkdir -p /tmp/void-repo
+                  tar -xzf /tmp/void.tar.gz -C /tmp/void-repo --strip-components=1
+                  rm /tmp/void.tar.gz
+
+                  pg-collect void \
+                    --repo-path /tmp/void-repo \
+                    --output /tmp/void.nt && \
+                  if [ "${COLLECTOR_FULL_RELOAD:-0}" = "1" ]; then
+                    pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  fi
+                  pg-collect load /tmp/void.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "2", memory: 4Gi}}
