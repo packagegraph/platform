@@ -18,3 +18,4 @@ pub mod sparql;
 pub mod osv;
 pub mod rubygems;
 pub mod maven;
+pub mod cpan;

@@ -34,6 +34,7 @@ DEB = Namespace("https://purl.org/packagegraph/ontology/debian#")
 RPM = Namespace("https://purl.org/packagegraph/ontology/rpm#")
 GEMS = Namespace("https://purl.org/packagegraph/ontology/rubygems#")
 MAVEN = Namespace("https://purl.org/packagegraph/ontology/maven#")
+CPAN = Namespace("https://purl.org/packagegraph/ontology/cpan#")
 
 # Data quality
 DQ = Namespace("https://purl.org/packagegraph/ontology/dq#")

@@ -6,6 +6,7 @@ use pg_collect::homebrew::HomebrewCollector;
 use pg_collect::rpm::RpmCollector;
 use pg_collect::rubygems::RubyGemsCollector;
 use pg_collect::maven::MavenCollector;
+use pg_collect::cpan::CpanCollector;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -308,6 +309,21 @@ enum Commands {
         /// Maven repository base URL
         #[arg(long, default_value = "https://repo1.maven.org/maven2")]
         repo_base: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
+    /// Collect CPAN distributions from MetaCPAN
+    Cpan {
+        /// Seed file with distribution names (one per line)
+        #[arg(long, required = true)]
+        packages_file: String,
+
+        /// MetaCPAN API base URL
+        #[arg(long, default_value = "https://fastapi.metacpan.org")]
+        api_base: String,
 
         /// Output file path
         #[arg(short, long, required = true)]
@@ -635,6 +651,17 @@ fn main() {
             eprintln!();
 
             let collector = MavenCollector::new(search_base, repo_base);
+            collector.collect(&packages_file, &output)
+        }
+
+        Commands::Cpan { packages_file, api_base, output } => {
+            eprintln!("=== PackageGraph CPAN Collector ===");
+            eprintln!("API: {}", api_base);
+            eprintln!("Seed: {}", packages_file);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let collector = CpanCollector::new(api_base);
             collector.collect(&packages_file, &output)
         }
 

@@ -1310,5 +1310,46 @@ def seed_maven(fuseki_endpoint, output, from_names):
     click.echo(f"Wrote {len(coords)} Maven coordinates to {output}")
 
 
+@cli.command()
+@click.option("--fuseki-endpoint", required=True, envvar="FUSEKI_ENDPOINT")
+@click.option("-o", "--output", required=True, type=click.Path())
+@click.option("--from-names", is_flag=True, help="Also extract from perl-* package names")
+def seed_cpan(fuseki_endpoint, output, from_names):
+    """Generate CPAN seed file from binary package graph."""
+    from packagegraph.sparql_client import SparqlQueryClient
+    import re
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    names = set()
+
+    def extract_cpan(pkg_name, homepage):
+        m = re.search(r'metacpan\.org/(?:pod|release)/(.+?)(?:/|$)', homepage)
+        if m:
+            return m.group(1)
+        m = re.search(r'cpan\.org/(?:dist|module)/(.+?)(?:/|$)', homepage)
+        if m:
+            return m.group(1)
+        return None
+
+    for n in _seed_from_homepage(client, "metacpan.org", extract_cpan):
+        if n:
+            names.add(n)
+
+    if from_names:
+        upstream = _seed_from_upstream(client, "cpan")
+        if upstream:
+            for n in upstream:
+                names.add(n)
+        else:
+            for n in _seed_from_names(client, "perl-"):
+                # Convert perl-Module-Name to Module::Name
+                parts = n.split("-")
+                dist_name = "::".join(parts)
+                names.add(dist_name)
+
+    Path(output).write_text("\n".join(sorted(names)) + "\n")
+    click.echo(f"Wrote {len(names)} CPAN distribution names to {output}")
+
+
 if __name__ == "__main__":
     cli()
