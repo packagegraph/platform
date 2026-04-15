@@ -25,6 +25,7 @@ resources:
   - jobs/collect-rubygems.yaml
   - jobs/collect-maven.yaml
   - jobs/collect-cpan.yaml
+  - jobs/collect-cran.yaml
   - jobs/snapshot-tdb2.yaml
   - jobs/enrich-github-vcs.yaml
   - jobs/enrich-license.yaml

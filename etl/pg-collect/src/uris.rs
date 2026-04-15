@@ -24,6 +24,7 @@ pub const VOID: &str = "https://purl.org/packagegraph/ontology/void#";
 pub const GEMS: &str = "https://purl.org/packagegraph/ontology/rubygems#";
 pub const MAVEN: &str = "https://purl.org/packagegraph/ontology/maven#";
 pub const CPAN: &str = "https://purl.org/packagegraph/ontology/cpan#";
+pub const CRAN: &str = "https://purl.org/packagegraph/ontology/cran#";
 pub const DATA: &str = "https://packagegraph.github.io/d/";
 pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 pub const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";

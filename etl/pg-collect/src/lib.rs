@@ -19,3 +19,4 @@ pub mod osv;
 pub mod rubygems;
 pub mod maven;
 pub mod cpan;
+pub mod cran;

@@ -7,6 +7,7 @@ use pg_collect::rpm::RpmCollector;
 use pg_collect::rubygems::RubyGemsCollector;
 use pg_collect::maven::MavenCollector;
 use pg_collect::cpan::CpanCollector;
+use pg_collect::cran::CranCollector;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -324,6 +325,17 @@ enum Commands {
         /// MetaCPAN API base URL
         #[arg(long, default_value = "https://fastapi.metacpan.org")]
         api_base: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
+    /// Collect CRAN packages from CRAN mirror
+    Cran {
+        /// CRAN mirror URL
+        #[arg(long, default_value = "https://cran.r-project.org")]
+        mirror: String,
 
         /// Output file path
         #[arg(short, long, required = true)]
@@ -663,6 +675,16 @@ fn main() {
 
             let collector = CpanCollector::new(api_base);
             collector.collect(&packages_file, &output)
+        }
+
+        Commands::Cran { mirror, output } => {
+            eprintln!("=== PackageGraph CRAN Collector ===");
+            eprintln!("Mirror: {}", mirror);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let collector = CranCollector::new(mirror);
+            collector.collect(&output)
         }
 
         Commands::Load { file, graph, endpoint, batch_size } => {
