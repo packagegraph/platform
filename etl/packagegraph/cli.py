@@ -1351,5 +1351,106 @@ def seed_cpan(fuseki_endpoint, output, from_names):
     click.echo(f"Wrote {len(names)} CPAN distribution names to {output}")
 
 
+@cli.command()
+@click.option("--fuseki-endpoint", required=True, envvar="FUSEKI_ENDPOINT")
+@click.option("-o", "--output", required=True, type=click.Path())
+@click.option("--from-names", is_flag=True, help="Also extract from ghc-* package names")
+def seed_hackage(fuseki_endpoint, output, from_names):
+    """Generate Hackage seed file from binary package graph."""
+    from packagegraph.sparql_client import SparqlQueryClient
+    import re
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    names = set()
+
+    def extract_hackage(pkg_name, homepage):
+        m = re.search(r'hackage\.haskell\.org/package/(.+?)(?:/|$)', homepage)
+        return m.group(1) if m else None
+
+    for n in _seed_from_homepage(client, "hackage.haskell.org", extract_hackage):
+        if n:
+            names.add(n)
+
+    if from_names:
+        upstream = _seed_from_upstream(client, "hackage")
+        if upstream:
+            for n in upstream:
+                names.add(n)
+        else:
+            for n in _seed_from_names(client, "ghc-"):
+                names.add(n)
+
+    Path(output).write_text("\n".join(sorted(names)) + "\n")
+    click.echo(f"Wrote {len(names)} Hackage package names to {output}")
+
+
+@cli.command()
+@click.option("--fuseki-endpoint", required=True, envvar="FUSEKI_ENDPOINT")
+@click.option("-o", "--output", required=True, type=click.Path())
+@click.option("--from-names", is_flag=True, help="Also extract from dotnet-*/aspnetcore-* package names")
+def seed_nuget(fuseki_endpoint, output, from_names):
+    """Generate NuGet seed file from binary package graph."""
+    from packagegraph.sparql_client import SparqlQueryClient
+    import re
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    names = set()
+
+    def extract_nuget(pkg_name, homepage):
+        m = re.search(r'nuget\.org/packages/(.+?)(?:/|$)', homepage)
+        return m.group(1) if m else None
+
+    for n in _seed_from_homepage(client, "nuget.org", extract_nuget):
+        if n:
+            names.add(n)
+
+    if from_names:
+        upstream = _seed_from_upstream(client, "nuget")
+        if upstream:
+            for n in upstream:
+                names.add(n)
+        else:
+            for n in _seed_from_names(client, "dotnet-"):
+                names.add(n)
+            for n in _seed_from_names(client, "aspnetcore-"):
+                names.add(n)
+
+    Path(output).write_text("\n".join(sorted(names)) + "\n")
+    click.echo(f"Wrote {len(names)} NuGet package names to {output}")
+
+
+@cli.command()
+@click.option("--fuseki-endpoint", required=True, envvar="FUSEKI_ENDPOINT")
+@click.option("-o", "--output", required=True, type=click.Path())
+@click.option("--from-names", is_flag=True, help="Also extract from erlang-* package names")
+def seed_hex(fuseki_endpoint, output, from_names):
+    """Generate Hex seed file from binary package graph."""
+    from packagegraph.sparql_client import SparqlQueryClient
+    import re
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    names = set()
+
+    def extract_hex(pkg_name, homepage):
+        m = re.search(r'hex\.pm/packages/(.+?)(?:/|$)', homepage)
+        return m.group(1) if m else None
+
+    for n in _seed_from_homepage(client, "hex.pm", extract_hex):
+        if n:
+            names.add(n)
+
+    if from_names:
+        upstream = _seed_from_upstream(client, "hex")
+        if upstream:
+            for n in upstream:
+                names.add(n)
+        else:
+            for n in _seed_from_names(client, "erlang-"):
+                names.add(n)
+
+    Path(output).write_text("\n".join(sorted(names)) + "\n")
+    click.echo(f"Wrote {len(names)} Hex package names to {output}")
+
+
 if __name__ == "__main__":
     cli()

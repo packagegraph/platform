@@ -8,6 +8,7 @@ use pg_collect::rubygems::RubyGemsCollector;
 use pg_collect::maven::MavenCollector;
 use pg_collect::cpan::CpanCollector;
 use pg_collect::cran::CranCollector;
+use pg_collect::hackage::HackageCollector;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -336,6 +337,21 @@ enum Commands {
         /// CRAN mirror URL
         #[arg(long, default_value = "https://cran.r-project.org")]
         mirror: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
+    /// Collect Hackage packages from hackage.haskell.org
+    Hackage {
+        /// Seed file with package names (one per line)
+        #[arg(long, required = true)]
+        packages_file: String,
+
+        /// Hackage base URL
+        #[arg(long, default_value = "https://hackage.haskell.org")]
+        base_url: String,
 
         /// Output file path
         #[arg(short, long, required = true)]
@@ -685,6 +701,17 @@ fn main() {
 
             let collector = CranCollector::new(mirror);
             collector.collect(&output)
+        }
+
+        Commands::Hackage { packages_file, base_url, output } => {
+            eprintln!("=== PackageGraph Hackage Collector ===");
+            eprintln!("Base URL: {}", base_url);
+            eprintln!("Seed: {}", packages_file);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let collector = HackageCollector::new(base_url);
+            collector.collect(&packages_file, &output)
         }
 
         Commands::Load { file, graph, endpoint, batch_size } => {

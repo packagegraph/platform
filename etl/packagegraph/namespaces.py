@@ -36,6 +36,12 @@ GEMS = Namespace("https://purl.org/packagegraph/ontology/rubygems#")
 MAVEN = Namespace("https://purl.org/packagegraph/ontology/maven#")
 CPAN = Namespace("https://purl.org/packagegraph/ontology/cpan#")
 CRAN = Namespace("https://purl.org/packagegraph/ontology/cran#")
+HACKAGE = Namespace("https://purl.org/packagegraph/ontology/hackage#")
+NUGET = Namespace("https://purl.org/packagegraph/ontology/nuget#")
+HEX = Namespace("https://purl.org/packagegraph/ontology/hex#")
+FREEBSD = Namespace("https://purl.org/packagegraph/ontology/freebsd#")
+NIX = Namespace("https://purl.org/packagegraph/ontology/nix#")
+CHOCO = Namespace("https://purl.org/packagegraph/ontology/chocolatey#")
 
 # Data quality
 DQ = Namespace("https://purl.org/packagegraph/ontology/dq#")
