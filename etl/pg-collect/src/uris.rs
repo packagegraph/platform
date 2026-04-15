@@ -23,6 +23,7 @@ pub const GENTOO: &str = "https://purl.org/packagegraph/ontology/gentoo#";
 pub const VOID: &str = "https://purl.org/packagegraph/ontology/void#";
 pub const DATA: &str = "https://packagegraph.github.io/d/";
 pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+pub const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
 pub const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
 // Define encoding set: encode everything except unreserved characters
@@ -45,7 +46,9 @@ const ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'/')
     .add(b':')
     .add(b';')
+    .add(b'<')
     .add(b'=')
+    .add(b'>')
     .add(b'?')
     .add(b'@')
     .add(b'[')

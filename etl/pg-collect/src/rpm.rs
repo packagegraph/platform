@@ -10,6 +10,19 @@ use std::fs::File;
 use std::io::{BufReader, Result};
 use std::time::Duration;
 
+/// Map distribution ID to human-readable display name.
+fn distro_display_name(distro_id: &str) -> &str {
+    match distro_id {
+        "fedora" => "Fedora",
+        "rhel" => "Red Hat Enterprise Linux",
+        "centos-stream" => "CentOS Stream",
+        "opensuse" => "openSUSE",
+        "alpine" => "Alpine Linux",
+        "gentoo" => "Gentoo",
+        _ => distro_id,
+    }
+}
+
 /// A parsed RPM dependency entry from primary.xml.
 #[derive(Debug, Clone)]
 pub struct RpmDep {
@@ -385,6 +398,10 @@ impl RpmCollector {
             &format!("{PKG}distributionName"),
             &self.distro_name,
         )?;
+
+        // Add human-readable label
+        let display_name = distro_display_name(&self.distro_name);
+        writer.write_literal(&dist_uri, RDFS_LABEL, display_name)?;
 
         if !self.release_name.is_empty() {
             let rel_uri = release_uri(&self.distro_name, &self.release_name);

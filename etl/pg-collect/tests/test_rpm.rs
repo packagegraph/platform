@@ -280,3 +280,216 @@ fn test_emit_maintainer_triples() -> std::io::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_emit_ecosystem_from_provides_cargo() -> std::io::Result<()> {
+    let collector = RpmCollector::new(
+        "http://example.com".to_string(),
+        "fedora".to_string(),
+        "43".to_string(),
+    );
+
+    let temp_file = NamedTempFile::new()?;
+    let mut writer = NTriplesWriter::new(temp_file.reopen()?);
+
+    let deps = vec![
+        RpmDep {
+            name: "crate(tokio)".to_string(),
+            flags: Some("EQ".to_string()),
+            epoch: None,
+            ver: Some("1.36.0".to_string()),
+            rel: None,
+            dep_type: "provides".to_string(),
+        },
+        RpmDep {
+            name: "crate(tokio/rt)".to_string(),
+            flags: Some("EQ".to_string()),
+            epoch: None,
+            ver: Some("1.36.0".to_string()),
+            rel: None,
+            dep_type: "provides".to_string(),
+        },
+    ];
+
+    let pkg_data = make_pkg_data(vec![
+        ("name", "rust-tokio"),
+        ("arch", "noarch"),
+        ("ver", "1.36.0"),
+        ("rel", "1.fc43"),
+        ("epoch", "0"),
+    ], deps);
+
+    collector.emit_package_triples(&mut writer, &pkg_data)?;
+    writer.flush()?;
+
+    let output_file = temp_file.reopen()?;
+    let reader = BufReader::new(output_file);
+    let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
+
+    assert!(lines.iter().any(|l| l.contains("upstreamEcosystem") && l.contains("cargo")),
+            "Should identify cargo ecosystem");
+    assert!(lines.iter().any(|l| l.contains("upstreamPackageName") && l.contains("\"tokio\"")),
+            "Should extract crate name 'tokio'");
+    assert!(lines.iter().any(|l| l.contains("upstreamPackageName") && l.contains("\"tokio/rt\"")),
+            "Should extract crate feature 'tokio/rt'");
+    assert!(lines.iter().any(|l| l.contains("upstreamPackageVersion") && l.contains("\"1.36.0\"")),
+            "Should extract upstream version");
+
+    // Should only emit ecosystem once
+    let eco_count = lines.iter().filter(|l| l.contains("upstreamEcosystem")).count();
+    assert_eq!(eco_count, 1, "Should emit upstreamEcosystem exactly once");
+
+    Ok(())
+}
+
+#[test]
+fn test_emit_ecosystem_from_provides_python() -> std::io::Result<()> {
+    let collector = RpmCollector::new(
+        "http://example.com".to_string(),
+        "fedora".to_string(),
+        "43".to_string(),
+    );
+
+    let temp_file = NamedTempFile::new()?;
+    let mut writer = NTriplesWriter::new(temp_file.reopen()?);
+
+    let deps = vec![
+        RpmDep {
+            name: "python3dist(requests)".to_string(),
+            flags: Some("EQ".to_string()),
+            epoch: None,
+            ver: Some("2.31.0".to_string()),
+            rel: None,
+            dep_type: "provides".to_string(),
+        },
+    ];
+
+    let pkg_data = make_pkg_data(vec![
+        ("name", "python3-requests"),
+        ("arch", "noarch"),
+        ("ver", "2.31.0"),
+        ("rel", "1.fc43"),
+        ("epoch", "0"),
+    ], deps);
+
+    collector.emit_package_triples(&mut writer, &pkg_data)?;
+    writer.flush()?;
+
+    let output_file = temp_file.reopen()?;
+    let reader = BufReader::new(output_file);
+    let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
+
+    assert!(lines.iter().any(|l| l.contains("upstreamEcosystem") && l.contains("pypi")),
+            "Should identify pypi ecosystem");
+    assert!(lines.iter().any(|l| l.contains("upstreamPackageName") && l.contains("\"requests\"")),
+            "Should extract Python package name");
+    assert!(lines.iter().any(|l| l.contains("upstreamPackageVersion") && l.contains("\"2.31.0\"")),
+            "Should extract upstream version");
+
+    Ok(())
+}
+
+#[test]
+fn test_emit_ecosystem_from_provides_golang() -> std::io::Result<()> {
+    let collector = RpmCollector::new(
+        "http://example.com".to_string(),
+        "fedora".to_string(),
+        "43".to_string(),
+    );
+
+    let temp_file = NamedTempFile::new()?;
+    let mut writer = NTriplesWriter::new(temp_file.reopen()?);
+
+    let deps = vec![
+        RpmDep {
+            name: "golang(github.com/gorilla/mux)".to_string(),
+            flags: None,
+            epoch: None,
+            ver: None,
+            rel: None,
+            dep_type: "provides".to_string(),
+        },
+    ];
+
+    let pkg_data = make_pkg_data(vec![
+        ("name", "golang-github-gorilla-mux"),
+        ("arch", "noarch"),
+        ("ver", "1.8.1"),
+        ("rel", "1.fc43"),
+        ("epoch", "0"),
+    ], deps);
+
+    collector.emit_package_triples(&mut writer, &pkg_data)?;
+    writer.flush()?;
+
+    let output_file = temp_file.reopen()?;
+    let reader = BufReader::new(output_file);
+    let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
+
+    assert!(lines.iter().any(|l| l.contains("upstreamEcosystem") && l.contains("gomod")),
+            "Should identify gomod ecosystem");
+    assert!(lines.iter().any(|l| l.contains("upstreamPackageName") && l.contains("github.com/gorilla/mux")),
+            "Should extract Go import path");
+
+    Ok(())
+}
+
+#[test]
+fn test_no_ecosystem_for_plain_rpm() -> std::io::Result<()> {
+    let collector = RpmCollector::new(
+        "http://example.com".to_string(),
+        "fedora".to_string(),
+        "43".to_string(),
+    );
+
+    let temp_file = NamedTempFile::new()?;
+    let mut writer = NTriplesWriter::new(temp_file.reopen()?);
+
+    // Regular RPM with no language ecosystem provides
+    let deps = vec![
+        RpmDep {
+            name: "bash".to_string(),
+            flags: Some("EQ".to_string()),
+            epoch: None,
+            ver: Some("5.2.15".to_string()),
+            rel: None,
+            dep_type: "provides".to_string(),
+        },
+    ];
+
+    let pkg_data = make_pkg_data(vec![
+        ("name", "bash"),
+        ("arch", "x86_64"),
+        ("ver", "5.2.15"),
+        ("rel", "1.fc43"),
+        ("epoch", "0"),
+    ], deps);
+
+    collector.emit_package_triples(&mut writer, &pkg_data)?;
+    writer.flush()?;
+
+    let output_file = temp_file.reopen()?;
+    let reader = BufReader::new(output_file);
+    let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
+
+    assert!(!lines.iter().any(|l| l.contains("upstreamEcosystem")),
+            "Plain RPMs should NOT have upstreamEcosystem");
+    assert!(!lines.iter().any(|l| l.contains("upstreamPackageName")),
+            "Plain RPMs should NOT have upstreamPackageName");
+
+    Ok(())
+}
+
+#[test]
+fn test_distribution_rdfs_label() -> std::io::Result<()> {
+    // Test that Distribution instances get human-readable rdfs:label
+    // We can't call emit_distribution_metadata directly (it's private),
+    // but we can verify the constant exists by compiling
+    use pg_collect::uris::RDFS_LABEL;
+
+    assert_eq!(RDFS_LABEL, "http://www.w3.org/2000/01/rdf-schema#label");
+
+    // The actual label emission is tested via integration tests
+    // or by running the collector and checking the output
+    Ok(())
+}

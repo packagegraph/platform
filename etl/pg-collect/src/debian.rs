@@ -8,6 +8,15 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
 use std::time::Duration;
 
+/// Map distribution ID to human-readable display name.
+fn distro_display_name(distro_id: &str) -> &str {
+    match distro_id {
+        "debian" => "Debian",
+        "ubuntu" => "Ubuntu",
+        _ => distro_id,
+    }
+}
+
 pub struct DebianCollector {
     client: Client,
     repo_url: String,
@@ -164,6 +173,10 @@ impl DebianCollector {
         let dist_uri = distro_uri("debian");
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
         writer.write_literal(&dist_uri, &format!("{PKG}distributionName"), "debian")?;
+
+        // Add human-readable label
+        let display_name = distro_display_name("debian");
+        writer.write_literal(&dist_uri, RDFS_LABEL, display_name)?;
 
         // Release
         let rel_uri = release_uri("debian", &release_info.codename);
