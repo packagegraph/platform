@@ -282,6 +282,57 @@ fn test_emit_maintainer_triples() -> std::io::Result<()> {
 }
 
 #[test]
+fn test_emit_maintainer_triples_name_only() -> std::io::Result<()> {
+    // Test the real-world Fedora format: just "Fedora Project" with no email
+    let collector = RpmCollector::new(
+        "http://example.com".to_string(),
+        "fedora".to_string(),
+        "43".to_string(),
+    );
+
+    let temp_file = NamedTempFile::new()?;
+    let mut writer = NTriplesWriter::new(temp_file.reopen()?);
+
+    let pkg_data = make_pkg_data(vec![
+        ("name", "bash"),
+        ("arch", "x86_64"),
+        ("ver", "5.2.15"),
+        ("rel", "1.fc43"),
+        ("packager", "Fedora Project"),
+    ], vec![]);
+
+    collector.emit_package_triples(&mut writer, &pkg_data)?;
+
+    writer.flush()?;
+
+    let output_file = temp_file.reopen()?;
+    let reader = BufReader::new(output_file);
+    let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
+
+    // Should emit Maintainer type
+    assert!(lines.iter().any(|l| l.contains("Maintainer")),
+            "Should create Maintainer resource");
+
+    // Should emit maintainedBy link
+    assert!(lines.iter().any(|l| l.contains("maintainedBy")),
+            "Should link package to maintainer");
+
+    // Should emit foaf:name
+    assert!(lines.iter().any(|l| l.contains("foaf") && l.contains("name") && l.contains("Fedora Project")),
+            "Should emit maintainer name");
+
+    // Should NOT emit foaf:mbox when there's no email
+    assert!(!lines.iter().any(|l| l.contains("foaf") && l.contains("mbox")),
+            "Should not emit mbox when packager has no email");
+
+    // URI should use stable ID (lowercase, hyphenated)
+    assert!(lines.iter().any(|l| l.contains("fedora-project")),
+            "Should use stable ID in maintainer URI");
+
+    Ok(())
+}
+
+#[test]
 fn test_emit_ecosystem_from_provides_cargo() -> std::io::Result<()> {
     let collector = RpmCollector::new(
         "http://example.com".to_string(),

@@ -665,25 +665,43 @@ impl RpmCollector {
         packager: &str,
     ) -> Result<usize> {
         let re = Regex::new(r"^(.+?)\s*<(.+?)>$").unwrap();
-        if let Some(caps) = re.captures(packager) {
+
+        let (name, email_or_id) = if let Some(caps) = re.captures(packager) {
+            // Format: "Name <email>" - extract both parts
             let name = caps.get(1).unwrap().as_str().trim();
             let email = caps.get(2).unwrap().as_str().trim();
+            (name, email.to_string())
+        } else {
+            // Format: "Name" - no email, generate stable ID from name
+            let name = packager.trim();
+            if name.is_empty() {
+                return Ok(0);
+            }
+            // Use lowercase, no spaces for stable ID
+            let stable_id = name.to_lowercase().replace(' ', "-");
+            (name, stable_id)
+        };
 
-            let maint_uri = maintainer_uri(email);
+        let maint_uri = maintainer_uri(&email_or_id);
 
-            writer.write_triple(&maint_uri, RDF_TYPE, &format!("{PKG}Maintainer"))?;
-            writer.write_literal(&maint_uri, &format!("{FOAF}name"), name)?;
+        writer.write_triple(&maint_uri, RDF_TYPE, &format!("{PKG}Maintainer"))?;
+        writer.write_literal(&maint_uri, &format!("{FOAF}name"), name)?;
+
+        // Only emit mbox if it looks like an email (contains @)
+        let mut triple_count = 2;
+        if email_or_id.contains('@') {
             writer.write_triple(
                 &maint_uri,
                 &format!("{FOAF}mbox"),
-                &format!("mailto:{email}"),
+                &format!("mailto:{email_or_id}"),
             )?;
-            writer.write_triple(pkg_uri, &format!("{PKG}maintainedBy"), &maint_uri)?;
-
-            return Ok(4);
+            triple_count += 1;
         }
 
-        Ok(0)
+        writer.write_triple(pkg_uri, &format!("{PKG}maintainedBy"), &maint_uri)?;
+        triple_count += 1;
+
+        Ok(triple_count)
     }
 
     fn emit_source_package_triples(
