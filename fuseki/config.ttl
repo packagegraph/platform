@@ -2,6 +2,8 @@
 @prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
 @prefix ja:      <http://jena.hpl.hp.com/2005/11/Assembler#> .
 @prefix tdb2:    <http://jena.apache.org/2016/tdb#> .
+@prefix text:    <http://jena.apache.org/text#> .
+@prefix pkg:     <https://purl.org/packagegraph/ontology/core#> .
 
 <#service> rdf:type fuseki:Service ;
     fuseki:name "packagegraph" ;
@@ -10,13 +12,23 @@
     fuseki:endpoint [ fuseki:operation fuseki:update ; fuseki:name "update" ] ;
     fuseki:endpoint [ fuseki:operation fuseki:gsp-r ; fuseki:name "get" ] ;
     fuseki:endpoint [ fuseki:operation fuseki:gsp-rw ; fuseki:name "data" ] ;
-    fuseki:dataset <#dataset> .
+    ## BULK LOAD MODE: bypass Lucene text index during data loading.
+    ## After loading, change back to <#text_dataset>, delete /data/text-index, and restart.
+    fuseki:dataset <#tdb_dataset> .
+
+# Text-indexed dataset wrapping TDB2 for SPARQL text:query substring search.
+# Usage: ?s text:query (pkg:packageName "openssl*") .
+# The text index is built incrementally — new triples are indexed on insertion.
+# To rebuild from scratch, delete /data/text-index and restart Fuseki.
+<#text_dataset> rdf:type text:TextDataset ;
+    text:dataset <#tdb_dataset> ;
+    text:index <#text_index> .
 
 # Ontology TBox is loaded into a named graph by the ETL pipeline
 # (https://packagegraph.github.io/ontology) to keep class/property
 # definitions out of the instance data default graph.
 # unionDefaultGraph makes queries see both graphs transparently.
-<#dataset> rdf:type tdb2:DatasetTDB2 ;
+<#tdb_dataset> rdf:type tdb2:DatasetTDB2 ;
     tdb2:location "/data/tdb2" ;
     tdb2:unionDefaultGraph true ;
     ## Query timeout: first value = initial timeout (ms), second = hard limit (ms)
@@ -24,3 +36,25 @@
     ## 30s soft timeout (query can be interrupted), 120s hard kill.
     ## See: https://jena.apache.org/documentation/fuseki2/fuseki-configuration.html
     ja:context [ ja:cxtName "arq:queryTimeout" ;  ja:cxtValue "30000,120000" ] .
+
+# Lucene text index for substring package search.
+# Stored on the TDB2 PVC at /data/text-index (survives restarts).
+# See: https://jena.apache.org/documentation/query/text-query.html
+<#text_index> rdf:type text:TextIndexLucene ;
+    text:directory <file:///data/text-index> ;
+    text:entityMap <#entity_map> ;
+    text:storeValues true ;
+    text:analyzer [ rdf:type text:StandardAnalyzer ] .
+
+# Entity map: predicates indexed for text search.
+# packageName — primary search field (e.g., "openssl", "python3-requests")
+# description — full-text discovery (e.g., "HTTP library")
+# upstreamPackageName — cross-ecosystem search (e.g., "tokio", "numpy")
+<#entity_map> rdf:type text:EntityMap ;
+    text:defaultField "packageName" ;
+    text:entityField "uri" ;
+    text:map (
+        [ text:field "packageName" ; text:predicate pkg:packageName ]
+        [ text:field "description" ; text:predicate pkg:description ]
+        [ text:field "upstreamPackageName" ; text:predicate pkg:upstreamPackageName ]
+    ) .

@@ -9,6 +9,8 @@ data:
     @prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
     @prefix ja:      <http://jena.hpl.hp.com/2005/11/Assembler#> .
     @prefix tdb2:    <http://jena.apache.org/2016/tdb#> .
+    @prefix text:    <http://jena.apache.org/text#> .
+    @prefix pkg:     <https://purl.org/packagegraph/ontology/core#> .
 
     <#service> rdf:type fuseki:Service ;
         fuseki:name "packagegraph" ;
@@ -17,9 +19,31 @@ data:
         fuseki:endpoint [ fuseki:operation fuseki:update ; fuseki:name "update" ] ;
         fuseki:endpoint [ fuseki:operation fuseki:gsp-r ; fuseki:name "get" ] ;
         fuseki:endpoint [ fuseki:operation fuseki:gsp-rw ; fuseki:name "data" ] ;
-        fuseki:dataset <#dataset> .
+        fuseki:dataset <#text_dataset> .
 
-    <#dataset> rdf:type tdb2:DatasetTDB2 ;
+    # Text-indexed dataset wrapping TDB2 for SPARQL text:query substring search
+    <#text_dataset> rdf:type text:TextDataset ;
+        text:dataset <#tdb_dataset> ;
+        text:index <#text_index> .
+
+    # unionDefaultGraph makes queries see all named graphs transparently
+    <#tdb_dataset> rdf:type tdb2:DatasetTDB2 ;
         tdb2:location "/data/tdb2" ;
         tdb2:unionDefaultGraph true ;
         ja:context [ ja:cxtName "arq:queryTimeout" ;  ja:cxtValue "30000,120000" ] .
+
+    # Lucene text index for substring package search
+    <#text_index> rdf:type text:TextIndexLucene ;
+        text:directory <file:///data/text-index> ;
+        text:entityMap <#entity_map> ;
+        text:storeValues true ;
+        text:analyzer [ rdf:type text:StandardAnalyzer ] .
+
+    <#entity_map> rdf:type text:EntityMap ;
+        text:defaultField "packageName" ;
+        text:entityField "uri" ;
+        text:map (
+            [ text:field "packageName" ; text:predicate pkg:packageName ]
+            [ text:field "description" ; text:predicate pkg:description ]
+            [ text:field "upstreamPackageName" ; text:predicate pkg:upstreamPackageName ]
+        ) .
