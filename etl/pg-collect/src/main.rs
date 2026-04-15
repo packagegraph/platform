@@ -9,6 +9,7 @@ use pg_collect::maven::MavenCollector;
 use pg_collect::cpan::CpanCollector;
 use pg_collect::cran::CranCollector;
 use pg_collect::hackage::HackageCollector;
+use pg_collect::nuget::NugetCollector;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -352,6 +353,21 @@ enum Commands {
         /// Hackage base URL
         #[arg(long, default_value = "https://hackage.haskell.org")]
         base_url: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
+    /// Collect NuGet packages from nuget.org
+    Nuget {
+        /// Seed file with package IDs (one per line)
+        #[arg(long, required = true)]
+        packages_file: String,
+
+        /// NuGet service index URL
+        #[arg(long, default_value = "https://api.nuget.org/v3/index.json")]
+        service_index: String,
 
         /// Output file path
         #[arg(short, long, required = true)]
@@ -712,6 +728,19 @@ fn main() {
 
             let collector = HackageCollector::new(base_url);
             collector.collect(&packages_file, &output)
+        }
+
+        Commands::Nuget { packages_file, service_index, output } => {
+            eprintln!("=== PackageGraph NuGet Collector ===");
+            eprintln!("Service Index: {}", service_index);
+            eprintln!("Seed: {}", packages_file);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            match NugetCollector::new_from_service_index(&service_index) {
+                Ok(collector) => collector.collect(&packages_file, &output),
+                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+            }
         }
 
         Commands::Load { file, graph, endpoint, batch_size } => {

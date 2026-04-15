@@ -27,6 +27,7 @@ resources:
   - jobs/collect-cpan.yaml
   - jobs/collect-cran.yaml
   - jobs/collect-hackage.yaml
+  - jobs/collect-nuget.yaml
   - jobs/snapshot-tdb2.yaml
   - jobs/enrich-github-vcs.yaml
   - jobs/enrich-license.yaml

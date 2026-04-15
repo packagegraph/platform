@@ -21,3 +21,4 @@ pub mod maven;
 pub mod cpan;
 pub mod cran;
 pub mod hackage;
+pub mod nuget;
