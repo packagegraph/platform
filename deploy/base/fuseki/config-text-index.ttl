@@ -1,0 +1,116 @@
+# Fuseki Configuration with Lucene Text Indexing
+# ================================================
+#
+# This configuration extends the base TDB2 dataset with full-text search
+# capabilities using Apache Jena's text:TextDataset wrapper and Lucene.
+#
+# DEPLOYMENT STEPS:
+# -----------------
+# 1. Ensure /data/text-index directory exists with write permissions:
+#    mkdir -p /data/text-index && chown fuseki:fuseki /data/text-index
+#
+# 2. Replace existing config.ttl with this file in the Fuseki container
+#
+# 3. Restart Fuseki (text index auto-builds on first query)
+#
+# 4. Verify with a test query:
+#    SELECT ?pkg ?name WHERE {
+#      ?name text:query "numpy" .
+#      ?pkg core:packageName ?name .
+#    } LIMIT 10
+#
+# FEATURES ENABLED:
+# -----------------
+# - text:query() SPARQL function for keyword search
+# - Indexed properties: core:packageName, core:description
+# - Lucene StandardAnalyzer (handles stemming, stopwords)
+# - Auto-commit on updates (keeps index synchronized)
+#
+# REQUIREMENTS:
+# -------------
+# - jena-text module (included in jena-fuseki-fulljar)
+# - Lucene analyzer libraries (bundled with Jena)
+# - ~200MB disk space for text index (scales with dataset)
+#
+# EXAMPLE QUERIES:
+# ----------------
+# Search package names:
+#   ?name text:query "tensorflow" .
+#   ?pkg core:packageName ?name .
+#
+# Search descriptions:
+#   ?desc text:query "machine learning" .
+#   ?pkg core:description ?desc .
+#
+# Combined search with filters:
+#   ?text text:query (core:packageName "pandas") .
+#   ?pkg core:packageName ?text ; core:ecosystem "PyPI" .
+
+@prefix fuseki:  <http://jena.apache.org/fuseki#> .
+@prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix ja:      <http://jena.hpl.hp.com/2005/11/Assembler#> .
+@prefix tdb2:    <http://jena.apache.org/2016/tdb#> .
+@prefix text:    <http://jena.apache.org/text#> .
+@prefix core:    <https://packagegraph.github.io/ontology#> .
+
+# Service definition (unchanged from base config)
+<#service> rdf:type fuseki:Service ;
+    fuseki:name "packagegraph" ;
+    fuseki:endpoint [ fuseki:operation fuseki:query ; fuseki:name "sparql" ] ;
+    fuseki:endpoint [ fuseki:operation fuseki:query ; fuseki:name "query" ] ;
+    fuseki:endpoint [ fuseki:operation fuseki:update ; fuseki:name "update" ] ;
+    fuseki:endpoint [ fuseki:operation fuseki:gsp-r ; fuseki:name "get" ] ;
+    fuseki:endpoint [ fuseki:operation fuseki:gsp-rw ; fuseki:name "data" ] ;
+    fuseki:dataset <#text_dataset> .
+
+# Text-indexed dataset (wraps TDB2 dataset)
+<#text_dataset> rdf:type text:TextDataset ;
+    text:dataset <#tdb_dataset> ;
+    text:index <#text_index> .
+
+# Base TDB2 dataset (same as base config)
+<#tdb_dataset> rdf:type tdb2:DatasetTDB2 ;
+    tdb2:location "/data/tdb2" ;
+    tdb2:unionDefaultGraph true ;
+    ## Query timeout: first value = initial timeout (ms), second = hard limit (ms)
+    ## Protects against runaway queries from YASGUI or query-raw.
+    ## 30s soft timeout (query can be interrupted), 120s hard kill.
+    ## See: https://jena.apache.org/documentation/fuseki2/fuseki-configuration.html
+    ja:context [ ja:cxtName "arq:queryTimeout" ;  ja:cxtValue "30000,120000" ] .
+
+# Lucene text index configuration
+<#text_index> rdf:type text:TextIndexLucene ;
+    text:directory <file:/data/text-index> ;
+    text:entityMap <#entity_map> ;
+    text:storeValues true ;
+    text:analyzer [
+        rdf:type text:StandardAnalyzer
+    ] ;
+    text:queryAnalyzer [
+        rdf:type text:StandardAnalyzer
+    ] ;
+    text:queryParser text:QueryParserStandard ;
+    text:multilingualSupport false ;
+    ## Auto-commit keeps index synchronized with dataset updates
+    text:defineAnalyzers (
+        [text:addLang "en" ; text:analyzer [ rdf:type text:StandardAnalyzer ]]
+    ) .
+
+# Entity mapping: which properties to index
+<#entity_map> rdf:type text:EntityMap ;
+    text:defaultField "text" ;
+    text:entityField "uri" ;
+    text:uidField "uid" ;
+    text:langField "lang" ;
+    text:graphField "graph" ;
+    text:map (
+        ## Index package names (exact matches critical for package lookup)
+        [ text:field "packageName" ;
+          text:predicate core:packageName ;
+          text:analyzer [ rdf:type text:KeywordAnalyzer ] ]
+
+        ## Index descriptions (full-text search with stemming)
+        [ text:field "description" ;
+          text:predicate core:description ]
+    ) .
