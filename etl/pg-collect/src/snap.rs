@@ -44,11 +44,19 @@ struct SnapInfoResponse {
     name: String,
     #[serde(rename = "snap-id")]
     snap_id: Option<String>,
-    summary: Option<String>,
+    snap: Option<SnapDetails>,
     #[serde(rename = "default-track")]
     default_track: Option<String>,
     #[serde(rename = "channel-map")]
     channel_map: Option<Vec<SnapChannel>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapDetails {
+    summary: Option<String>,
+    license: Option<String>,
+    #[serde(rename = "snap-id")]
+    snap_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,7 +136,41 @@ impl SnapCollector {
         }
 
         let text = response.text().map_err(|e| e.to_string())?;
-        serde_json::from_str(&text).map_err(|e| e.to_string())
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+
+        // Parse manually to handle API response variations
+        let snap_name = v["name"].as_str().unwrap_or(name).to_string();
+        let snap_id = v["snap-id"].as_str().map(|s| s.to_string());
+        let snap_details = v.get("snap").and_then(|s| {
+            Some(SnapDetails {
+                summary: s["summary"].as_str().map(|s| s.to_string()),
+                license: s["license"].as_str().map(|s| s.to_string()),
+                snap_id: s["snap-id"].as_str().map(|s| s.to_string()),
+            })
+        });
+
+        let channel_map = v["channel-map"].as_array().map(|channels| {
+            channels.iter().filter_map(|ch| {
+                let channel_obj = ch.get("channel")?;
+                Some(SnapChannel {
+                    channel: SnapChannelInfo {
+                        name: channel_obj["name"].as_str().map(|s| s.to_string()),
+                        risk: channel_obj["risk"].as_str().map(|s| s.to_string()),
+                        track: channel_obj["track"].as_str().map(|s| s.to_string()),
+                    },
+                    version: ch["version"].as_str().map(|s| s.to_string()),
+                    confinement: ch["confinement"].as_str().map(|s| s.to_string()),
+                })
+            }).collect()
+        });
+
+        Ok(SnapInfoResponse {
+            name: snap_name,
+            snap_id,
+            snap: snap_details,
+            default_track: v["default-track"].as_str().map(|s| s.to_string()),
+            channel_map,
+        })
     }
 
     fn emit_snap_triples(&self, writer: &mut NTriplesWriter, info: &SnapInfoResponse) -> Result<usize> {
@@ -170,9 +212,16 @@ impl SnapCollector {
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         triples += 1;
 
-        if let Some(summary) = &info.summary {
-            writer.write_literal(&pkg_uri, &format!("{PKG}description"), summary)?;
-            triples += 1;
+        // Extract summary and license from snap sub-object
+        if let Some(snap) = &info.snap {
+            if let Some(summary) = &snap.summary {
+                writer.write_literal(&pkg_uri, &format!("{PKG}description"), summary)?;
+                triples += 1;
+            }
+            if let Some(license) = &snap.license {
+                writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
+                triples += 1;
+            }
         }
 
         if let Some(snap_id) = &info.snap_id {
@@ -200,7 +249,11 @@ mod tests {
         let json = r#"{
             "name": "firefox",
             "snap-id": "3wdHCAVyZEmYsCMFDE9qt92UV8rC8Wdk",
-            "summary": "Mozilla Firefox web browser",
+            "snap": {
+                "summary": "Mozilla Firefox web browser",
+                "license": "MPL-2.0",
+                "snap-id": "3wdHCAVyZEmYsCMFDE9qt92UV8rC8Wdk"
+            },
             "default-track": "latest",
             "channel-map": [{
                 "channel": {"name": "stable", "risk": "stable", "track": "latest"},
@@ -211,6 +264,7 @@ mod tests {
 
         let info: SnapInfoResponse = serde_json::from_str(json).unwrap();
         assert_eq!(info.name, "firefox");
+        assert_eq!(info.snap.as_ref().unwrap().summary.as_deref(), Some("Mozilla Firefox web browser"));
         assert_eq!(info.channel_map.as_ref().unwrap()[0].version.as_deref(), Some("125.0"));
     }
 
@@ -223,7 +277,11 @@ mod tests {
         let info = SnapInfoResponse {
             name: "firefox".into(),
             snap_id: Some("3wdHCAVyZEmYsCMFDE9qt92UV8rC8Wdk".into()),
-            summary: Some("Web browser".into()),
+            snap: Some(SnapDetails {
+                summary: Some("Web browser".into()),
+                license: Some("MPL-2.0".into()),
+                snap_id: Some("3wdHCAVyZEmYsCMFDE9qt92UV8rC8Wdk".into()),
+            }),
             default_track: Some("latest".into()),
             channel_map: Some(vec![SnapChannel {
                 channel: SnapChannelInfo { name: Some("stable".into()), risk: Some("stable".into()), track: Some("latest".into()) },
@@ -244,6 +302,8 @@ mod tests {
         assert!(content.contains("snap#confinement"));
         assert!(content.contains("\"strict\""));
         assert!(content.contains("snap#snapId"));
+        assert!(content.contains("licenseName"));
+        assert!(content.contains("\"MPL-2.0\""));
         assert!(triples > 10);
     }
 }

@@ -24,27 +24,61 @@ impl GoModCollector {
         Self { client, proxy_url }
     }
 
-    pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
+    pub fn collect(&self, packages_file: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
+        use std::collections::{HashSet, HashMap, VecDeque};
+
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new(file);
 
         self.emit_distribution_metadata(&mut writer)?;
 
-        let module_paths = read_seed_file(packages_file)?;
-        eprintln!("Loaded {} module paths from seed file", module_paths.len());
+        let seeds = read_seed_file(packages_file)?;
+        eprintln!("Loaded {} seed modules", seeds.len());
+        eprintln!("Spider config: max_depth={}, max_packages={}", max_depth, max_packages);
+
+        // BFS state
+        let mut queue: VecDeque<String> = seeds.into_iter().collect();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut depth_map: HashMap<String, u32> = HashMap::new();
+
+        for path in queue.iter() {
+            depth_map.insert(path.clone(), 0);
+        }
 
         let mut total_packages = 0;
         let mut total_triples = 0;
 
-        for (idx, module_path) in module_paths.iter().enumerate() {
-            if (idx + 1) % 100 == 0 {
-                eprintln!("Progress: {}/{}", idx + 1, module_paths.len());
+        while let Some(module_path) = queue.pop_front() {
+            if !visited.insert(module_path.clone()) {
+                continue;
             }
 
-            match self.collect_module(&mut writer, module_path) {
-                Ok(triples) => {
+            if visited.len() > max_packages {
+                eprintln!("Reached max_packages limit ({})", max_packages);
+                break;
+            }
+
+            let depth = *depth_map.get(&module_path).unwrap_or(&0);
+
+            if visited.len() % 100 == 0 {
+                eprintln!("Progress: {} modules (depth {})", visited.len(), depth);
+            }
+
+            // collect_module fetches and emits, returns (triples, deps)
+            match self.collect_module_with_deps(&mut writer, &module_path) {
+                Ok((triples, dep_paths)) => {
                     total_triples += triples;
                     total_packages += 1;
+
+                    // Enqueue requires (both direct and indirect)
+                    if depth < max_depth {
+                        for dep_path in dep_paths {
+                            if !visited.contains(&dep_path) && !depth_map.contains_key(&dep_path) {
+                                depth_map.insert(dep_path.clone(), depth + 1);
+                                queue.push_back(dep_path);
+                            }
+                        }
+                    }
                 }
                 Err(e) => eprintln!("  Error collecting {}: {}", module_path, e),
             }
@@ -52,6 +86,7 @@ impl GoModCollector {
             std::thread::sleep(Duration::from_millis(100));
         }
 
+        eprintln!("Collected {} modules ({} total in graph)", total_packages, visited.len());
         writer.flush()?;
         Ok((total_packages, total_triples))
     }
@@ -78,6 +113,15 @@ impl GoModCollector {
         writer: &mut NTriplesWriter,
         module_path: &str,
     ) -> std::result::Result<usize, String> {
+        let (triples, _deps) = self.collect_module_with_deps(writer, module_path)?;
+        Ok(triples)
+    }
+
+    fn collect_module_with_deps(
+        &self,
+        writer: &mut NTriplesWriter,
+        module_path: &str,
+    ) -> std::result::Result<(usize, Vec<String>), String> {
         let encoded = encode_go_module_path(module_path);
 
         // Fetch version list
@@ -99,9 +143,16 @@ impl GoModCollector {
         // Parse go.mod for dependencies
         let go_mod = parse_go_mod(&go_mod_content);
 
+        // Extract dep paths before emitting (for spidering)
+        let dep_paths: Vec<String> = go_mod.requires.iter()
+            .map(|r| r.module_path.clone())
+            .collect();
+
         // Emit triples
-        self.emit_module_triples(writer, module_path, version, &go_mod)
-            .map_err(|e| e.to_string())
+        let triples = self.emit_module_triples(writer, module_path, version, &go_mod)
+            .map_err(|e| e.to_string())?;
+
+        Ok((triples, dep_paths))
     }
 
     fn fetch_text(&self, url: &str) -> std::result::Result<String, String> {

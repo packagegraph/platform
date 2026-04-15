@@ -54,12 +54,11 @@ impl CondaCollector {
         let url = format!("{}/{}/repodata.json", self.channel_url.trim_end_matches('/'), self.subdir);
         eprintln!("Fetching {}", url);
 
-        let repodata: RepodataJson = self.client.get(&url).send()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
-            .text()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            .and_then(|t| serde_json::from_str(&t)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        let response = self.client.get(&url).send()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let reader = std::io::BufReader::new(response);
+        let repodata: RepodataJson = serde_json::from_reader(reader)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         let mut total_packages = 0;
         let mut total_triples = 0;
@@ -94,12 +93,11 @@ impl CondaCollector {
         let url = format!("{}/{}/repodata.json", self.channel_url.trim_end_matches('/'), self.subdir);
         eprintln!("Fetching {}", url);
 
-        let repodata: RepodataJson = self.client.get(&url).send()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
-            .text()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            .and_then(|t| serde_json::from_str(&t)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        let response = self.client.get(&url).send()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let reader = std::io::BufReader::new(response);
+        let repodata: RepodataJson = serde_json::from_reader(reader)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         let name_set: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
         let mut total_packages = 0;
@@ -195,12 +193,18 @@ impl CondaCollector {
         }
 
         // Dependencies
-        if let Some(deps) = &entry.depends {
+        let has_python_dep = if let Some(deps) = &entry.depends {
             let dep_re = Regex::new(r"^([a-zA-Z0-9_.-]+)\s*(.*)$").unwrap();
+            let mut has_python = false;
+
             for dep_str in deps {
                 if let Some(caps) = dep_re.captures(dep_str) {
                     let dep_name = caps.get(1).unwrap().as_str();
                     let constraint = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+
+                    if dep_name.starts_with("python") {
+                        has_python = true;
+                    }
 
                     let target_uri = package_identity_uri("conda", "conda-forge", &self.subdir, dep_name);
                     writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
@@ -223,6 +227,35 @@ impl CondaCollector {
                     }
                 }
             }
+            has_python
+        } else {
+            false
+        };
+
+        // Cross-ecosystem correlation via upstreamPackageName
+        // Conda-forge packages often map 1:1 to upstream ecosystems
+        let ecosystem = if has_python_dep {
+            Some("pypi")
+        } else if entry.name.starts_with("r-") {
+            Some("cran")
+        } else if entry.name.starts_with("rust-") {
+            Some("cargo")
+        } else {
+            None
+        };
+
+        if let Some(eco) = ecosystem {
+            writer.write_literal(&pkg_uri, &format!("{PKG}upstreamEcosystem"), eco)?;
+            // For r-* packages, strip r- prefix; for rust-*, strip rust-; otherwise use name as-is
+            let upstream_name = if entry.name.starts_with("r-") {
+                entry.name.strip_prefix("r-").unwrap_or(&entry.name)
+            } else if entry.name.starts_with("rust-") {
+                entry.name.strip_prefix("rust-").unwrap_or(&entry.name)
+            } else {
+                &entry.name
+            };
+            writer.write_literal(&pkg_uri, &format!("{PKG}upstreamPackageName"), upstream_name)?;
+            triples += 2;
         }
 
         Ok(triples)

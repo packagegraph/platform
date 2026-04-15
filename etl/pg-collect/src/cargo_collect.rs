@@ -65,28 +65,61 @@ impl CargoCollector {
         Self { client }
     }
 
-    pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
+    pub fn collect(&self, packages_file: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
+        use std::collections::{HashSet, HashMap, VecDeque};
+
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new(file);
 
         self.emit_distribution_metadata(&mut writer)?;
 
-        let crate_names = read_seed_file(packages_file)?;
-        eprintln!("Loaded {} crate names from seed file", crate_names.len());
+        let seeds = read_seed_file(packages_file)?;
+        eprintln!("Loaded {} seed crates", seeds.len());
+        eprintln!("Spider config: max_depth={}, max_packages={}", max_depth, max_packages);
+
+        // BFS state
+        let mut queue: VecDeque<String> = seeds.into_iter().collect();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut depth_map: HashMap<String, u32> = HashMap::new();
+
+        for name in queue.iter() {
+            depth_map.insert(name.clone(), 0);
+        }
 
         let mut total_packages = 0;
         let mut total_triples = 0;
         let mut base_delay_ms: u64 = 200;
 
-        for (idx, name) in crate_names.iter().enumerate() {
-            if (idx + 1) % 100 == 0 {
-                eprintln!("Progress: {}/{}", idx + 1, crate_names.len());
+        while let Some(name) = queue.pop_front() {
+            if !visited.insert(name.clone()) {
+                continue;
             }
 
-            match self.fetch_crate_with_retry(name, &mut base_delay_ms) {
+            if visited.len() > max_packages {
+                eprintln!("Reached max_packages limit ({})", max_packages);
+                break;
+            }
+
+            let depth = *depth_map.get(&name).unwrap_or(&0);
+
+            if visited.len() % 100 == 0 {
+                eprintln!("Progress: {} crates (depth {})", visited.len(), depth);
+            }
+
+            match self.fetch_crate_with_retry(&name, &mut base_delay_ms) {
                 Ok((crate_resp, deps)) => {
                     total_triples += self.emit_crate_triples(&mut writer, &crate_resp, &deps)?;
                     total_packages += 1;
+
+                    // Enqueue runtime + build deps (skip dev)
+                    if depth < max_depth {
+                        for dep in deps {
+                            if dep.kind != "dev" && !visited.contains(&dep.crate_id) && !depth_map.contains_key(&dep.crate_id) {
+                                depth_map.insert(dep.crate_id.clone(), depth + 1);
+                                queue.push_back(dep.crate_id);
+                            }
+                        }
+                    }
                 }
                 Err(e) => eprintln!("  Error fetching {}: {}", name, e),
             }
@@ -94,6 +127,7 @@ impl CargoCollector {
             std::thread::sleep(Duration::from_millis(base_delay_ms));
         }
 
+        eprintln!("Collected {} crates ({} total in graph)", total_packages, visited.len());
         writer.flush()?;
         Ok((total_packages, total_triples))
     }

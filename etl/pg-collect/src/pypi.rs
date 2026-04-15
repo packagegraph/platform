@@ -41,28 +41,63 @@ impl PypiCollector {
         Self { client }
     }
 
-    pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
+    pub fn collect(&self, packages_file: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
+        use std::collections::{HashSet, HashMap, VecDeque};
+
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new(file);
 
         self.emit_distribution_metadata(&mut writer)?;
 
-        let package_names = read_seed_file(packages_file)?;
-        eprintln!("Loaded {} package names from seed file", package_names.len());
+        let seeds = read_seed_file(packages_file)?;
+        eprintln!("Loaded {} seed packages", seeds.len());
+        eprintln!("Spider config: max_depth={}, max_packages={}", max_depth, max_packages);
+
+        // BFS state
+        let mut queue: VecDeque<String> = seeds.into_iter().collect();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut depth_map: HashMap<String, u32> = HashMap::new();
+
+        // Seeds start at depth 0
+        for name in queue.iter() {
+            depth_map.insert(name.clone(), 0);
+        }
 
         let mut total_packages = 0;
         let mut total_triples = 0;
         let mut base_delay_ms = 200;
 
-        for (idx, name) in package_names.iter().enumerate() {
-            if (idx + 1) % 50 == 0 {
-                eprintln!("Progress: {}/{}", idx + 1, package_names.len());
+        while let Some(name) = queue.pop_front() {
+            if !visited.insert(name.clone()) {
+                continue; // Already processed
             }
 
-            match self.fetch_package_with_retry(name, &mut base_delay_ms) {
+            if visited.len() > max_packages {
+                eprintln!("Reached max_packages limit ({})", max_packages);
+                break;
+            }
+
+            let depth = *depth_map.get(&name).unwrap_or(&0);
+
+            if (visited.len()) % 50 == 0 {
+                eprintln!("Progress: {} packages (depth {})", visited.len(), depth);
+            }
+
+            match self.fetch_package_with_retry(&name, &mut base_delay_ms) {
                 Ok(pkg) => {
-                    total_triples += self.emit_package_triples(&mut writer, &pkg)?;
+                    let (pkg_triples, dep_names) = self.emit_package_triples(&mut writer, &pkg)?;
+                    total_triples += pkg_triples;
                     total_packages += 1;
+
+                    // Enqueue dependencies if under max_depth
+                    if depth < max_depth {
+                        for dep_name in dep_names {
+                            if !visited.contains(&dep_name) && !depth_map.contains_key(&dep_name) {
+                                depth_map.insert(dep_name.clone(), depth + 1);
+                                queue.push_back(dep_name);
+                            }
+                        }
+                    }
                 }
                 Err(e) => eprintln!("  Error fetching {}: {}", name, e),
             }
@@ -70,6 +105,7 @@ impl PypiCollector {
             std::thread::sleep(Duration::from_millis(base_delay_ms));
         }
 
+        eprintln!("Collected {} packages ({} total in graph)", total_packages, visited.len());
         writer.flush()?;
         Ok((total_packages, total_triples))
     }
@@ -138,11 +174,12 @@ impl PypiCollector {
         Err(format!("Max retries exceeded for {}", name))
     }
 
+    /// Emit package triples and return (triple_count, dep_names) for spidering.
     fn emit_package_triples(
         &self,
         writer: &mut NTriplesWriter,
         response: &PypiProjectResponse,
-    ) -> Result<usize> {
+    ) -> Result<(usize, Vec<String>)> {
         let info = &response.info;
         let pkg_uri = package_uri("pypi", "index", "any", &info.name, &info.version);
         let identity_uri = package_identity_uri("pypi", "index", "any", &info.name);
@@ -203,36 +240,43 @@ impl PypiCollector {
         }
 
         // Dependencies (requires_dist format: "package (>=1.0,<2.0)")
-        if let Some(requires_dist) = &info.requires_dist {
-            triples += self.parse_requires_dist(writer, &pkg_uri, requires_dist)?;
-        }
+        let dep_names = if let Some(requires_dist) = &info.requires_dist {
+            let (dep_triples, names) = self.parse_requires_dist(writer, &pkg_uri, requires_dist)?;
+            triples += dep_triples;
+            names
+        } else {
+            Vec::new()
+        };
 
-        Ok(triples)
+        Ok((triples, dep_names))
     }
 
+    /// Parse requires_dist and emit dependency triples.
+    /// Returns (triple_count, Vec<dep_names>) for spidering.
     fn parse_requires_dist(
         &self,
         writer: &mut NTriplesWriter,
         pkg_uri: &str,
         requires_dist: &[String],
-    ) -> Result<usize> {
+    ) -> Result<(usize, Vec<String>)> {
         let dep_re = Regex::new(r"^([a-zA-Z0-9._-]+)\s*(\(.*\))?").unwrap();
         let mut triples = 0;
+        let mut dep_names = Vec::new();
 
         for req in requires_dist {
             // Skip extras markers like "foo[extra]" - just parse the base name
             let cleaned = req.split(';').next().unwrap_or(req).trim();
 
             if let Some(caps) = dep_re.captures(cleaned) {
-                let dep_name = caps.get(1).unwrap().as_str();
+                let dep_name = caps.get(1).unwrap().as_str().to_string();
                 let version_spec = caps.get(2).map(|m| m.as_str());
 
-                let target_uri = package_identity_uri("pypi", "index", "any", dep_name);
+                let target_uri = package_identity_uri("pypi", "index", "any", &dep_name);
 
                 writer.write_triple(pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
                 triples += 1;
 
-                let bnode = bnode_id("depends", &format!("{}-{}", pkg_uri, dep_name));
+                let bnode = bnode_id("depends", &format!("{}-{}", pkg_uri, &dep_name));
                 writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
                 writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
                 writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
@@ -240,17 +284,19 @@ impl PypiCollector {
                 triples += 4;
 
                 if let Some(spec) = version_spec {
-                    let cb = bnode_id("constraint", &format!("{}-{}", pkg_uri, dep_name));
+                    let cb = bnode_id("constraint", &format!("{}-{}", pkg_uri, &dep_name));
                     writer.write_bnode_object(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
                     writer.write_bnode_subject(&cb, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
                     writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintOperator"), "pep440")?;
                     writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintValue"), spec)?;
                     triples += 4;
                 }
+
+                dep_names.push(dep_name);
             }
         }
 
-        Ok(triples)
+        Ok((triples, dep_names))
     }
 }
 
@@ -300,7 +346,7 @@ mod tests {
             },
         };
 
-        let triples = collector.emit_package_triples(&mut writer, &response).unwrap();
+        let (triples, dep_names) = collector.emit_package_triples(&mut writer, &response).unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
@@ -314,6 +360,7 @@ mod tests {
         assert!(content.contains("classifierString"));
         assert!(content.contains("directlyDependsOn"));
         assert!(triples > 15);
+        assert_eq!(dep_names, vec!["charset-normalizer"], "Should extract dep name");
     }
 
     #[test]
@@ -329,7 +376,7 @@ mod tests {
             "urllib3 (<3,>=1.21.1)".into(),
         ];
 
-        let triples = collector.parse_requires_dist(&mut writer, &pkg_uri, &requires).unwrap();
+        let (triples, dep_names) = collector.parse_requires_dist(&mut writer, &pkg_uri, &requires).unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
@@ -341,5 +388,9 @@ mod tests {
         assert!(content.contains("directlyDependsOn"));
         assert!(content.contains("dependencyTarget"));
         assert!(triples >= 15); // 3 deps * 5 triples
+        assert_eq!(dep_names.len(), 3, "Should extract 3 dep names");
+        assert!(dep_names.contains(&"charset-normalizer".to_string()));
+        assert!(dep_names.contains(&"idna".to_string()));
+        assert!(dep_names.contains(&"urllib3".to_string()));
     }
 }
