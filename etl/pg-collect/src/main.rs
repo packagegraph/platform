@@ -12,6 +12,7 @@ use pg_collect::hackage::HackageCollector;
 use pg_collect::nuget::NugetCollector;
 use pg_collect::hex_collect::HexCollector;
 use pg_collect::freebsd::FreebsdCollector;
+use pg_collect::nix::NixCollector;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -410,6 +411,17 @@ enum Commands {
         output: String,
     },
 
+    /// Collect Nix packages from NixOS channel
+    Nix {
+        /// Channel URL
+        #[arg(long, default_value = "https://channels.nixos.org/nixos-24.05")]
+        channel_url: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
     /// Load N-Triples file into a Fuseki named graph via SPARQL Update
     Load {
         /// N-Triples file to load
@@ -799,6 +811,16 @@ fn main() {
             eprintln!();
 
             let collector = FreebsdCollector::new(mirror, release, arch);
+            collector.collect(&output)
+        }
+
+        Commands::Nix { channel_url, output } => {
+            eprintln!("=== PackageGraph Nix Collector ===");
+            eprintln!("Channel: {}", channel_url);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let collector = NixCollector::new(channel_url);
             collector.collect(&output)
         }
 
