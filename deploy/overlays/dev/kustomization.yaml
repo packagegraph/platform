@@ -31,6 +31,7 @@ resources:
   - jobs/collect-hex.yaml
   - jobs/collect-freebsd.yaml
   - jobs/collect-nix.yaml
+  - jobs/collect-chocolatey.yaml
   - jobs/snapshot-tdb2.yaml
   - jobs/enrich-github-vcs.yaml
   - jobs/enrich-license.yaml

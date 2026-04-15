@@ -13,6 +13,7 @@ use pg_collect::nuget::NugetCollector;
 use pg_collect::hex_collect::HexCollector;
 use pg_collect::freebsd::FreebsdCollector;
 use pg_collect::nix::NixCollector;
+use pg_collect::chocolatey::ChocolateyCollector;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -422,6 +423,17 @@ enum Commands {
         output: String,
     },
 
+    /// Collect Chocolatey packages from community repository
+    Chocolatey {
+        /// API URL
+        #[arg(long, default_value = "https://community.chocolatey.org/api/v2")]
+        api_url: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
     /// Load N-Triples file into a Fuseki named graph via SPARQL Update
     Load {
         /// N-Triples file to load
@@ -821,6 +833,16 @@ fn main() {
             eprintln!();
 
             let collector = NixCollector::new(channel_url);
+            collector.collect(&output)
+        }
+
+        Commands::Chocolatey { api_url, output } => {
+            eprintln!("=== PackageGraph Chocolatey Collector ===");
+            eprintln!("API: {}", api_url);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let collector = ChocolateyCollector::new(api_url);
             collector.collect(&output)
         }
 

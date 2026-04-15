@@ -25,3 +25,4 @@ pub mod nuget;
 pub mod hex_collect;
 pub mod freebsd;
 pub mod nix;
+pub mod chocolatey;
