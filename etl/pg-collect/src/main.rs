@@ -10,6 +10,7 @@ use pg_collect::cpan::CpanCollector;
 use pg_collect::cran::CranCollector;
 use pg_collect::hackage::HackageCollector;
 use pg_collect::nuget::NugetCollector;
+use pg_collect::hex_collect::HexCollector;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -368,6 +369,21 @@ enum Commands {
         /// NuGet service index URL
         #[arg(long, default_value = "https://api.nuget.org/v3/index.json")]
         service_index: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
+    /// Collect Hex packages from hex.pm
+    Hex {
+        /// Seed file with package names (one per line)
+        #[arg(long, required = true)]
+        packages_file: String,
+
+        /// Hex API base URL
+        #[arg(long, default_value = "https://hex.pm")]
+        api_base: String,
 
         /// Output file path
         #[arg(short, long, required = true)]
@@ -741,6 +757,17 @@ fn main() {
                 Ok(collector) => collector.collect(&packages_file, &output),
                 Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
             }
+        }
+
+        Commands::Hex { packages_file, api_base, output } => {
+            eprintln!("=== PackageGraph Hex Collector ===");
+            eprintln!("API: {}", api_base);
+            eprintln!("Seed: {}", packages_file);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let collector = HexCollector::new(api_base);
+            collector.collect(&packages_file, &output)
         }
 
         Commands::Load { file, graph, endpoint, batch_size } => {
