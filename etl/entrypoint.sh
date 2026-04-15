@@ -69,12 +69,15 @@ fi
 
 # Step 2: Load into Fuseki or build TDB2
 if [ -n "$FUSEKI_ENDPOINT" ] && [ -n "$GRAPH_URI" ]; then
-    echo "Loading via SPARQL Update into graph <$GRAPH_URI>..."
+    echo "Loading via GSP into graph <$GRAPH_URI>..."
 
-    # Drop existing graph
-    pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+    # Only DROP on explicit full reload (avoids TDB2 mmap corruption on large graphs)
+    if [ "${COLLECTOR_FULL_RELOAD:-0}" = "1" ]; then
+        echo "Full reload requested — dropping existing graph..."
+        pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+    fi
 
-    # Load all .nt files
+    # Load all .nt files (GSP POST appends to existing graph)
     for f in "$OUTPUT_DIR"/*.nt; do
         [ -f "$f" ] && pg-collect load "$f" --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
     done

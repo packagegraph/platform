@@ -17,7 +17,17 @@ impl NTriplesWriter {
     }
 
     /// Write a triple: `<subject> <predicate> <object> .\n`
+    ///
+    /// Validates that URIs don't contain characters illegal in N-Triples IRIs.
+    /// Skips the triple and warns on stderr if any URI is malformed.
     pub fn write_triple(&mut self, subject: &str, predicate: &str, object: &str) -> Result<()> {
+        if has_invalid_iri_chars(subject) || has_invalid_iri_chars(predicate) || has_invalid_iri_chars(object) {
+            eprintln!("WARNING: skipping triple with invalid URI character: <{}> <{}> <{}>",
+                &subject[..subject.len().min(80)],
+                &predicate[..predicate.len().min(80)],
+                &object[..object.len().min(80)]);
+            return Ok(());
+        }
         writeln!(self.writer, "<{subject}> <{predicate}> <{object}> .")
     }
 
@@ -90,6 +100,31 @@ impl NTriplesWriter {
     pub fn flush(&mut self) -> Result<()> {
         self.writer.flush()
     }
+}
+
+/// Check if a URI string contains characters that are illegal in N-Triples IRIs.
+/// N-Triples IRIs must not contain: < > " { } | ^ ` \ or unescaped whitespace.
+/// Also rejects bare `%` not followed by two hex digits (invalid percent-encoding).
+fn has_invalid_iri_chars(uri: &str) -> bool {
+    let bytes = uri.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`' | b'\\' | b' ' | b'\t' | b'\n' | b'\r' => {
+                return true;
+            }
+            b'%' => {
+                // Must be followed by exactly two hex digits
+                if i + 2 >= bytes.len()
+                    || !bytes[i + 1].is_ascii_hexdigit()
+                    || !bytes[i + 2].is_ascii_hexdigit()
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Escape a string literal for N-Triples.
@@ -265,6 +300,50 @@ mod tests {
         let mut content = String::new();
         temp_file.reopen()?.read_to_string(&mut content)?;
         assert!(content.contains("_:dep1"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_has_invalid_iri_chars() {
+        assert!(!has_invalid_iri_chars("https://example.org/foo/bar"));
+        assert!(!has_invalid_iri_chars("https://example.org/foo%2Fbar"));  // valid percent-encoding
+        assert!(!has_invalid_iri_chars("https://example.org/foo%25bar"));  // encoded %
+        assert!(has_invalid_iri_chars("https://example.org/foo bar"));     // space
+        assert!(has_invalid_iri_chars("https://example.org/foo%xyz"));     // bare % (not followed by hex)
+        assert!(has_invalid_iri_chars("https://example.org/foo%GGbar"));   // % followed by non-hex
+        assert!(has_invalid_iri_chars("https://example.org/<foo>"));       // angle brackets
+        assert!(has_invalid_iri_chars("https://example.org/foo\"bar"));    // quote
+        assert!(has_invalid_iri_chars("https://example.org/foo\\bar"));    // backslash
+    }
+
+    #[test]
+    fn test_write_triple_skips_invalid_uris() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut writer = NTriplesWriter::new(temp_file.reopen()?);
+
+        // Valid triple — should be written
+        writer.write_triple(
+            "https://example.org/s",
+            "https://example.org/p",
+            "https://example.org/o",
+        )?;
+
+        // Invalid triple — object has bare % — should be skipped
+        writer.write_triple(
+            "https://example.org/s",
+            "https://example.org/p",
+            "https://example.org/bad%object",
+        )?;
+
+        writer.flush()?;
+
+        let mut content = String::new();
+        temp_file.reopen()?.read_to_string(&mut content)?;
+
+        assert_eq!(content.lines().count(), 1, "Only valid triple should be written");
+        assert!(content.contains("example.org/o"));
+        assert!(!content.contains("bad%object"));
 
         Ok(())
     }

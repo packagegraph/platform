@@ -23,26 +23,42 @@ impl SparqlClient {
         }
     }
 
-    /// Send a SPARQL Update query string.
+    /// Send a SPARQL Update query string with retry on transient failures.
     pub fn update(&self, sparql: &str) -> Result<()> {
         let url = format!("{}/update", self.endpoint);
+        let max_retries = 3;
 
-        let response = self.client
-            .post(&url)
-            .header("Content-Type", "application/sparql-update")
-            .body(sparql.to_string())
-            .send()
-            .map_err(|e| Error::new(ErrorKind::Other, format!("SPARQL update failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!("SPARQL update failed with status {}: {}",
-                    response.status(),
-                    response.text().unwrap_or_default())
-            ));
+        for attempt in 0..=max_retries {
+            match self.client
+                .post(&url)
+                .header("Content-Type", "application/sparql-update")
+                .body(sparql.to_string())
+                .send()
+            {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response) if response.status().is_server_error() && attempt < max_retries => {
+                    let delay = 5 * (1 << attempt);
+                    eprintln!("    SPARQL update failed ({}), retrying in {}s...", response.status(), delay);
+                    std::thread::sleep(Duration::from_secs(delay));
+                }
+                Ok(response) => {
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        format!("SPARQL update failed with status {}: {}",
+                            response.status(),
+                            response.text().unwrap_or_default())
+                    ));
+                }
+                Err(e) if attempt < max_retries => {
+                    let delay = 5 * (1 << attempt);
+                    eprintln!("    SPARQL update error: {}, retrying in {}s...", e, delay);
+                    std::thread::sleep(Duration::from_secs(delay));
+                }
+                Err(e) => {
+                    return Err(Error::new(ErrorKind::Other, format!("SPARQL update failed: {}", e)));
+                }
+            }
         }
-
         Ok(())
     }
 
@@ -84,7 +100,7 @@ impl SparqlClient {
     /// separately. Fuseki's GSP POST is additive, so multiple POSTs to the
     /// same graph accumulate correctly. This avoids Fuseki OOM on large files.
     fn gsp_upload(&self, file_path: &str, graph_uri: &str) -> Result<()> {
-        const CHUNK_SIZE: usize = 50 * 1024 * 1024; // 50MB per chunk
+        const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB per chunk (reduced from 50MB to avoid Fuseki JVM memory faults)
 
         let url = format!(
             "{}/data?graph={}",
@@ -138,22 +154,38 @@ impl SparqlClient {
     }
 
     fn gsp_post_chunk(&self, url: &str, data: &[u8]) -> Result<()> {
-        let response = self.client
-            .post(url)
-            .header("Content-Type", "application/n-triples")
-            .body(data.to_vec())
-            .send()
-            .map_err(|e| Error::new(ErrorKind::Other, format!("GSP upload failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!("GSP upload failed with status {}: {}",
-                    response.status(),
-                    response.text().unwrap_or_default())
-            ));
+        let max_retries = 3;
+        for attempt in 0..=max_retries {
+            match self.client
+                .post(url)
+                .header("Content-Type", "application/n-triples")
+                .body(data.to_vec())
+                .send()
+            {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response) if response.status().is_server_error() && attempt < max_retries => {
+                    let delay = 5 * (1 << attempt);
+                    eprintln!("    GSP chunk failed ({}), retrying in {}s...", response.status(), delay);
+                    std::thread::sleep(Duration::from_secs(delay));
+                }
+                Ok(response) => {
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        format!("GSP upload failed with status {}: {}",
+                            response.status(),
+                            response.text().unwrap_or_default())
+                    ));
+                }
+                Err(e) if attempt < max_retries => {
+                    let delay = 5 * (1 << attempt);
+                    eprintln!("    GSP chunk error: {}, retrying in {}s...", e, delay);
+                    std::thread::sleep(Duration::from_secs(delay));
+                }
+                Err(e) => {
+                    return Err(Error::new(ErrorKind::Other, format!("GSP upload failed: {}", e)));
+                }
+            }
         }
-
         Ok(())
     }
 
