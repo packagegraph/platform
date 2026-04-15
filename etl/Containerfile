@@ -1,5 +1,5 @@
 # Stage 1: Rust builder
-FROM docker.io/rust:1.86-slim AS rust-builder
+FROM docker.io/rust:1.88-slim AS rust-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
