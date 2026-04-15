@@ -19,6 +19,7 @@ class TestLicenseEnricher:
         ]
 
         mock_cache = MagicMock(spec=CacheManager)
+        mock_cache.sync_to_minio.return_value = 0
         # Mock GitHub API response with license data
         mock_cache.get.return_value = {
             'license': {
@@ -55,6 +56,7 @@ class TestLicenseEnricher:
         ]
 
         mock_cache = MagicMock(spec=CacheManager)
+        mock_cache.sync_to_minio.return_value = 0
         # GitHub API returns None for license
         mock_cache.get.return_value = {'license': None}
 
@@ -83,6 +85,7 @@ class TestLicenseEnricher:
         ]
 
         mock_cache = MagicMock(spec=CacheManager)
+        mock_cache.sync_to_minio.return_value = 0
         # GitHub returns valid SPDX ID
         mock_cache.get.return_value = {
             'license': {'spdx_id': 'Apache-2.0', 'name': 'Apache License 2.0'}
@@ -111,6 +114,7 @@ class TestLicenseEnricher:
         ]
 
         mock_cache = MagicMock(spec=CacheManager)
+        mock_cache.sync_to_minio.return_value = 0
         mock_cache.get.return_value = {
             'license': {'spdx_id': 'MIT', 'name': 'MIT License'}
         }

@@ -238,46 +238,69 @@ class CacheManager:
         }
 
     def sync_to_minio(self) -> int:
-        """Upload all local cache entries to Minio nearline storage.
+        """Upload all local cache entries to Minio as a tarball.
 
-        Returns the number of entries synced. Uses mc mirror for efficiency.
+        Single HTTP request instead of per-file mc mirror.
+        Returns the number of entries archived.
         """
         if not self._minio_env:
-            return 0
-
-        minio_path = f"{self.minio_alias}/{self.minio_bucket}/enricher-cache/{self.enricher_name}/"
-        result = subprocess.run(
-            ['mc', 'mirror', '--overwrite', str(self.cache_dir) + '/', minio_path],
-            env=self._minio_env,
-            capture_output=True,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            print(f"Warning: cache sync to Minio failed: {result.stderr[:200]}")
             return 0
 
         count = sum(1 for _ in self.cache_dir.rglob('*.json') if _.name != 'manifest.json')
-        return count
-
-    def sync_from_minio(self) -> int:
-        """Download cache entries from Minio to local disk.
-
-        Returns the number of entries synced.
-        """
-        if not self._minio_env:
+        if count == 0:
             return 0
 
-        minio_path = f"{self.minio_alias}/{self.minio_bucket}/enricher-cache/{self.enricher_name}/"
+        tarball_path = f"{self.minio_alias}/{self.minio_bucket}/enricher-cache/{self.enricher_name}.tar.gz"
+
+        # tar | mc pipe — single HTTP upload
+        tar_cmd = subprocess.Popen(
+            ['tar', 'czf', '-', '-C', str(self.cache_dir.parent), self.cache_dir.name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
         result = subprocess.run(
-            ['mc', 'mirror', '--overwrite', minio_path, str(self.cache_dir) + '/'],
+            ['mc', 'pipe', tarball_path],
+            stdin=tar_cmd.stdout,
             env=self._minio_env,
             capture_output=True,
             text=True,
         )
+        tar_cmd.wait()
 
         if result.returncode != 0:
-            # Not an error — Minio path may not exist yet
+            print(f"Warning: cache archive to Minio failed: {result.stderr[:200]}")
+            return 0
+
+        return count
+
+    def sync_from_minio(self) -> int:
+        """Download cache tarball from Minio and extract to local disk.
+
+        Single HTTP request instead of per-file mc mirror.
+        Returns the number of entries restored.
+        """
+        if not self._minio_env:
+            return 0
+
+        tarball_path = f"{self.minio_alias}/{self.minio_bucket}/enricher-cache/{self.enricher_name}.tar.gz"
+
+        # mc cat | tar — single HTTP download
+        mc_cmd = subprocess.Popen(
+            ['mc', 'cat', tarball_path],
+            env=self._minio_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        result = subprocess.run(
+            ['tar', 'xzf', '-', '-C', str(self.cache_dir.parent)],
+            stdin=mc_cmd.stdout,
+            capture_output=True,
+            text=True,
+        )
+        mc_cmd.wait()
+
+        if mc_cmd.returncode != 0:
+            # Not an error — tarball may not exist yet
             return 0
 
         count = sum(1 for _ in self.cache_dir.rglob('*.json') if _.name != 'manifest.json')

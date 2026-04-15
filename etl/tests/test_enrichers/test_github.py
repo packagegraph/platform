@@ -45,7 +45,14 @@ class TestGitHubEnricher:
 
         output = tmp_path / "github.nt"
         with patch("packagegraph.enrichers.github.requests.get") as mock_get:
-            mock_get.side_effect = [_mock_resp(repo), _mock_resp(commits)]
+            # Mock both calls - repo data returned for any /repos/ call, commits for /commits call
+            def mock_api_call(*args, **kwargs):
+                url = args[0] if args else kwargs.get('url', '')
+                if '/commits' in url:
+                    return _mock_resp(commits)
+                else:
+                    return _mock_resp(repo)
+            mock_get.side_effect = mock_api_call
             enricher = GitHubEnricher(
                 mock_client,
                 str(output),

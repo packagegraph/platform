@@ -112,3 +112,40 @@ class SparqlQueryClient:
             }
             for b in bindings
         ]
+
+    def query_packages_by_type(self, rdf_type_uri: str) -> list[tuple[str, str]]:
+        """Get (package_name, version_string) for packages of a specific RDF type.
+
+        Args:
+            rdf_type_uri: Full URI of the package type (e.g., "npm:NpmPackage")
+
+        Returns:
+            List of (name, version) tuples
+        """
+        # Extract namespace prefix and local name from URI
+        # e.g., "npm:NpmPackage" or full URI
+        if ':' in rdf_type_uri and not rdf_type_uri.startswith('http'):
+            # It's already a prefixed name like "npm:NpmPackage"
+            prefix, local_name = rdf_type_uri.split(':', 1)
+            type_ref = f"{prefix}:{local_name}"
+        else:
+            # It's a full URI - use as-is
+            type_ref = f"<{rdf_type_uri}>"
+
+        sparql = f"""
+        PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+        PREFIX deb: <https://purl.org/packagegraph/ontology/debian#>
+        PREFIX alpine: <https://purl.org/packagegraph/ontology/alpine#>
+        PREFIX npm: <https://purl.org/packagegraph/ontology/npm#>
+        PREFIX pypi: <https://purl.org/packagegraph/ontology/pypi#>
+        PREFIX cargo: <https://purl.org/packagegraph/ontology/cargo#>
+        PREFIX gomod: <https://purl.org/packagegraph/ontology/gomod#>
+        SELECT DISTINCT ?name ?version WHERE {{
+            ?p a {type_ref} .
+            ?p pkg:packageName ?name .
+            ?p pkg:hasVersion ?v .
+            ?v pkg:versionString ?version .
+        }}
+        """
+        bindings = self.query(sparql)
+        return [(b["name"]["value"], b["version"]["value"]) for b in bindings]

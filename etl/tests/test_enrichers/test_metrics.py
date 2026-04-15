@@ -18,6 +18,7 @@ class TestMetricsEnricher:
         ]
 
         mock_cache = MagicMock(spec=CacheManager)
+        mock_cache.sync_to_minio.return_value = 0
         # Mock /languages endpoint response
         mock_cache.get.return_value = {
             'Python': 45231,
@@ -54,6 +55,7 @@ class TestMetricsEnricher:
         ]
 
         mock_cache = MagicMock(spec=CacheManager)
+        mock_cache.sync_to_minio.return_value = 0
         # Total: 60000 bytes
         mock_cache.get.return_value = {
             'Python': 48000,  # 80%
@@ -87,6 +89,7 @@ class TestMetricsEnricher:
         ]
 
         mock_cache = MagicMock(spec=CacheManager)
+        mock_cache.sync_to_minio.return_value = 0
         mock_cache.get.return_value = {}  # Empty languages response
 
         enricher = MetricsEnricher(
@@ -114,6 +117,7 @@ class TestMetricsEnricher:
         ]
 
         mock_cache = MagicMock(spec=CacheManager)
+        mock_cache.sync_to_minio.return_value = 0
         mock_cache.get.return_value = {
             'Rust': 50000,
             'TypeScript': 30000,

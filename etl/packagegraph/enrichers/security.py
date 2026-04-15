@@ -7,11 +7,22 @@ from .cache import CacheManager
 from ..sparql_client import SparqlQueryClient
 from ..namespaces import SEC, cve_uri, version_uri
 
+# Mapping from our ecosystem identifiers to OSV API ecosystem names and RDF types
+OSV_ECOSYSTEMS = {
+    "debian": {"osv_name": "Debian", "rdf_type": "deb:BinaryPackage", "distro": "debian", "release": "trixie"},
+    "alpine": {"osv_name": "Alpine", "rdf_type": "alpine:AlpinePackage", "distro": "alpine", "release": "v3.20"},
+    "npm": {"osv_name": "npm", "rdf_type": "npm:NpmPackage", "distro": "npm", "release": "registry"},
+    "pypi": {"osv_name": "PyPI", "rdf_type": "pypi:PythonPackage", "distro": "pypi", "release": "pypi"},
+    "cargo": {"osv_name": "crates.io", "rdf_type": "cargo:Crate", "distro": "cargo", "release": "crates.io"},
+    "gomod": {"osv_name": "Go", "rdf_type": "gomod:GoModule", "distro": "gomod", "release": "proxy"},
+}
+
 
 class SecurityEnricher(BaseEnricher):
     """Enriches package graph with vulnerability data from OSV.dev API.
 
     Queries OSV for vulnerabilities and records them as attributed claims.
+    Supports multiple ecosystems (Debian, Alpine, npm, PyPI, crates.io, Go).
     """
 
     def __init__(
@@ -20,7 +31,7 @@ class SecurityEnricher(BaseEnricher):
         output_path: str,
         cache_dir: str | None = None,
         cache_ttl_hours: int = 24,
-        ecosystem: str = "Debian",
+        ecosystem: str = "debian",
     ):
         super().__init__(
             sparql_client=sparql_client,
@@ -30,6 +41,12 @@ class SecurityEnricher(BaseEnricher):
         )
         self.osv_api = "https://api.osv.dev/v1"
         self.ecosystem = ecosystem
+
+        # Validate ecosystem
+        if ecosystem not in OSV_ECOSYSTEMS:
+            raise ValueError(f"Unsupported ecosystem: {ecosystem}. Supported: {list(OSV_ECOSYSTEMS.keys())}")
+
+        self.ecosystem_config = OSV_ECOSYSTEMS[ecosystem]
 
         # Create CacheManager if cache_dir provided
         if cache_dir:
@@ -44,8 +61,8 @@ class SecurityEnricher(BaseEnricher):
             self.cache_ttl_hours = cache_ttl_hours
 
     def _query_packages(self):
-        """Query Fuseki for package names and versions."""
-        packages = self.client.query_package_names_and_versions()
+        """Query Fuseki for packages of this ecosystem's RDF type."""
+        packages = self.client.query_packages_by_type(self.ecosystem_config["rdf_type"])
         # Deduplicate by name
         seen = set()
         unique = []
@@ -66,7 +83,7 @@ class SecurityEnricher(BaseEnricher):
     def _query_osv(self, package_name: str) -> list[dict] | None:
         """Query OSV API for vulnerabilities affecting package."""
         url = f"{self.osv_api}/query"
-        params = {"package": {"name": package_name, "ecosystem": self.ecosystem}}
+        params = {"package": {"name": package_name, "ecosystem": self.ecosystem_config["osv_name"]}}
 
         # Check cache
         if self.cache:
@@ -138,7 +155,13 @@ class SecurityEnricher(BaseEnricher):
                     affected.get("package", {}).get("name", "").lower()
                     == pkg_name.lower()
                 ):
-                    ver_uri = str(version_uri("debian", "trixie", pkg_name, version_str))
+                    # Use ecosystem-specific version URI
+                    ver_uri = str(version_uri(
+                        self.ecosystem_config["distro"],
+                        self.ecosystem_config["release"],
+                        pkg_name,
+                        version_str
+                    ))
                     self.writer.write_uri(v_uri, str(SEC.affectsVersion), ver_uri)
 
                     # Extract fixed version
@@ -146,7 +169,12 @@ class SecurityEnricher(BaseEnricher):
                         for event in range_entry.get("events", []):
                             if "fixed" in event:
                                 fixed_ver = event["fixed"]
-                                fixed_uri = str(version_uri("debian", "trixie", pkg_name, fixed_ver))
+                                fixed_uri = str(version_uri(
+                                    self.ecosystem_config["distro"],
+                                    self.ecosystem_config["release"],
+                                    pkg_name,
+                                    fixed_ver
+                                ))
                                 self.writer.write_uri(v_uri, str(SEC.fixedInVersion), fixed_uri)
                                 break
                     break

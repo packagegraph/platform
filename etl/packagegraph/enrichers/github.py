@@ -61,29 +61,42 @@ class GitHubEnricher(BaseEnricher):
     def _query_packages(self):
         """Query Fuseki for packages with GitHub homepages, deduplicated.
 
-        Returns only unique (owner/repo) entries, and pre-seeds _processed_repos
-        with repos already in the enrichment graph to skip reprocessing.
+        Incremental: skips repos already enriched within the freshness threshold.
+        The enrichment graph tracks per-repo `pkg:enrichedAt` timestamps, and
+        the named graph implicitly scopes these to this enricher.
+
+        Freshness threshold is controlled by ENRICHER_FRESHNESS_DAYS env var
+        (default: 7 days). Set to 0 to force re-enrichment of everything.
         """
-        # Pre-seed with repos already enriched in a prior run
-        try:
-            existing = self.client.query("""
-                PREFIX vcs: <https://purl.org/packagegraph/ontology/vcs#>
-                SELECT ?url WHERE {
-                  GRAPH <https://packagegraph.github.io/graph/enrichment/github-vcs> {
-                    ?r a vcs:Repository .
-                    ?r vcs:repositoryURL ?url .
-                  }
-                }
-            """)
-            github_re = re.compile(r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$")
-            for b in existing:
-                m = github_re.match(b["url"]["value"])
-                if m:
-                    self._processed_repos.add(f"{m.group(1)}/{m.group(2)}")
-            if self._processed_repos:
-                print(f"Skipping {len(self._processed_repos)} repos already in enrichment graph")
-        except Exception as e:
-            print(f"Warning: could not query existing enrichment graph: {e}")
+        import os
+        freshness_days = int(os.environ.get('ENRICHER_FRESHNESS_DAYS', '7'))
+        github_re = re.compile(r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$")
+
+        # Query repos already enriched within the freshness window
+        fresh_count = 0
+        if freshness_days > 0:
+            try:
+                cutoff = (datetime.now() - __import__('datetime').timedelta(days=freshness_days)).isoformat()
+                existing = self.client.query(f"""
+                    PREFIX vcs: <https://purl.org/packagegraph/ontology/vcs#>
+                    PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+                    SELECT ?url WHERE {{
+                      GRAPH <https://packagegraph.github.io/graph/enrichment/github-vcs> {{
+                        ?r vcs:repositoryURL ?url .
+                        ?r pkg:enrichedAt ?ts .
+                        FILTER(?ts > "{cutoff}"^^<http://www.w3.org/2001/XMLSchema#dateTime>)
+                      }}
+                    }}
+                """)
+                for b in existing:
+                    m = github_re.match(b["url"]["value"])
+                    if m:
+                        self._processed_repos.add(f"{m.group(1)}/{m.group(2)}")
+                fresh_count = len(self._processed_repos)
+                if fresh_count:
+                    print(f"Skipping {fresh_count} repos enriched within {freshness_days} days")
+            except Exception as e:
+                print(f"Warning: could not query enrichment graph: {e}")
 
         # Get all packages with GitHub homepages, deduplicate by repo
         all_items = self.client.query_github_homepages()
@@ -98,7 +111,8 @@ class GitHubEnricher(BaseEnricher):
                 seen.add(repo_key)
                 unique_items.append((pkg_uri, homepage))
 
-        print(f"Found {len(all_items)} packages, {len(seen) + len(self._processed_repos)} unique repos, {len(unique_items)} to process")
+        total_unique = len(seen) + fresh_count
+        print(f"Found {len(all_items)} packages, {total_unique} unique repos, {len(unique_items)} to process ({fresh_count} fresh, skipped)")
         return unique_items
 
     def _process_item(self, item):
@@ -207,14 +221,23 @@ class GitHubEnricher(BaseEnricher):
 
                 response.raise_for_status()
 
-                # Adaptive rate limiting based on remaining quota
-                remaining = int(response.headers.get("X-RateLimit-Remaining", "100"))
-                if remaining < 50:
-                    time.sleep(5.0)
-                elif remaining < 200:
-                    time.sleep(1.0)
-                elif remaining < 500:
-                    time.sleep(0.2)
+                # Pace API calls to spread evenly across the rate limit window.
+                # Uses X-RateLimit-Reset and X-RateLimit-Remaining to calculate
+                # exact sleep needed instead of conservative fixed thresholds.
+                remaining = int(response.headers.get("X-RateLimit-Remaining", "5000"))
+                reset_at = int(response.headers.get("X-RateLimit-Reset", "0"))
+                if remaining > 0 and reset_at > 0:
+                    seconds_until_reset = max(reset_at - int(time.time()), 1)
+                    # Spread remaining calls evenly, leave 5% buffer
+                    sleep_per_call = seconds_until_reset / (remaining * 0.95)
+                    # Clamp: never sleep more than 10s, never less than 0.05s
+                    sleep_per_call = max(0.05, min(sleep_per_call, 10.0))
+                    time.sleep(sleep_per_call)
+                elif remaining <= 0:
+                    # Exhausted — wait for reset
+                    wait = max(reset_at - int(time.time()), 60)
+                    print(f"    Rate limit exhausted. Waiting {wait}s for reset...")
+                    time.sleep(wait)
 
                 data = response.json()
 
@@ -262,6 +285,11 @@ class GitHubEnricher(BaseEnricher):
             self.writer.write_uri(r_uri, str(VCS.repositoryURL), repo_url)
             self.writer.write_lit(r_uri, str(VCS.repositoryStatus), "not-found")
             self.writer.write_lit(r_uri, str(VCS.statusCheckedAt), datetime.now().isoformat())
+            self.writer.write_lit(r_uri, str(PKG.enrichedAt), datetime.now().isoformat())
+            self.writer.flag_quality_issue(
+                r_uri, "dead-repo", "homepage",
+                repo_url, "enrich-github-vcs"
+            )
             # Cache so we don't re-check on future runs
             if self.cache:
                 self.cache.put(
@@ -307,7 +335,18 @@ class GitHubEnricher(BaseEnricher):
                 if info.get("message"):
                     self.writer.write_lit(c_uri, str(VCS.commitMessage), info["message"][:500])
                 if author.get("name") and author.get("email"):
-                    m_uri = str(maintainer_uri(author["email"]))
-                    self.writer.write_uri(c_uri, str(VCS.authoredBy), m_uri)
-                    self.writer.write_uri(m_uri, RDF_TYPE, str(PKG.Maintainer))
-                    self.writer.write_lit(m_uri, str(FOAF.name), author["name"])
+                    email = author["email"]
+                    if ' ' not in email and '@' in email and '\\' not in email:
+                        m_uri = str(maintainer_uri(email))
+                        self.writer.write_uri(c_uri, str(VCS.authoredBy), m_uri)
+                        self.writer.write_uri(m_uri, RDF_TYPE, str(PKG.Maintainer))
+                        self.writer.write_lit(m_uri, str(FOAF.name), author["name"])
+                    else:
+                        self.writer.flag_quality_issue(
+                            r_uri, "malformed-email", "commit.author.email",
+                            email, "enrich-github-vcs"
+                        )
+
+        # Record when this repo was enriched — used for incremental freshness checks.
+        # Scoped to this enricher via the named graph (graph/enrichment/github-vcs).
+        self.writer.write_lit(r_uri, str(PKG.enrichedAt), datetime.now().isoformat())

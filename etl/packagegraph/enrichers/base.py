@@ -8,14 +8,19 @@ import json
 import os
 from pathlib import Path
 from packagegraph.sparql_client import SparqlQueryClient
-from packagegraph.namespaces import PROV, PKG, DATA, snapshot_uri
+from packagegraph.namespaces import PROV, PKG, DQ, DATA, snapshot_uri
 
 
 class NTriplesWriter:
-    """Writes N-Triples with deterministic sorted output."""
+    """Writes N-Triples directly to file handle (streaming, no in-memory accumulation)."""
 
-    def __init__(self):
-        self._triples: list[str] = []
+    def __init__(self, file_handle: TextIO):
+        """Initialize with a file handle to write to.
+
+        Args:
+            file_handle: Open file handle (text mode) to write N-Triples to
+        """
+        self._file = file_handle
 
     def _escape_nt(self, s: str) -> str:
         """Escape string for N-Triples literal."""
@@ -28,28 +33,43 @@ class NTriplesWriter:
         )
 
     def write_lit(self, subject: str, predicate: str, value: str | int | float) -> None:
-        """Write a literal triple."""
+        """Write a literal triple directly to file."""
         escaped = self._escape_nt(str(value))
-        self._triples.append(f'<{subject}> <{predicate}> "{escaped}" .\n')
+        self._file.write(f'<{subject}> <{predicate}> "{escaped}" .\n')
 
     def write_int(self, subject: str, predicate: str, value: int) -> None:
-        """Write an integer triple with xsd:integer datatype."""
-        self._triples.append(
+        """Write an integer triple with xsd:integer datatype directly to file."""
+        self._file.write(
             f'<{subject}> <{predicate}> "{value}"^^<http://www.w3.org/2001/XMLSchema#integer> .\n'
         )
 
     def write_uri(self, subject: str, predicate: str, obj: str) -> None:
-        """Write a URI triple."""
-        self._triples.append(f'<{subject}> <{predicate}> <{obj}> .\n')
+        """Write a URI triple directly to file."""
+        self._file.write(f'<{subject}> <{predicate}> <{obj}> .\n')
 
-    def get_sorted_triples(self) -> list[str]:
-        """Return all triples sorted lexicographically."""
-        return sorted(self._triples)
+    def flag_quality_issue(
+        self, subject_uri: str, issue_type: str, field: str, value: str, source: str
+    ) -> None:
+        """Record a data quality issue as queryable triples.
 
-    def write_to_file(self, file_handle: TextIO) -> None:
-        """Write sorted triples to file handle."""
-        for triple in self.get_sorted_triples():
-            file_handle.write(triple)
+        Creates a dq:DataQualityIssue linked to the subject with:
+        - dq:issueType (e.g., "malformed-email", "dead-homepage", "missing-field")
+        - dq:field (which property has the issue)
+        - dq:rawValue (the problematic value)
+        - dq:detectedBy (which enricher/collector found it)
+        """
+        import hashlib
+        issue_hash = hashlib.sha256(f"{subject_uri}:{field}:{value}".encode()).hexdigest()[:12]
+        issue_uri = f"https://packagegraph.github.io/d/dq/{issue_hash}"
+
+        self._file.write(
+            f'<{issue_uri}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{DQ}DataQualityIssue> .\n'
+        )
+        self._file.write(f'<{issue_uri}> <{DQ}issueType> "{self._escape_nt(issue_type)}" .\n')
+        self._file.write(f'<{issue_uri}> <{DQ}field> "{self._escape_nt(field)}" .\n')
+        self._file.write(f'<{issue_uri}> <{DQ}rawValue> "{self._escape_nt(value[:500])}" .\n')
+        self._file.write(f'<{issue_uri}> <{DQ}detectedBy> "{self._escape_nt(source)}" .\n')
+        self._file.write(f'<{subject_uri}> <{DQ}hasQualityIssue> <{issue_uri}> .\n')
 
 
 class BaseEnricher(ABC):
@@ -75,9 +95,10 @@ class BaseEnricher(ABC):
         self.enricher_version: str = enricher_version
         self.cache_dir: str | None = cache_dir
         self.recency_threshold_days: int = fuseki_recency_threshold_days
-        self.writer: NTriplesWriter = NTriplesWriter()
         self.start_time: datetime | None = None
         self.end_time: datetime | None = None
+        # writer is created in enrich() when file is opened
+        self.writer: NTriplesWriter
 
     @abstractmethod
     def _query_packages(self) -> list[Any]:
@@ -187,7 +208,7 @@ class BaseEnricher(ABC):
         """Main enrichment entry point.
 
         Lifecycle: validate Fuseki recency → preflight check → query packages →
-        process each → sort output → write to file → record provenance → write manifest.
+        process each → stream to file → record provenance → write manifest.
         """
         self.start_time = datetime.now()
 
@@ -205,27 +226,27 @@ class BaseEnricher(ABC):
         cache_disabled = os.environ.get('ENRICHER_CACHE_DISABLED', '0') == '1'
         sync_interval = int(os.environ.get('ENRICHER_CACHE_SYNC_INTERVAL', '500'))
 
-        # Process each item
-        for idx, item in enumerate(items, 1):
-            if idx % 100 == 0:
-                print(f"  [{idx}/{len(items)}]")
-            self._process_item(item)
+        # Open output file and create streaming writer
+        with open(self.output_path, 'w') as f:
+            self.writer = NTriplesWriter(f)
 
-            # Periodic cache sync to Minio
-            if not cache_disabled and sync_interval > 0 and idx % sync_interval == 0:
+            # Process each item (writes triples directly to file)
+            for idx, item in enumerate(items, 1):
+                if idx % 100 == 0:
+                    print(f"  [{idx}/{len(items)}]")
+                self._process_item(item)
+
+                # Periodic cache sync to Minio
+                if not cache_disabled and sync_interval > 0 and idx % sync_interval == 0:
+                    self._sync_cache_to_minio()
+
+            # Final cache sync
+            if not cache_disabled:
                 self._sync_cache_to_minio()
 
-        # Final cache sync
-        if not cache_disabled:
-            self._sync_cache_to_minio()
-
-        # Record provenance (before writing, so it's included in output)
-        self.end_time = datetime.now()
-        self._record_provenance()
-
-        # Write sorted output
-        with open(self.output_path, 'w') as f:
-            self.writer.write_to_file(f)
+            # Record provenance (appends to same file)
+            self.end_time = datetime.now()
+            self._record_provenance()
 
         # Write sidecar manifest (after file is written, needs content hash)
         self._write_manifest()

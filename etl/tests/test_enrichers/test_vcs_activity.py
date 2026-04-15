@@ -18,6 +18,7 @@ class TestVCSActivityEnricher:
         ]
 
         mock_cache = MagicMock(spec=CacheManager)
+        mock_cache.sync_to_minio.return_value = 0
         # Mock /releases endpoint response
         mock_cache.get.return_value = [
             {
@@ -61,6 +62,7 @@ class TestVCSActivityEnricher:
         ]
 
         mock_cache = MagicMock(spec=CacheManager)
+        mock_cache.sync_to_minio.return_value = 0
         mock_cache.get.return_value = [
             {'tag_name': 'v1.0.0-rc1', 'published_at': '2026-01-01T00:00:00Z', 'prerelease': True}
         ]
@@ -89,6 +91,7 @@ class TestVCSActivityEnricher:
         ]
 
         mock_cache = MagicMock(spec=CacheManager)
+        mock_cache.sync_to_minio.return_value = 0
 
         def cache_get(url):
             if '/releases' in url:
@@ -128,6 +131,7 @@ class TestVCSActivityEnricher:
         ]
 
         mock_cache = MagicMock(spec=CacheManager)
+        mock_cache.sync_to_minio.return_value = 0
         mock_cache.get.return_value = []  # Empty releases array
 
         enricher = VCSActivityEnricher(

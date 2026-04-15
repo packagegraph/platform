@@ -1,0 +1,67 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: enrich-koji
+  namespace: packagegraph
+spec:
+  schedule: "0 11 * * 1"  # Weekly on Monday at 11am (after Fedora/CentOS collectors)
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: enricher
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: PYTHONUNBUFFERED, value: "1"}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  CACHE_DIR=/tmp/cache/koji
+                  MINIO_CACHE="pgraph/${MINIO_BUCKET}/enricher-cache/koji"
+                  mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
+
+                  if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
+                    echo "Syncing cache from Minio..."
+                    mc mirror --overwrite "${MINIO_CACHE}/" "${CACHE_DIR}/" 2>/dev/null || true
+                    echo "Cache warmed: $(find "${CACHE_DIR}" -name '*.json' 2>/dev/null | wc -l) entries"
+                  fi
+
+                  packagegraph enrich-koji \
+                    --fuseki-endpoint "$FUSEKI_ENDPOINT" \
+                    --output /tmp/enrichment/koji.ttl \
+                    --cache-dir "${CACHE_DIR}" \
+                    --koji-hub https://koji.fedoraproject.org/kojihub \
+                    --distro-name fedora || true
+
+                  if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
+                    echo "Syncing cache to Minio..."
+                    mc mirror --overwrite "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
+                  fi
+
+                  if [ -f /tmp/enrichment/koji.ttl ]; then
+                    pg-collect drop \
+                      --graph "https://packagegraph.github.io/graph/enrichment/koji" \
+                      --endpoint "$FUSEKI_ENDPOINT" && \
+                    # Koji output is Turtle, needs conversion or direct load
+                    # For now, assume pg-collect load handles both .nt and .ttl
+                    pg-collect load /tmp/enrichment/koji.ttl \
+                      --graph "https://packagegraph.github.io/graph/enrichment/koji" \
+                      --endpoint "$FUSEKI_ENDPOINT"
+                  fi
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}

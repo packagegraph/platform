@@ -7,7 +7,7 @@ from packagegraph.enrichers.security import SecurityEnricher
 class TestSecurityEnricher:
     def test_enrich_writes_ntriples_for_vulnerable_package(self, tmp_path):
         mock_client = MagicMock()
-        mock_client.query_package_names_and_versions.return_value = [
+        mock_client.query_packages_by_type.return_value = [
             ("openssl", "3.0.2-1")
         ]
 
@@ -33,9 +33,10 @@ class TestSecurityEnricher:
             "packagegraph.enrichers.security.requests.post", return_value=osv_resp
         ):
             enricher = SecurityEnricher(
-                mock_client, str(output), cache_dir=str(tmp_path / "cache")
+                mock_client, str(output), cache_dir=str(tmp_path / "cache"), ecosystem="debian"
             )
-            enricher.enrich()
+            with patch.object(enricher, '_validate_fuseki_recency'):
+                enricher.enrich()
 
         content = output.read_text()
         assert "CVE-2022-0778" in content
@@ -44,7 +45,7 @@ class TestSecurityEnricher:
 
     def test_enrich_skips_unrelated_cves(self, tmp_path):
         mock_client = MagicMock()
-        mock_client.query_package_names_and_versions.return_value = [("bash", "5.2")]
+        mock_client.query_packages_by_type.return_value = [("bash", "5.2")]
 
         osv_resp = MagicMock()
         osv_resp.status_code = 200
@@ -65,9 +66,10 @@ class TestSecurityEnricher:
             "packagegraph.enrichers.security.requests.post", return_value=osv_resp
         ):
             enricher = SecurityEnricher(
-                mock_client, str(output), cache_dir=str(tmp_path / "cache")
+                mock_client, str(output), cache_dir=str(tmp_path / "cache"), ecosystem="debian"
             )
-            enricher.enrich()
+            with patch.object(enricher, '_validate_fuseki_recency'):
+                enricher.enrich()
 
         content = output.read_text()
         assert "affectsVersion" not in content
@@ -75,7 +77,7 @@ class TestSecurityEnricher:
     def test_enrich_extracts_cvss_vector_and_score(self, tmp_path):
         """Test that CVSS vector and numeric score are extracted."""
         mock_client = MagicMock()
-        mock_client.query_package_names_and_versions.return_value = [
+        mock_client.query_packages_by_type.return_value = [
             ("glibc", "2.36-1")
         ]
 
@@ -103,9 +105,10 @@ class TestSecurityEnricher:
             "packagegraph.enrichers.security.requests.post", return_value=osv_resp
         ):
             enricher = SecurityEnricher(
-                mock_client, str(output), cache_dir=str(tmp_path / "cache")
+                mock_client, str(output), cache_dir=str(tmp_path / "cache"), ecosystem="debian"
             )
-            enricher.enrich()
+            with patch.object(enricher, '_validate_fuseki_recency'):
+                enricher.enrich()
 
         content = output.read_text()
         assert "cvssVector" in content
@@ -115,7 +118,7 @@ class TestSecurityEnricher:
     def test_enrich_extracts_cwe_id(self, tmp_path):
         """Test that CWE ID is extracted from database_specific."""
         mock_client = MagicMock()
-        mock_client.query_package_names_and_versions.return_value = [
+        mock_client.query_packages_by_type.return_value = [
             ("curl", "7.88.1")
         ]
 
@@ -142,9 +145,10 @@ class TestSecurityEnricher:
             "packagegraph.enrichers.security.requests.post", return_value=osv_resp
         ):
             enricher = SecurityEnricher(
-                mock_client, str(output), cache_dir=str(tmp_path / "cache")
+                mock_client, str(output), cache_dir=str(tmp_path / "cache"), ecosystem="debian"
             )
-            enricher.enrich()
+            with patch.object(enricher, '_validate_fuseki_recency'):
+                enricher.enrich()
 
         content = output.read_text()
         assert "cweId" in content
@@ -153,7 +157,7 @@ class TestSecurityEnricher:
     def test_enrich_extracts_fixed_version(self, tmp_path):
         """Test that fixed version is extracted from ranges/events."""
         mock_client = MagicMock()
-        mock_client.query_package_names_and_versions.return_value = [
+        mock_client.query_packages_by_type.return_value = [
             ("nginx", "1.22.0")
         ]
 
@@ -188,10 +192,51 @@ class TestSecurityEnricher:
             "packagegraph.enrichers.security.requests.post", return_value=osv_resp
         ):
             enricher = SecurityEnricher(
-                mock_client, str(output), cache_dir=str(tmp_path / "cache")
+                mock_client, str(output), cache_dir=str(tmp_path / "cache"), ecosystem="debian"
             )
-            enricher.enrich()
+            with patch.object(enricher, '_validate_fuseki_recency'):
+                enricher.enrich()
 
         content = output.read_text()
         assert "fixedInVersion" in content
         assert "1.23.0" in content
+
+    def test_enrich_supports_npm_ecosystem(self, tmp_path):
+        """Test that enricher works with npm ecosystem."""
+        mock_client = MagicMock()
+        mock_client.query_packages_by_type.return_value = [
+            ("express", "4.18.2")
+        ]
+
+        osv_resp = MagicMock()
+        osv_resp.status_code = 200
+        osv_resp.json.return_value = {
+            "vulns": [
+                {
+                    "id": "GHSA-1234-5678-9abc",
+                    "summary": "Prototype pollution",
+                    "affected": [
+                        {"package": {"name": "express", "ecosystem": "npm"}}
+                    ],
+                }
+            ]
+        }
+        osv_resp.raise_for_status.return_value = None
+
+        output = tmp_path / "security_npm.nt"
+        with patch(
+            "packagegraph.enrichers.security.requests.post", return_value=osv_resp
+        ):
+            enricher = SecurityEnricher(
+                mock_client, str(output), cache_dir=str(tmp_path / "cache"), ecosystem="npm"
+            )
+            with patch.object(enricher, '_validate_fuseki_recency'):
+                enricher.enrich()
+
+        content = output.read_text()
+        assert "GHSA-1234-5678-9abc" in content
+        assert "Vulnerability" in content
+        # Should query with npm RDF type
+        mock_client.query_packages_by_type.assert_called_once()
+        call_args = mock_client.query_packages_by_type.call_args
+        assert "npm:NpmPackage" in str(call_args)
