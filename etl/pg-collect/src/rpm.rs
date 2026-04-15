@@ -52,6 +52,47 @@ impl RpmCollector {
         }
     }
 
+    /// Create a collector with TLS client certificate authentication (for RHEL CDN).
+    pub fn new_with_tls(
+        repo_url: String,
+        distro_name: String,
+        release_name: String,
+        client_cert_path: &str,
+        client_key_path: &str,
+        ca_cert_path: &str,
+    ) -> Self {
+        let cert_pem = std::fs::read(client_cert_path)
+            .unwrap_or_else(|e| panic!("Failed to read client cert {}: {}", client_cert_path, e));
+        let key_pem = std::fs::read(client_key_path)
+            .unwrap_or_else(|e| panic!("Failed to read client key {}: {}", client_key_path, e));
+
+        // rustls Identity::from_pem expects key then cert in PEM format
+        let mut identity_pem = key_pem;
+        identity_pem.extend_from_slice(&cert_pem);
+        let identity = reqwest::Identity::from_pem(&identity_pem)
+            .expect("Failed to parse client certificate + key");
+
+        let ca_pem = std::fs::read(ca_cert_path)
+            .unwrap_or_else(|e| panic!("Failed to read CA cert {}: {}", ca_cert_path, e));
+        let ca_cert = reqwest::Certificate::from_pem(&ca_pem)
+            .expect("Failed to parse CA certificate");
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .identity(identity)
+            .add_root_certificate(ca_cert)
+            .build()
+            .expect("Failed to create TLS-authenticated HTTP client");
+
+        Self {
+            client,
+            repo_url,
+            distro_name,
+            release_name,
+        }
+    }
+
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new(file);
@@ -520,9 +561,82 @@ impl RpmCollector {
             }
         }
 
+        // Upstream ecosystem identification from Provides entries
+        triples +=
+            self.emit_ecosystem_triples(writer, &pkg_uri, &pkg_data.deps)?;
+
         // Dependencies
         triples +=
-            self.emit_dependency_triples(writer, &pkg_uri, &pkg_data.deps, release_name, arch)?;
+            self.emit_dependency_triples(writer, &pkg_uri, &pkg_data.deps, release_name, arch, name)?;
+
+        Ok(triples)
+    }
+
+    /// Extract upstream ecosystem identity from RPM Provides entries.
+    ///
+    /// Fedora packaging guidelines require specific Provides for language ecosystems:
+    ///   crate(name) = version       → Rust/Cargo
+    ///   python3dist(name) = version → Python/PyPI
+    ///   golang(import/path)         → Go modules
+    ///   nodejs(name)                → NPM
+    ///   perl(Module::Name)          → Perl/CPAN
+    ///   rubygem(name)               → Ruby/RubyGems
+    ///   ghc-pkg(name)               → Haskell/Hackage
+    ///   R(name)                     → R/CRAN
+    fn emit_ecosystem_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        pkg_uri: &str,
+        deps: &[RpmDep],
+    ) -> Result<usize> {
+        let mut triples = 0;
+        let mut emitted_ecosystem = false;
+
+        let provides: Vec<&RpmDep> = deps.iter().filter(|d| d.dep_type == "provides").collect();
+
+        for dep in &provides {
+            let name = &dep.name;
+
+            let (ecosystem, upstream_name) = if let Some(crate_name) = name.strip_prefix("crate(").and_then(|s| s.strip_suffix(')')) {
+                ("cargo", crate_name.to_string())
+            } else if let Some(py_name) = name.strip_prefix("python3dist(").and_then(|s| s.strip_suffix(')')) {
+                ("pypi", py_name.to_string())
+            } else if let Some(py_name) = name.strip_prefix("python3.").and_then(|s| {
+                // python3.12dist(name) format
+                s.find("dist(").map(|pos| &s[pos + 5..s.len() - 1])
+            }) {
+                ("pypi", py_name.to_string())
+            } else if let Some(go_path) = name.strip_prefix("golang(").and_then(|s| s.strip_suffix(')')) {
+                ("gomod", go_path.to_string())
+            } else if let Some(node_name) = name.strip_prefix("nodejs(").and_then(|s| s.strip_suffix(')')) {
+                ("npm", node_name.to_string())
+            } else if let Some(perl_name) = name.strip_prefix("perl(").and_then(|s| s.strip_suffix(')')) {
+                ("cpan", perl_name.to_string())
+            } else if let Some(gem_name) = name.strip_prefix("rubygem(").and_then(|s| s.strip_suffix(')')) {
+                ("rubygems", gem_name.to_string())
+            } else if let Some(ghc_name) = name.strip_prefix("ghc-pkg(").and_then(|s| s.strip_suffix(')')) {
+                ("hackage", ghc_name.to_string())
+            } else if let Some(r_name) = name.strip_prefix("R(").and_then(|s| s.strip_suffix(')')) {
+                ("cran", r_name.to_string())
+            } else {
+                continue;
+            };
+
+            // Emit ecosystem and upstream name (once per ecosystem per package)
+            if !emitted_ecosystem {
+                writer.write_literal(pkg_uri, &format!("{PKG}upstreamEcosystem"), ecosystem)?;
+                emitted_ecosystem = true;
+                triples += 1;
+            }
+            writer.write_literal(pkg_uri, &format!("{PKG}upstreamPackageName"), &upstream_name)?;
+            triples += 1;
+
+            // Emit upstream version if available
+            if let Some(ver) = &dep.ver {
+                writer.write_literal(pkg_uri, &format!("{PKG}upstreamPackageVersion"), ver)?;
+                triples += 1;
+            }
+        }
 
         Ok(triples)
     }
@@ -616,10 +730,11 @@ impl RpmCollector {
         deps: &[RpmDep],
         release_name: &str,
         arch: &str,
+        pkg_name: &str,
     ) -> Result<usize> {
         let mut triples = 0;
 
-        // Only emit "requires" dependencies (provides/obsoletes are metadata, not graph edges)
+        // Emit requires, provides, conflicts, and obsoletes relationships
         let requires: Vec<&RpmDep> = deps.iter().filter(|d| d.dep_type == "requires").collect();
 
         for dep in &requires {
@@ -743,6 +858,36 @@ impl RpmCollector {
             writer.write_literal(&dep_uri, &format!("{PKG}packageName"), &dep.name)?;
             writer.write_triple(pkg_uri, &format!("{RPM}rpmObsoletes"), &dep_uri)?;
             triples += 3;
+        }
+
+        // Emit provides
+        let provides: Vec<&RpmDep> = deps.iter().filter(|d| d.dep_type == "provides").collect();
+        for dep in &provides {
+            // Skip internal provides
+            if dep.name.starts_with("config(")
+                || dep.name.starts_with("rpmlib(")
+                || dep.name.starts_with("rtld(")
+            {
+                continue;
+            }
+
+            // Skip self-provides (where provides name matches package name)
+            if dep.name == pkg_name {
+                continue;
+            }
+
+            let dep_uri = package_identity_uri(
+                &self.distro_name,
+                release_name,
+                arch,
+                &dep.name,
+            );
+
+            writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
+            writer.write_literal(&dep_uri, &format!("{PKG}packageName"), &dep.name)?;
+            writer.write_triple(pkg_uri, &format!("{PKG}directlyProvides"), &dep_uri)?;
+            writer.write_triple(pkg_uri, &format!("{RPM}rpmProvides"), &dep_uri)?;
+            triples += 4;
         }
 
         Ok(triples)
