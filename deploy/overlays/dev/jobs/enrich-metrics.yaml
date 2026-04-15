@@ -10,6 +10,7 @@ spec:
   failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
+      activeDeadlineSeconds: 3600
       backoffLimit: 2
       ttlSecondsAfterFinished: 600
       template:
@@ -40,7 +41,7 @@ spec:
 
                   if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
                     echo "Syncing GitHub cache from Minio..."
-                    mc mirror --overwrite "${MINIO_CACHE}/" "${CACHE_DIR}/" 2>/dev/null || true
+                    mc cat "${MINIO_CACHE}.tar.gz" 2>/dev/null | tar xzf - -C /tmp/cache/ 2>/dev/null || true
                     echo "Cache warmed: $(find "${CACHE_DIR}" -name '*.json' 2>/dev/null | wc -l) entries"
                   fi
 

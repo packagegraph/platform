@@ -10,6 +10,7 @@ spec:
   failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
+      activeDeadlineSeconds: 1800
       backoffLimit: 2
       ttlSecondsAfterFinished: 600
       template:
@@ -37,6 +38,8 @@ spec:
                   pg-collect npm \
                     --packages-file /tmp/seed-npm.txt \
                     -o /tmp/packages.nt && \
-                  pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT" && \
+                  if [ "${COLLECTOR_FULL_RELOAD:-0}" = "1" ]; then
+                    pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  fi
                   pg-collect load /tmp/packages.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
               resources: {requests: {cpu: 500m, memory: 512Mi}, limits: {cpu: "1", memory: 1Gi}}

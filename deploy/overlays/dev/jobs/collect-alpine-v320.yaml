@@ -10,6 +10,7 @@ spec:
   failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
+      activeDeadlineSeconds: 900
       backoffLimit: 2
       ttlSecondsAfterFinished: 600
       template:
@@ -36,9 +37,9 @@ spec:
                     --repo main --repo community \
                     --arch x86_64 \
                     -o /tmp/packages.nt && \
-                  pg-collect drop \
-                    --graph "$GRAPH_URI" \
-                    --endpoint "$FUSEKI_ENDPOINT" && \
+                  if [ "${COLLECTOR_FULL_RELOAD:-0}" = "1" ]; then
+                    pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  fi
                   pg-collect load /tmp/packages.nt \
                     --graph "$GRAPH_URI" \
                     --endpoint "$FUSEKI_ENDPOINT"

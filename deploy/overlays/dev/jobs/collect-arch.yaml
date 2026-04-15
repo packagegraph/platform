@@ -35,9 +35,9 @@ spec:
                     --repo core --repo extra --repo multilib \
                     --include-aur \
                     -o /tmp/packages.nt && \
-                  pg-collect drop \
-                    --graph "$GRAPH_URI" \
-                    --endpoint "$FUSEKI_ENDPOINT" && \
+                  if [ "${COLLECTOR_FULL_RELOAD:-0}" = "1" ]; then
+                    pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  fi
                   pg-collect load /tmp/packages.nt \
                     --graph "$GRAPH_URI" \
                     --endpoint "$FUSEKI_ENDPOINT"
