@@ -23,3 +23,4 @@ pub mod cran;
 pub mod hackage;
 pub mod nuget;
 pub mod hex_collect;
+pub mod freebsd;

@@ -11,6 +11,7 @@ use pg_collect::cran::CranCollector;
 use pg_collect::hackage::HackageCollector;
 use pg_collect::nuget::NugetCollector;
 use pg_collect::hex_collect::HexCollector;
+use pg_collect::freebsd::FreebsdCollector;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -384,6 +385,25 @@ enum Commands {
         /// Hex API base URL
         #[arg(long, default_value = "https://hex.pm")]
         api_base: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
+    /// Collect FreeBSD packages from pkg.freebsd.org
+    Freebsd {
+        /// Mirror URL
+        #[arg(long, default_value = "https://pkg.freebsd.org")]
+        mirror: String,
+
+        /// FreeBSD release (e.g., "14", "13")
+        #[arg(long, default_value = "14")]
+        release: String,
+
+        /// Architecture (e.g., "amd64", "arm64")
+        #[arg(long, default_value = "amd64")]
+        arch: String,
 
         /// Output file path
         #[arg(short, long, required = true)]
@@ -768,6 +788,18 @@ fn main() {
 
             let collector = HexCollector::new(api_base);
             collector.collect(&packages_file, &output)
+        }
+
+        Commands::Freebsd { mirror, release, arch, output } => {
+            eprintln!("=== PackageGraph FreeBSD Collector ===");
+            eprintln!("Mirror: {}", mirror);
+            eprintln!("Release: {}", release);
+            eprintln!("Arch: {}", arch);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let collector = FreebsdCollector::new(mirror, release, arch);
+            collector.collect(&output)
         }
 
         Commands::Load { file, graph, endpoint, batch_size } => {
