@@ -17,3 +17,4 @@ pub mod void_collect;
 pub mod sparql;
 pub mod osv;
 pub mod rubygems;
+pub mod maven;

@@ -1263,5 +1263,52 @@ def seed_rubygems(fuseki_endpoint, output, from_names):
     click.echo(f"Wrote {len(names)} RubyGems names to {output}")
 
 
+@cli.command()
+@click.option("--fuseki-endpoint", required=True, envvar="FUSEKI_ENDPOINT")
+@click.option("-o", "--output", required=True, type=click.Path())
+@click.option("--from-names", is_flag=True, help="Also extract from maven-* and java-* package names")
+def seed_maven(fuseki_endpoint, output, from_names):
+    """Generate Maven seed file (groupId:artifactId) from binary package graph."""
+    from packagegraph.sparql_client import SparqlQueryClient
+    import re
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    coords = set()
+
+    # Extract from homepages matching maven.apache.org or search.maven.org
+    def extract_maven(pkg_name, homepage):
+        # Match: mvnrepository.com/artifact/groupId/artifactId
+        m = re.search(r'mvnrepository\.com/artifact/([^/]+)/([^/]+)', homepage)
+        if m:
+            return f"{m.group(1)}:{m.group(2)}"
+        # Match: search.maven.org/artifact/groupId/artifactId
+        m = re.search(r'search\.maven\.org/artifact/([^/]+)/([^/]+)', homepage)
+        if m:
+            return f"{m.group(1)}:{m.group(2)}"
+        return None
+
+    for coord in _seed_from_homepage(client, "maven", extract_maven):
+        if coord:
+            coords.add(coord)
+
+    if from_names:
+        # Get from upstreamPackageName (ecosystem=maven)
+        upstream = _seed_from_upstream(client, "maven")
+        if upstream:
+            for coord in upstream:
+                coords.add(coord)
+        else:
+            # Fallback: extract from maven-* package names
+            for n in _seed_from_names(client, "maven-"):
+                # Try to derive groupId:artifactId — this is lossy
+                # Many maven-* packages don't encode coordinates in the name
+                # Example: maven-compiler-plugin → org.apache.maven.plugins:maven-compiler-plugin
+                # For now, just use the name as artifactId with a placeholder groupId
+                coords.add(f"org.apache.maven.plugins:{n}")
+
+    Path(output).write_text("\n".join(sorted(coords)) + "\n")
+    click.echo(f"Wrote {len(coords)} Maven coordinates to {output}")
+
+
 if __name__ == "__main__":
     cli()

@@ -33,6 +33,7 @@ MET = Namespace("https://purl.org/packagegraph/ontology/metrics#")
 DEB = Namespace("https://purl.org/packagegraph/ontology/debian#")
 RPM = Namespace("https://purl.org/packagegraph/ontology/rpm#")
 GEMS = Namespace("https://purl.org/packagegraph/ontology/rubygems#")
+MAVEN = Namespace("https://purl.org/packagegraph/ontology/maven#")
 
 # Data quality
 DQ = Namespace("https://purl.org/packagegraph/ontology/dq#")

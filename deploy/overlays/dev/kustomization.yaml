@@ -23,6 +23,7 @@ resources:
   - jobs/collect-void.yaml
   - jobs/collect-osv.yaml
   - jobs/collect-rubygems.yaml
+  - jobs/collect-maven.yaml
   - jobs/snapshot-tdb2.yaml
   - jobs/enrich-github-vcs.yaml
   - jobs/enrich-license.yaml

@@ -5,6 +5,7 @@ use pg_collect::debian::DebianCollector;
 use pg_collect::homebrew::HomebrewCollector;
 use pg_collect::rpm::RpmCollector;
 use pg_collect::rubygems::RubyGemsCollector;
+use pg_collect::maven::MavenCollector;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -288,6 +289,25 @@ enum Commands {
         /// API base URL
         #[arg(long, default_value = "https://rubygems.org")]
         api_base: String,
+
+        /// Output file path
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
+    /// Collect Maven artifacts from Maven Central
+    Maven {
+        /// Seed file with groupId:artifactId coordinates (one per line)
+        #[arg(long, required = true)]
+        packages_file: String,
+
+        /// Maven search API base URL
+        #[arg(long, default_value = "https://search.maven.org")]
+        search_base: String,
+
+        /// Maven repository base URL
+        #[arg(long, default_value = "https://repo1.maven.org/maven2")]
+        repo_base: String,
 
         /// Output file path
         #[arg(short, long, required = true)]
@@ -603,6 +623,18 @@ fn main() {
             eprintln!();
 
             let collector = RubyGemsCollector::new(api_base);
+            collector.collect(&packages_file, &output)
+        }
+
+        Commands::Maven { packages_file, search_base, repo_base, output } => {
+            eprintln!("=== PackageGraph Maven Collector ===");
+            eprintln!("Search API: {}", search_base);
+            eprintln!("Repository: {}", repo_base);
+            eprintln!("Seed: {}", packages_file);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let collector = MavenCollector::new(search_base, repo_base);
             collector.collect(&packages_file, &output)
         }
 
