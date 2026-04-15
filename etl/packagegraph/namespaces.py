@@ -32,6 +32,10 @@ MET = Namespace("https://purl.org/packagegraph/ontology/metrics#")
 # Distribution-specific ontology extensions
 DEB = Namespace("https://purl.org/packagegraph/ontology/debian#")
 RPM = Namespace("https://purl.org/packagegraph/ontology/rpm#")
+GEMS = Namespace("https://purl.org/packagegraph/ontology/rubygems#")
+
+# Data quality
+DQ = Namespace("https://purl.org/packagegraph/ontology/dq#")
 
 # External vocabularies
 FOAF = Namespace("http://xmlns.com/foaf/0.1/")

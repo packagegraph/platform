@@ -386,39 +386,50 @@ def enrich_github(input_file, output_file, github_token, cache_dir):
 
 @cli.command()
 @click.option(
-    "--input-file",
-    "-i",
+    "--fuseki-endpoint",
     required=True,
-    type=click.Path(exists=True),
-    help="Path to existing package graph (.ttl file).",
+    envvar="FUSEKI_ENDPOINT",
+    help="Fuseki SPARQL endpoint URL (e.g., http://fuseki:3030/packagegraph).",
 )
 @click.option(
-    "--output-file",
-    "-o",
+    "--output-dir",
     required=True,
     type=click.Path(),
-    help="Path to save enriched graph.",
+    help="Directory for enrichment output (.nt files).",
 )
 @click.option(
-    "--cache-dir", default=None, help="Directory for caching OSV API responses."
+    "--cache-dir",
+    default=None,
+    help="Directory for caching OSV API responses.",
 )
-def enrich_security(input_file, output_file, cache_dir):
-    """Enrich package graph with vulnerability data from OSV.dev."""
-    from packagegraph.collectors.security import SecurityEnricher
+@click.option(
+    "--ecosystem",
+    required=True,
+    type=click.Choice(["debian", "alpine", "npm", "pypi", "cargo", "gomod"], case_sensitive=False),
+    help="Ecosystem to enrich (debian, alpine, npm, pypi, cargo, gomod).",
+)
+def enrich_security(fuseki_endpoint, output_dir, cache_dir, ecosystem):
+    """Enrich package graph with vulnerability data from OSV.dev (Fuseki-aware)."""
+    from packagegraph.sparql_client import SparqlQueryClient
+    from packagegraph.enrichers.security import SecurityEnricher
 
     if cache_dir is None:
-        cache_dir = Path.home() / ".cache" / "packagegraph" / "security"
+        cache_dir = Path.home() / ".cache" / "packagegraph" / "security" / ecosystem
 
-    g = Graph()
-    click.echo(f"Loading graph from {input_file}...")
-    g.parse(input_file)
-    click.echo(f"Loaded {len(g)} triples.")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / f"security_{ecosystem}.nt"
 
-    enricher = SecurityEnricher(g, cache_dir=str(cache_dir))
+    client = SparqlQueryClient(fuseki_endpoint)
+
+    enricher = SecurityEnricher(
+        sparql_client=client,
+        output_path=str(output_file),
+        cache_dir=str(cache_dir),
+        ecosystem=ecosystem,
+    )
     enricher.enrich()
-
-    g.serialize(destination=output_file, format="turtle")
-    click.echo(f"Enriched graph saved to {output_file}. Total triples: {len(g)}")
+    click.echo(f"Security enrichment ({ecosystem}) complete. Output: {output_file}")
 
 
 @cli.command()
@@ -728,6 +739,92 @@ def enrich_vcs_activity(
     click.echo(f"VCS activity enrichment complete. Output: {output_file}")
 
 
+@cli.command()
+@click.option(
+    "--fuseki-endpoint",
+    required=True,
+    envvar="FUSEKI_ENDPOINT",
+    help="Fuseki SPARQL endpoint URL (e.g., http://fuseki:3030/packagegraph).",
+)
+@click.option(
+    "--output-dir",
+    required=True,
+    type=click.Path(),
+    help="Directory for enrichment output (.nt files).",
+)
+@click.option("--cache-dir", default=None, help="Directory for caching API responses.")
+@click.option(
+    "--type",
+    "advisory_type",
+    required=True,
+    type=click.Choice(["rhsa", "dsa"], case_sensitive=False),
+    help="Advisory type: rhsa (Red Hat) or dsa (Debian).",
+)
+@click.option("--days-back", default=365, type=int, help="For RHSA: days back to fetch advisories.")
+def enrich_advisory(fuseki_endpoint, output_dir, cache_dir, advisory_type, days_back):
+    """Enrich package graph with vendor security advisories (RHSA, DSA)."""
+    from packagegraph.sparql_client import SparqlQueryClient
+    from packagegraph.enrichers.advisory import RHSAEnricher, DSAEnricher
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / f"advisory_{advisory_type}.nt"
+
+    if cache_dir is None:
+        cache_dir = Path.home() / ".cache" / "packagegraph" / f"advisory_{advisory_type}"
+
+    client = SparqlQueryClient(fuseki_endpoint)
+
+    if advisory_type == "rhsa":
+        enricher = RHSAEnricher(
+            sparql_client=client,
+            output_path=str(output_file),
+            cache_dir=str(cache_dir),
+            days_back=days_back,
+        )
+    else:  # dsa
+        enricher = DSAEnricher(
+            sparql_client=client,
+            output_path=str(output_file),
+            cache_dir=str(cache_dir),
+        )
+
+    enricher.enrich()
+    click.echo(f"Advisory enrichment ({advisory_type.upper()}) complete. Output: {output_file}")
+
+
+@cli.command()
+@click.option(
+    "--fuseki-endpoint",
+    required=True,
+    envvar="FUSEKI_ENDPOINT",
+    help="Fuseki SPARQL endpoint URL (e.g., http://fuseki:3030/packagegraph).",
+)
+@click.option(
+    "--output-dir",
+    required=True,
+    type=click.Path(),
+    help="Directory for enrichment output (.nt files).",
+)
+def enrich_npm_provenance(fuseki_endpoint, output_dir):
+    """Enrich npm packages with SLSA provenance attestations from registry."""
+    from packagegraph.sparql_client import SparqlQueryClient
+    from packagegraph.enrichers.npm_provenance import NpmProvenanceEnricher
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / "npm_provenance.nt"
+
+    client = SparqlQueryClient(fuseki_endpoint)
+
+    enricher = NpmProvenanceEnricher(
+        sparql_client=client,
+        output_path=str(output_file),
+    )
+    enricher.enrich()
+    click.echo(f"npm provenance enrichment complete. Output: {output_file}")
+
+
 # ─── Canned Query Commands ────────────────────────────────────────────────────
 
 def _query_to_json(client, sparql: str) -> str:
@@ -943,8 +1040,34 @@ def _seed_from_homepage(client, pattern: str, extract_fn) -> list[str]:
     return sorted(names)
 
 
+def _seed_from_upstream(client, ecosystem: str) -> list[str]:
+    """Query Fuseki for upstream package names via pkg:upstreamPackageName.
+
+    This is the preferred method — uses Provides data from RPM metadata
+    which has the exact upstream name (e.g., 'tokio' not 'rust-tokio-devel').
+    """
+    sparql = f"""
+    PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+    SELECT DISTINCT ?upstream WHERE {{
+      ?p a pkg:BinaryPackage ;
+         pkg:upstreamEcosystem "{ecosystem}" ;
+         pkg:upstreamPackageName ?upstream .
+    }}
+    """
+    try:
+        bindings = client.query(sparql)
+        return [b["upstream"]["value"] for b in bindings]
+    except Exception:
+        return []
+
+
 def _seed_from_names(client, prefix: str) -> list[str]:
-    """Query Fuseki for binary packages with a prefix and extract language package names."""
+    """Fallback: extract upstream names from distro package names by stripping prefix/suffix.
+
+    Use _seed_from_upstream() when possible — this method loses information
+    (scoped packages, case sensitivity, etc.).
+    """
+    import re
     sparql = f"""
     PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
     SELECT DISTINCT ?name WHERE {{
@@ -953,13 +1076,18 @@ def _seed_from_names(client, prefix: str) -> list[str]:
       FILTER(STRSTARTS(?name, "{prefix}"))
     }}
     """
+    rpm_suffixes = re.compile(
+        r'(\+\w+)?-(devel|doc|static|libs|tools|data|common|debuginfo|debugsource|tests|help)$'
+    )
     bindings = client.query(sparql)
     names = set()
     for b in bindings:
         full_name = b["name"]["value"]
         lang_name = full_name[len(prefix):]
         if lang_name:
-            names.add(lang_name)
+            lang_name = rpm_suffixes.sub('', lang_name)
+            if lang_name:
+                names.add(lang_name)
     return sorted(names)
 
 
@@ -985,8 +1113,15 @@ def seed_npm(fuseki_endpoint, output, from_names):
 
     # From binary package names
     if from_names:
-        for n in _seed_from_names(client, "node-"):
-            names.add(n)
+        # Prefer Provides-derived names (exact upstream names)
+        upstream = _seed_from_upstream(client, "npm")
+        if upstream:
+            for n in upstream:
+                names.add(n)
+        else:
+            # Fallback: strip node- prefix (lossy — misses scoped packages)
+            for n in _seed_from_names(client, "node-"):
+                names.add(n)
 
     Path(output).write_text("\n".join(sorted(names)) + "\n")
     click.echo(f"Wrote {len(names)} NPM package names to {output}")
@@ -1012,10 +1147,15 @@ def seed_pypi(fuseki_endpoint, output, from_names):
         names.add(n)
 
     if from_names:
-        for n in _seed_from_names(client, "python3-"):
-            names.add(n)
-        for n in _seed_from_names(client, "python-"):
-            names.add(n)
+        upstream = _seed_from_upstream(client, "pypi")
+        if upstream:
+            for n in upstream:
+                names.add(n)
+        else:
+            for n in _seed_from_names(client, "python3-"):
+                names.add(n)
+            for n in _seed_from_names(client, "python-"):
+                names.add(n)
 
     Path(output).write_text("\n".join(sorted(names)) + "\n")
     click.echo(f"Wrote {len(names)} PyPI package names to {output}")
@@ -1041,8 +1181,13 @@ def seed_cargo(fuseki_endpoint, output, from_names):
         names.add(n)
 
     if from_names:
-        for n in _seed_from_names(client, "rust-"):
-            names.add(n)
+        upstream = _seed_from_upstream(client, "cargo")
+        if upstream:
+            for n in upstream:
+                names.add(n)
+        else:
+            for n in _seed_from_names(client, "rust-"):
+                names.add(n)
 
     Path(output).write_text("\n".join(sorted(names)) + "\n")
     click.echo(f"Wrote {len(names)} Cargo crate names to {output}")
@@ -1071,15 +1216,51 @@ def seed_gomod(fuseki_endpoint, output, from_names):
         names.add(n)
 
     if from_names:
-        for n in _seed_from_names(client, "golang-"):
-            # golang-github-foo-bar → github.com/foo/bar
-            parts = n.split("-", 2)
-            if len(parts) >= 3 and parts[0] in ("github", "gitlab", "golang"):
-                host = parts[0] + ".com" if parts[0] != "golang" else "golang.org"
-                names.add(f"{host}/{'/'.join(parts[1:])}")
+        upstream = _seed_from_upstream(client, "gomod")
+        if upstream:
+            for n in upstream:
+                names.add(n)
+        else:
+            for n in _seed_from_names(client, "golang-"):
+                parts = n.split("-", 2)
+                if len(parts) >= 3 and parts[0] in ("github", "gitlab", "golang"):
+                    host = parts[0] + ".com" if parts[0] != "golang" else "golang.org"
+                    names.add(f"{host}/{'/'.join(parts[1:])}")
 
     Path(output).write_text("\n".join(sorted(names)) + "\n")
     click.echo(f"Wrote {len(names)} Go module paths to {output}")
+
+
+@cli.command()
+@click.option("--fuseki-endpoint", required=True, envvar="FUSEKI_ENDPOINT")
+@click.option("-o", "--output", required=True, type=click.Path())
+@click.option("--from-names", is_flag=True, help="Also extract from rubygem-* package names")
+def seed_rubygems(fuseki_endpoint, output, from_names):
+    """Generate RubyGems seed file from binary package graph."""
+    from packagegraph.sparql_client import SparqlQueryClient
+
+    client = SparqlQueryClient(fuseki_endpoint)
+    names = set()
+
+    def extract_rubygem(pkg_name, homepage):
+        import re
+        m = re.search(r'rubygems\.org/gems/(.+?)(?:/|$)', homepage)
+        return m.group(1) if m else None
+
+    for n in _seed_from_homepage(client, "rubygems.org", extract_rubygem):
+        names.add(n)
+
+    if from_names:
+        upstream = _seed_from_upstream(client, "rubygems")
+        if upstream:
+            for n in upstream:
+                names.add(n)
+        else:
+            for n in _seed_from_names(client, "rubygem-"):
+                names.add(n)
+
+    Path(output).write_text("\n".join(sorted(names)) + "\n")
+    click.echo(f"Wrote {len(names)} RubyGems names to {output}")
 
 
 if __name__ == "__main__":

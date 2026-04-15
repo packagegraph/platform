@@ -16,11 +16,23 @@ resources:
   - jobs/collect-pypi.yaml
   - jobs/collect-cargo.yaml
   - jobs/collect-gomod.yaml
+  - jobs/collect-conda.yaml
+  - jobs/collect-flatpak.yaml
+  - jobs/collect-snap.yaml
+  - jobs/collect-gentoo.yaml
+  - jobs/collect-void.yaml
+  - jobs/collect-osv.yaml
+  - jobs/collect-rubygems.yaml
   - jobs/snapshot-tdb2.yaml
   - jobs/enrich-github-vcs.yaml
   - jobs/enrich-license.yaml
   - jobs/enrich-metrics.yaml
   - jobs/enrich-vcs-activity.yaml
+  - jobs/enrich-security-system.yaml
+  - jobs/enrich-security-lang.yaml
+  - jobs/enrich-advisory.yaml
+  - jobs/enrich-npm-provenance.yaml
+  - jobs/enrich-koji.yaml
   - jobs/validate-data.yaml
 
 patches:

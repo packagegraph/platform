@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-rubygems
+  namespace: packagegraph
+spec:
+  schedule: "0 6 * * 1"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/rubygems"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  packagegraph seed-rubygems \
+                    --fuseki-endpoint "$FUSEKI_ENDPOINT" \
+                    --from-names \
+                    -o /tmp/seed-rubygems.txt && \
+                  pg-collect rubygems \
+                    --packages-file /tmp/seed-rubygems.txt \
+                    -o /tmp/packages.nt && \
+                  if [ "${COLLECTOR_FULL_RELOAD:-0}" = "1" ]; then
+                    pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  fi
+                  pg-collect load /tmp/packages.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+              resources: {requests: {cpu: 500m, memory: 512Mi}, limits: {cpu: "1", memory: 1Gi}}

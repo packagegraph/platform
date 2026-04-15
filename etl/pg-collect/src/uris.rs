@@ -21,6 +21,7 @@ pub const FLATPAK: &str = "https://purl.org/packagegraph/ontology/flatpak#";
 pub const SNAP: &str = "https://purl.org/packagegraph/ontology/snap#";
 pub const GENTOO: &str = "https://purl.org/packagegraph/ontology/gentoo#";
 pub const VOID: &str = "https://purl.org/packagegraph/ontology/void#";
+pub const GEMS: &str = "https://purl.org/packagegraph/ontology/rubygems#";
 pub const DATA: &str = "https://packagegraph.github.io/d/";
 pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 pub const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
@@ -143,6 +144,12 @@ pub fn upstream_uri(name: &str) -> String {
 /// Build a Vulnerability URI from CVE ID.
 pub fn cve_uri(cve_id: &str) -> String {
     format!("{DATA}cve/{}", encode(cve_id))
+}
+
+/// Build a Vulnerability URI from OSV ID (for non-CVE vulnerabilities).
+/// Used when an OSV record has no CVE alias (e.g., GHSA-*, RUSTSEC-*, PYSEC-*).
+pub fn vuln_uri(osv_id: &str) -> String {
+    format!("{DATA}vuln/{}", encode(osv_id))
 }
 
 /// Build a VCS Repository URI from repository URL.
@@ -456,6 +463,22 @@ mod tests {
         assert_eq!(
             uri,
             "https://packagegraph.github.io/d/buildenv/fedora/41/gcc/14.0.1-1.fc41"
+        );
+    }
+
+    #[test]
+    fn test_vuln_uri() {
+        let uri = vuln_uri("GHSA-2g4f-4pwh-qvx6");
+        assert_eq!(
+            uri,
+            "https://packagegraph.github.io/d/vuln/GHSA-2g4f-4pwh-qvx6"
+        );
+
+        // Test with special characters
+        let uri2 = vuln_uri("RUSTSEC-2024-001");
+        assert_eq!(
+            uri2,
+            "https://packagegraph.github.io/d/vuln/RUSTSEC-2024-001"
         );
     }
 }
