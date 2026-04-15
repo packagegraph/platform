@@ -480,6 +480,30 @@ impl DebianCollector {
             }
         }
 
+        // Emit provides — virtual package resolution
+        if let Some(provides_str) = pkg_data.get("Provides") {
+            for part in provides_str.split(',') {
+                let provided = part.trim();
+                if provided.is_empty() {
+                    continue;
+                }
+                // Strip version constraint if present: "foo (= 1.0)" → "foo"
+                let name = provided.split_whitespace().next().unwrap_or(provided);
+
+                let dep_uri = package_identity_uri("debian", codename, arch_name, name);
+
+                writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
+                writer.write_literal(&dep_uri, &format!("{PKG}packageName"), name)?;
+                writer.write_triple(
+                    pkg_uri,
+                    &format!("{PKG}directlyProvides"),
+                    &dep_uri,
+                )?;
+                writer.write_triple(pkg_uri, &format!("{DEB}debProvides"), &dep_uri)?;
+                triples += 4;
+            }
+        }
+
         Ok(triples)
     }
 

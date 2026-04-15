@@ -151,3 +151,58 @@ fn test_emit_package_with_source_field() -> std::io::Result<()> {
 
 // Full integration test with mock HTTP server will be in integration.rs (Task 8)
 
+#[test]
+fn test_emit_package_with_provides() -> std::io::Result<()> {
+    let collector = DebianCollector::new(
+        "http://example.com".to_string(),
+        "stable".to_string(),
+        "main".to_string(),
+    );
+
+    let temp_file = NamedTempFile::new()?;
+    let mut writer = NTriplesWriter::new(temp_file.reopen()?);
+
+    let mut pkg_data = HashMap::new();
+    pkg_data.insert("Package".to_string(), "testpkg".to_string());
+    pkg_data.insert("Version".to_string(), "1.0-1".to_string());
+    pkg_data.insert("Provides".to_string(), "virtual-foo, virtual-bar (= 2.0), virtual-baz".to_string());
+
+    collector.emit_package_triples(
+        &mut writer,
+        &pkg_data,
+        "trixie",
+        "stable",
+        "amd64",
+    )?;
+
+    writer.flush()?;
+
+    let output_file = temp_file.reopen()?;
+    let reader = BufReader::new(output_file);
+    let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
+
+    // Check for provides triples
+    assert!(lines.iter().any(|l| l.contains("directlyProvides")),
+            "Should have directlyProvides triple");
+
+    assert!(lines.iter().any(|l| l.contains("debProvides")),
+            "Should have debProvides triple");
+
+    // Check for provided package identities
+    assert!(lines.iter().any(|l| l.contains("virtual-foo")),
+            "Should reference virtual-foo");
+    assert!(lines.iter().any(|l| l.contains("virtual-bar")),
+            "Should reference virtual-bar");
+    assert!(lines.iter().any(|l| l.contains("virtual-baz")),
+            "Should reference virtual-baz");
+
+    assert!(lines.iter().any(|l| l.contains("PackageIdentity")),
+            "Should have PackageIdentity type for provided packages");
+
+    // Verify that version constraints are stripped (we should NOT see "(= 2.0)" in package names)
+    assert!(!lines.iter().any(|l| l.contains("packageName") && l.contains("(=")),
+            "Package names should not include version constraints");
+
+    Ok(())
+}
+
