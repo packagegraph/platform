@@ -41,6 +41,9 @@ struct PomMetadata {
     url: Option<String>,
     licenses: Vec<String>,
     dependencies: Vec<PomDependency>,
+    scm_url: Option<String>,
+    scm_connection: Option<String>,
+    scm_tag: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,17 +57,34 @@ struct PomDependency {
 
 impl MavenCollector {
     pub fn new(search_base: String, repo_base: String) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .expect("Failed to create HTTP client");
+        let client = crate::enricher::default_http_client();
 
         Self {
             client,
             search_base,
             repo_base,
         }
+    }
+
+    pub fn collect_discover(&self, endpoint: &str, output_path: &str) -> Result<(usize, usize)> {
+        let raw_names = crate::seed::discover_by_ecosystem(endpoint, "maven")?;
+        let raw_count = raw_names.len();
+        // Normalize: strip version/classifier from old-format entries (g:a:v:c → g:a),
+        // keep only valid groupId:artifactId pairs, deduplicate
+        let mut seen = std::collections::HashSet::new();
+        let names: Vec<String> = raw_names.into_iter().filter_map(|n| {
+            let parts: Vec<&str> = n.splitn(3, ':').collect();
+            if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                let coord = format!("{}:{}", parts[0], parts[1]);
+                if seen.insert(coord.clone()) { Some(coord) } else { None }
+            } else {
+                None
+            }
+        }).collect();
+        eprintln!("Normalized {} raw → {} unique Maven coordinates", raw_count, names.len());
+        let seed_path = "/tmp/seed-maven-discover.txt";
+        std::fs::write(seed_path, names.join("\n"))?;
+        self.collect(seed_path, output_path)
     }
 
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
@@ -78,7 +98,7 @@ impl MavenCollector {
 
         let mut total_packages = 0;
         let mut total_triples = 0;
-        let mut base_delay_ms = 200;
+        let mut base_delay_ms = 500;
 
         for (idx, coord) in coordinates.iter().enumerate() {
             if (idx + 1) % 100 == 0 {
@@ -190,9 +210,33 @@ impl MavenCollector {
                         continue;
                     }
 
+                    if !response.status().is_success() {
+                        let status = response.status();
+                        if attempt < max_attempts - 1 {
+                            let delay = 2u64.pow(attempt as u32 + 1);
+                            eprintln!("  HTTP {}, backing off {}s...", status, delay);
+                            std::thread::sleep(Duration::from_secs(delay));
+                            *base_delay_ms = (*base_delay_ms * 2).min(5000);
+                            continue;
+                        }
+                        return Err(format!("HTTP {}", status));
+                    }
+
                     let text = response.text().map_err(|e| e.to_string())?;
-                    let search_resp: SearchResponse = serde_json::from_str(&text)
-                        .map_err(|e| format!("Failed to parse search response: {}", e))?;
+                    let search_resp: SearchResponse = match serde_json::from_str(&text) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            if attempt < max_attempts - 1 {
+                                // Non-JSON response (Cloudflare challenge) — treat as rate limit
+                                let delay = 2u64.pow(attempt as u32 + 1);
+                                eprintln!("  Non-JSON response, backing off {}s...", delay);
+                                std::thread::sleep(Duration::from_secs(delay));
+                                *base_delay_ms = (*base_delay_ms * 2).min(5000);
+                                continue;
+                            }
+                            return Err(format!("Failed to parse search response: {}", e));
+                        }
+                    };
 
                     if let Some(doc) = search_resp.response.docs.first() {
                         return Ok(doc.latest_version.clone());
@@ -242,6 +286,7 @@ impl MavenCollector {
         let mut current_element = String::new();
         let mut in_dependencies = false;
         let mut in_licenses = false;
+        let mut in_scm = false;
         let mut current_dep = PomDependency {
             group_id: String::new(),
             artifact_id: String::new(),
@@ -259,6 +304,8 @@ impl MavenCollector {
                         in_dependencies = true;
                     } else if name == "licenses" {
                         in_licenses = true;
+                    } else if name == "scm" && !in_dependencies {
+                        in_scm = true;
                     } else if in_dependencies && name == "dependency" {
                         current_dep = PomDependency {
                             group_id: String::new(),
@@ -275,6 +322,8 @@ impl MavenCollector {
                         in_dependencies = false;
                     } else if name == "licenses" {
                         in_licenses = false;
+                    } else if name == "scm" {
+                        in_scm = false;
                     } else if in_dependencies && name == "dependency" {
                         if !current_dep.group_id.is_empty() && !current_dep.artifact_id.is_empty() {
                             pom.dependencies.push(current_dep.clone());
@@ -290,7 +339,7 @@ impl MavenCollector {
 
                     match current_element.as_str() {
                         "description" if !in_dependencies => pom.description = Some(text),
-                        "url" if !in_dependencies && !in_licenses => pom.url = Some(text),
+                        "url" if !in_dependencies && !in_licenses && !in_scm => pom.url = Some(text),
                         "name" if in_licenses => {
                             if !pom.licenses.contains(&text) {
                                 pom.licenses.push(text);
@@ -301,6 +350,9 @@ impl MavenCollector {
                         "version" if in_dependencies => current_dep.version = Some(text),
                         "scope" if in_dependencies => current_dep.scope = Some(text),
                         "optional" if in_dependencies => current_dep.optional = text == "true",
+                        "url" if in_scm => pom.scm_url = Some(text),
+                        "connection" if in_scm => pom.scm_connection = Some(text),
+                        "tag" if in_scm => pom.scm_tag = Some(text),
                         _ => {}
                     }
                 }
@@ -316,6 +368,7 @@ impl MavenCollector {
 
     fn emit_artifact_triples(&self, writer: &mut NTriplesWriter, pom: &PomMetadata) -> Result<usize> {
         let name = format!("{}/{}", pom.group_id, pom.artifact_id);
+        let identity_name = format!("{}:{}", pom.group_id, pom.artifact_id);
         let pkg_uri = package_uri("maven", "central", "any", &name, &pom.version);
         let identity_uri = package_identity_uri("maven", "central", "any", &name);
         let mut triples = 0;
@@ -327,11 +380,19 @@ impl MavenCollector {
 
         // Identity
         writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &name)?;
+        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &identity_name)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 
-        writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), &name)?;
+        // Canonical identity name (colon form for OSV join) and PURL
+        writer.write_literal(&identity_uri, &format!("{PKG}identityName"), &identity_name)?;
+        triples += 1;
+
+        let purl = format!("pkg:maven/{}/{}", pom.group_id, pom.artifact_id);
+        writer.write_literal(&identity_uri, &format!("{PKG}purl"), &purl)?;
+        triples += 1;
+
+        writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), &identity_name)?;
         triples += 1;
 
         // Maven-specific coordinates
@@ -363,6 +424,37 @@ impl MavenCollector {
         for license in &pom.licenses {
             writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
             triples += 1;
+            // License entity (SPDX)
+            let license_uri = crate::uris::spdx_license_uri(license);
+            writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+            writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+            triples += 2;
+        }
+
+        // SCM → upstream repository
+        if let Some(scm_url) = &pom.scm_url {
+            if let Some(repo_uri) = crate::uris::normalize_forge_url(scm_url) {
+                writer.write_triple(&identity_uri, &format!("{PKG}upstreamRepository"), &repo_uri)?;
+                writer.write_triple(&repo_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
+                triples += 2;
+
+                if let Some(conn) = &pom.scm_connection {
+                    let clone_url = conn.strip_prefix("scm:git:").unwrap_or(conn);
+                    writer.write_literal(&repo_uri, &format!("{VCS}cloneUrl"), clone_url)?;
+                    triples += 1;
+                }
+            }
+        }
+
+        // SCM tag → packagedFromTag
+        if let Some(tag) = &pom.scm_tag {
+            if tag != "HEAD" && !tag.is_empty() {
+                let tag_uri = format!("{DATA}tag/maven/{}/{}/{}", pom.group_id, pom.artifact_id, tag);
+                writer.write_triple(&pkg_uri, &format!("{VCS}packagedFromTag"), &tag_uri)?;
+                writer.write_triple(&tag_uri, RDF_TYPE, &format!("{VCS}Tag"))?;
+                writer.write_literal(&tag_uri, &format!("{VCS}tagName"), tag)?;
+                triples += 3;
+            }
         }
 
         // Dependencies
@@ -391,7 +483,7 @@ impl MavenCollector {
         writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
         writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
         writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-        writer.write_bnode_literal(&bnode, &format!("{PKG}dependencyType"), scope)?;
+        writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri(scope))?;
         writer.write_bnode_literal(&bnode, &format!("{MAVEN}scope"), scope)?;
         triples += 5;
 
@@ -402,7 +494,7 @@ impl MavenCollector {
 
         if let Some(version_constraint) = &dep.version {
             let cb = bnode_id("constraint", &format!("{}-{}", pkg_uri, &dep_name));
-            writer.write_bnode_object(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
+            writer.write_bnode_to_bnode(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
             writer.write_bnode_subject(&cb, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
             writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintOperator"), "maven")?;
             writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintValue"), version_constraint)?;
@@ -526,6 +618,9 @@ mod tests {
             url: Some("https://commons.apache.org/proper/commons-lang/".to_string()),
             licenses: vec!["Apache-2.0".to_string()],
             dependencies: vec![],
+            scm_url: None,
+            scm_connection: None,
+            scm_tag: None,
         };
 
         let triples = collector.emit_artifact_triples(&mut writer, &pom).unwrap();
@@ -541,6 +636,40 @@ mod tests {
         assert!(content.contains("\"org.apache.commons\""));
         assert!(content.contains("\"commons-lang3\""));
         assert!(content.contains("\"3.14.0\""));
+
+        // Verify colon-form identityName and PURL
+        assert!(content.contains("\"org.apache.commons:commons-lang3\""));
+        assert!(content.contains("core#identityName"));
+        assert!(content.contains("core#purl"));
+        assert!(content.contains("\"pkg:maven/org.apache.commons/commons-lang3\""));
+
         assert!(triples > 10);
+    }
+
+    #[test]
+    fn test_parse_pom_with_scm() {
+        let collector = MavenCollector::new(
+            "https://search.maven.org".to_string(),
+            "https://repo1.maven.org/maven2".to_string(),
+        );
+        let pom_xml = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.springframework</groupId>
+  <artifactId>spring-core</artifactId>
+  <version>6.2.0</version>
+  <url>https://spring.io/projects/spring-framework</url>
+  <scm>
+    <url>https://github.com/spring-projects/spring-framework</url>
+    <connection>scm:git:git://github.com/spring-projects/spring-framework.git</connection>
+    <tag>v6.2.0</tag>
+  </scm>
+</project>"#;
+
+        let pom = collector.parse_pom(pom_xml, "org.springframework", "spring-core", "6.2.0").unwrap();
+        assert_eq!(pom.scm_url.as_deref(), Some("https://github.com/spring-projects/spring-framework"));
+        assert_eq!(pom.scm_connection.as_deref(), Some("scm:git:git://github.com/spring-projects/spring-framework.git"));
+        assert_eq!(pom.scm_tag.as_deref(), Some("v6.2.0"));
+        // Verify project URL is NOT overwritten by SCM URL
+        assert_eq!(pom.url.as_deref(), Some("https://spring.io/projects/spring-framework"));
     }
 }

@@ -1,4 +1,5 @@
 use crate::ntriples::{bnode_id, NTriplesWriter};
+use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use flate2::read::GzDecoder;
 use regex::Regex;
@@ -15,22 +16,38 @@ pub struct ArchCollector {
     mirror_url: String,
     repos: Vec<String>,
     include_aur: bool,
+    distro_name: String,
+    release_name: String,
+    arch_name: String,
+    source_cache: Option<SourceCache>,
 }
 
 impl ArchCollector {
-    pub fn new(mirror_url: String, repos: Vec<String>, include_aur: bool) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .expect("Failed to create HTTP client");
+    pub fn new(
+        mirror_url: String,
+        distro_name: String,
+        release_name: String,
+        arch_name: String,
+        repos: Vec<String>,
+        include_aur: bool,
+    ) -> Self {
+        let client = crate::enricher::default_http_client();
 
         Self {
             client,
             mirror_url,
             repos,
             include_aur,
+            distro_name,
+            release_name,
+            arch_name,
+            source_cache: None,
         }
+    }
+
+    pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
+        self.source_cache = Some(SourceCache::new(cache_dir, "arch")?);
+        Ok(self)
     }
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
@@ -73,17 +90,19 @@ impl ArchCollector {
     }
 
     fn emit_distribution_metadata(&self, writer: &mut NTriplesWriter) -> Result<usize> {
-        let dist_uri = distro_uri("arch");
-        let rel_uri = release_uri("arch", "rolling");
-        let arch_uri_val = arch_uri("x86_64");
+        let dist_uri = distro_uri(&self.distro_name);
+        let rel_uri = release_uri(&self.distro_name, &self.release_name);
+        let arch_uri_val = arch_uri(&self.arch_name);
         let mut triples = 0;
 
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
         writer.write_literal(&dist_uri, &format!("{PKG}projectName"), "Arch Linux")?;
-        triples += 2;
+        writer.write_literal(&dist_uri, RDFS_LABEL, "Arch")?;
+        triples += 3;
 
         writer.write_triple(&rel_uri, RDF_TYPE, &format!("{PKG}DistributionRelease"))?;
         writer.write_literal(&rel_uri, &format!("{PKG}releaseCodename"), "rolling")?;
+        // partOfDistribution auto-emits hasRelease inverse
         writer.write_triple(&rel_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         triples += 3;
 
@@ -98,12 +117,14 @@ impl ArchCollector {
         writer: &mut NTriplesWriter,
         repo: &str,
     ) -> Result<(usize, usize)> {
-        let url = format!(
-            "{}/{}/os/x86_64/{}.db.tar.gz",
-            self.mirror_url.trim_end_matches('/'),
-            repo,
-            repo
-        );
+        // Standard Arch: {mirror}/{repo}/os/x86_64/{repo}.db.tar.gz
+        // ArchLinux ARM: {mirror}/{repo}/{repo}.db (flat layout, no os/arch subpath)
+        let base = self.mirror_url.trim_end_matches('/');
+        let url = if base.contains("archlinuxarm") {
+            format!("{}/{}/{}.db", base, repo, repo)
+        } else {
+            format!("{}/{}/os/x86_64/{}.db.tar.gz", base, repo, repo)
+        };
 
         eprintln!("  Fetching {}", url);
 
@@ -175,13 +196,13 @@ impl ArchCollector {
             None => return Ok(0),
         };
 
-        let pkg_uri = package_uri("arch", "rolling", "x86_64", &name, &version);
-        let identity_uri = package_identity_uri("arch", "rolling", "x86_64", &name);
+        let pkg_uri = package_uri(&self.distro_name, &self.release_name, &self.arch_name, &name, &version);
+        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, &self.arch_name, &name);
         let mut triples = 0;
 
         // Dual typing
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{PKG}BinaryPackage"))?;
-        writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{ARCH}ArchPackage"))?;
+        writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{ARCH}PacmanPackage"))?;
         triples += 2;
 
         // Identity
@@ -202,7 +223,7 @@ impl ArchCollector {
         triples += 3;
 
         // Distribution
-        let dist_uri = distro_uri("arch");
+        let dist_uri = distro_uri(&self.distro_name);
         let rel_uri = release_uri("arch", "rolling");
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfRelease"), &rel_uri)?;
@@ -232,6 +253,11 @@ impl ArchCollector {
             for lic in license_vals {
                 writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), lic)?;
                 triples += 1;
+                // License entity (SPDX)
+                let license_uri = crate::uris::spdx_license_uri(lic);
+                writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+                writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+                triples += 2;
             }
         }
         if let Some(isize_str) = fields.get("%ISIZE%").and_then(|v| v.first()) {
@@ -262,10 +288,11 @@ impl ArchCollector {
                 let maint_name = caps.get(1).unwrap().as_str().trim();
                 let maint_email = caps.get(2).unwrap().as_str().trim();
                 let maint_uri = maintainer_uri(maint_email);
-                writer.write_triple(&maint_uri, RDF_TYPE, &format!("{PKG}Maintainer"))?;
+                writer.write_triple(&maint_uri, RDF_TYPE, &format!("{PKG}Person"))?;
                 writer.write_literal(&maint_uri, &format!("{FOAF}name"), maint_name)?;
+                writer.write_literal(&maint_uri, RDFS_LABEL, maint_name)?;
                 writer.write_triple(&pkg_uri, &format!("{PKG}maintainedBy"), &maint_uri)?;
-                triples += 3;
+                triples += 4;
             }
         }
 
@@ -336,7 +363,7 @@ impl ArchCollector {
                 dep_name = dep_entry;
             }
 
-            let target_uri = package_identity_uri("arch", "rolling", "x86_64", dep_name);
+            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, &self.arch_name, dep_name);
 
             writer.write_triple(pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
@@ -345,12 +372,12 @@ impl ArchCollector {
             writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-            writer.write_bnode_literal(&bnode, &format!("{PKG}dependencyType"), dep_type)?;
+            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri(dep_type))?;
             triples += 4;
 
             if let (Some(op), Some(val)) = (&constraint_op, &constraint_val) {
                 let cb = bnode_id("constraint", &format!("{}-{}", pkg_uri, dep_name));
-                writer.write_bnode_object(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
+                writer.write_bnode_to_bnode(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
                 writer.write_bnode_subject(&cb, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
                 writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintOperator"), op)?;
                 writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintValue"), val)?;
@@ -442,13 +469,13 @@ impl ArchCollector {
         pkg: &AurPackage,
     ) -> Result<usize> {
         let version = pkg.version.as_deref().unwrap_or("unknown");
-        let pkg_uri = package_uri("arch", "aur", "x86_64", &pkg.name, version);
-        let identity_uri = package_identity_uri("arch", "aur", "x86_64", &pkg.name);
+        let pkg_uri = package_uri(&self.distro_name, "aur", &self.arch_name, &pkg.name, version);
+        let identity_uri = package_identity_uri(&self.distro_name, "aur", &self.arch_name, &pkg.name);
         let mut triples = 0;
 
         // Dual typing + AUR type
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{PKG}BinaryPackage"))?;
-        writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{ARCH}ArchPackage"))?;
+        writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{ARCH}PacmanPackage"))?;
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{ARCH}AUR"))?;
         triples += 3;
 
@@ -462,14 +489,14 @@ impl ArchCollector {
         triples += 1;
 
         // Version
-        let ver_uri = version_uri("arch", "aur", &pkg.name, version);
+        let ver_uri = version_uri(&self.distro_name, "aur", &pkg.name, version);
         writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
         writer.write_literal(&ver_uri, &format!("{PKG}versionString"), version)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
         triples += 3;
 
         // Distribution
-        let dist_uri = distro_uri("arch");
+        let dist_uri = distro_uri(&self.distro_name);
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         triples += 1;
 
@@ -499,10 +526,11 @@ impl ArchCollector {
         // Maintainer
         if let Some(maint) = &pkg.maintainer {
             let maint_uri = maintainer_uri(&format!("{}@aur.archlinux.org", maint));
-            writer.write_triple(&maint_uri, RDF_TYPE, &format!("{PKG}Maintainer"))?;
+            writer.write_triple(&maint_uri, RDF_TYPE, &format!("{PKG}Person"))?;
             writer.write_literal(&maint_uri, &format!("{FOAF}name"), maint)?;
+            writer.write_literal(&maint_uri, RDFS_LABEL, maint)?;
             writer.write_triple(&pkg_uri, &format!("{PKG}maintainedBy"), &maint_uri)?;
-            triples += 3;
+            triples += 4;
         }
 
         // Dependencies
@@ -520,6 +548,11 @@ impl ArchCollector {
             for lic in licenses {
                 writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), lic)?;
                 triples += 1;
+                // License entity (SPDX)
+                let license_uri = crate::uris::spdx_license_uri(lic);
+                writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+                writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+                triples += 2;
             }
         }
 
@@ -689,6 +722,9 @@ libnghttp3: HTTP/3 support
     fn test_emit_arch_package_triples_dual_typing() {
         let collector = ArchCollector::new(
             "https://archive.archlinux.org/repos/last".into(),
+            "arch".into(),
+            "rolling".into(),
+            "x86_64".into(),
             vec!["core".into()],
             false,
         );
@@ -711,7 +747,7 @@ libnghttp3: HTTP/3 support
         temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
 
         assert!(content.contains("core#BinaryPackage"));
-        assert!(content.contains("arch#ArchPackage"));
+        assert!(content.contains("pacman#PacmanPackage"));
         assert!(content.contains("\"curl\""));
         assert!(content.contains("\"8.7.1-3\""));
         assert!(content.contains("directlyDependsOn"));
@@ -750,6 +786,9 @@ libnghttp3: HTTP/3 support
     fn test_emit_aur_package_triples() {
         let collector = ArchCollector::new(
             "https://archive.archlinux.org/repos/last".into(),
+            "arch".into(),
+            "rolling".into(),
+            "x86_64".into(),
             vec![],
             true,
         );
@@ -779,11 +818,64 @@ libnghttp3: HTTP/3 support
 
         // AUR packages get triple typing
         assert!(content.contains("core#BinaryPackage"));
-        assert!(content.contains("arch#ArchPackage"));
-        assert!(content.contains("arch#AUR"));
+        assert!(content.contains("pacman#PacmanPackage"));
+        assert!(content.contains("pacman#AUR"));
         assert!(content.contains("\"yay\""));
         assert!(content.contains("aurVotes"));
         assert!(content.contains("aurPopularity"));
         assert!(triples > 15);
+    }
+
+    #[test]
+    fn test_aur_uses_aur_release_with_custom_distro() {
+        let collector = ArchCollector::new(
+            "https://archive.archlinux.org/repos/last".into(),
+            "testdistro".into(),
+            "rolling".into(),
+            "x86_64".into(),
+            vec![],
+            true,
+        );
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+
+        let pkg = AurPackage {
+            name: "yay".into(),
+            version: Some("12.3.5-1".into()),
+            description: Some("AUR helper".into()),
+            url: Some("https://github.com/Jguer/yay".into()),
+            maintainer: Some("jguer".into()),
+            num_votes: Some(2500),
+            popularity: Some(45.67),
+            out_of_date: None,
+            depends: Some(vec!["pacman".into()]),
+            make_depends: Some(vec!["go".into()]),
+            license: Some(vec!["GPL-3.0-or-later".into()]),
+        };
+
+        collector.emit_aur_package_triples(&mut writer, &pkg).unwrap();
+        writer.flush().unwrap();
+
+        let mut content = String::new();
+        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+
+        // Verify the AUR package URI itself uses "aur" as release
+        assert!(content.contains("/d/pkg/testdistro/aur/x86_64/yay/"), "AUR package URI should use '/testdistro/aur/', got: {}", content);
+
+        // Verify dependencies point to the main repo (rolling), not AUR
+        // (AUR packages depend on packages from the main Arch repos, not other AUR packages)
+        assert!(content.contains("/d/pkg/testdistro/rolling/x86_64/pacman"), "Dependencies should point to main repo (/testdistro/rolling/)");
+    }
+
+    #[test]
+    fn test_arch_field_present_in_package_data() {
+        let fields = parse_desc_file(SAMPLE_DESC);
+
+        // Verify %ARCH% field is present in sample Arch package data
+        assert!(fields.contains_key("%ARCH%"), "%ARCH% field must be present in package data");
+        let arch_values = fields.get("%ARCH%").unwrap();
+        assert_eq!(arch_values.len(), 1, "%ARCH% should have one value");
+        assert_eq!(arch_values[0], "x86_64", "%ARCH% field should contain architecture value");
     }
 }

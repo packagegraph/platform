@@ -34,7 +34,7 @@ fn test_emit_package_triples_basic() -> std::io::Result<()> {
         ("summary", "The GNU Bourne Again shell"),
     ], vec![]);
 
-    let triple_count = collector.emit_package_triples(&mut writer, &pkg_data)?;
+    let triple_count = collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
 
     writer.flush()?;
 
@@ -80,7 +80,7 @@ fn test_emit_package_with_rpm_specific_properties() -> std::io::Result<()> {
         ("group", "System Environment/Kernel"),
     ], vec![]);
 
-    collector.emit_package_triples(&mut writer, &pkg_data)?;
+    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
 
     writer.flush()?;
 
@@ -127,7 +127,7 @@ fn test_version_string_format() -> std::io::Result<()> {
         ("rel", "1.fc39"),
     ], vec![]);
 
-    collector.emit_package_triples(&mut writer, &pkg_data)?;
+    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
 
     writer.flush()?;
 
@@ -196,7 +196,7 @@ fn test_emit_package_with_dependencies() -> std::io::Result<()> {
         ("epoch", "0"),
     ], deps);
 
-    let triple_count = collector.emit_package_triples(&mut writer, &pkg_data)?;
+    let triple_count = collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
 
     writer.flush()?;
 
@@ -258,7 +258,7 @@ fn test_emit_maintainer_triples() -> std::io::Result<()> {
         ("packager", "Fedora Project <packager@fedoraproject.org>"),
     ], vec![]);
 
-    collector.emit_package_triples(&mut writer, &pkg_data)?;
+    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
 
     writer.flush()?;
 
@@ -266,9 +266,11 @@ fn test_emit_maintainer_triples() -> std::io::Result<()> {
     let reader = BufReader::new(output_file);
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
-    // Should emit Maintainer type
-    assert!(lines.iter().any(|l| l.contains("Maintainer")),
-            "Should create Maintainer resource");
+    // Should emit Person type (SD-3 data contract — not Maintainer)
+    assert!(lines.iter().any(|l| l.contains("Person")),
+            "Should create Person resource per SD-3");
+    assert!(!lines.iter().any(|l| l.contains("core#Maintainer")),
+            "Should NOT type as Maintainer per SD-3");
 
     // Should emit maintainedBy link
     assert!(lines.iter().any(|l| l.contains("maintainedBy")),
@@ -301,7 +303,7 @@ fn test_emit_maintainer_triples_name_only() -> std::io::Result<()> {
         ("packager", "Fedora Project"),
     ], vec![]);
 
-    collector.emit_package_triples(&mut writer, &pkg_data)?;
+    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
 
     writer.flush()?;
 
@@ -309,9 +311,9 @@ fn test_emit_maintainer_triples_name_only() -> std::io::Result<()> {
     let reader = BufReader::new(output_file);
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
-    // Should emit Maintainer type
-    assert!(lines.iter().any(|l| l.contains("Maintainer")),
-            "Should create Maintainer resource");
+    // Should emit Person type (SD-3 data contract)
+    assert!(lines.iter().any(|l| l.contains("Person")),
+            "Should create Person resource per SD-3");
 
     // Should emit maintainedBy link
     assert!(lines.iter().any(|l| l.contains("maintainedBy")),
@@ -370,7 +372,7 @@ fn test_emit_ecosystem_from_provides_cargo() -> std::io::Result<()> {
         ("epoch", "0"),
     ], deps);
 
-    collector.emit_package_triples(&mut writer, &pkg_data)?;
+    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
     writer.flush()?;
 
     let output_file = temp_file.reopen()?;
@@ -423,7 +425,7 @@ fn test_emit_ecosystem_from_provides_python() -> std::io::Result<()> {
         ("epoch", "0"),
     ], deps);
 
-    collector.emit_package_triples(&mut writer, &pkg_data)?;
+    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
     writer.flush()?;
 
     let output_file = temp_file.reopen()?;
@@ -470,7 +472,7 @@ fn test_emit_ecosystem_from_provides_golang() -> std::io::Result<()> {
         ("epoch", "0"),
     ], deps);
 
-    collector.emit_package_triples(&mut writer, &pkg_data)?;
+    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
     writer.flush()?;
 
     let output_file = temp_file.reopen()?;
@@ -516,7 +518,7 @@ fn test_no_ecosystem_for_plain_rpm() -> std::io::Result<()> {
         ("epoch", "0"),
     ], deps);
 
-    collector.emit_package_triples(&mut writer, &pkg_data)?;
+    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
     writer.flush()?;
 
     let output_file = temp_file.reopen()?;
@@ -542,5 +544,46 @@ fn test_distribution_rdfs_label() -> std::io::Result<()> {
 
     // The actual label emission is tested via integration tests
     // or by running the collector and checking the output
+    Ok(())
+}
+
+#[test]
+fn test_emit_rpm_build_time() -> std::io::Result<()> {
+    let collector = RpmCollector::new(
+        "http://example.com".to_string(),
+        "fedora".to_string(),
+        "43".to_string(),
+    );
+
+    let temp_file = NamedTempFile::new()?;
+    let mut writer = NTriplesWriter::new(temp_file.reopen()?);
+
+    // Package with build time from <time build="1713456000"/> (2024-04-18 16:00:00 UTC)
+    let pkg_data = make_pkg_data(vec![
+        ("name", "openssl"),
+        ("arch", "x86_64"),
+        ("ver", "3.0.9"),
+        ("rel", "1.fc43"),
+        ("build", "1713456000"),  // Unix epoch from <time build="epoch"/>
+    ], vec![]);
+
+    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
+    writer.flush()?;
+
+    let output_file = temp_file.reopen()?;
+    let reader = BufReader::new(output_file);
+    let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
+
+    // Verify rpm:buildTime is emitted
+    let build_time_line = lines.iter()
+        .find(|l| l.contains("rpm#buildTime"))
+        .expect("Should emit rpm:buildTime triple");
+
+    // Verify format is xsd:dateTime with ISO 8601 format
+    assert!(build_time_line.contains("^^<http://www.w3.org/2001/XMLSchema#dateTime>"),
+            "buildTime should be typed as xsd:dateTime");
+    assert!(build_time_line.contains("2024-04-18T16:00:00Z"),
+            "buildTime should be formatted as ISO 8601: {}", build_time_line);
+
     Ok(())
 }

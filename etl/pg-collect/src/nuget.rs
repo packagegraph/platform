@@ -102,6 +102,13 @@ impl NugetCollector {
         })
     }
 
+    pub fn collect_discover(&self, endpoint: &str, output_path: &str) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "nuget")?;
+        let seed_path = "/tmp/seed-nuget-discover.txt";
+        std::fs::write(seed_path, names.join("\n"))?;
+        self.collect(seed_path, output_path)
+    }
+
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new(file);
@@ -249,6 +256,11 @@ impl NugetCollector {
         if let Some(license) = &entry.license_expression {
             writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
             triples += 1;
+            // License entity (SPDX)
+            let license_uri = crate::uris::spdx_license_uri(license);
+            writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+            writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+            triples += 2;
         }
         if let Some(tags) = &entry.tags {
             let tags_str = tags.join(" ");

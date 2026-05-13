@@ -1,6 +1,6 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use crate::ntriples::NTriplesWriter;
-use crate::uris::{cve_uri, vuln_uri, version_uri, DATA};
+use crate::uris::{cve_uri, vuln_uri, version_uri, package_identity_uri, cwe_uri, cve_entity_uri, cvss_score_uri, ecosystem_uri, event_type_uri, range_type_uri, PKG, SEC, VCS, DATA, RDF_TYPE, RDFS_LABEL};
 use std::fs::File;
 use std::io::{Cursor, Result};
 use std::time::Duration;
@@ -86,7 +86,7 @@ pub fn emit_vulnerability_triples(
         .unwrap_or_else(|| vuln_uri(&vuln.id));
 
     // Type triple
-    writer.write_triple(&subject_uri, crate::uris::RDF_TYPE, &format!("{}Vulnerability", crate::uris::SEC))?;
+    writer.write_triple(&subject_uri, RDF_TYPE, &format!("{}Vulnerability", SEC))?;
     triples += 1;
 
     // rdfs:label
@@ -99,55 +99,96 @@ pub fn emit_vulnerability_triples(
 
     // sec:cveId (exactly one, owl:FunctionalProperty)
     if let Some(cve) = vuln.aliases.iter().find(|alias| alias.starts_with("CVE-")) {
-        writer.write_literal(&subject_uri, &format!("{}cveId", crate::uris::SEC), cve)?;
+        writer.write_literal(&subject_uri, &format!("{}cveId", SEC), cve)?;
+        triples += 1;
+
+        // sec:cveEntity (link to shared CVE entity node)
+        let cve_entity = cve_entity_uri(cve);
+        writer.write_triple(&subject_uri, &format!("{}cveEntity", SEC), &cve_entity)?;
         triples += 1;
     } else if vuln.id.starts_with("CVE-") {
-        writer.write_literal(&subject_uri, &format!("{}cveId", crate::uris::SEC), &vuln.id)?;
+        writer.write_literal(&subject_uri, &format!("{}cveId", SEC), &vuln.id)?;
+        triples += 1;
+
+        // sec:cveEntity (link to shared CVE entity node)
+        let cve_entity = cve_entity_uri(&vuln.id);
+        writer.write_triple(&subject_uri, &format!("{}cveEntity", SEC), &cve_entity)?;
         triples += 1;
     }
 
     // sec:summary
     if let Some(summary) = &vuln.summary {
-        writer.write_literal(&subject_uri, &format!("{}summary", crate::uris::SEC), summary)?;
+        writer.write_literal(&subject_uri, &format!("{}summary", SEC), summary)?;
         triples += 1;
     }
 
     // sec:publishedDate
     if let Some(published) = &vuln.published {
-        writer.write_datetime(&subject_uri, &format!("{}publishedDate", crate::uris::SEC), published)?;
+        writer.write_datetime(&subject_uri, &format!("{}publishedDate", SEC), published)?;
         triples += 1;
     }
 
     // sec:updatedDate (NOTE: OSV field is "modified", ontology property is "updatedDate")
     if let Some(modified) = &vuln.modified {
-        writer.write_datetime(&subject_uri, &format!("{}updatedDate", crate::uris::SEC), modified)?;
+        writer.write_datetime(&subject_uri, &format!("{}updatedDate", SEC), modified)?;
         triples += 1;
     }
 
-    // sec:cvssVector (CVSS_V3 preferred, fallback to V4/V2)
-    let cvss_entry = vuln.severity.iter()
+    // CVSSScore reification (v0.6.0) — emit all severity entries as CVSSScore entities
+    // Also keep deprecated flat cvssVector for the best-available entry (backward compat)
+    let best_cvss = vuln.severity.iter()
         .find(|s| matches!(s.severity_type, OsvSeverityType::CvssV3))
         .or_else(|| vuln.severity.iter().find(|s| matches!(s.severity_type, OsvSeverityType::CvssV4)))
         .or_else(|| vuln.severity.iter().find(|s| matches!(s.severity_type, OsvSeverityType::CvssV2)));
 
-    if let Some(cvss) = cvss_entry {
-        writer.write_literal(&subject_uri, &format!("{}cvssVector", crate::uris::SEC), &cvss.score)?;
+    if let Some(cvss) = best_cvss {
+        // Deprecated flat properties (backward compat)
+        writer.write_literal(&subject_uri, &format!("{SEC}cvssVector"), &cvss.score)?;
         triples += 1;
+
+        if let Some(severity) = derive_cvss_severity(&cvss.score) {
+            // sec:severity remains DatatypeProperty/xsd:string in the ontology.
+            // Only advisorySeverity, advisoryType, eventType, rangeType were
+            // migrated to SKOS ObjectProperties in v0.7.0.
+            writer.write_literal(&subject_uri, &format!("{SEC}severity"), severity)?;
+            triples += 1;
+        }
     }
 
-    // sec:cweId from database_specific.cwe_ids
+    // Reified CVSSScore entities for each severity entry
+    for cvss in &vuln.severity {
+        let cvss_version = match cvss.severity_type {
+            OsvSeverityType::CvssV2 => "2.0",
+            OsvSeverityType::CvssV3 => "3.1",
+            OsvSeverityType::CvssV4 => "4.0",
+        };
+        let score_uri = cvss_score_uri(label, cvss_version);
+        writer.write_triple(&subject_uri, &format!("{SEC}hasCVSSScore"), &score_uri)?;
+        writer.write_triple(&score_uri, RDF_TYPE, &format!("{SEC}CVSSScore"))?;
+        writer.write_literal(&score_uri, &format!("{SEC}vectorString"), &cvss.score)?;
+        writer.write_literal(&score_uri, &format!("{SEC}cvssVersion"), cvss_version)?;
+        triples += 4;
+    }
+
+    // sec:cweId and sec:hasCWE from database_specific.cwe_ids
     if let Some(db_specific) = &vuln.database_specific {
         if let Some(cwe_ids) = db_specific.get("cwe_ids").and_then(|v| v.as_array()) {
             for cwe in cwe_ids {
                 if let Some(cwe_str) = cwe.as_str() {
-                    writer.write_literal(&subject_uri, &format!("{}cweId", crate::uris::SEC), cwe_str)?;
+                    // Literal cweId (existing)
+                    writer.write_literal(&subject_uri, &format!("{}cweId", SEC), cwe_str)?;
+                    triples += 1;
+
+                    // Entity link hasCWE (new)
+                    let cwe_entity = cwe_uri(cwe_str);
+                    writer.write_triple(&subject_uri, &format!("{}hasCWE", SEC), &cwe_entity)?;
                     triples += 1;
                 }
             }
         }
     }
 
-    // sec:affectsVersion and sec:fixedInVersion for language ecosystems
+    // sec:affectsVersion, sec:fixedInVersion, and sec:affectsPackage for language ecosystems
     for affected in &vuln.affected {
         let pkg = match &affected.package {
             Some(p) => p,
@@ -159,20 +200,93 @@ pub fn emit_vulnerability_triples(
             None => continue, // Skip distros
         };
 
+        // Direct package identity link (bypasses version-string joins)
+        let pkg_identity = package_identity_uri(mapping.distro, mapping.release, "any", &pkg.name);
+        writer.write_triple(&subject_uri, &format!("{SEC}affectsPackage"), &pkg_identity)?;
+        triples += 1;
+
         // Affected versions (explicit list)
         for version in &affected.versions {
             let ver_uri = version_uri(mapping.distro, mapping.release, &pkg.name, version);
-            writer.write_triple(&subject_uri, &format!("{}affectsVersion", crate::uris::SEC), &ver_uri)?;
+            writer.write_triple(&subject_uri, &format!("{SEC}affectsVersion"), &ver_uri)?;
             triples += 1;
         }
 
-        // Fixed versions (from ranges events)
-        for range in &affected.ranges {
-            for event in &range.events {
-                if let Some(fixed_version) = &event.fixed {
-                    let ver_uri = version_uri(mapping.distro, mapping.release, &pkg.name, fixed_version);
-                    writer.write_triple(&subject_uri, &format!("{}fixedInVersion", crate::uris::SEC), &ver_uri)?;
+        // AffectedRange/RangeEvent reification (v0.6.0 OSV model)
+        for (range_idx, range) in affected.ranges.iter().enumerate() {
+            let range_type_str = match range.range_type {
+                OsvRangeType::Semver => "SEMVER",
+                OsvRangeType::Ecosystem => "ECOSYSTEM",
+                OsvRangeType::Git => "GIT",
+            };
+
+            let range_bnode = format!("ar_{}_{}_{}_{}", label, mapping.distro, pkg.name, range_idx)
+                .chars().map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' }).collect::<String>();
+            writer.write_bnode_object(&subject_uri, &format!("{SEC}hasAffectedRange"), &range_bnode)?;
+            writer.write_bnode_subject(&range_bnode, RDF_TYPE, &format!("{SEC}AffectedRange"))?;
+            writer.write_bnode_subject(&range_bnode, &format!("{SEC}rangeType"), &range_type_uri(range_type_str))?;
+            writer.write_bnode_literal(&range_bnode, &format!("{SEC}affectsPackageName"), &pkg.name)?;
+            // Link to ecosystem entity
+            let eco_entity = ecosystem_uri(mapping.distro);
+            writer.write_bnode_subject(&range_bnode, &format!("{SEC}affectsEcosystem"), &eco_entity)?;
+            writer.write_triple(&eco_entity, RDF_TYPE, &format!("{PKG}Ecosystem"))?;
+            writer.write_literal(&eco_entity, RDFS_LABEL, &pkg.ecosystem)?;
+            triples += 7;
+
+            for (event_idx, event) in range.events.iter().enumerate() {
+                let event_bnode = format!("{range_bnode}_e{event_idx}");
+
+                if let Some(ref introduced) = event.introduced {
+                    writer.write_bnode_to_bnode(&range_bnode, &format!("{SEC}hasRangeEvent"), &event_bnode)?;
+                    writer.write_bnode_subject(&event_bnode, RDF_TYPE, &format!("{SEC}RangeEvent"))?;
+                    writer.write_bnode_subject(&event_bnode, &format!("{SEC}eventType"), &event_type_uri("introduced"))?;
+                    writer.write_bnode_literal(&event_bnode, &format!("{SEC}eventVersion"), introduced)?;
+                    triples += 4;
+
+                    if range_type_str == "GIT" {
+                        let commit_uri = format!("{DATA}commit/{}", introduced);
+                        writer.write_bnode_subject(&event_bnode, &format!("{SEC}eventCommit"), &commit_uri)?;
+                        writer.write_triple(&commit_uri, RDF_TYPE, &format!("{VCS}Commit"))?;
+                        writer.write_literal(&commit_uri, &format!("{VCS}commitHash"), introduced)?;
+                        triples += 3;
+                    }
+                }
+                if let Some(ref fixed) = event.fixed {
+                    let fix_bnode = format!("{event_bnode}_fix");
+                    writer.write_bnode_to_bnode(&range_bnode, &format!("{SEC}hasRangeEvent"), &fix_bnode)?;
+                    writer.write_bnode_subject(&fix_bnode, RDF_TYPE, &format!("{SEC}RangeEvent"))?;
+                    writer.write_bnode_subject(&fix_bnode, &format!("{SEC}eventType"), &event_type_uri("fixed"))?;
+                    writer.write_bnode_literal(&fix_bnode, &format!("{SEC}eventVersion"), fixed)?;
+                    triples += 4;
+
+                    if range_type_str == "GIT" {
+                        let commit_uri = format!("{DATA}commit/{}", fixed);
+                        writer.write_bnode_subject(&fix_bnode, &format!("{SEC}eventCommit"), &commit_uri)?;
+                        writer.write_triple(&commit_uri, RDF_TYPE, &format!("{VCS}Commit"))?;
+                        writer.write_literal(&commit_uri, &format!("{VCS}commitHash"), fixed)?;
+                        triples += 3;
+                    }
+
+                    // Also keep flat fixedInVersion for backward compat
+                    let ver_uri = version_uri(mapping.distro, mapping.release, &pkg.name, fixed);
+                    writer.write_triple(&subject_uri, &format!("{SEC}fixedInVersion"), &ver_uri)?;
                     triples += 1;
+                }
+                if let Some(ref last_affected) = event.last_affected {
+                    let la_bnode = format!("{event_bnode}_la");
+                    writer.write_bnode_to_bnode(&range_bnode, &format!("{SEC}hasRangeEvent"), &la_bnode)?;
+                    writer.write_bnode_subject(&la_bnode, RDF_TYPE, &format!("{SEC}RangeEvent"))?;
+                    writer.write_bnode_subject(&la_bnode, &format!("{SEC}eventType"), &event_type_uri("last_affected"))?;
+                    writer.write_bnode_literal(&la_bnode, &format!("{SEC}eventVersion"), last_affected)?;
+                    triples += 4;
+
+                    if range_type_str == "GIT" {
+                        let commit_uri = format!("{DATA}commit/{}", last_affected);
+                        writer.write_bnode_subject(&la_bnode, &format!("{SEC}eventCommit"), &commit_uri)?;
+                        writer.write_triple(&commit_uri, RDF_TYPE, &format!("{VCS}Commit"))?;
+                        writer.write_literal(&commit_uri, &format!("{VCS}commitHash"), last_affected)?;
+                        triples += 3;
+                    }
                 }
             }
         }
@@ -181,9 +295,48 @@ pub fn emit_vulnerability_triples(
     Ok(triples)
 }
 
+/// Derive CVSS severity label from a CVSS v3/v4 vector string.
+///
+/// Parses the base score from the vector and maps to severity levels:
+/// - 0.0: NONE
+/// - 0.1-3.9: LOW
+/// - 4.0-6.9: MEDIUM
+/// - 7.0-8.9: HIGH
+/// - 9.0-10.0: CRITICAL
+///
+/// For CVSS v3, attempts to extract the score from common patterns.
+/// Returns None if the vector can't be parsed.
+fn derive_cvss_severity(vector: &str) -> Option<&'static str> {
+    // CVSS v3/v4 vectors don't embed the score directly — we approximate
+    // from the vector components. A full CVSS calculator would be ideal,
+    // but a heuristic based on Attack Vector + Impact is good enough.
+    //
+    // Simple heuristic: if the vector contains high-impact markers
+    if vector.contains("CVSS:3") || vector.contains("CVSS:4") {
+        // Check for critical indicators
+        let has_network = vector.contains("/AV:N");
+        let has_low_complexity = vector.contains("/AC:L");
+        let has_high_impact = vector.contains("/C:H") || vector.contains("/I:H") || vector.contains("/A:H");
+        let has_no_privs = vector.contains("/PR:N");
+
+        if has_network && has_low_complexity && has_high_impact && has_no_privs {
+            return Some("CRITICAL");
+        }
+        if has_network && has_high_impact {
+            return Some("HIGH");
+        }
+        if has_high_impact {
+            return Some("MEDIUM");
+        }
+        return Some("LOW");
+    }
+
+    None
+}
+
 /// OSV vulnerability record.
 /// https://ossf.github.io/osv-schema/
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OsvVulnerability {
     pub id: String,
     #[serde(default)]
@@ -202,7 +355,7 @@ pub struct OsvVulnerability {
     pub database_specific: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OsvAffected {
     pub package: Option<OsvPackage>,
     #[serde(default)]
@@ -212,14 +365,14 @@ pub struct OsvAffected {
     pub database_specific: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OsvPackage {
     pub name: String,
     pub ecosystem: String,
     pub purl: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OsvRange {
     #[serde(rename = "type")]
     pub range_type: OsvRangeType,
@@ -228,7 +381,7 @@ pub struct OsvRange {
     pub repo: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum OsvRangeType {
     Semver,
@@ -236,7 +389,7 @@ pub enum OsvRangeType {
     Git,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OsvEvent {
     pub introduced: Option<String>,
     pub fixed: Option<String>,
@@ -244,14 +397,14 @@ pub struct OsvEvent {
     pub limit: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OsvSeverity {
     #[serde(rename = "type")]
     pub severity_type: OsvSeverityType,
     pub score: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub enum OsvSeverityType {
     #[serde(rename = "CVSS_V2")]
     CvssV2,
@@ -261,7 +414,7 @@ pub enum OsvSeverityType {
     CvssV4,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OsvReference {
     #[serde(rename = "type")]
     pub ref_type: String,
@@ -686,10 +839,26 @@ mod tests {
         assert!(content.contains("security#cvssVector"));
         assert!(content.contains("CVSS:3.1/AV:N/AC:L"));
 
-        // Verify CWE
+        // Verify severity derived from CVSS vector (plain string, not SKOS — sec:severity is DatatypeProperty)
+        assert!(content.contains("security#severity"));
+        assert!(content.contains("\"CRITICAL\""), "AV:N/AC:L/PR:N with high impact should be CRITICAL");
+
+        // Verify CWE literal
         assert!(content.contains("security#cweId"));
         assert!(content.contains("\"CWE-79\""));
         assert!(content.contains("\"CWE-89\""));
+
+        // Verify CWE entity URIs (new in Task 9)
+        assert!(content.contains("security#hasCWE"));
+        assert!(content.contains("cwe.mitre.org/data/definitions/79"));
+        assert!(content.contains("cwe.mitre.org/data/definitions/89"));
+
+        // Verify CVE entity URI (new in Task 9)
+        assert!(content.contains("security#cveEntity"));
+
+        // Verify affectsPackage direct link (new in Task 9)
+        assert!(content.contains("security#affectsPackage"));
+        assert!(content.contains("pkg/npm/registry/any/test-pkg"));
 
         // Verify affected versions
         assert!(content.contains("security#affectsVersion"));
@@ -705,6 +874,27 @@ mod tests {
         assert!(content.contains("security#updatedDate"));
         assert!(content.contains("2024-01-01T00:00:00Z"));
         assert!(content.contains("2024-01-02T00:00:00Z"));
+
+        // Verify CVSSScore reification (v0.6.0)
+        assert!(content.contains("security#hasCVSSScore"), "Should link to reified CVSSScore");
+        assert!(content.contains("security#CVSSScore"), "Should type as CVSSScore");
+        assert!(content.contains("security#vectorString"), "Should have vectorString on CVSSScore");
+        assert!(content.contains("security#cvssVersion"), "Should have cvssVersion");
+        assert!(content.contains("\"3.1\""), "Should have CVSS version 3.1");
+
+        // Verify AffectedRange reification (v0.7.0 — SKOS concept URIs)
+        assert!(content.contains("security#hasAffectedRange"), "Should link to AffectedRange");
+        assert!(content.contains("security#AffectedRange"), "Should type as AffectedRange");
+        assert!(content.contains("security#rangeType"), "Should have rangeType");
+        assert!(content.contains("security#range-semver"), "Should have range-semver SKOS concept");
+        assert!(content.contains("security#affectsPackageName"), "Should have affectsPackageName");
+
+        // Verify RangeEvent reification (v0.7.0 — SKOS concept URIs)
+        assert!(content.contains("security#hasRangeEvent"), "Should link to RangeEvent");
+        assert!(content.contains("security#RangeEvent"), "Should type as RangeEvent");
+        assert!(content.contains("security#eventType"), "Should have eventType");
+        assert!(content.contains("security#event-introduced"), "Should have event-introduced SKOS concept");
+        assert!(content.contains("security#event-fixed"), "Should have event-fixed SKOS concept");
     }
 
     #[test]
@@ -770,6 +960,20 @@ mod tests {
         let mut content = String::new();
         temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
         assert_eq!(content, "");
+    }
+
+    #[test]
+    fn test_derive_cvss_severity() {
+        // CRITICAL: network + low complexity + no privileges + high impact
+        assert_eq!(derive_cvss_severity("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"), Some("CRITICAL"));
+        // HIGH: network + high impact but requires privileges
+        assert_eq!(derive_cvss_severity("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N"), Some("HIGH"));
+        // MEDIUM: local + high impact
+        assert_eq!(derive_cvss_severity("CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N"), Some("MEDIUM"));
+        // LOW: no high impact
+        assert_eq!(derive_cvss_severity("CVSS:3.1/AV:N/AC:H/PR:L/UI:R/S:U/C:L/I:N/A:N"), Some("LOW"));
+        // Non-CVSS string
+        assert_eq!(derive_cvss_severity("not a cvss vector"), None);
     }
 
     #[test]

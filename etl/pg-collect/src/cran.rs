@@ -2,10 +2,8 @@ use crate::ntriples::NTriplesWriter;
 use crate::uris::*;
 use flate2::read::GzDecoder;
 use reqwest::blocking::Client;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
-use std::time::Duration;
 
 pub struct CranCollector {
     client: Client,
@@ -34,10 +32,7 @@ struct CranPackage {
 
 impl CranCollector {
     pub fn new(mirror_url: String) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .expect("Failed to create HTTP client");
+        let client = crate::enricher::default_http_client();
 
         Self { client, mirror_url }
     }
@@ -92,8 +87,9 @@ impl CranCollector {
         let mut triples = 0;
 
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
+        writer.write_literal(&dist_uri, RDFS_LABEL, "CRAN")?;
         writer.write_literal(&dist_uri, &format!("{PKG}projectName"), "CRAN")?;
-        triples += 2;
+        triples += 3;
 
         writer.write_triple(&rel_uri, RDF_TYPE, &format!("{PKG}DistributionRelease"))?;
         writer.write_literal(&rel_uri, &format!("{PKG}releaseCodename"), "cran")?;
@@ -233,6 +229,11 @@ impl CranCollector {
         if let Some(license) = &pkg.license {
             writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
             triples += 1;
+            // License entity (SPDX)
+            let license_uri = crate::uris::spdx_license_uri(license);
+            writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+            writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+            triples += 2;
         }
         if let Some(author) = &pkg.author {
             writer.write_literal(&pkg_uri, &format!("{CRAN}author"), author)?;

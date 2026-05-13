@@ -9,6 +9,8 @@ use std::io::Result;
 use std::time::Duration;
 
 pub struct SnapCollector {
+    distro_name: String,
+    release_name: String,
     client: Client,
 }
 
@@ -74,21 +76,87 @@ struct SnapChannelInfo {
 }
 
 impl SnapCollector {
-    pub fn new() -> Self {
+    pub fn new(distro_name: String, release_name: String, ) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
             .expect("Failed to create HTTP client");
-        Self { client }
+        Self { distro_name, release_name, client }
     }
 
+    /// Collect from a seed file of snap names.
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
+        let names = read_seed_file(packages_file)?;
+        eprintln!("Loaded {} snap names from seed file", names.len());
+        self.collect_names(&names, output_path)
+    }
+
+    /// Discover all snaps from the Snap Store and collect them (no seed file needed).
+    pub fn collect_discover(&self, output_path: &str) -> Result<(usize, usize)> {
+        let names = self.discover_snaps()?;
+        eprintln!("Discovered {} snaps from Snap Store", names.len());
+        self.collect_names(&names, output_path)
+    }
+
+    /// Paginate the Snap Store v1 search API to discover all snap names.
+    fn discover_snaps(&self) -> Result<Vec<String>> {
+        eprintln!("Discovering snaps from Snap Store (v1 API)...");
+        let mut names = Vec::new();
+        let mut page = 1;
+        let page_size = 500;
+
+        loop {
+            let url = format!(
+                "https://api.snapcraft.io/api/v1/snaps/search?fields=package_name&page={}&size={}",
+                page, page_size
+            );
+            let response = self.client.get(&url)
+                .header("X-Ubuntu-Series", "16")
+                .send()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+            if !response.status().is_success() {
+                if response.status().as_u16() == 404 {
+                    break;
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Snap Store API returned {}", response.status()),
+                ));
+            }
+
+            let data: serde_json::Value = response.json()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+            let packages = match data["_embedded"]["clickindex:package"].as_array() {
+                Some(p) if !p.is_empty() => p,
+                _ => break,
+            };
+
+            let batch_count = packages.len();
+            for pkg in packages {
+                if let Some(name) = pkg["package_name"].as_str() {
+                    names.push(name.to_string());
+                }
+            }
+
+            eprintln!("  Page {}: {} snaps (total: {})", page, batch_count, names.len());
+
+            // Check if there's a next page
+            if data["_links"]["next"].is_null() || batch_count < page_size {
+                break;
+            }
+            page += 1;
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        Ok(names)
+    }
+
+    fn collect_names(&self, names: &[String], output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new(file);
         self.emit_distribution_metadata(&mut writer)?;
-
-        let names = read_seed_file(packages_file)?;
-        eprintln!("Loaded {} snap names from seed file", names.len());
 
         let mut total_packages = 0;
         let mut total_triples = 0;
@@ -111,8 +179,8 @@ impl SnapCollector {
     }
 
     fn emit_distribution_metadata(&self, writer: &mut NTriplesWriter) -> Result<usize> {
-        let dist_uri = distro_uri("snap");
-        let rel_uri = release_uri("snap", "store");
+        let dist_uri = distro_uri(&self.distro_name);
+        let rel_uri = release_uri(&self.distro_name, &self.release_name);
         let mut triples = 0;
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
         writer.write_literal(&dist_uri, &format!("{PKG}projectName"), "Snap Store")?;
@@ -186,8 +254,8 @@ impl SnapCollector {
                 .find(|c| c.channel.risk.as_deref() == Some("stable"))
                 .and_then(|c| c.confinement.as_deref()));
 
-        let pkg_uri = package_uri("snap", "store", "any", &info.name, version);
-        let identity_uri = package_identity_uri("snap", "store", "any", &info.name);
+        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", &info.name, version);
+        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", &info.name);
         let mut triples = 0;
 
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{PKG}Package"))?;
@@ -202,13 +270,13 @@ impl SnapCollector {
         writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), &info.name)?;
         triples += 1;
 
-        let ver_uri = version_uri("snap", "store", &info.name, version);
+        let ver_uri = version_uri(&self.distro_name, &self.release_name, &info.name, version);
         writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
         writer.write_literal(&ver_uri, &format!("{PKG}versionString"), version)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
         triples += 3;
 
-        let dist_uri = distro_uri("snap");
+        let dist_uri = distro_uri(&self.distro_name);
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         triples += 1;
 
@@ -221,6 +289,11 @@ impl SnapCollector {
             if let Some(license) = &snap.license {
                 writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
                 triples += 1;
+                // License entity (SPDX)
+                let license_uri = crate::uris::spdx_license_uri(license);
+                writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+                writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+                triples += 2;
             }
         }
 
@@ -270,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_emit_snap_triples_dual_typing() {
-        let collector = SnapCollector::new();
+        let collector = SnapCollector::new("snap".into(), "store".into());
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 

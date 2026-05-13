@@ -1,17 +1,20 @@
 use crate::ntriples::NTriplesWriter;
+use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use brotli::Decompressor;
 use reqwest::blocking::Client;
 use serde::Deserialize;
-use serde_json::Deserializer;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Result};
 use std::time::Duration;
 
 pub struct NixCollector {
+    distro_name: String,
+    release_name: String,
     client: Client,
     channel_url: String,
+    source_cache: Option<SourceCache>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,13 +40,18 @@ struct NixMeta {
 }
 
 impl NixCollector {
-    pub fn new(channel_url: String) -> Self {
+    pub fn new(distro_name: String, release_name: String, channel_url: String) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
             .expect("Failed to create HTTP client");
 
-        Self { client, channel_url }
+        Self { distro_name, release_name, client, channel_url, source_cache: None }
+    }
+
+    pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
+        self.source_cache = Some(SourceCache::new(cache_dir, "nix")?);
+        Ok(self)
     }
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
@@ -101,13 +109,14 @@ impl NixCollector {
     }
 
     fn emit_distribution_metadata(&self, writer: &mut NTriplesWriter) -> Result<usize> {
-        let dist_uri = distro_uri("nix");
-        let rel_uri = release_uri("nix", "nixpkgs");
+        let dist_uri = distro_uri(&self.distro_name);
+        let rel_uri = release_uri(&self.distro_name, &self.release_name);
         let mut triples = 0;
 
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
+        writer.write_literal(&dist_uri, RDFS_LABEL, "Nix")?;
         writer.write_literal(&dist_uri, &format!("{PKG}projectName"), "Nix")?;
-        triples += 2;
+        triples += 3;
 
         writer.write_triple(&rel_uri, RDF_TYPE, &format!("{PKG}DistributionRelease"))?;
         writer.write_literal(&rel_uri, &format!("{PKG}releaseCodename"), "nixpkgs")?;
@@ -125,8 +134,8 @@ impl NixCollector {
         attr_path: &str,
         pkg: &NixPackage,
     ) -> Result<usize> {
-        let pkg_uri = package_uri("nix", "nixpkgs", "any", pname, version);
-        let identity_uri = package_identity_uri("nix", "nixpkgs", "any", pname);
+        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", pname, version);
+        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", pname);
         let mut triples = 0;
 
         // Dual typing
@@ -148,14 +157,14 @@ impl NixCollector {
         triples += 1;
 
         // Version
-        let ver_uri = version_uri("nix", "nixpkgs", pname, version);
+        let ver_uri = version_uri(&self.distro_name, &self.release_name, pname, version);
         writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
         writer.write_literal(&ver_uri, &format!("{PKG}versionString"), version)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
         triples += 3;
 
         // Distribution
-        let dist_uri = distro_uri("nix");
+        let dist_uri = distro_uri(&self.distro_name);
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         triples += 1;
 
@@ -196,6 +205,11 @@ impl NixCollector {
                 if let Some(license) = license_str {
                     writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), &license)?;
                     triples += 1;
+                    // License entity (SPDX)
+                    let license_uri = crate::uris::spdx_license_uri(&license);
+                    writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+                    writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+                    triples += 2;
                 }
             }
 
@@ -228,7 +242,7 @@ mod tests {
         use std::io::{Read, Write};
         use tempfile::NamedTempFile;
 
-        let collector = NixCollector::new("https://channels.nixos.org/nixos-24.05".into());
+        let collector = NixCollector::new("nix".into(), "nixpkgs".into(), "https://channels.nixos.org/nixos-24.05".into());
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 

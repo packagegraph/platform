@@ -12,6 +12,7 @@ fn test_emit_package_triples_basic() -> std::io::Result<()> {
     // Test that basic package triple emission works
     let collector = DebianCollector::new(
         "http://example.com".to_string(),
+        "debian".to_string(),
         "stable".to_string(),
         "main".to_string(),
     );
@@ -70,6 +71,7 @@ fn test_emit_package_triples_basic() -> std::io::Result<()> {
 fn test_emit_package_with_dependencies() -> std::io::Result<()> {
     let collector = DebianCollector::new(
         "http://example.com".to_string(),
+        "debian".to_string(),
         "stable".to_string(),
         "main".to_string(),
     );
@@ -113,6 +115,7 @@ fn test_emit_package_with_dependencies() -> std::io::Result<()> {
 fn test_emit_package_with_source_field() -> std::io::Result<()> {
     let collector = DebianCollector::new(
         "http://example.com".to_string(),
+        "debian".to_string(),
         "stable".to_string(),
         "main".to_string(),
     );
@@ -155,6 +158,7 @@ fn test_emit_package_with_source_field() -> std::io::Result<()> {
 fn test_emit_package_with_provides() -> std::io::Result<()> {
     let collector = DebianCollector::new(
         "http://example.com".to_string(),
+        "debian".to_string(),
         "stable".to_string(),
         "main".to_string(),
     );

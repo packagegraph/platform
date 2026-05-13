@@ -1,43 +1,50 @@
+use crate::forge::emit_dq_issue;
 use crate::ntriples::{bnode_id, NTriplesWriter};
+use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use regex::Regex;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Result};
-use std::time::Duration;
 use tar::Archive;
 
 pub struct AlpineCollector {
     client: Client,
     mirror_url: String,
+    distro_name: String,
     branch: String,
     repos: Vec<String>,
     arch: String,
+    source_cache: Option<SourceCache>,
 }
 
 impl AlpineCollector {
     pub fn new(
         mirror_url: String,
+        distro_name: String,
         branch: String,
         repos: Vec<String>,
         arch: String,
     ) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .expect("Failed to create HTTP client");
+        let client = crate::enricher::default_http_client();
 
         Self {
             client,
             mirror_url,
+            distro_name,
             branch,
             repos,
             arch,
+            source_cache: None,
         }
+    }
+
+    pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
+        self.source_cache = Some(SourceCache::new(cache_dir, "alpine")?);
+        Ok(self)
     }
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
@@ -61,6 +68,14 @@ impl AlpineCollector {
                 }
                 Err(e) => {
                     eprintln!("  Error processing {}: {}", repo, e);
+                    total_triples += emit_dq_issue(
+                        &mut writer,
+                        "alpine-collector",
+                        &format!("repo_{}", repo),
+                        &e.to_string(),
+                        "parse_error",
+                        "high",
+                    )?;
                 }
             }
         }
@@ -74,6 +89,14 @@ impl AlpineCollector {
             }
             Err(e) => {
                 eprintln!("Warning: secdb collection failed: {}", e);
+                total_triples += emit_dq_issue(
+                    &mut writer,
+                    "alpine-collector",
+                    "secdb",
+                    &e.to_string(),
+                    "fetch_error",
+                    "medium",
+                )?;
             }
         }
 
@@ -82,17 +105,23 @@ impl AlpineCollector {
     }
 
     fn emit_distribution_metadata(&self, writer: &mut NTriplesWriter) -> Result<usize> {
-        let dist_uri = distro_uri("alpine");
-        let rel_uri = release_uri("alpine", &self.branch);
+        let dist_uri = distro_uri(&self.distro_name);
+        let rel_uri = release_uri(&self.distro_name, &self.branch);
         let arch_uri_val = arch_uri(&self.arch);
         let mut triples = 0;
 
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
         writer.write_literal(&dist_uri, &format!("{PKG}projectName"), "Alpine Linux")?;
-        triples += 2;
+        writer.write_literal(&dist_uri, RDFS_LABEL, "Alpine")?;
+        triples += 3;
 
         writer.write_triple(&rel_uri, RDF_TYPE, &format!("{PKG}DistributionRelease"))?;
-        writer.write_literal(&rel_uri, &format!("{PKG}releaseCodename"), &self.branch)?;
+        if is_numeric_release(&self.branch) {
+            writer.write_literal(&rel_uri, &format!("{PKG}releaseVersion"), &self.branch)?;
+        } else {
+            writer.write_literal(&rel_uri, &format!("{PKG}releaseCodename"), &self.branch)?;
+        }
+        // partOfDistribution auto-emits hasRelease inverse
         writer.write_triple(&rel_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         triples += 3;
 
@@ -128,8 +157,13 @@ impl AlpineCollector {
             .bytes()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-        let gz = GzDecoder::new(&bytes[..]);
-        let mut archive = Archive::new(gz);
+        // Decompress gzip to memory (MultiGzDecoder handles concatenated gzip members
+        // used by Alpine's signed APKINDEX archives), then parse tar
+        let mut gz = MultiGzDecoder::new(&bytes[..]);
+        let mut tar_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut gz, &mut tar_bytes)?;
+
+        let mut archive = Archive::new(std::io::Cursor::new(&tar_bytes));
 
         let mut apkindex_content = String::new();
 
@@ -168,20 +202,40 @@ impl AlpineCollector {
     ) -> Result<usize> {
         let name = match pkg.get("P") {
             Some(n) => n,
-            None => return Ok(0),
+            None => {
+                eprintln!("  Warning: package missing P (name) field, skipping");
+                return emit_dq_issue(
+                    writer,
+                    "alpine-collector",
+                    "package_name",
+                    "<missing>",
+                    "missing_field",
+                    "high",
+                );
+            }
         };
         let version = match pkg.get("V") {
             Some(v) => v,
-            None => return Ok(0),
+            None => {
+                eprintln!("  Warning: package {} missing V (version) field, skipping", name);
+                return emit_dq_issue(
+                    writer,
+                    "alpine-collector",
+                    "package_version",
+                    name,
+                    "missing_field",
+                    "high",
+                );
+            }
         };
 
-        let pkg_uri = package_uri("alpine", &self.branch, &self.arch, name, version);
-        let identity_uri = package_identity_uri("alpine", &self.branch, &self.arch, name);
+        let pkg_uri = package_uri(&self.distro_name, &self.branch, &self.arch, name, version);
+        let identity_uri = package_identity_uri(&self.distro_name, &self.branch, &self.arch, name);
         let mut triples = 0;
 
         // Dual typing
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{PKG}BinaryPackage"))?;
-        writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{APK}AlpinePackage"))?;
+        writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{APK}ApkPackage"))?;
         triples += 2;
 
         // Package identity
@@ -195,7 +249,7 @@ impl AlpineCollector {
         triples += 1;
 
         // Version
-        let ver_uri = version_uri("alpine", &self.branch, name, version);
+        let ver_uri = version_uri(&self.distro_name, &self.branch, name, version);
         writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
         writer.write_literal(&ver_uri, &format!("{PKG}versionString"), version)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
@@ -207,8 +261,8 @@ impl AlpineCollector {
         triples += 1;
 
         // Distribution and release
-        let dist_uri = distro_uri("alpine");
-        let rel_uri = release_uri("alpine", &self.branch);
+        let dist_uri = distro_uri(&self.distro_name);
+        let rel_uri = release_uri(&self.distro_name, &self.branch);
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfRelease"), &rel_uri)?;
         triples += 2;
@@ -229,6 +283,11 @@ impl AlpineCollector {
         if let Some(license) = pkg.get("L") {
             writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
             triples += 1;
+            // License entity (SPDX)
+            let license_uri = crate::uris::spdx_license_uri(license);
+            writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+            writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+            triples += 2;
         }
         if let Some(size) = pkg.get("S") {
             if let Ok(s) = size.parse::<i64>() {
@@ -258,16 +317,17 @@ impl AlpineCollector {
                 let maint_name = caps.get(1).unwrap().as_str().trim();
                 let maint_email = caps.get(2).unwrap().as_str().trim();
                 let maint_uri = maintainer_uri(maint_email);
-                writer.write_triple(&maint_uri, RDF_TYPE, &format!("{PKG}Maintainer"))?;
+                writer.write_triple(&maint_uri, RDF_TYPE, &format!("{PKG}Person"))?;
                 writer.write_literal(&maint_uri, &format!("{FOAF}name"), maint_name)?;
+                writer.write_literal(&maint_uri, RDFS_LABEL, maint_name)?;
                 writer.write_triple(&pkg_uri, &format!("{PKG}maintainedBy"), &maint_uri)?;
-                triples += 3;
+                triples += 4;
             }
         }
 
         // Origin → SourcePackage link
         if let Some(origin) = pkg.get("o") {
-            let src_uri = source_uri("alpine", &self.branch, origin, version);
+            let src_uri = source_uri(&self.distro_name, &self.branch, origin, version);
             writer.write_triple(&src_uri, RDF_TYPE, &format!("{PKG}SourcePackage"))?;
             writer.write_literal(&src_uri, &format!("{PKG}packageName"), origin)?;
             writer.write_triple(&pkg_uri, &format!("{PKG}builtFromSource"), &src_uri)?;
@@ -340,7 +400,7 @@ impl AlpineCollector {
             }
 
             let target_uri =
-                package_identity_uri("alpine", &self.branch, &self.arch, dep_name);
+                package_identity_uri(&self.distro_name, &self.branch, &self.arch, dep_name);
 
             // Direct dependency link
             writer.write_triple(pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
@@ -353,13 +413,13 @@ impl AlpineCollector {
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
             triples += 3;
 
-            // Dependency type literal on bnode
-            writer.write_bnode_literal(&bnode, &format!("{PKG}dependencyType"), dep_type)?;
+            // Dependency type as property URI (v0.6.0 properties-as-taxonomy)
+            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri(dep_type))?;
             triples += 1;
 
             if let (Some(op), Some(val)) = (&constraint_op, &constraint_val) {
                 let constraint_bnode = bnode_id("constraint", &format!("{}-{}", pkg_uri, dep_name));
-                writer.write_bnode_object(&bnode, &format!("{PKG}hasVersionConstraint"), &constraint_bnode)?;
+                writer.write_bnode_to_bnode(&bnode, &format!("{PKG}hasVersionConstraint"), &constraint_bnode)?;
                 writer.write_bnode_subject(&constraint_bnode, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
                 writer.write_bnode_literal(&constraint_bnode, &format!("{PKG}versionConstraintOperator"), op)?;
                 writer.write_bnode_literal(&constraint_bnode, &format!("{PKG}versionConstraintValue"), val)?;
@@ -431,6 +491,14 @@ impl AlpineCollector {
                 }
                 Err(e) => {
                     eprintln!("  Warning: secdb fetch failed for {}: {}", repo, e);
+                    total_triples += emit_dq_issue(
+                        writer,
+                        "alpine-collector",
+                        &format!("secdb_{}", repo),
+                        &e.to_string(),
+                        "fetch_error",
+                        "medium",
+                    )?;
                 }
             }
         }
@@ -475,12 +543,12 @@ impl AlpineCollector {
                         triples += 2;
 
                         // Fixed version link
-                        let fixed_ver_uri = version_uri("alpine", &self.branch, pkg_name, fixed_version);
+                        let fixed_ver_uri = version_uri(&self.distro_name, &self.branch, pkg_name, fixed_version);
                         writer.write_triple(&cve_uri, &format!("{SEC}fixedInVersion"), &fixed_ver_uri)?;
                         triples += 1;
 
                         // Affected package link (the package identity)
-                        let identity = package_identity_uri("alpine", &self.branch, &self.arch, pkg_name);
+                        let identity = package_identity_uri(&self.distro_name, &self.branch, &self.arch, pkg_name);
                         writer.write_triple(&cve_uri, &format!("{SEC}affectsPackage"), &identity)?;
                         triples += 1;
                     }
@@ -585,6 +653,7 @@ D:readline ncurses-libs
     fn test_emit_package_triples_produces_dual_typing() {
         let collector = AlpineCollector::new(
             "https://mirror.example.com/alpine".into(),
+            "alpine".into(),
             "v3.20".into(),
             vec!["main".into()],
             "x86_64".into(),
@@ -606,7 +675,7 @@ D:readline ncurses-libs
 
         // Verify dual typing
         assert!(content.contains("core#BinaryPackage"));
-        assert!(content.contains("alpine#AlpinePackage"));
+        assert!(content.contains("apk#ApkPackage"));
         assert!(content.contains("\"curl\""));
         assert!(triples > 10);
     }
@@ -615,6 +684,7 @@ D:readline ncurses-libs
     fn test_emit_dependencies_with_version_constraint() {
         let collector = AlpineCollector::new(
             "https://mirror.example.com/alpine".into(),
+            "alpine".into(),
             "v3.20".into(),
             vec!["main".into()],
             "x86_64".into(),
@@ -648,6 +718,7 @@ D:readline ncurses-libs
     fn test_secdb_parsing_and_triples() {
         let collector = AlpineCollector::new(
             "https://mirror.example.com/alpine".into(),
+            "alpine".into(),
             "v3.20".into(),
             vec!["main".into()],
             "x86_64".into(),
@@ -694,6 +765,7 @@ D:readline ncurses-libs
     fn test_maintainer_parsing() {
         let collector = AlpineCollector::new(
             "https://mirror.example.com/alpine".into(),
+            "alpine".into(),
             "v3.20".into(),
             vec!["main".into()],
             "x86_64".into(),

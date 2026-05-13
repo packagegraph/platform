@@ -1,4 +1,5 @@
 use crate::ntriples::NTriplesWriter;
+use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -10,12 +11,20 @@ static VAR_RE_QUOTED: Lazy<Regex> = Lazy::new(|| Regex::new(r#"^([a-z_]+)="([^"]
 static VAR_RE_UNQUOTED: Lazy<Regex> = Lazy::new(|| Regex::new(r#"^([a-z_]+)=([^\s]+)"#).unwrap());
 
 pub struct VoidCollector {
+    distro_name: String,
+    release_name: String,
     repo_path: String,
+    source_cache: Option<SourceCache>,
 }
 
 impl VoidCollector {
-    pub fn new(repo_path: String) -> Self {
-        Self { repo_path }
+    pub fn new(distro_name: String, release_name: String, repo_path: String) -> Self {
+        Self { distro_name, release_name, repo_path, source_cache: None }
+    }
+
+    pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
+        self.source_cache = Some(SourceCache::new(cache_dir, "void")?);
+        Ok(self)
     }
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
@@ -64,12 +73,13 @@ impl VoidCollector {
     }
 
     fn emit_distribution_metadata(&self, writer: &mut NTriplesWriter) -> Result<usize> {
-        let dist_uri = distro_uri("void");
-        let rel_uri = release_uri("void", "void");
+        let dist_uri = distro_uri(&self.distro_name);
+        let rel_uri = release_uri(&self.distro_name, &self.release_name);
         let mut triples = 0;
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
+        writer.write_literal(&dist_uri, RDFS_LABEL, "Void")?;
         writer.write_literal(&dist_uri, &format!("{PKG}projectName"), "Void Linux")?;
-        triples += 2;
+        triples += 3;
         writer.write_triple(&rel_uri, RDF_TYPE, &format!("{PKG}DistributionRelease"))?;
         writer.write_literal(&rel_uri, &format!("{PKG}releaseCodename"), "void")?;
         writer.write_triple(&rel_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
@@ -143,13 +153,13 @@ impl VoidCollector {
         pkg: &VoidPackage,
     ) -> Result<usize> {
         let version = pkg.version.as_ref().unwrap();
-        let pkg_uri = package_uri("void", "void", "any", &pkg.pkgname, version);
-        let identity_uri = package_identity_uri("void", "void", "any", &pkg.pkgname);
+        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", &pkg.pkgname, version);
+        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", &pkg.pkgname);
         let mut triples = 0;
 
         // Dual typing
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{PKG}Package"))?;
-        writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{VOID}VoidPackage"))?;
+        writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{VOID}XbpsPackage"))?;
         triples += 2;
 
         writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
@@ -160,13 +170,13 @@ impl VoidCollector {
         writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), &pkg.pkgname)?;
         triples += 1;
 
-        let ver_uri = version_uri("void", "void", &pkg.pkgname, version);
+        let ver_uri = version_uri(&self.distro_name, &self.release_name, &pkg.pkgname, version);
         writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
         writer.write_literal(&ver_uri, &format!("{PKG}versionString"), version)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
         triples += 3;
 
-        let dist_uri = distro_uri("void");
+        let dist_uri = distro_uri(&self.distro_name);
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         triples += 1;
 
@@ -183,6 +193,11 @@ impl VoidCollector {
         if let Some(license) = &pkg.license {
             writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
             triples += 1;
+            // License entity (SPDX)
+            let license_uri = crate::uris::spdx_license_uri(license);
+            writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+            writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+            triples += 2;
         }
 
         if let Some(revision) = &pkg.revision {
@@ -197,17 +212,17 @@ impl VoidCollector {
 
         // Dependencies
         for dep in &pkg.depends {
-            let target_uri = package_identity_uri("void", "void", "any", dep);
+            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
             writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
         }
         for dep in &pkg.makedepends {
-            let target_uri = package_identity_uri("void", "void", "any", dep);
+            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
             writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
         }
         for dep in &pkg.hostmakedepends {
-            let target_uri = package_identity_uri("void", "void", "any", dep);
+            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
             writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
         }
@@ -238,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_parse_template() {
-        let collector = VoidCollector::new("/tmp".to_string());
+        let collector = VoidCollector::new("void".into(), "void".into(), "/tmp".to_string());
         let template_content = r#"
 pkgname=firefox
 version=125.0
@@ -271,7 +286,7 @@ hostmakedepends="python3 nodejs"
 
     #[test]
     fn test_emit_void_package_dual_typing() {
-        let collector = VoidCollector::new("/tmp".to_string());
+        let collector = VoidCollector::new("void".into(), "void".into(), "/tmp".to_string());
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 
@@ -295,11 +310,11 @@ hostmakedepends="python3 nodejs"
         temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
 
         assert!(content.contains("core#Package"));
-        assert!(content.contains("void#VoidPackage"));
+        assert!(content.contains("xbps#XbpsPackage"));
         assert!(content.contains("\"firefox\""));
-        assert!(content.contains("void#buildStyle"));
+        assert!(content.contains("xbps#buildStyle"));
         assert!(content.contains("\"gnu-configure\""));
-        assert!(content.contains("void#revision"));
+        assert!(content.contains("xbps#revision"));
         assert!(content.contains("\"1\""));
         assert!(content.contains("directlyDependsOn"));
         assert!(triples > 15);

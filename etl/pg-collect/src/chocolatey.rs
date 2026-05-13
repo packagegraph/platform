@@ -8,6 +8,8 @@ use std::io::Result;
 use std::time::Duration;
 
 pub struct ChocolateyCollector {
+    distro_name: String,
+    release_name: String,
     client: Client,
     api_url: String,
 }
@@ -27,13 +29,10 @@ struct ChocolateyPackage {
 }
 
 impl ChocolateyCollector {
-    pub fn new(api_url: String) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .expect("Failed to create HTTP client");
+    pub fn new(distro_name: String, release_name: String, api_url: String) -> Self {
+        let client = crate::enricher::default_http_client();
 
-        Self { client, api_url }
+        Self { distro_name, release_name, client, api_url }
     }
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
@@ -71,8 +70,8 @@ impl ChocolateyCollector {
     }
 
     fn emit_distribution_metadata(&self, writer: &mut NTriplesWriter) -> Result<usize> {
-        let dist_uri = distro_uri("chocolatey");
-        let rel_uri = release_uri("chocolatey", "community");
+        let dist_uri = distro_uri(&self.distro_name);
+        let rel_uri = release_uri(&self.distro_name, &self.release_name);
         let mut triples = 0;
 
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
@@ -102,6 +101,11 @@ impl ChocolateyCollector {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         if !response.status().is_success() {
+            // 406 = Chocolatey OData pagination limit (~10K); treat as end of results
+            if response.status().as_u16() == 406 {
+                eprintln!("  HTTP 406 — reached Chocolatey pagination limit, stopping");
+                return Ok(vec![]);
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("HTTP {}", response.status()),
@@ -137,6 +141,10 @@ impl ChocolateyCollector {
                         current = ChocolateyPackage::default();
                     } else if name == "m:properties" {
                         in_properties = true;
+                    } else if name == "title" && in_entry && !in_properties && current.id.is_empty() {
+                        // Chocolatey API no longer includes d:Id in properties;
+                        // extract package ID from <title> element instead
+                        current_element = "atom:title".to_string();
                     }
                 }
                 Ok(Event::End(e)) => {
@@ -153,7 +161,7 @@ impl ChocolateyCollector {
                     current_element.clear();
                 }
                 Ok(Event::Text(e)) => {
-                    if !in_properties {
+                    if !in_properties && current_element != "atom:title" {
                         continue;
                     }
 
@@ -163,7 +171,7 @@ impl ChocolateyCollector {
                     }
 
                     match current_element.as_str() {
-                        "d:Id" => current.id = text,
+                        "d:Id" | "atom:title" => current.id = text,
                         "d:Version" => current.version = text,
                         "d:Title" => current.title = Some(text),
                         "d:Description" => current.description = Some(text),
@@ -190,8 +198,8 @@ impl ChocolateyCollector {
     }
 
     fn emit_package_triples(&self, writer: &mut NTriplesWriter, pkg: &ChocolateyPackage) -> Result<usize> {
-        let pkg_uri = package_uri("chocolatey", "community", "windows", &pkg.id, &pkg.version);
-        let identity_uri = package_identity_uri("chocolatey", "community", "windows", &pkg.id);
+        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "windows", &pkg.id, &pkg.version);
+        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "windows", &pkg.id);
         let mut triples = 0;
 
         // Dual typing
@@ -209,14 +217,14 @@ impl ChocolateyCollector {
         triples += 1;
 
         // Version
-        let ver_uri = version_uri("chocolatey", "community", &pkg.id, &pkg.version);
+        let ver_uri = version_uri(&self.distro_name, &self.release_name, &pkg.id, &pkg.version);
         writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
         writer.write_literal(&ver_uri, &format!("{PKG}versionString"), &pkg.version)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
         triples += 3;
 
         // Distribution
-        let dist_uri = distro_uri("chocolatey");
+        let dist_uri = distro_uri(&self.distro_name);
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         triples += 1;
 
@@ -269,7 +277,7 @@ mod tests {
   </entry>
 </feed>"#;
 
-        let collector = ChocolateyCollector::new("https://community.chocolatey.org/api/v2".into());
+        let collector = ChocolateyCollector::new("chocolatey".into(), "community".into(), "https://community.chocolatey.org/api/v2".into());
         let packages = collector.parse_odata_feed(xml).unwrap();
 
         assert_eq!(packages.len(), 1);
@@ -285,7 +293,7 @@ mod tests {
         use std::io::{Read, Write};
         use tempfile::NamedTempFile;
 
-        let collector = ChocolateyCollector::new("https://community.chocolatey.org/api/v2".into());
+        let collector = ChocolateyCollector::new("chocolatey".into(), "community".into(), "https://community.chocolatey.org/api/v2".into());
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 

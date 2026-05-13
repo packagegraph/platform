@@ -9,6 +9,16 @@ use std::fs::File;
 use std::io::Result;
 use std::time::Duration;
 
+/// PEP 503 name normalization: lowercase, replace runs of [-_. ] with a single hyphen.
+/// Also strips extras brackets (e.g. "aiohttp[speedups]" → "aiohttp").
+pub fn normalize_pypi_name(name: &str) -> String {
+    // Strip extras: everything from first '[' onward
+    let base = name.split('[').next().unwrap_or(name).trim();
+    // PEP 503: lowercase, then collapse [-_. ]+ runs into single '-'
+    let re = Regex::new(r"[-_. ]+").unwrap();
+    re.replace_all(&base.to_lowercase(), "-").to_string()
+}
+
 pub struct PypiCollector {
     client: Client,
 }
@@ -41,6 +51,13 @@ impl PypiCollector {
         Self { client }
     }
 
+    pub fn collect_discover(&self, endpoint: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "pypi")?;
+        let seed_path = "/tmp/seed-pypi-discover.txt";
+        std::fs::write(seed_path, names.join("\n"))?;
+        self.collect(seed_path, max_depth, max_packages, output_path)
+    }
+
     pub fn collect(&self, packages_file: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
         use std::collections::{HashSet, HashMap, VecDeque};
 
@@ -49,7 +66,8 @@ impl PypiCollector {
 
         self.emit_distribution_metadata(&mut writer)?;
 
-        let seeds = read_seed_file(packages_file)?;
+        let raw_seeds = read_seed_file(packages_file)?;
+        let seeds: Vec<String> = raw_seeds.iter().map(|s| normalize_pypi_name(s)).collect();
         eprintln!("Loaded {} seed packages", seeds.len());
         eprintln!("Spider config: max_depth={}, max_packages={}", max_depth, max_packages);
 
@@ -91,7 +109,11 @@ impl PypiCollector {
 
                     // Enqueue dependencies if under max_depth
                     if depth < max_depth {
-                        for dep_name in dep_names {
+                        for raw_dep in dep_names {
+                            let dep_name = normalize_pypi_name(&raw_dep);
+                            if dep_name.is_empty() {
+                                continue;
+                            }
                             if !visited.contains(&dep_name) && !depth_map.contains_key(&dep_name) {
                                 depth_map.insert(dep_name.clone(), depth + 1);
                                 queue.push_back(dep_name);
@@ -223,6 +245,11 @@ impl PypiCollector {
         if let Some(license) = &info.license {
             writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
             triples += 1;
+            // License entity (SPDX)
+            let license_uri = crate::uris::spdx_license_uri(license);
+            writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+            writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+            triples += 2;
         }
 
         // PyPI-specific
@@ -259,16 +286,21 @@ impl PypiCollector {
         pkg_uri: &str,
         requires_dist: &[String],
     ) -> Result<(usize, Vec<String>)> {
-        let dep_re = Regex::new(r"^([a-zA-Z0-9._-]+)\s*(\(.*\))?").unwrap();
+        // Captures base name, optional extras, optional version spec
+        let dep_re = Regex::new(r"^([a-zA-Z0-9._-]+)(?:\[.*?\])?\s*(\(.*\))?").unwrap();
         let mut triples = 0;
         let mut dep_names = Vec::new();
 
         for req in requires_dist {
-            // Skip extras markers like "foo[extra]" - just parse the base name
+            // Strip environment markers (after ';')
             let cleaned = req.split(';').next().unwrap_or(req).trim();
 
             if let Some(caps) = dep_re.captures(cleaned) {
-                let dep_name = caps.get(1).unwrap().as_str().to_string();
+                let raw_name = caps.get(1).unwrap().as_str();
+                let dep_name = normalize_pypi_name(raw_name);
+                if dep_name.is_empty() {
+                    continue;
+                }
                 let version_spec = caps.get(2).map(|m| m.as_str());
 
                 let target_uri = package_identity_uri("pypi", "index", "any", &dep_name);
@@ -280,12 +312,12 @@ impl PypiCollector {
                 writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
                 writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
                 writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-                writer.write_bnode_literal(&bnode, &format!("{PKG}dependencyType"), "depends")?;
+                writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri("depends"))?;
                 triples += 4;
 
                 if let Some(spec) = version_spec {
                     let cb = bnode_id("constraint", &format!("{}-{}", pkg_uri, &dep_name));
-                    writer.write_bnode_object(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
+                    writer.write_bnode_to_bnode(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
                     writer.write_bnode_subject(&cb, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
                     writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintOperator"), "pep440")?;
                     writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintValue"), spec)?;
@@ -392,5 +424,51 @@ mod tests {
         assert!(dep_names.contains(&"charset-normalizer".to_string()));
         assert!(dep_names.contains(&"idna".to_string()));
         assert!(dep_names.contains(&"urllib3".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_pypi_name() {
+        // PEP 503: lowercase, collapse [-_. ]+ to single '-'
+        assert_eq!(normalize_pypi_name("Requests"), "requests");
+        assert_eq!(normalize_pypi_name("My_Package"), "my-package");
+        assert_eq!(normalize_pypi_name("My.Package"), "my-package");
+        assert_eq!(normalize_pypi_name("My__Package"), "my-package");
+        assert_eq!(normalize_pypi_name("azure-core"), "azure-core");
+
+        // Extras stripping
+        assert_eq!(normalize_pypi_name("aiohttp[speedups]"), "aiohttp");
+        assert_eq!(normalize_pypi_name("accelerate[rich]"), "accelerate");
+        assert_eq!(normalize_pypi_name("azure-core[aio]"), "azure-core");
+        assert_eq!(normalize_pypi_name("anyio[trio]"), "anyio");
+
+        // Combined: extras + normalization
+        assert_eq!(normalize_pypi_name("Azure_Core[aio]"), "azure-core");
+
+        // Edge cases
+        assert_eq!(normalize_pypi_name("  requests  "), "requests");
+        assert_eq!(normalize_pypi_name(""), "");
+    }
+
+    #[test]
+    fn test_parse_requires_dist_with_extras() {
+        let collector = PypiCollector::new();
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+
+        let pkg_uri = package_uri("pypi", "index", "any", "myproject", "1.0.0");
+        let requires = vec![
+            "aiohttp[speedups] (>=3.0)".into(),
+            "azure-core[aio]".into(),
+            "My_Package (>=1.0); extra == \"dev\"".into(),
+            "Normal.Dep".into(),
+        ];
+
+        let (_triples, dep_names) = collector.parse_requires_dist(&mut writer, &pkg_uri, &requires).unwrap();
+
+        assert_eq!(dep_names.len(), 4);
+        assert!(dep_names.contains(&"aiohttp".to_string()), "Should strip extras from aiohttp[speedups]");
+        assert!(dep_names.contains(&"azure-core".to_string()), "Should strip extras from azure-core[aio]");
+        assert!(dep_names.contains(&"my-package".to_string()), "Should normalize My_Package");
+        assert!(dep_names.contains(&"normal-dep".to_string()), "Should normalize Normal.Dep");
     }
 }

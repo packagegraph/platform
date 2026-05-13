@@ -4,6 +4,7 @@ use crate::uris::*;
 use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Result;
 use std::time::Duration;
@@ -11,6 +12,10 @@ use std::time::Duration;
 pub struct GoModCollector {
     client: Client,
     proxy_url: String,
+    /// Cache of verified module roots (paths that have versions on the proxy)
+    known_modules: std::cell::RefCell<HashSet<String>>,
+    /// Cache of paths known NOT to be modules
+    known_non_modules: std::cell::RefCell<HashSet<String>>,
 }
 
 impl GoModCollector {
@@ -21,7 +26,79 @@ impl GoModCollector {
             .build()
             .expect("Failed to create HTTP client");
 
-        Self { client, proxy_url }
+        Self {
+            client,
+            proxy_url,
+            known_modules: std::cell::RefCell::new(HashSet::new()),
+            known_non_modules: std::cell::RefCell::new(HashSet::new()),
+        }
+    }
+
+    /// Resolve an import path to its module root by trying progressively shorter
+    /// prefixes against the proxy. Caches results to avoid repeated lookups.
+    ///
+    /// For `cloud.google.com/go/storage/internal/apiv2`, tries:
+    ///   1. cloud.google.com/go/storage/internal/apiv2 (miss)
+    ///   2. cloud.google.com/go/storage/internal (miss)
+    ///   3. cloud.google.com/go/storage (HIT → module root)
+    ///
+    /// Returns None if no module root found at any prefix.
+    fn resolve_module_root(&self, import_path: &str) -> Option<String> {
+        // Check if this exact path or a known parent is already cached
+        {
+            let known = self.known_modules.borrow();
+            // Check if any known module is a prefix of this path
+            for module in known.iter() {
+                if import_path == module || import_path.starts_with(&format!("{}/", module)) {
+                    return Some(module.clone());
+                }
+            }
+        }
+
+        // Check negative cache
+        if self.known_non_modules.borrow().contains(import_path) {
+            return None;
+        }
+
+        // Try progressively shorter prefixes
+        let parts: Vec<&str> = import_path.split('/').collect();
+        // Minimum module path: domain + at least one segment (e.g., "golang.org/x")
+        let min_segments = if parts.first().map(|d| d.contains('.')) == Some(true) { 2 } else { 2 };
+
+        // Start from the full path and work down
+        for end in (min_segments..=parts.len()).rev() {
+            let candidate = parts[..end].join("/");
+
+            // Skip if we already know this isn't a module
+            if self.known_non_modules.borrow().contains(&candidate) {
+                continue;
+            }
+
+            // Check if proxy has versions for this candidate
+            let encoded = encode_go_module_path(&candidate);
+            let list_url = format!("{}/{}/@v/list", self.proxy_url, encoded);
+
+            match self.fetch_text(&list_url) {
+                Ok(text) if !text.trim().is_empty() => {
+                    // Found a module root with versions
+                    self.known_modules.borrow_mut().insert(candidate.clone());
+                    return Some(candidate);
+                }
+                _ => {
+                    self.known_non_modules.borrow_mut().insert(candidate);
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn collect_discover(&self, endpoint: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "gomod")?;
+        let seed_path = "/tmp/seed-gomod-discover.txt";
+        std::fs::write(seed_path, names.join("\n"))?;
+        self.collect(seed_path, max_depth, max_packages, output_path)
     }
 
     pub fn collect(&self, packages_file: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
@@ -48,7 +125,22 @@ impl GoModCollector {
         let mut total_packages = 0;
         let mut total_triples = 0;
 
-        while let Some(module_path) = queue.pop_front() {
+        while let Some(raw_path) = queue.pop_front() {
+            // Sanitize: strip commit annotations like ")(commit=...)"
+            let sanitized = sanitize_module_path(&raw_path);
+            if sanitized.is_empty() {
+                continue;
+            }
+
+            // Resolve to module root (import paths → module paths)
+            let module_path = match self.resolve_module_root(&sanitized) {
+                Some(root) => root,
+                None => {
+                    // No module found at any prefix — skip entirely
+                    continue;
+                }
+            };
+
             if !visited.insert(module_path.clone()) {
                 continue;
             }
@@ -130,7 +222,10 @@ impl GoModCollector {
         let version_list: Vec<&str> = versions.lines().filter(|l| !l.is_empty()).collect();
 
         if version_list.is_empty() {
-            return Err(format!("No versions found for {}", module_path));
+            // Soft failure: proxy has no versions (untagged repo, cached 404, etc.)
+            // Record as zero-version module rather than hard error
+            eprintln!("  Skipping {} (no versions on proxy)", module_path);
+            return Ok((0, vec![]));
         }
 
         // Use latest version
@@ -159,7 +254,12 @@ impl GoModCollector {
         let response = self.client.get(url).send().map_err(|e| e.to_string())?;
 
         if response.status() == StatusCode::NOT_FOUND || response.status() == StatusCode::GONE {
-            return Err(format!("404/410: {}", url));
+            // Return empty string for 404/410 — caller handles as "no data"
+            return Ok(String::new());
+        }
+
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}: {}", response.status(), url));
         }
 
         response.text().map_err(|e| e.to_string())
@@ -222,12 +322,12 @@ impl GoModCollector {
             writer.write_bnode_object(&pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-            writer.write_bnode_literal(&bnode, &format!("{PKG}dependencyType"), "depends")?;
+            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri("depends"))?;
             triples += 4;
 
             if !dep.version.is_empty() {
                 let cb = bnode_id("constraint", &format!("{}-{}", pkg_uri, dep.module_path));
-                writer.write_bnode_object(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
+                writer.write_bnode_to_bnode(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
                 writer.write_bnode_subject(&cb, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
                 writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintOperator"), "exact")?;
                 writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintValue"), &dep.version)?;
@@ -242,6 +342,35 @@ impl GoModCollector {
 
         Ok(triples)
     }
+}
+
+/// Sanitize a module path from seed files or dependency lists.
+///
+/// 1. Strips commit annotations: `bazil.org/fuse)(commit=fb710f7...)` → `bazil.org/fuse`
+/// 2. Strips parentheses and junk suffixes
+/// 3. Rejects paths with invalid characters (spaces, brackets, etc.)
+pub fn sanitize_module_path(raw: &str) -> String {
+    let mut path = raw.trim().to_string();
+
+    // Strip anything from first '(' or ')' onward (commit annotations, metadata)
+    if let Some(idx) = path.find(|c: char| c == '(' || c == ')') {
+        path.truncate(idx);
+    }
+
+    // Trim trailing slashes
+    let path = path.trim_end_matches('/');
+
+    // Reject obviously invalid paths
+    if path.is_empty()
+        || path.contains(' ')
+        || path.contains('[')
+        || path.contains(']')
+        || !path.contains('.')
+    {
+        return String::new();
+    }
+
+    path.to_string()
 }
 
 /// Encode a Go module path for the module proxy.
@@ -325,6 +454,30 @@ mod tests {
     use super::*;
     use std::io::Read;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_sanitize_module_path() {
+        // Normal paths pass through
+        assert_eq!(sanitize_module_path("github.com/go-chi/chi"), "github.com/go-chi/chi");
+
+        // Strip commit annotations
+        assert_eq!(
+            sanitize_module_path("bazil.org/fuse)(commit=fb710f7dfd05)"),
+            "bazil.org/fuse"
+        );
+        assert_eq!(
+            sanitize_module_path("bazil.org/fuse/fs)(commit=fb710f7dfd05)"),
+            "bazil.org/fuse/fs"
+        );
+
+        // Reject invalid paths
+        assert_eq!(sanitize_module_path(""), "");
+        assert_eq!(sanitize_module_path("no-dots"), "");
+        assert_eq!(sanitize_module_path("has spaces.com/foo"), "");
+
+        // Trim trailing slashes
+        assert_eq!(sanitize_module_path("github.com/foo/bar/"), "github.com/foo/bar");
+    }
 
     #[test]
     fn test_encode_go_module_path() {

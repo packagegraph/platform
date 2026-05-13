@@ -1,4 +1,5 @@
 use crate::ntriples::NTriplesWriter;
+use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -18,12 +19,20 @@ static DEP_ATOM_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?:^|[\s(])(?:[<>=!~]*)?([a-z0-9_-]+/[a-z0-9_.+-]+?)(?:[-:]\d|[\s)\n]|$)").unwrap());
 
 pub struct GentooCollector {
+    distro_name: String,
+    release_name: String,
     repo_path: String,
+    source_cache: Option<SourceCache>,
 }
 
 impl GentooCollector {
-    pub fn new(repo_path: String) -> Self {
-        Self { repo_path }
+    pub fn new(distro_name: String, release_name: String, repo_path: String) -> Self {
+        Self { distro_name, release_name, repo_path, source_cache: None }
+    }
+
+    pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
+        self.source_cache = Some(SourceCache::new(cache_dir, "gentoo")?);
+        Ok(self)
     }
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
@@ -85,12 +94,13 @@ impl GentooCollector {
     }
 
     fn emit_distribution_metadata(&self, writer: &mut NTriplesWriter) -> Result<usize> {
-        let dist_uri = distro_uri("gentoo");
-        let rel_uri = release_uri("gentoo", "gentoo");
+        let dist_uri = distro_uri(&self.distro_name);
+        let rel_uri = release_uri(&self.distro_name, &self.release_name);
         let mut triples = 0;
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
+        writer.write_literal(&dist_uri, RDFS_LABEL, "Gentoo")?;
         writer.write_literal(&dist_uri, &format!("{PKG}projectName"), "Gentoo")?;
-        triples += 2;
+        triples += 3;
         writer.write_triple(&rel_uri, RDF_TYPE, &format!("{PKG}DistributionRelease"))?;
         writer.write_literal(&rel_uri, &format!("{PKG}releaseCodename"), "gentoo")?;
         writer.write_triple(&rel_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
@@ -186,14 +196,14 @@ impl GentooCollector {
         let full_name = format!("{}/{}", pkg.category, pkg.name);
         // Gentoo has no arch in the same sense as RPM/Debian — use category as the
         // organizational axis. URIs: d/pkg/gentoo/gentoo/{category}/{name}/{version}
-        let pkg_uri = package_uri("gentoo", "gentoo", &pkg.category, &pkg.name, &pkg.version);
+        let pkg_uri = package_uri(&self.distro_name, &self.release_name, &pkg.category, &pkg.name, &pkg.version);
         let identity_uri =
-            package_identity_uri("gentoo", "gentoo", &pkg.category, &pkg.name);
+            package_identity_uri(&self.distro_name, &self.release_name, &pkg.category, &pkg.name);
         let mut triples = 0;
 
         // Gentoo ebuilds are source packages — they compile from source
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{PKG}SourcePackage"))?;
-        writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{GENTOO}GentooPackage"))?;
+        writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{GENTOO}PortagePackage"))?;
         triples += 2;
 
         writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
@@ -208,14 +218,18 @@ impl GentooCollector {
         writer.write_literal(&pkg_uri, &format!("{GENTOO}category"), &pkg.category)?;
         triples += 1;
 
-        let ver_uri = version_uri("gentoo", "gentoo", &full_name, &pkg.version);
+        let ver_uri = version_uri(&self.distro_name, &self.release_name, &full_name, &pkg.version);
         writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
         writer.write_literal(&ver_uri, &format!("{PKG}versionString"), &pkg.version)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
         triples += 3;
 
-        let dist_uri = distro_uri("gentoo");
+        let dist_uri = distro_uri(&self.distro_name);
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
+        triples += 1;
+
+        let rel_uri = release_uri(&self.distro_name, &self.release_name);
+        writer.write_triple(&pkg_uri, &format!("{PKG}partOfRelease"), &rel_uri)?;
         triples += 1;
 
         if let Some(desc) = &pkg.description {
@@ -224,18 +238,34 @@ impl GentooCollector {
         }
 
         if let Some(homepage) = &pkg.homepage {
-            // Gentoo HOMEPAGE can have multiple space-separated URLs — take the first.
-            // Skip URLs containing unresolved bash variables.
-            let first_url = homepage.split_whitespace().next().unwrap_or(homepage);
-            if !first_url.contains("${") && !first_url.is_empty() {
+            // Gentoo HOMEPAGE can have multiple space-separated URLs.
+            // First URL goes to pkg:homepage; try all URLs for upstream repo.
+            let urls: Vec<&str> = homepage.split_whitespace()
+                .filter(|u| !u.contains("${") && !u.is_empty())
+                .collect();
+
+            if let Some(first_url) = urls.first() {
                 writer.write_literal(&pkg_uri, &format!("{PKG}homepage"), first_url)?;
                 triples += 1;
+            }
+
+            // Try all HOMEPAGE URLs for upstream repo extraction (best confidence wins)
+            let candidates: Vec<(&str, &str)> = urls.iter()
+                .map(|u| ("homepage", *u))
+                .collect();
+            if let Some(extraction) = crate::forge::extract_best_repo(&candidates) {
+                triples += crate::forge::emit_upstream_repo(writer, &identity_uri, &extraction, None)?;
             }
         }
 
         if let Some(license) = &pkg.license {
             writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
             triples += 1;
+            // License entity (SPDX)
+            let license_uri = crate::uris::spdx_license_uri(license);
+            writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+            writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+            triples += 2;
         }
 
         if let Some(eapi) = &pkg.eapi {
@@ -268,7 +298,7 @@ impl GentooCollector {
             if seen_deps.insert(dep.clone()) {
                 if let Some((dep_cat, dep_name)) = dep.split_once('/') {
                     let target_uri =
-                        package_identity_uri("gentoo", "gentoo", dep_cat, dep_name);
+                        package_identity_uri(&self.distro_name, &self.release_name, dep_cat, dep_name);
                     writer.write_triple(&target_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
                     writer.write_literal(&target_uri, &format!("{PKG}packageName"), dep)?;
                     writer.write_triple(
@@ -392,7 +422,7 @@ mod tests {
 
     #[test]
     fn test_parse_ebuild_basic() {
-        let collector = GentooCollector::new("/tmp".to_string());
+        let collector = GentooCollector::new("gentoo".into(), "gentoo".into(), "/tmp".to_string());
         let content = r#"
 EAPI=8
 DESCRIPTION="A text editor for GNOME"
@@ -429,7 +459,7 @@ BDEPEND="sys-devel/gettext"
 
     #[test]
     fn test_package_uri_no_double_category() {
-        let collector = GentooCollector::new("/tmp".to_string());
+        let collector = GentooCollector::new("gentoo".into(), "gentoo".into(), "/tmp".to_string());
         let pkg = make_test_package();
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
@@ -457,7 +487,7 @@ BDEPEND="sys-devel/gettext"
 
     #[test]
     fn test_dependency_uri_no_double_slash() {
-        let collector = GentooCollector::new("/tmp".to_string());
+        let collector = GentooCollector::new("gentoo".into(), "gentoo".into(), "/tmp".to_string());
         let pkg = make_test_package();
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
@@ -474,7 +504,7 @@ BDEPEND="sys-devel/gettext"
 
     #[test]
     fn test_dependency_dedup_across_dep_types() {
-        let collector = GentooCollector::new("/tmp".to_string());
+        let collector = GentooCollector::new("gentoo".into(), "gentoo".into(), "/tmp".to_string());
         let pkg = make_test_package();  // sys-libs/zlib appears in both DEPEND and RDEPEND
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
@@ -494,7 +524,7 @@ BDEPEND="sys-devel/gettext"
 
     #[test]
     fn test_source_package_typing() {
-        let collector = GentooCollector::new("/tmp".to_string());
+        let collector = GentooCollector::new("gentoo".into(), "gentoo".into(), "/tmp".to_string());
         let pkg = make_test_package();
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
@@ -506,12 +536,12 @@ BDEPEND="sys-devel/gettext"
 
         assert!(content.contains("core#SourcePackage"), "Gentoo packages should be typed as SourcePackage");
         assert!(!content.contains("core#Package>"), "Should not use generic Package type");
-        assert!(content.contains("gentoo#GentooPackage"), "Should have Gentoo-specific type");
+        assert!(content.contains("portage#PortagePackage"), "Should have Gentoo-specific type");
     }
 
     #[test]
     fn test_use_flags_not_empty() {
-        let collector = GentooCollector::new("/tmp".to_string());
+        let collector = GentooCollector::new("gentoo".into(), "gentoo".into(), "/tmp".to_string());
         let pkg = make_test_package();
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
@@ -530,7 +560,7 @@ BDEPEND="sys-devel/gettext"
 
     #[test]
     fn test_category_as_separate_property() {
-        let collector = GentooCollector::new("/tmp".to_string());
+        let collector = GentooCollector::new("gentoo".into(), "gentoo".into(), "/tmp".to_string());
         let pkg = make_test_package();
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
@@ -540,13 +570,13 @@ BDEPEND="sys-devel/gettext"
         let mut content = String::new();
         temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
 
-        assert!(content.contains("gentoo#category"), "Category should be a separate property");
+        assert!(content.contains("portage#category"), "Category should be a separate property");
         assert!(content.contains("\"dev-libs\""), "Category value should be just the category");
     }
 
     #[test]
     fn test_homepage_takes_first_url() {
-        let collector = GentooCollector::new("/tmp".to_string());
+        let collector = GentooCollector::new("gentoo".into(), "gentoo".into(), "/tmp".to_string());
         let pkg = make_test_package();  // homepage has two URLs
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
@@ -557,7 +587,9 @@ BDEPEND="sys-devel/gettext"
         temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
 
         assert!(content.contains("\"https://www.openssl.org/\""), "Should take first homepage URL");
-        assert!(!content.contains("https://github.com/openssl/openssl"), "Should not include second URL in homepage literal");
+        // Second HOMEPAGE URL should appear as upstreamRepository, not in homepage literal
+        assert!(content.contains("core#upstreamRepository"), "Should emit upstreamRepository from second HOMEPAGE URL");
+        assert!(content.contains("vcs#repositoryURL"), "Should emit repositoryURL for upstream repo");
     }
 
     #[test]
@@ -614,7 +646,7 @@ BDEPEND="sys-devel/gettext"
 
     #[test]
     fn test_full_ebuild_roundtrip() {
-        let collector = GentooCollector::new("/tmp".to_string());
+        let collector = GentooCollector::new("gentoo".into(), "gentoo".into(), "/tmp".to_string());
         let content = r#"
 EAPI=8
 DESCRIPTION="SSL/TLS toolkit"
@@ -647,7 +679,7 @@ BDEPEND="dev-build/make"
         // Structural checks
         assert!(triple_count >= 15, "Should produce at least 15 triples, got {}", triple_count);
         assert!(content.contains("core#SourcePackage"));
-        assert!(content.contains("gentoo#GentooPackage"));
+        assert!(content.contains("portage#PortagePackage"));
         assert!(content.contains("d/pkg/gentoo/gentoo/dev-libs/openssl/3.2.1"));
         assert!(content.contains("d/pkg/gentoo/gentoo/dev-libs/openssl>"));  // identity URI
         assert!(content.contains("\"dev-libs/openssl\""));  // packageName

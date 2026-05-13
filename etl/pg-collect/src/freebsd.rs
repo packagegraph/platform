@@ -1,4 +1,5 @@
 use crate::ntriples::NTriplesWriter;
+use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -9,10 +10,12 @@ use tar::Archive;
 use xz2::read::XzDecoder;
 
 pub struct FreebsdCollector {
+    distro_name: String,
     client: Client,
     mirror: String,
     release: String,
     arch: String,
+    source_cache: Option<SourceCache>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,49 +41,86 @@ struct DependencyInfo {
 use std::collections::HashMap;
 
 impl FreebsdCollector {
-    pub fn new(mirror: String, release: String, arch: String) -> Self {
+    pub fn new(distro_name: String, mirror: String, release: String, arch: String) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
             .expect("Failed to create HTTP client");
 
         Self {
+            distro_name,
             client,
             mirror,
             release,
             arch,
+            source_cache: None,
         }
     }
 
+    pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
+        self.source_cache = Some(SourceCache::new(cache_dir, "freebsd")?);
+        Ok(self)
+    }
+
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
-        let url = format!(
+        // Try .pkg (zstd, current format) first, fall back to .txz (xz, legacy)
+        let pkg_url = format!(
+            "{}/FreeBSD:{}:{}/latest/packagesite.pkg",
+            self.mirror.trim_end_matches('/'),
+            self.release,
+            self.arch
+        );
+        let txz_url = format!(
             "{}/FreeBSD:{}:{}/latest/packagesite.txz",
             self.mirror.trim_end_matches('/'),
             self.release,
             self.arch
         );
-        eprintln!("Fetching packagesite.txz from: {}", url);
 
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let (url, use_zstd) = {
+            eprintln!("Fetching packagesite.pkg from: {}", pkg_url);
+            let resp = self.client.get(&pkg_url).send()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            if resp.status().is_success() {
+                (pkg_url, true)
+            } else {
+                eprintln!("  .pkg not found, trying .txz...");
+                (txz_url, false)
+            }
+        };
 
-        if !response.status().is_success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("HTTP {}", response.status()),
-            ));
-        }
+        let response = if use_zstd {
+            // Re-fetch since we consumed the first response checking status
+            self.client.get(&url).send()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+        } else {
+            let resp = self.client.get(&url).send()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            if !resp.status().is_success() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("HTTP {} for both .pkg and .txz", resp.status()),
+                ));
+            }
+            resp
+        };
 
         let bytes = response
             .bytes()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-        // Extract .tar.xz
-        let xz_decoder = XzDecoder::new(&bytes[..]);
-        let mut archive = Archive::new(xz_decoder);
+        // Decompress to memory then parse tar (handles both zstd and xz)
+        let tar_bytes: Vec<u8> = if use_zstd {
+            zstd::stream::decode_all(&bytes[..])
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+        } else {
+            let mut decoder = XzDecoder::new(&bytes[..]);
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut decoder, &mut buf)?;
+            buf
+        };
+
+        let mut archive = Archive::new(std::io::Cursor::new(&tar_bytes));
 
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new(file);
@@ -125,16 +165,21 @@ impl FreebsdCollector {
     }
 
     fn emit_distribution_metadata(&self, writer: &mut NTriplesWriter) -> Result<usize> {
-        let dist_uri = distro_uri("freebsd");
-        let rel_uri = release_uri("freebsd", &self.release);
+        let dist_uri = distro_uri(&self.distro_name);
+        let rel_uri = release_uri(&self.distro_name, &self.release);
         let mut triples = 0;
 
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
+        writer.write_literal(&dist_uri, RDFS_LABEL, "FreeBSD")?;
         writer.write_literal(&dist_uri, &format!("{PKG}projectName"), "FreeBSD")?;
-        triples += 2;
+        triples += 3;
 
         writer.write_triple(&rel_uri, RDF_TYPE, &format!("{PKG}DistributionRelease"))?;
-        writer.write_literal(&rel_uri, &format!("{PKG}releaseCodename"), &self.release)?;
+        if is_numeric_release(&self.release) {
+            writer.write_literal(&rel_uri, &format!("{PKG}releaseVersion"), &self.release)?;
+        } else {
+            writer.write_literal(&rel_uri, &format!("{PKG}releaseCodename"), &self.release)?;
+        }
         writer.write_triple(&rel_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         triples += 3;
 
@@ -142,8 +187,8 @@ impl FreebsdCollector {
     }
 
     fn emit_package_triples(&self, writer: &mut NTriplesWriter, pkg: &PackageSiteEntry) -> Result<usize> {
-        let pkg_uri = package_uri("freebsd", &self.release, &self.arch, &pkg.name, &pkg.version);
-        let identity_uri = package_identity_uri("freebsd", &self.release, &self.arch, &pkg.name);
+        let pkg_uri = package_uri(&self.distro_name, &self.release, &self.arch, &pkg.name, &pkg.version);
+        let identity_uri = package_identity_uri(&self.distro_name, &self.release, &self.arch, &pkg.name);
         let mut triples = 0;
 
         // Dual typing
@@ -168,7 +213,7 @@ impl FreebsdCollector {
         triples += 3;
 
         // Distribution
-        let dist_uri = distro_uri("freebsd");
+        let dist_uri = distro_uri(&self.distro_name);
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         triples += 1;
 
@@ -197,12 +242,17 @@ impl FreebsdCollector {
             for license in licenses {
                 writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
                 triples += 1;
+                // License entity (SPDX)
+                let license_uri = crate::uris::spdx_license_uri(license);
+                writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+                writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+                triples += 2;
             }
         }
 
         // Dependencies
         for (dep_name, _info) in &pkg.deps {
-            let target = package_identity_uri("freebsd", &self.release, &self.arch, dep_name);
+            let target = package_identity_uri(&self.distro_name, &self.release, &self.arch, dep_name);
             writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target)?;
             triples += 1;
         }
@@ -232,6 +282,7 @@ mod tests {
         use tempfile::NamedTempFile;
 
         let collector = FreebsdCollector::new(
+            "freebsd".into(),
             "https://pkg.freebsd.org".into(),
             "14".into(),
             "amd64".into(),
@@ -258,9 +309,9 @@ mod tests {
         temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
 
         assert!(content.contains("core#Package"));
-        assert!(content.contains("freebsd#BinaryPackage"));
+        assert!(content.contains("bsdpkg#BinaryPackage"));
         assert!(content.contains("\"nginx\""));
-        assert!(content.contains("freebsd#origin"));
+        assert!(content.contains("bsdpkg#origin"));
         assert!(content.contains("\"www/nginx\""));
         assert!(triples > 10);
     }

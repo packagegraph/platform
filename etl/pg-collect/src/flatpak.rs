@@ -8,6 +8,8 @@ use std::io::Result;
 use std::time::Duration;
 
 pub struct FlatpakCollector {
+    distro_name: String,
+    release_name: String,
     client: Client,
 }
 
@@ -25,21 +27,53 @@ struct FlatpakBundle {
 }
 
 impl FlatpakCollector {
-    pub fn new() -> Self {
+    pub fn new(distro_name: String, release_name: String, ) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
             .expect("Failed to create HTTP client");
-        Self { client }
+        Self { distro_name, release_name, client }
     }
 
+    /// Collect from a seed file of app IDs.
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
+        let app_ids = read_seed_file(packages_file)?;
+        eprintln!("Loaded {} Flatpak app IDs from seed file", app_ids.len());
+        self.collect_apps(&app_ids, output_path)
+    }
+
+    /// Discover all apps from Flathub and collect them (no seed file needed).
+    pub fn collect_discover(&self, output_path: &str) -> Result<(usize, usize)> {
+        let app_ids = self.discover_apps()?;
+        eprintln!("Discovered {} Flatpak apps from Flathub", app_ids.len());
+        self.collect_apps(&app_ids, output_path)
+    }
+
+    /// Query the Flathub appstream index for all app IDs.
+    fn discover_apps(&self) -> Result<Vec<String>> {
+        eprintln!("Discovering Flatpak apps from Flathub...");
+        let url = "https://flathub.org/api/v2/appstream";
+        let response = self.client.get(url)
+            .send()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+        if !response.status().is_success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Flathub API returned {}", response.status()),
+            ));
+        }
+
+        let app_ids: Vec<String> = response.json()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+        Ok(app_ids)
+    }
+
+    fn collect_apps(&self, app_ids: &[String], output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new(file);
         self.emit_distribution_metadata(&mut writer)?;
-
-        let app_ids = read_seed_file(packages_file)?;
-        eprintln!("Loaded {} Flatpak app IDs from seed file", app_ids.len());
 
         let mut total_apps = 0;
         let mut total_triples = 0;
@@ -64,8 +98,8 @@ impl FlatpakCollector {
     }
 
     fn emit_distribution_metadata(&self, writer: &mut NTriplesWriter) -> Result<usize> {
-        let dist_uri = distro_uri("flatpak");
-        let rel_uri = release_uri("flatpak", "flathub");
+        let dist_uri = distro_uri(&self.distro_name);
+        let rel_uri = release_uri(&self.distro_name, &self.release_name);
         let mut triples = 0;
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
         writer.write_literal(&dist_uri, &format!("{PKG}projectName"), "Flathub")?;
@@ -94,8 +128,8 @@ impl FlatpakCollector {
     fn emit_app_triples(&self, writer: &mut NTriplesWriter, app: &FlatpakAppResponse) -> Result<usize> {
         // Use app ID as version since Flatpak apps don't expose versions in the API
         let version = "latest";
-        let pkg_uri = package_uri("flatpak", "flathub", "any", &app.id, version);
-        let identity_uri = package_identity_uri("flatpak", "flathub", "any", &app.id);
+        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", &app.id, version);
+        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", &app.id);
         let mut triples = 0;
 
         // Dual typing: pkg:Package + flatpak:FlatpakApp
@@ -111,13 +145,13 @@ impl FlatpakCollector {
         writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), &app.id)?;
         triples += 1;
 
-        let ver_uri = version_uri("flatpak", "flathub", &app.id, version);
+        let ver_uri = version_uri(&self.distro_name, &self.release_name, &app.id, version);
         writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
         writer.write_literal(&ver_uri, &format!("{PKG}versionString"), version)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
         triples += 3;
 
-        let dist_uri = distro_uri("flatpak");
+        let dist_uri = distro_uri(&self.distro_name);
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         triples += 1;
 
@@ -138,7 +172,7 @@ impl FlatpakCollector {
             if let Some(runtime) = &bundle.runtime {
                 // Parse runtime string like "org.gnome.Platform/x86_64/50"
                 if let Some(runtime_name) = runtime.split('/').next() {
-                    let runtime_uri = package_identity_uri("flatpak", "flathub", "any", runtime_name);
+                    let runtime_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", runtime_name);
                     writer.write_triple(&pkg_uri, &format!("{FLATPAK}runtime"), &runtime_uri)?;
                     triples += 1;
 
@@ -181,7 +215,7 @@ mod tests {
 
     #[test]
     fn test_emit_flatpak_app_dual_typing() {
-        let collector = FlatpakCollector::new();
+        let collector = FlatpakCollector::new("flatpak".into(), "flathub".into());
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 

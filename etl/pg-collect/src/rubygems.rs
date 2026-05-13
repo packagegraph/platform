@@ -70,14 +70,24 @@ impl RubyGemsCollector {
         Self { client, api_base }
     }
 
+    /// Collect from a seed file of gem names.
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
+        let package_names = read_seed_file(packages_file)?;
+        eprintln!("Loaded {} gem names from seed file", package_names.len());
+        self.collect_names(&package_names, output_path)
+    }
+
+    /// Discover gem names from Fuseki (rubygem() provides in RPM repos) and collect them.
+    pub fn collect_discover(&self, endpoint: &str, output_path: &str) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "rubygems")?;
+        self.collect_names(&names, output_path)
+    }
+
+    fn collect_names(&self, package_names: &[String], output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new(file);
 
         self.emit_distribution_metadata(&mut writer)?;
-
-        let package_names = read_seed_file(packages_file)?;
-        eprintln!("Loaded {} gem names from seed file", package_names.len());
 
         let mut total_packages = 0;
         let mut total_triples = 0;
@@ -240,6 +250,11 @@ impl RubyGemsCollector {
             for license in licenses {
                 writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
                 triples += 1;
+                // License entity (SPDX)
+                let license_uri = crate::uris::spdx_license_uri(license);
+                writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+                writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+                triples += 2;
             }
         }
 

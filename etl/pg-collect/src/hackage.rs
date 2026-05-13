@@ -14,6 +14,7 @@ pub struct HackageCollector {
 
 #[derive(Debug, Deserialize)]
 struct PreferredInfo {
+    #[serde(rename = "normal-version")]
     normal: Vec<String>,
 }
 
@@ -41,6 +42,13 @@ impl HackageCollector {
             .expect("Failed to create HTTP client");
 
         Self { client, base_url }
+    }
+
+    pub fn collect_discover(&self, endpoint: &str, output_path: &str) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "hackage")?;
+        let seed_path = "/tmp/seed-hackage-discover.txt";
+        std::fs::write(seed_path, names.join("\n"))?;
+        self.collect(seed_path, output_path)
     }
 
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
@@ -104,7 +112,9 @@ impl HackageCollector {
         // Get preferred version
         let mut version = String::new();
         for attempt in 0..max_attempts {
-            match self.client.get(&preferred_url).send() {
+            match self.client.get(&preferred_url)
+                .header("Accept", "application/json")
+                .send() {
                 Ok(response) => {
                     if response.status() == StatusCode::NOT_FOUND {
                         return Err(format!("404: {}", name));
@@ -273,6 +283,11 @@ impl HackageCollector {
         if let Some(license) = &cabal.license {
             writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
             triples += 1;
+            // License entity (SPDX)
+            let license_uri = crate::uris::spdx_license_uri(license);
+            writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+            writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+            triples += 2;
         }
         if let Some(homepage) = &cabal.homepage {
             writer.write_literal(&pkg_uri, &format!("{PKG}homepage"), homepage)?;
@@ -374,5 +389,13 @@ mod tests {
         assert!(content.contains("\"aeson\""));
         assert!(content.contains("hackage#category"));
         assert!(triples > 10);
+    }
+
+    #[test]
+    fn test_preferred_info_deserialization() {
+        // Hackage API returns "normal-version", not "normal"
+        let json = r#"{"normal-version":["2.2.1.0","2.1.0.0"],"deprecated-version":["0.8.0.0"]}"#;
+        let pref: PreferredInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(pref.normal, vec!["2.2.1.0", "2.1.0.0"]);
     }
 }

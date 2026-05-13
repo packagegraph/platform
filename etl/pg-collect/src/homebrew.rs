@@ -1,4 +1,6 @@
+use crate::forge::emit_dq_issue;
 use crate::ntriples::{bnode_id, NTriplesWriter};
+use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -9,6 +11,9 @@ use std::time::Duration;
 pub struct HomebrewCollector {
     client: Client,
     api_base: String,
+    distro_name: String,
+    release_name: String,
+    source_cache: Option<SourceCache>,
 }
 
 /// Minimal serde model for Homebrew formula JSON.
@@ -50,14 +55,19 @@ pub struct Cask {
 }
 
 impl HomebrewCollector {
-    pub fn new(api_base: String) -> Self {
+    pub fn new(api_base: String, distro_name: String, release_name: String) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()
             .expect("Failed to create HTTP client");
 
-        Self { client, api_base }
+        Self { client, api_base, distro_name, release_name, source_cache: None }
+    }
+
+    pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
+        self.source_cache = Some(SourceCache::new(cache_dir, "homebrew")?);
+        Ok(self)
     }
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
@@ -80,7 +90,17 @@ impl HomebrewCollector {
                 }
                 total_packages += formulae.len();
             }
-            Err(e) => eprintln!("Error fetching formulae: {}", e),
+            Err(e) => {
+                eprintln!("Error fetching formulae: {}", e);
+                total_triples += emit_dq_issue(
+                    &mut writer,
+                    "homebrew-collector",
+                    "formula_api",
+                    &e.to_string(),
+                    "fetch_error",
+                    "high",
+                )?;
+            }
         }
 
         // Fetch and process casks
@@ -93,7 +113,17 @@ impl HomebrewCollector {
                 }
                 total_packages += casks.len();
             }
-            Err(e) => eprintln!("Error fetching casks: {}", e),
+            Err(e) => {
+                eprintln!("Error fetching casks: {}", e);
+                total_triples += emit_dq_issue(
+                    &mut writer,
+                    "homebrew-collector",
+                    "cask_api",
+                    &e.to_string(),
+                    "fetch_error",
+                    "high",
+                )?;
+            }
         }
 
         writer.flush()?;
@@ -101,13 +131,14 @@ impl HomebrewCollector {
     }
 
     fn emit_distribution_metadata(&self, writer: &mut NTriplesWriter) -> Result<usize> {
-        let dist_uri = distro_uri("darwin");
-        let rel_uri = release_uri("darwin", "homebrew");
+        let dist_uri = distro_uri(&self.distro_name);
+        let rel_uri = release_uri(&self.distro_name, &self.release_name);
         let mut triples = 0;
 
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
         writer.write_literal(&dist_uri, &format!("{PKG}projectName"), "macOS")?;
-        triples += 2;
+        writer.write_literal(&dist_uri, RDFS_LABEL, "Homebrew")?;
+        triples += 3;
 
         writer.write_triple(&rel_uri, RDF_TYPE, &format!("{PKG}DistributionRelease"))?;
         writer.write_literal(&rel_uri, &format!("{PKG}releaseCodename"), "homebrew")?;
@@ -138,8 +169,8 @@ impl HomebrewCollector {
             .and_then(|v| v.stable.as_deref())
             .unwrap_or("unknown");
 
-        let pkg_uri = package_uri("darwin", "homebrew", "x86_64", &formula.name, version);
-        let identity_uri = package_identity_uri("darwin", "homebrew", "x86_64", &formula.name);
+        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", &formula.name, version);
+        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", &formula.name);
         let mut triples = 0;
 
         // Dual typing
@@ -163,15 +194,15 @@ impl HomebrewCollector {
         }
 
         // Version
-        let ver_uri = version_uri("darwin", "homebrew", &formula.name, version);
+        let ver_uri = version_uri(&self.distro_name, &self.release_name, &formula.name, version);
         writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
         writer.write_literal(&ver_uri, &format!("{PKG}versionString"), version)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
         triples += 3;
 
         // Distribution
-        let dist_uri = distro_uri("darwin");
-        let rel_uri = release_uri("darwin", "homebrew");
+        let dist_uri = distro_uri(&self.distro_name);
+        let rel_uri = release_uri(&self.distro_name, &self.release_name);
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfRelease"), &rel_uri)?;
         triples += 2;
@@ -188,6 +219,11 @@ impl HomebrewCollector {
         if let Some(license) = &formula.license {
             writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
             triples += 1;
+            // License entity (SPDX)
+            let license_uri = crate::uris::spdx_license_uri(license);
+            writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+            writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+            triples += 2;
         }
 
         // Deprecated/disabled status
@@ -220,8 +256,8 @@ impl HomebrewCollector {
 
     fn emit_cask_triples(&self, writer: &mut NTriplesWriter, cask: &Cask) -> Result<usize> {
         let version = cask.version.as_deref().unwrap_or("latest");
-        let pkg_uri = package_uri("darwin", "homebrew", "x86_64", &cask.token, version);
-        let identity_uri = package_identity_uri("darwin", "homebrew", "x86_64", &cask.token);
+        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", &cask.token, version);
+        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", &cask.token);
         let mut triples = 0;
 
         // Dual typing
@@ -240,14 +276,14 @@ impl HomebrewCollector {
         triples += 2;
 
         // Version
-        let ver_uri = version_uri("darwin", "homebrew", &cask.token, version);
+        let ver_uri = version_uri(&self.distro_name, &self.release_name, &cask.token, version);
         writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
         writer.write_literal(&ver_uri, &format!("{PKG}versionString"), version)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
         triples += 3;
 
         // Distribution
-        let dist_uri = distro_uri("darwin");
+        let dist_uri = distro_uri(&self.distro_name);
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         triples += 1;
 
@@ -276,7 +312,7 @@ impl HomebrewCollector {
     ) -> Result<usize> {
         let mut triples = 0;
         for dep_name in deps {
-            let target_uri = package_identity_uri("darwin", "homebrew", "x86_64", dep_name);
+            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", dep_name);
 
             writer.write_triple(pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
@@ -285,7 +321,7 @@ impl HomebrewCollector {
             writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-            writer.write_bnode_literal(&bnode, &format!("{PKG}dependencyType"), dep_type)?;
+            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri(dep_type))?;
             triples += 4;
         }
         Ok(triples)
@@ -346,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_emit_formula_triples_produces_dual_typing() {
-        let collector = HomebrewCollector::new("https://formulae.brew.sh/api".into());
+        let collector = HomebrewCollector::new("https://formulae.brew.sh/api".into(), "homebrew".into(), "homebrew".into());
 
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
@@ -387,7 +423,7 @@ mod tests {
 
     #[test]
     fn test_emit_cask_triples() {
-        let collector = HomebrewCollector::new("https://formulae.brew.sh/api".into());
+        let collector = HomebrewCollector::new("https://formulae.brew.sh/api".into(), "homebrew".into(), "homebrew".into());
 
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());

@@ -56,6 +56,13 @@ impl NpmCollector {
         }
     }
 
+    pub fn collect_discover(&self, endpoint: &str, output_path: &str) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "npm")?;
+        let seed_path = "/tmp/seed-npm-discover.txt";
+        std::fs::write(seed_path, names.join("\n"))?;
+        self.collect(seed_path, output_path)
+    }
+
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new(file);
@@ -209,6 +216,11 @@ impl NpmCollector {
         if let Some(license) = &pkg.license {
             writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
             triples += 1;
+            // License entity (SPDX)
+            let license_uri = crate::uris::spdx_license_uri(license);
+            writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+            writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+            triples += 2;
         }
 
         // Dependencies from the latest version
@@ -259,13 +271,13 @@ impl NpmCollector {
             writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-            writer.write_bnode_literal(&bnode, &format!("{PKG}dependencyType"), dep_type)?;
+            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri(dep_type))?;
             triples += 4;
 
             // Version constraint (NPM uses semver ranges like "^1.2.3", "~2.0.0")
             if !version_range.is_empty() {
                 let cb = bnode_id("constraint", &format!("{}-{}", pkg_uri, dep_name));
-                writer.write_bnode_object(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
+                writer.write_bnode_to_bnode(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
                 writer.write_bnode_subject(&cb, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
                 writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintOperator"), "semver")?;
                 writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintValue"), version_range)?;

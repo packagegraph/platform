@@ -47,13 +47,16 @@ struct MetaCpanRepo {
 
 impl CpanCollector {
     pub fn new(api_base: String) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .expect("Failed to create HTTP client");
+        let client = crate::enricher::default_http_client();
 
         Self { client, api_base }
+    }
+
+    pub fn collect_discover(&self, endpoint: &str, output_path: &str) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "cpan")?;
+        let seed_path = "/tmp/seed-cpan-discover.txt";
+        std::fs::write(seed_path, names.join("\n"))?;
+        self.collect(seed_path, output_path)
     }
 
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
@@ -204,6 +207,11 @@ impl CpanCollector {
             for license in licenses {
                 writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
                 triples += 1;
+                // License entity (SPDX)
+                let license_uri = crate::uris::spdx_license_uri(license);
+                writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+                writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+                triples += 2;
             }
         }
         if let Some(resources) = &release.resources {

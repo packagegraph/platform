@@ -13,22 +13,37 @@ pub struct HexCollector {
     api_base: String,
 }
 
+/// Package listing from /api/packages/{name}
 #[derive(Debug, Deserialize)]
 struct HexPackageResponse {
     name: String,
     #[serde(default)]
-    releases: Vec<HexRelease>,
+    releases: Vec<HexReleaseSummary>,
+    /// Map of version → retirement info. Present at the package level.
+    #[serde(default)]
+    retirements: HashMap<String, HexRetirement>,
     meta: Option<HexMeta>,
 }
 
+/// Release entry in the package listing (minimal fields only)
 #[derive(Debug, Deserialize)]
-struct HexRelease {
+struct HexReleaseSummary {
+    version: String,
+}
+
+/// Individual release from /api/packages/{name}/releases/{version}
+#[derive(Debug, Deserialize)]
+struct HexReleaseDetail {
     version: String,
     #[serde(default)]
     requirements: HashMap<String, HexRequirement>,
     checksum: Option<String>,
-    #[serde(default)]
-    retired: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HexRetirement {
+    reason: Option<String>,
+    message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,13 +60,16 @@ struct HexMeta {
 
 impl HexCollector {
     pub fn new(api_base: String) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .expect("Failed to create HTTP client");
+        let client = crate::enricher::default_http_client();
 
         Self { client, api_base }
+    }
+
+    pub fn collect_discover(&self, endpoint: &str, output_path: &str) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "hex")?;
+        let seed_path = "/tmp/seed-hex-discover.txt";
+        std::fs::write(seed_path, names.join("\n"))?;
+        self.collect(seed_path, output_path)
     }
 
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
@@ -72,9 +90,9 @@ impl HexCollector {
                 eprintln!("Progress: {}/{}", idx + 1, package_names.len());
             }
 
-            match self.fetch_package_with_retry(name, &mut base_delay_ms) {
-                Ok(pkg) => {
-                    total_triples += self.emit_package_triples(&mut writer, &pkg)?;
+            match self.fetch_and_emit_package(&mut writer, name, &mut base_delay_ms) {
+                Ok(triples) => {
+                    total_triples += triples;
                     total_packages += 1;
                 }
                 Err(e) => eprintln!("  Error fetching {}: {}", name, e),
@@ -102,6 +120,35 @@ impl HexCollector {
         triples += 3;
 
         Ok(triples)
+    }
+
+    /// Fetch package listing, select latest release, fetch its details, emit triples.
+    fn fetch_and_emit_package(
+        &self,
+        writer: &mut NTriplesWriter,
+        name: &str,
+        base_delay_ms: &mut u64,
+    ) -> std::result::Result<usize, String> {
+        let pkg = self.fetch_package_with_retry(name, base_delay_ms)?;
+
+        // Select latest non-retired release
+        let version = pkg
+            .releases
+            .iter()
+            .find(|r| !pkg.retirements.contains_key(&r.version))
+            .or_else(|| pkg.releases.first())
+            .ok_or_else(|| format!("No releases for {}", name))?
+            .version
+            .clone();
+
+        // Small delay before the release detail request
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Fetch individual release details for requirements/checksum
+        let release_detail = self.fetch_release_detail(name, &version, base_delay_ms)?;
+
+        self.emit_package_triples(writer, &pkg, &release_detail)
+            .map_err(|e| e.to_string())
     }
 
     fn fetch_package_with_retry(
@@ -145,15 +192,49 @@ impl HexCollector {
         Err(format!("Max retries exceeded for {}", name))
     }
 
-    fn emit_package_triples(&self, writer: &mut NTriplesWriter, pkg: &HexPackageResponse) -> Result<usize> {
-        // Get latest non-retired release
-        let release = pkg
-            .releases
-            .iter()
-            .find(|r| !r.retired)
-            .or_else(|| pkg.releases.first())
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "No releases"))?;
+    fn fetch_release_detail(
+        &self,
+        name: &str,
+        version: &str,
+        base_delay_ms: &mut u64,
+    ) -> std::result::Result<HexReleaseDetail, String> {
+        let url = format!("{}/api/packages/{}/releases/{}", self.api_base, name, version);
+        let max_attempts = 5;
 
+        for attempt in 0..max_attempts {
+            match self.client.get(&url).send() {
+                Ok(response) => {
+                    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                        let retry_secs = 2u64.pow(attempt as u32);
+                        eprintln!("  Rate limited on {}/{}, waiting {}s...", name, version, retry_secs);
+                        std::thread::sleep(Duration::from_secs(retry_secs));
+                        *base_delay_ms = (*base_delay_ms * 2).min(5000);
+                        continue;
+                    }
+
+                    let text = response.text().map_err(|e| e.to_string())?;
+                    return serde_json::from_str(&text).map_err(|e| e.to_string());
+                }
+                Err(e) => {
+                    if attempt < max_attempts - 1 {
+                        let delay = Duration::from_millis(1000 * 2u64.pow(attempt as u32));
+                        std::thread::sleep(delay);
+                        continue;
+                    }
+                    return Err(e.to_string());
+                }
+            }
+        }
+
+        Err(format!("Max retries exceeded for {}/{}", name, version))
+    }
+
+    fn emit_package_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        pkg: &HexPackageResponse,
+        release: &HexReleaseDetail,
+    ) -> Result<usize> {
         let pkg_uri = package_uri("hex", "pm", "any", &pkg.name, &release.version);
         let identity_uri = package_identity_uri("hex", "pm", "any", &pkg.name);
         let mut triples = 0;
@@ -194,6 +275,11 @@ impl HexCollector {
                 for license in licenses {
                     writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
                     triples += 1;
+                    // License entity (SPDX)
+                    let license_uri = crate::uris::spdx_license_uri(license);
+                    writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
+                    writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
+                    triples += 2;
                 }
             }
             if let Some(links) = &meta.links {
@@ -209,7 +295,7 @@ impl HexCollector {
             triples += 1;
         }
 
-        // Dependencies
+        // Dependencies from individual release details
         for (dep_name, _req) in &release.requirements {
             let target = package_identity_uri("hex", "pm", "any", dep_name);
             writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target)?;
@@ -267,7 +353,8 @@ mod tests {
     fn test_hex_package_deserialization() {
         let json = r#"{
             "name": "phoenix",
-            "releases": [{"version": "1.7.11", "requirements": {}, "checksum": "abc123"}],
+            "releases": [{"version": "1.7.11"}],
+            "retirements": {},
             "meta": {
                 "description": "Web framework",
                 "licenses": ["MIT"],
@@ -278,6 +365,43 @@ mod tests {
         let pkg: HexPackageResponse = serde_json::from_str(json).unwrap();
         assert_eq!(pkg.name, "phoenix");
         assert_eq!(pkg.releases[0].version, "1.7.11");
+        assert!(pkg.retirements.is_empty());
+    }
+
+    #[test]
+    fn test_hex_release_detail_deserialization() {
+        let json = r#"{
+            "version": "1.7.11",
+            "requirements": {
+                "jason": {"optional": false, "app": "jason", "requirement": ">= 0.0.0"},
+                "plug": {"optional": false, "app": "plug", "requirement": "~> 1.14"}
+            },
+            "checksum": "abc123def456"
+        }"#;
+
+        let detail: HexReleaseDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(detail.version, "1.7.11");
+        assert_eq!(detail.requirements.len(), 2);
+        assert!(detail.requirements.contains_key("jason"));
+        assert!(detail.requirements.contains_key("plug"));
+        assert_eq!(detail.checksum, Some("abc123def456".to_string()));
+    }
+
+    #[test]
+    fn test_hex_retirements_deserialization() {
+        let json = r#"{
+            "name": "oldpkg",
+            "releases": [{"version": "1.0.0"}, {"version": "2.0.0"}],
+            "retirements": {
+                "1.0.0": {"reason": "security", "message": "CVE-2024-1234"}
+            },
+            "meta": null
+        }"#;
+
+        let pkg: HexPackageResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(pkg.retirements.len(), 1);
+        assert!(pkg.retirements.contains_key("1.0.0"));
+        assert!(!pkg.retirements.contains_key("2.0.0"));
     }
 
     #[test]
@@ -288,12 +412,10 @@ mod tests {
 
         let pkg = HexPackageResponse {
             name: "ecto".to_string(),
-            releases: vec![HexRelease {
+            releases: vec![HexReleaseSummary {
                 version: "3.11.1".to_string(),
-                requirements: HashMap::new(),
-                checksum: Some("abc123".to_string()),
-                retired: false,
             }],
+            retirements: HashMap::new(),
             meta: Some(HexMeta {
                 description: Some("Database wrapper".to_string()),
                 licenses: Some(vec!["Apache-2.0".to_string()]),
@@ -301,7 +423,19 @@ mod tests {
             }),
         };
 
-        let triples = collector.emit_package_triples(&mut writer, &pkg).unwrap();
+        let release = HexReleaseDetail {
+            version: "3.11.1".to_string(),
+            requirements: {
+                let mut m = HashMap::new();
+                m.insert("decimal".to_string(), HexRequirement {
+                    requirement: Some("~> 2.0".to_string()),
+                });
+                m
+            },
+            checksum: Some("abc123".to_string()),
+        };
+
+        let triples = collector.emit_package_triples(&mut writer, &pkg, &release).unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
@@ -311,6 +445,8 @@ mod tests {
         assert!(content.contains("hex#HexPackage"));
         assert!(content.contains("\"ecto\""));
         assert!(content.contains("\"3.11.1\""));
+        assert!(content.contains("directlyDependsOn"), "Should emit dependency from release detail");
+        assert!(content.contains("\"abc123\""), "Should emit checksum from release detail");
         assert!(triples > 10);
     }
 }
