@@ -223,17 +223,6 @@ curl -s -H 'Accept: application/sparql-results+json' \
     } LIMIT 20' | jq '.results.bindings[] | {name: .name.value, version: .version.value}'
 ```
 
-### Named Graph Inventory
-
-```bash
-curl -s -H 'Accept: text/tab-separated-values' \
-  'http://localhost:3030/packagegraph/sparql' \
-  --data-urlencode 'query=
-    SELECT ?graph (COUNT(*) AS ?triples) WHERE {
-      GRAPH ?graph { ?s ?p ?o }
-    } GROUP BY ?graph ORDER BY DESC(?triples)' | column -t
-```
-
 ### Composing with Shell Tools
 
 ```bash
@@ -254,10 +243,14 @@ curl -s -H 'Accept: application/sparql-results+json' \
 
 ## SPARQL Reference
 
+Fuseki is configured with `unionDefaultGraph = true`, so all queries see data
+from every collection source without needing `GRAPH` clauses. Just query the
+default graph.
+
 ### Namespace Prefixes
 
-Use these prefixes in YASGUI and raw SPARQL queries. The Jupyter notebook and
-CLI canned queries add them automatically.
+Use these prefixes in YASGUI and raw SPARQL queries. The Jupyter notebook
+adds them automatically.
 
 ```sparql
 PREFIX pkg:  <https://purl.org/packagegraph/ontology/core#>
@@ -357,15 +350,6 @@ SELECT ?pkg ?cve ?fixed_ver WHERE {
 ORDER BY ?pkg
 ```
 
-**Named graph contents (data is partitioned by collection source):**
-```sparql
-SELECT ?graph (COUNT(*) AS ?triples) WHERE {
-  GRAPH ?graph { ?s ?p ?o }
-}
-GROUP BY ?graph
-ORDER BY DESC(?triples)
-```
-
 ---
 
 ## Administration
@@ -425,11 +409,10 @@ endpoints are for the ETL pipeline only.
 
 Key settings:
 - `tdb2:location "/data/tdb2"` — TDB2 storage directory (PVC-backed for writer, emptyDir for readers)
-- `tdb2:unionDefaultGraph true` — queries against the default graph see all
-  named graphs transparently. This means `SELECT ... WHERE { ?s ?p ?o }` returns
-  results from all collection graphs without requiring `GRAPH ?g { ... }`.
-- `arq:queryTimeout "30000,120000"` — 30-second soft timeout, 120-second hard
-  kill. Protects against runaway queries from YASGUI or `query-raw`.
+- `tdb2:unionDefaultGraph true` — the default graph is the union of all
+  named graphs. Users never need `GRAPH` clauses; all data is visible by default.
+- `arq:queryTimeout "300000,600000"` — 5-minute soft timeout, 10-minute hard
+  kill. Transitive property path queries on 37.5M triples can take 1-5 minutes.
 
 ### JVM Memory Tuning
 
@@ -519,9 +502,11 @@ is acceptable for the read workload (package metadata doesn't change between
 snapshots). If exact consistency is required, drain all readers first:
 `make scale-readers N=0`, wait, then `make scale-readers N=3`.
 
-### Named Graphs
+### Named Graphs (internal partitioning)
 
-Data is partitioned into named graphs by collection source:
+Data is partitioned into named graphs by collection source. Users don't need
+to know about this — `unionDefaultGraph` makes everything visible by default.
+This table is for operators managing individual collection pipelines.
 
 | Graph URI | Source |
 |-----------|--------|
@@ -539,6 +524,13 @@ Data is partitioned into named graphs by collection source:
 | `ontology` | OWL ontology (TBox) |
 
 Graph URIs are prefixed with `https://packagegraph.github.io/`.
+To inspect graphs directly:
+
+```sparql
+SELECT ?graph (COUNT(*) AS ?triples) WHERE {
+  GRAPH ?graph { ?s ?p ?o }
+} GROUP BY ?graph ORDER BY DESC(?triples)
+```
 
 ### Monitoring
 
@@ -613,16 +605,13 @@ oc scale deployment/fuseki --replicas=1 -n packagegraph
 
 ### Performance Considerations
 
-- **Query timeout:** Configured at 30s soft / 120s hard (`arq:queryTimeout`
-  in `config.ttl`). Queries exceeding the soft timeout can be interrupted;
-  those exceeding the hard timeout are killed. Users see a timeout error.
-  Add `LIMIT` to exploratory queries to stay well under the timeout.
+- **Query timeout:** Configured at 5 min soft / 10 min hard
+  (`arq:queryTimeout` in `config.ttl`). Add `LIMIT` to exploratory queries.
+  Transitive property path queries (`pkg:directlyDependsOn+`) can take
+  minutes on large graphs — this is expected.
 - **JVM heap vs OS cache:** TDB2 performance depends on the OS file cache,
   not the JVM heap. See [JVM Memory Tuning](#jvm-memory-tuning) above.
   **Never increase `-Xmx` without increasing the container memory limit too.**
-- **unionDefaultGraph:** Enabled, so all queries see all named graphs. This
-  simplifies querying but means cross-graph queries can be slower than
-  targeting a specific graph with `GRAPH <uri> { ... }`.
 - **Concurrent queries:** Fuseki handles concurrent read queries well. Write
   operations (SPARQL UPDATE, graph loading) acquire exclusive locks. For
   high concurrent query load, use [read replicas](#horizontal-scaling-read-replicas).
@@ -637,9 +626,9 @@ oc scale deployment/fuseki --replicas=1 -n packagegraph
 | Connection refused on port 3030 | Port-forward not running or Fuseki pod not ready | `oc port-forward svc/fuseki 3030:3030 -n packagegraph` |
 | Empty results for all queries | No data loaded or wrong endpoint | Check `query-graphs` output; verify endpoint URL |
 | "Service Unavailable" from route | Fuseki pod crashing (OOM) | Check `oc logs`; increase memory limit in deployment |
-| Slow queries (>10s) | Missing LIMIT or scanning all triples | Add `LIMIT`; use specific graph with `GRAPH <uri>` |
+| Slow queries (>10s) | Missing LIMIT, unbound variables, or property paths | Add `LIMIT`; bind at least one variable; avoid `*` property paths |
 | CORS errors in YASGUI | Fuseki not configured for cross-origin | Port-forward bypasses CORS; for external access, configure Fuseki CORS filter |
 | "No such dataset" error | Wrong dataset name in endpoint URL | Endpoint must include `/packagegraph/` (the dataset name) |
-| "QueryExecException: timeout" | Query exceeded 30s soft limit | Add `LIMIT`, use `GRAPH <uri>` to target specific graph, simplify query |
+| "QueryExecException: timeout" | Query exceeded 5-min soft limit | Add `LIMIT`, bind variables, simplify property paths |
 | Fuseki OOM killed on startup | JVM heap + OS cache > container limit | Check `JAVA_OPTIONS` — heap should be ~1/3 of container limit |
 | Read replicas serve stale data | Readers haven't reloaded after ETL run | `make refresh-readers` — triggers rolling restart to reload from Minio |
