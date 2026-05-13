@@ -28,15 +28,15 @@ spec:
               image: ghcr.io/packagegraph/etl:latest
               imagePullPolicy: Always
               securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
               env:
                 - {name: HOME, value: /tmp}
-                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
                 - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
                   pg-collect osv --ecosystem npm -o /tmp/osv-npm.nt && \
-                  pg-collect load /tmp/osv-npm.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  /app/scripts/upload-nt.sh /tmp/osv-npm.nt "$GRAPH_URI"
               resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
 
 ---
@@ -65,15 +65,15 @@ spec:
               image: ghcr.io/packagegraph/etl:latest
               imagePullPolicy: Always
               securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
               env:
                 - {name: HOME, value: /tmp}
-                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
                 - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
                   pg-collect osv --ecosystem PyPI -o /tmp/osv-pypi.nt && \
-                  pg-collect load /tmp/osv-pypi.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  /app/scripts/upload-nt.sh /tmp/osv-pypi.nt "$GRAPH_URI"
               resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
 
 ---
@@ -102,15 +102,15 @@ spec:
               image: ghcr.io/packagegraph/etl:latest
               imagePullPolicy: Always
               securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
               env:
                 - {name: HOME, value: /tmp}
-                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
                 - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
                   pg-collect osv --ecosystem crates.io -o /tmp/osv-cargo.nt && \
-                  pg-collect load /tmp/osv-cargo.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  /app/scripts/upload-nt.sh /tmp/osv-cargo.nt "$GRAPH_URI"
               resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
 
 ---
@@ -139,15 +139,15 @@ spec:
               image: ghcr.io/packagegraph/etl:latest
               imagePullPolicy: Always
               securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
               env:
                 - {name: HOME, value: /tmp}
-                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
                 - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
                   pg-collect osv --ecosystem Go -o /tmp/osv-go.nt && \
-                  pg-collect load /tmp/osv-go.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  /app/scripts/upload-nt.sh /tmp/osv-go.nt "$GRAPH_URI"
               resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
 
 ---
@@ -176,15 +176,15 @@ spec:
               image: ghcr.io/packagegraph/etl:latest
               imagePullPolicy: Always
               securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
               env:
                 - {name: HOME, value: /tmp}
-                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
                 - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
                   pg-collect osv --ecosystem Maven -o /tmp/osv-maven.nt && \
-                  pg-collect load /tmp/osv-maven.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  /app/scripts/upload-nt.sh /tmp/osv-maven.nt "$GRAPH_URI"
               resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
 
 ---
@@ -213,15 +213,15 @@ spec:
               image: ghcr.io/packagegraph/etl:latest
               imagePullPolicy: Always
               securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
               env:
                 - {name: HOME, value: /tmp}
-                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
                 - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
                   pg-collect osv --ecosystem NuGet -o /tmp/osv-nuget.nt && \
-                  pg-collect load /tmp/osv-nuget.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  /app/scripts/upload-nt.sh /tmp/osv-nuget.nt "$GRAPH_URI"
               resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
 
 ---
@@ -250,15 +250,15 @@ spec:
               image: ghcr.io/packagegraph/etl:latest
               imagePullPolicy: Always
               securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
               env:
                 - {name: HOME, value: /tmp}
-                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
                 - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
                   pg-collect osv --ecosystem Packagist -o /tmp/osv-packagist.nt && \
-                  pg-collect load /tmp/osv-packagist.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  /app/scripts/upload-nt.sh /tmp/osv-packagist.nt "$GRAPH_URI"
               resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
 
 ---
@@ -287,15 +287,15 @@ spec:
               image: ghcr.io/packagegraph/etl:latest
               imagePullPolicy: Always
               securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
               env:
                 - {name: HOME, value: /tmp}
-                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
                 - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
                   pg-collect osv --ecosystem RubyGems -o /tmp/osv-rubygems.nt && \
-                  pg-collect load /tmp/osv-rubygems.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  /app/scripts/upload-nt.sh /tmp/osv-rubygems.nt "$GRAPH_URI"
               resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
 
 ---
@@ -324,15 +324,15 @@ spec:
               image: ghcr.io/packagegraph/etl:latest
               imagePullPolicy: Always
               securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
               env:
                 - {name: HOME, value: /tmp}
-                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
                 - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
                   pg-collect osv --ecosystem Hex -o /tmp/osv-hex.nt && \
-                  pg-collect load /tmp/osv-hex.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  /app/scripts/upload-nt.sh /tmp/osv-hex.nt "$GRAPH_URI"
               resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
 
 ---
@@ -361,15 +361,15 @@ spec:
               image: ghcr.io/packagegraph/etl:latest
               imagePullPolicy: Always
               securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
               env:
                 - {name: HOME, value: /tmp}
-                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
                 - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
                   pg-collect osv --ecosystem Pub -o /tmp/osv-pub.nt && \
-                  pg-collect load /tmp/osv-pub.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  /app/scripts/upload-nt.sh /tmp/osv-pub.nt "$GRAPH_URI"
               resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
 
 ---
@@ -398,15 +398,15 @@ spec:
               image: ghcr.io/packagegraph/etl:latest
               imagePullPolicy: Always
               securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
               env:
                 - {name: HOME, value: /tmp}
-                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
                 - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
                   pg-collect osv --ecosystem Hackage -o /tmp/osv-hackage.nt && \
-                  pg-collect load /tmp/osv-hackage.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  /app/scripts/upload-nt.sh /tmp/osv-hackage.nt "$GRAPH_URI"
               resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
 
 ---
@@ -435,13 +435,13 @@ spec:
               image: ghcr.io/packagegraph/etl:latest
               imagePullPolicy: Always
               securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
               env:
                 - {name: HOME, value: /tmp}
-                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
                 - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/security/osv"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
-                  pg-collect osv --ecosystem SwiftURL -o /tmp/osv-swift.nt && \
-                  pg-collect load /tmp/osv-swift.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  pg-collect osv --ecosystem SwiftURL -o /tmp/osv-swifturl.nt && \
+                  /app/scripts/upload-nt.sh /tmp/osv-swifturl.nt "$GRAPH_URI"
               resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}

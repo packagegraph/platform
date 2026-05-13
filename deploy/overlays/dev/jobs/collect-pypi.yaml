@@ -10,9 +10,9 @@ spec:
   failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
+      activeDeadlineSeconds: 7200
       backoffLimit: 2
       ttlSecondsAfterFinished: 600
-      activeDeadlineSeconds: 3600
       template:
         spec:
           restartPolicy: Never
@@ -31,15 +31,8 @@ spec:
               command: ["/bin/sh", "-c"]
               args:
                 - |
-                  packagegraph seed-pypi \
-                    --fuseki-endpoint "$FUSEKI_ENDPOINT" \
-                    --from-names \
-                    -o /tmp/seed-pypi.txt && \
                   pg-collect pypi \
-                    --packages-file /tmp/seed-pypi.txt \
-                    -o /tmp/packages.nt && \
-                  if [ "${COLLECTOR_FULL_RELOAD:-0}" = "1" ]; then
-                    pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
-                  fi
-                  pg-collect load /tmp/packages.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
-              resources: {requests: {cpu: 500m, memory: 512Mi}, limits: {cpu: "1", memory: 1Gi}}
+                    --endpoint "$FUSEKI_ENDPOINT" \
+                    -o /tmp/pypi.nt && \
+                  /app/scripts/upload-nt.sh /tmp/pypi.nt "$GRAPH_URI"
+              resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "1", memory: 2Gi}}

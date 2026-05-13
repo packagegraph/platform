@@ -25,15 +25,15 @@ spec:
               securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
               env:
                 - {name: HOME, value: /tmp}
-                - {name: PYTHONUNBUFFERED, value: "1"}
                 - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
                   set -eu
-                  packagegraph enrich-npm-provenance \
-                    --fuseki-endpoint "$FUSEKI_ENDPOINT" \
-                    --output-dir /tmp/enrichment && \
+                  mkdir -p /tmp/enrichment
+                  pg-collect enrich-npm-provenance \
+                    --endpoint "$FUSEKI_ENDPOINT" \
+                    -o /tmp/enrichment/npm_provenance.nt && \
                   pg-collect drop \
                     --graph "https://packagegraph.github.io/graph/enrichment/npm-provenance" \
                     --endpoint "$FUSEKI_ENDPOINT" && \

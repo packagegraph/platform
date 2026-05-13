@@ -31,15 +31,8 @@ spec:
               command: ["/bin/sh", "-c"]
               args:
                 - |
-                  packagegraph seed-maven \
-                    --fuseki-endpoint "$FUSEKI_ENDPOINT" \
-                    --from-names \
-                    -o /tmp/seed-maven.txt && \
                   pg-collect maven \
-                    --packages-file /tmp/seed-maven.txt \
-                    -o /tmp/packages.nt && \
-                  if [ "${COLLECTOR_FULL_RELOAD:-0}" = "1" ]; then
-                    pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
-                  fi
-                  pg-collect load /tmp/packages.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                    --endpoint "$FUSEKI_ENDPOINT" \
+                    -o /tmp/maven.nt && \
+                  /app/scripts/upload-nt.sh /tmp/maven.nt "$GRAPH_URI"
               resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "2", memory: 2Gi}}

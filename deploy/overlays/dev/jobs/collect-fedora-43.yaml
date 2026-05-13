@@ -26,7 +26,9 @@ spec:
               envFrom: [{secretRef: {name: minio-credentials}}]
               env:
                 - {name: HOME, value: /tmp}
-                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
                 - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/fedora/43"}
-                - {name: RPM_REPOS, value: "fedora:43:https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Everything/x86_64/os/"}
+                - name: RPM_REPOS
+                  value: |
+                    fedora:43:https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Everything/x86_64/os/
+                    fedora:43:https://dl.fedoraproject.org/pub/fedora/linux/updates/43/Everything/x86_64/
               resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "2", memory: 2Gi}}

@@ -31,15 +31,8 @@ spec:
               command: ["/bin/sh", "-c"]
               args:
                 - |
-                  packagegraph seed-cargo \
-                    --fuseki-endpoint "$FUSEKI_ENDPOINT" \
-                    --from-names \
-                    -o /tmp/seed-cargo.txt && \
                   pg-collect cargo \
-                    --packages-file /tmp/seed-cargo.txt \
-                    -o /tmp/packages.nt && \
-                  if [ "${COLLECTOR_FULL_RELOAD:-0}" = "1" ]; then
-                    pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
-                  fi
-                  pg-collect load /tmp/packages.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                    --endpoint "$FUSEKI_ENDPOINT" \
+                    -o /tmp/cargo.nt && \
+                  /app/scripts/upload-nt.sh /tmp/cargo.nt "$GRAPH_URI"
               resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "1", memory: 2Gi}}

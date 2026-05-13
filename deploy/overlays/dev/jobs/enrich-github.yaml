@@ -1,16 +1,16 @@
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: enrich-vcs-activity
+  name: enrich-github
   namespace: packagegraph
 spec:
-  schedule: "0 7 * * 1"  # Weekly on Monday at 7am
+  schedule: "0 3 * * 1"  # Weekly on Monday at 3am
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
-      activeDeadlineSeconds: 3600
+      activeDeadlineSeconds: 7200
       backoffLimit: 2
       ttlSecondsAfterFinished: 600
       template:
@@ -21,38 +21,43 @@ spec:
           containers:
             - name: enricher
               image: ghcr.io/packagegraph/etl:latest
-              imagePullPolicy: Always
+              imagePullPolicy: IfNotPresent
               securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
               envFrom:
                 - secretRef: {name: minio-credentials}
                 - secretRef: {name: github-token}
               env:
                 - {name: HOME, value: /tmp}
-                - {name: PYTHONUNBUFFERED, value: "1"}
                 - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
                   set -eu
+                  mkdir -p /tmp/enrichment
                   CACHE_DIR=/tmp/cache/github
                   MINIO_CACHE="pgraph/${MINIO_BUCKET}/enricher-cache/github"
-
                   mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
 
                   if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
-                    echo "Syncing GitHub cache from Minio..."
-                    mc cat "${MINIO_CACHE}.tar.gz" 2>/dev/null | tar xzf - -C /tmp/cache/ 2>/dev/null || true
+                    echo "Syncing cache from Minio..."
+                    mc mirror --overwrite "${MINIO_CACHE}/" "${CACHE_DIR}/" 2>/dev/null || true
                     echo "Cache warmed: $(find "${CACHE_DIR}" -name '*.json' 2>/dev/null | wc -l) entries"
                   fi
 
-                  packagegraph enrich-vcs-activity \
-                    --fuseki-endpoint "$FUSEKI_ENDPOINT" \
-                    --output-dir /tmp/enrichment \
-                    --cache-dir "${CACHE_DIR}" && \
-                  pg-collect drop \
-                    --graph "https://packagegraph.github.io/graph/enrichment/vcs-activity" \
-                    --endpoint "$FUSEKI_ENDPOINT" && \
-                  pg-collect load /tmp/enrichment/vcs_activity.nt \
-                    --graph "https://packagegraph.github.io/graph/enrichment/vcs-activity" \
-                    --endpoint "$FUSEKI_ENDPOINT"
-              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 1Gi}}
+                  # Unset Minio env vars so pg-collect uses local cache only
+                  unset MINIO_ENDPOINT MINIO_BUCKET MINIO_ACCESS_KEY MINIO_SECRET_KEY
+
+                  # Incremental mode: bounded batch with internal GSP loading
+                  GRAPH_URI="https://packagegraph.github.io/graph/enrichment/github"
+                  pg-collect enrich-github \
+                    --endpoint "$FUSEKI_ENDPOINT" \
+                    -o /tmp/enrichment/github.nt \
+                    --cache-dir "${CACHE_DIR}" \
+                    --max-repos 5000 \
+                    --load-graph "$GRAPH_URI"
+
+                  if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
+                    echo "Syncing cache to Minio..."
+                    mc mirror --overwrite "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
+                  fi
+              resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "2", memory: 4Gi}}

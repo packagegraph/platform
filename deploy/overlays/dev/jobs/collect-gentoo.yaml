@@ -27,7 +27,6 @@ spec:
               env:
                 - {name: HOME, value: /tmp}
                 - {name: PYTHONUNBUFFERED, value: "1"}
-                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
@@ -44,10 +43,5 @@ spec:
                   pg-collect gentoo \
                     --repo-path /tmp/gentoo-repo \
                     --output /tmp/gentoo.nt && \
-                  if [ "${COLLECTOR_FULL_RELOAD:-0}" = "1" ]; then
-                    pg-collect drop --graph "https://packagegraph.github.io/graph/gentoo" --endpoint "$FUSEKI_ENDPOINT"
-                  fi
-                  pg-collect load /tmp/gentoo.nt \
-                    --graph "https://packagegraph.github.io/graph/gentoo" \
-                    --endpoint "$FUSEKI_ENDPOINT"
+                  /app/scripts/upload-nt.sh /tmp/gentoo.nt "$GRAPH_URI"
               resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "2", memory: 4Gi}}

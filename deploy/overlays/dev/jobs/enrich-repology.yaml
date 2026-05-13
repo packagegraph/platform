@@ -1,10 +1,10 @@
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: enrich-koji
+  name: enrich-repology
   namespace: packagegraph
 spec:
-  schedule: "0 11 * * 1"  # Weekly on Monday at 11am (after Fedora/CentOS collectors)
+  schedule: "0 11 * * 1"  # Weekly on Monday at 11am (after other enrichers)
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 1
@@ -32,8 +32,8 @@ spec:
                 - |
                   set -eu
                   mkdir -p /tmp/enrichment
-                  CACHE_DIR=/tmp/cache/koji
-                  MINIO_CACHE="pgraph/${MINIO_BUCKET}/enricher-cache/koji"
+                  CACHE_DIR=/tmp/cache/repology
+                  MINIO_CACHE="pgraph/${MINIO_BUCKET}/enricher-cache/repology"
                   mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
 
                   if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
@@ -42,24 +42,22 @@ spec:
                     echo "Cache warmed: $(find "${CACHE_DIR}" -name '*.json' 2>/dev/null | wc -l) entries"
                   fi
 
-                  pg-collect enrich-koji \
+                  pg-collect enrich-repology \
                     --endpoint "$FUSEKI_ENDPOINT" \
-                    -o /tmp/enrichment/koji.nt \
-                    --cache-dir "${CACHE_DIR}" \
-                    --koji-hub https://koji.fedoraproject.org/kojihub \
-                    --distro fedora || true
+                    -o /tmp/enrichment/repology.nt \
+                    --cache-dir "${CACHE_DIR}" || true
 
                   if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
                     echo "Syncing cache to Minio..."
                     mc mirror --overwrite "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
                   fi
 
-                  if [ -f /tmp/enrichment/koji.nt ]; then
+                  if [ -f /tmp/enrichment/repology.nt ]; then
                     pg-collect drop \
-                      --graph "https://packagegraph.github.io/graph/enrichment/koji" \
+                      --graph "https://packagegraph.github.io/graph/enrichment/repology" \
                       --endpoint "$FUSEKI_ENDPOINT" && \
-                    pg-collect load /tmp/enrichment/koji.nt \
-                      --graph "https://packagegraph.github.io/graph/enrichment/koji" \
+                    pg-collect load /tmp/enrichment/repology.nt \
+                      --graph "https://packagegraph.github.io/graph/enrichment/repology" \
                       --endpoint "$FUSEKI_ENDPOINT"
                   fi
-              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 1Gi}}

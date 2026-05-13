@@ -27,7 +27,6 @@ spec:
               env:
                 - {name: HOME, value: /tmp}
                 - {name: PYTHONUNBUFFERED, value: "1"}
-                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
                 - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/conda-forge"}
               command: ["/bin/sh", "-c"]
               args:
@@ -36,8 +35,5 @@ spec:
                     --channel-url https://conda.anaconda.org/conda-forge \
                     --subdir linux-64 \
                     --output /tmp/conda.nt && \
-                  if [ "${COLLECTOR_FULL_RELOAD:-0}" = "1" ]; then
-                    pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
-                  fi
-                  pg-collect load /tmp/conda.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                  /app/scripts/upload-nt.sh /tmp/conda.nt "$GRAPH_URI"
               resources: {requests: {cpu: 500m, memory: 2Gi}, limits: {cpu: "2", memory: 4Gi}}

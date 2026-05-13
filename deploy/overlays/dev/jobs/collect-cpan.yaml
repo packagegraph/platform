@@ -31,15 +31,8 @@ spec:
               command: ["/bin/sh", "-c"]
               args:
                 - |
-                  packagegraph seed-cpan \
-                    --fuseki-endpoint "$FUSEKI_ENDPOINT" \
-                    --from-names \
-                    -o /tmp/seed-cpan.txt && \
                   pg-collect cpan \
-                    --packages-file /tmp/seed-cpan.txt \
-                    -o /tmp/packages.nt && \
-                  if [ "${COLLECTOR_FULL_RELOAD:-0}" = "1" ]; then
-                    pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
-                  fi
-                  pg-collect load /tmp/packages.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                    --endpoint "$FUSEKI_ENDPOINT" \
+                    -o /tmp/cpan.nt && \
+                  /app/scripts/upload-nt.sh /tmp/cpan.nt "$GRAPH_URI"
               resources: {requests: {cpu: 500m, memory: 512Mi}, limits: {cpu: "1", memory: 1Gi}}

@@ -26,12 +26,12 @@ spec:
               envFrom: [{secretRef: {name: minio-credentials}}]
               env:
                 - {name: HOME, value: /tmp}
-                - {name: PYTHONUNBUFFERED, value: "1"}
                 - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
               command: ["/bin/sh", "-c"]
               args:
                 - |
                   set -eu
+                  mkdir -p /tmp/enrichment
                   mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
 
                   for TYPE in rhsa dsa; do
@@ -45,11 +45,11 @@ spec:
                       echo "Cache warmed: $(find "${CACHE_DIR}" -name '*.json' 2>/dev/null | wc -l) entries"
                     fi
 
-                    packagegraph enrich-advisory \
-                      --fuseki-endpoint "$FUSEKI_ENDPOINT" \
-                      --output-dir /tmp/enrichment \
+                    pg-collect enrich-advisory \
+                      --advisory-type "$TYPE" \
+                      -o "/tmp/enrichment/advisory_${TYPE}.nt" \
                       --cache-dir "${CACHE_DIR}" \
-                      --type "$TYPE" || true
+                      --days-back 365 || true
 
                     if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
                       echo "Syncing cache to Minio..."
@@ -65,4 +65,4 @@ spec:
                         --endpoint "$FUSEKI_ENDPOINT"
                     fi
                   done
-              resources: {requests: {cpu: 250m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}

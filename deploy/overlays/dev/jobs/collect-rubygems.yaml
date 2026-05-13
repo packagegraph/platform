@@ -31,15 +31,8 @@ spec:
               command: ["/bin/sh", "-c"]
               args:
                 - |
-                  packagegraph seed-rubygems \
-                    --fuseki-endpoint "$FUSEKI_ENDPOINT" \
-                    --from-names \
-                    -o /tmp/seed-rubygems.txt && \
                   pg-collect rubygems \
-                    --packages-file /tmp/seed-rubygems.txt \
-                    -o /tmp/packages.nt && \
-                  if [ "${COLLECTOR_FULL_RELOAD:-0}" = "1" ]; then
-                    pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
-                  fi
-                  pg-collect load /tmp/packages.nt --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"
+                    --endpoint "$FUSEKI_ENDPOINT" \
+                    -o /tmp/rubygems.nt && \
+                  /app/scripts/upload-nt.sh /tmp/rubygems.nt "$GRAPH_URI"
               resources: {requests: {cpu: 500m, memory: 512Mi}, limits: {cpu: "1", memory: 1Gi}}
