@@ -1,0 +1,82 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: collect-fedora-rawhide-v080
+  namespace: packagegraph
+  labels:
+    phase: "3"
+    ontology: v0.8.0-pre
+spec:
+  activeDeadlineSeconds: 43200
+  backoffLimit: 0
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      restartPolicy: Never
+      volumes:
+        - name: cache
+          hostPath:
+            path: /var/lib/packagegraph/cache
+            type: DirectoryOrCreate
+      containers:
+        - name: collect
+          image: ghcr.io/packagegraph/etl:v0.8.0-pre
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              FUSEKI="http://fuseki.packagegraph.svc:3030/packagegraph"
+              GRAPH="https://packagegraph.github.io/graph/fedora/rawhide"
+              TAG="v0.8.0-pre"
+              NT_FILE="/tmp/fedora-rawhide.nt"
+              MINIO_PATH="pgraph/packagegraph/nt-output/${TAG}/fedora-rawhide.nt"
+
+              echo "=== Fedora Rawhide multiarch (v0.8.0-pre) ==="
+
+              mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 2>/dev/null
+
+              pg-collect rpm-full \
+                --url https://dl.fedoraproject.org/pub/fedora/linux/development/rawhide/Everything/x86_64/os/ \
+                --url https://dl.fedoraproject.org/pub/fedora/linux/development/rawhide/Everything/aarch64/os/ \
+                --distro fedora --release rawhide \
+                --with-koji --with-spec --with-buildrequires --with-maintainers \
+                --cache-dir /cache/fedora-rawhide \
+                -o "$NT_FILE"
+
+              TRIPLES=$(wc -l < "$NT_FILE")
+              echo "Collection complete: ${TRIPLES} triples"
+
+              echo "Saving to Minio..."
+              mc cp "$NT_FILE" "$MINIO_PATH"
+              echo "Saved to Minio ✓"
+
+              echo "Loading to Fuseki..."
+              pg-collect drop --graph "$GRAPH" --endpoint "$FUSEKI" || true
+              pg-collect load "$NT_FILE" --graph "$GRAPH" --endpoint "$FUSEKI"
+              echo "=== Done: $(date -Iseconds) ==="
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          env:
+            - name: HOME
+              value: /tmp
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

@@ -1,0 +1,80 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: collect-debian-trixie-v080
+  namespace: packagegraph
+  labels:
+    phase: "4"
+    ontology: v0.8.0
+spec:
+  activeDeadlineSeconds: 43200
+  backoffLimit: 0
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      restartPolicy: Never
+      containers:
+        - name: collect
+          image: ghcr.io/packagegraph/etl:v0.8.0-pre
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              TAG="v0.8.0"
+              NT_FILE="/tmp/debian-trixie.nt"
+              MINIO_PATH="pgraph/packagegraph/nt-output/${TAG}/debian-trixie.nt"
+              CACHE_DIR="/tmp/cache"
+              CACHE_TARBALL="pgraph/packagegraph/cache/debian-trixie.tar.gz"
+
+              echo "=== Debian Trixie deb-full multiarch (${TAG}) ==="
+              echo "Arches: amd64 arm64 i386 armhf ppc64el s390x riscv64"
+              echo "Features: Sources.gz Build-Depends, arch:all dedup, Salsa provenance, ecosystem detection"
+              echo "Deadline: 12 hours"
+
+              mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 2>/dev/null
+
+              # Restore cache from Minio tarball (Salsa responses + Packages.gz)
+              mkdir -p "$CACHE_DIR"
+              echo "Restoring cache from Minio tarball..."
+              mc cat "$CACHE_TARBALL" 2>/dev/null | tar xzf - -C "$CACHE_DIR" && \
+                echo "Restored $(find "$CACHE_DIR" -type f | wc -l) cached items" || \
+                echo "No prior cache tarball (first run)"
+
+              pg-collect deb-full \
+                --repo http://deb.debian.org/debian \
+                --dist trixie \
+                --arch amd64 --arch arm64 --arch i386 --arch armhf --arch ppc64el --arch s390x --arch riscv64 \
+                --with-sources --with-builddeps --with-maintainers --with-salsa \
+                --cache-dir "$CACHE_DIR" \
+                -o "$NT_FILE"
+
+              TRIPLES=$(wc -l < "$NT_FILE")
+              echo "Collection complete: ${TRIPLES} triples"
+
+              # Save updated cache tarball (includes Salsa responses for next run)
+              echo "Saving cache tarball to Minio..."
+              tar czf - -C "$CACHE_DIR" . | mc pipe "$CACHE_TARBALL" 2>/dev/null && \
+                echo "Cache tarball saved ✓" || echo "Cache save failed (non-fatal)"
+
+              # Save .nt output to Minio
+              echo "Saving output to Minio..."
+              mc cp "$NT_FILE" "$MINIO_PATH"
+              echo "Saved to Minio ✓"
+
+              echo "=== Collection Done: $(date -Iseconds) ==="
+              echo "Run offline TDB2 rebuild to load into Fuseki."
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          env:
+            - name: HOME
+              value: /tmp
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi

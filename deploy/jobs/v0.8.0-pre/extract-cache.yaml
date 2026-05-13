@@ -1,0 +1,110 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: extract-cache-fedora-43
+  namespace: packagegraph
+spec:
+  activeDeadlineSeconds: 14400
+  backoffLimit: 0
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      restartPolicy: Never
+      containers:
+        - name: extract
+          image: ghcr.io/packagegraph/etl:v0.8.0-pre
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "=== Extract Fedora 43 cache to Minio ==="
+
+              mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 2>/dev/null
+
+              # Find the running Fedora 43 pod's cache via shared /tmp
+              # Since we can't access another pod's filesystem, we'll pre-warm the cache
+              # by fetching the same spec files the collector would fetch.
+              # This populates Minio cache for the NEXT run.
+
+              CACHE_DIR="/tmp/cache"
+              mkdir -p "$CACHE_DIR"
+
+              echo "Pre-warming spec cache for Fedora 43 SRPMs..."
+              echo "Fetching SRPM list from Fuseki..."
+
+              # Get unique source package names from the Fedora 43 graph
+              FUSEKI="http://fuseki.packagegraph.svc:3030/packagegraph"
+              SRPM_LIST=$(curl -s "$FUSEKI/sparql" \
+                --data-urlencode "query=PREFIX rpm: <https://purl.org/packagegraph/ontology/rpm#>
+                  PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+                  SELECT DISTINCT ?srpm WHERE {
+                    GRAPH <https://packagegraph.github.io/graph/fedora/43> {
+                      ?pkg rpm:sourceRPM ?srpm .
+                    }
+                  }" \
+                -H "Accept: text/tab-separated-values" | tail -n +2 | tr -d '"' | sort -u)
+
+              TOTAL=$(echo "$SRPM_LIST" | wc -l)
+              echo "Found $TOTAL unique SRPMs"
+
+              # Extract source names from SRPM NVRs and fetch spec files
+              IDX=0
+              CACHED=0
+              for srpm in $SRPM_LIST; do
+                # Parse SRPM name: strip version-release.src.rpm suffix
+                name=$(echo "$srpm" | sed 's/-[0-9].*//')
+                if [ -z "$name" ]; then continue; fi
+
+                # Try to fetch spec file (cached locally)
+                SPEC_URL="https://src.fedoraproject.org/rpms/${name}/raw/f43/f/${name}.spec"
+                SPEC_FILE="$CACHE_DIR/spec/${name}.spec"
+                mkdir -p "$CACHE_DIR/spec"
+
+                if [ ! -f "$SPEC_FILE" ]; then
+                  HTTP_CODE=$(curl -s -o "$SPEC_FILE" -w "%{http_code}" "$SPEC_URL" 2>/dev/null || echo "000")
+                  if [ "$HTTP_CODE" = "200" ]; then
+                    CACHED=$((CACHED + 1))
+                  else
+                    rm -f "$SPEC_FILE"
+                  fi
+                  # Rate limit
+                  sleep 0.1
+                fi
+
+                IDX=$((IDX + 1))
+                if [ $((IDX % 500)) -eq 0 ]; then
+                  echo "Progress: $IDX/$TOTAL processed, $CACHED cached"
+                fi
+              done
+
+              echo "Fetched $CACHED spec files"
+
+              # Sync to Minio
+              echo "Syncing to Minio..."
+              mc mirror --overwrite "$CACHE_DIR/" "pgraph/packagegraph/cache/fedora-43/" 2>/dev/null
+              UPLOADED=$(mc ls -r "pgraph/packagegraph/cache/fedora-43/" 2>/dev/null | wc -l)
+              echo "Uploaded $UPLOADED cache entries to Minio"
+              echo "=== Done: $(date -Iseconds) ==="
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          env:
+            - name: HOME
+              value: /tmp
+          resources:
+            requests:
+              cpu: "250m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

@@ -1,0 +1,83 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: collect-fedora-43-v080
+  namespace: packagegraph
+  labels:
+    phase: "2"
+    ontology: v0.8.0-pre
+spec:
+  activeDeadlineSeconds: 43200
+  backoffLimit: 0
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      restartPolicy: Never
+      containers:
+        - name: collect
+          image: ghcr.io/packagegraph/etl:v0.8.0-pre
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              FUSEKI="http://fuseki.packagegraph.svc:3030/packagegraph"
+              GRAPH="https://packagegraph.github.io/graph/fedora/43"
+              TAG="v0.8.0-pre"
+              NT_FILE="/tmp/fedora-43.nt"
+              MINIO_PATH="pgraph/packagegraph/nt-output/${TAG}/fedora-43.nt"
+              CACHE_DIR="/tmp/cache"
+              CACHE_TARBALL="pgraph/packagegraph/cache/fedora-43.tar.gz"
+
+              echo "=== Fedora 43 multiarch (v0.8.0-pre) ==="
+              echo "Deadline: 12 hours"
+
+              mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 2>/dev/null
+
+              # Restore cache from Minio tarball (38MB → 23K spec files in ~2 seconds)
+              mkdir -p "$CACHE_DIR"
+              echo "Restoring cache from Minio tarball..."
+              mc cat "$CACHE_TARBALL" 2>/dev/null | tar xzf - -C "$CACHE_DIR" && \
+                echo "Restored $(find "$CACHE_DIR" -type f | wc -l) cached items" || \
+                echo "No prior cache tarball (first run)"
+
+              pg-collect rpm-full \
+                --url https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Everything/x86_64/os/ \
+                --url https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Everything/aarch64/os/ \
+                --distro fedora --release 43 \
+                --with-koji --with-spec --with-buildrequires --with-maintainers \
+                --cache-dir "$CACHE_DIR" \
+                -o "$NT_FILE"
+
+              TRIPLES=$(wc -l < "$NT_FILE")
+              echo "Collection complete: ${TRIPLES} triples"
+
+              # Save updated cache tarball to Minio (includes any new spec/koji entries)
+              echo "Saving cache tarball to Minio..."
+              tar czf - -C "$CACHE_DIR" . | mc pipe "$CACHE_TARBALL" 2>/dev/null && \
+                echo "Cache tarball saved ✓" || echo "Cache save failed (non-fatal)"
+
+              # Save .nt output to Minio BEFORE loading to Fuseki
+              echo "Saving output to Minio..."
+              mc cp "$NT_FILE" "$MINIO_PATH"
+              echo "Saved to Minio ✓"
+
+              # Load to Fuseki
+              echo "Loading to Fuseki..."
+              pg-collect drop --graph "$GRAPH" --endpoint "$FUSEKI" || true
+              pg-collect load "$NT_FILE" --graph "$GRAPH" --endpoint "$FUSEKI"
+              echo "=== Done: $(date -Iseconds) ==="
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          env:
+            - name: HOME
+              value: /tmp
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi

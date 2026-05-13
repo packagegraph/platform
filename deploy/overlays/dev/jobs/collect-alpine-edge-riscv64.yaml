@@ -1,0 +1,34 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-alpine-edge-riscv64
+  namespace: packagegraph
+spec:
+  schedule: "0 6 * * 1"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 900
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/alpine/edge/riscv64"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  pg-collect alpine --mirror https://dl-cdn.alpinelinux.org/alpine --branch edge --repo main --repo community --arch riscv64 -o /tmp/packages.nt && /app/scripts/upload-nt.sh /tmp/packages.nt "$GRAPH_URI"
+              resources: {requests: {cpu: 500m, memory: 512Mi}, limits: {cpu: "1", memory: 1Gi}}

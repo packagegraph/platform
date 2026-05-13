@@ -1,0 +1,94 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: load-from-minio
+  namespace: packagegraph
+  labels:
+    ontology: v0.8.0-pre
+spec:
+  activeDeadlineSeconds: 14400
+  backoffLimit: 1
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      restartPolicy: Never
+      containers:
+        - name: load
+          image: ghcr.io/packagegraph/etl:v0.8.0-pre
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              FUSEKI="http://fuseki.packagegraph.svc:3030/packagegraph"
+              TAG="v0.8.0-pre"
+
+              mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 2>/dev/null
+
+              echo "=== Load v0.8.0-pre .nt files from Minio to Fuseki ==="
+              echo "Available files:"
+              mc ls "pgraph/packagegraph/nt-output/${TAG}/" 2>/dev/null || { echo "No files found"; exit 1; }
+
+              # Graph URI mapping: filename → graph URI
+              declare -A GRAPHS
+              GRAPHS[centos-stream-9]="https://packagegraph.github.io/graph/centos-stream/9"
+              GRAPHS[centos-stream-10]="https://packagegraph.github.io/graph/centos-stream/10"
+              GRAPHS[fedora-43]="https://packagegraph.github.io/graph/fedora/43"
+              GRAPHS[fedora-rawhide]="https://packagegraph.github.io/graph/fedora/rawhide"
+              GRAPHS[debian-trixie]="https://packagegraph.github.io/graph/debian/trixie"
+
+              LOADED=0
+              FAILED=0
+
+              for filename in $(mc ls --json "pgraph/packagegraph/nt-output/${TAG}/" 2>/dev/null | jq -r '.key'); do
+                base=$(basename "$filename" .nt)
+
+                GRAPH="${GRAPHS[$base]:-}"
+                if [ -z "$GRAPH" ]; then
+                  echo "  Skipping $filename (no graph mapping)"
+                  continue
+                fi
+
+                echo ""
+                echo "--- Loading $base → $GRAPH ---"
+                mc cp "pgraph/packagegraph/nt-output/${TAG}/$filename" "/tmp/$filename"
+                TRIPLES=$(wc -l < "/tmp/$filename")
+                echo "  ${TRIPLES} triples"
+
+                pg-collect drop --graph "$GRAPH" --endpoint "$FUSEKI" || true
+
+                if pg-collect load "/tmp/$filename" --graph "$GRAPH" --endpoint "$FUSEKI"; then
+                  echo "  ✓ Loaded $base"
+                  LOADED=$((LOADED + 1))
+                else
+                  echo "  ✗ Failed to load $base"
+                  FAILED=$((FAILED + 1))
+                fi
+
+                rm -f "/tmp/$filename"
+              done
+
+              echo ""
+              echo "=== Load complete: ${LOADED} succeeded, ${FAILED} failed ==="
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          env:
+            - name: HOME
+              value: /tmp
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

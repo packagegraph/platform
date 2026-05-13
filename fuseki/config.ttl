@@ -12,9 +12,7 @@
     fuseki:endpoint [ fuseki:operation fuseki:update ; fuseki:name "update" ] ;
     fuseki:endpoint [ fuseki:operation fuseki:gsp-r ; fuseki:name "get" ] ;
     fuseki:endpoint [ fuseki:operation fuseki:gsp-rw ; fuseki:name "data" ] ;
-    ## BULK LOAD MODE: bypass Lucene text index during data loading.
-    ## After loading, change back to <#text_dataset>, delete /data/text-index, and restart.
-    fuseki:dataset <#tdb_dataset> .
+    fuseki:dataset <#text_dataset> .
 
 # Text-indexed dataset wrapping TDB2 for SPARQL text:query substring search.
 # Usage: ?s text:query (pkg:packageName "openssl*") .
@@ -33,9 +31,10 @@
     tdb2:unionDefaultGraph true ;
     ## Query timeout: first value = initial timeout (ms), second = hard limit (ms)
     ## Protects against runaway queries from YASGUI or query-raw.
-    ## 30s soft timeout (query can be interrupted), 120s hard kill.
+    ## 5min soft timeout (query can be interrupted), 10min hard kill.
+    ## Increased from 30s/120s to support transitive property path queries (pkg:directlyDependsOn+).
     ## See: https://jena.apache.org/documentation/fuseki2/fuseki-configuration.html
-    ja:context [ ja:cxtName "arq:queryTimeout" ;  ja:cxtValue "30000,120000" ] .
+    ja:context [ ja:cxtName "arq:queryTimeout" ;  ja:cxtValue "300000,600000" ] .
 
 # Lucene text index for substring package search.
 # Stored on the TDB2 PVC at /data/text-index (survives restarts).

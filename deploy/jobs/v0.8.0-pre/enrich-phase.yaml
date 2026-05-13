@@ -1,0 +1,147 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: enrich-github-v080
+  namespace: packagegraph
+  labels:
+    phase: "5"
+    ontology: v0.8.0-pre
+spec:
+  activeDeadlineSeconds: 43200
+  backoffLimit: 0
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      restartPolicy: Never
+      containers:
+        - name: enrich
+          image: ghcr.io/packagegraph/etl:v0.8.0-pre
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              FUSEKI="http://fuseki.packagegraph.svc:3030/packagegraph"
+              TAG="v0.8.0-pre"
+              NT_FILE="/tmp/enrich-github.nt"
+              MINIO_PATH="pgraph/packagegraph/nt-output/${TAG}/enrich-github.nt"
+
+              echo "=== GitHub VCS Enricher (v0.8.0-pre) ==="
+              mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 2>/dev/null
+
+              pg-collect enrich-github \
+                --endpoint "$FUSEKI" \
+                --github-token "$GITHUB_TOKEN" \
+                --cache-dir /tmp/cache \
+                -o "$NT_FILE"
+
+              TRIPLES=$(wc -l < "$NT_FILE")
+              echo "Enrichment complete: ${TRIPLES} triples"
+
+              echo "Saving to Minio..."
+              mc cp "$NT_FILE" "$MINIO_PATH"
+              echo "Saved to Minio ✓"
+
+              echo "Loading to Fuseki..."
+              pg-collect drop --graph "https://packagegraph.github.io/graph/enrichment/github" --endpoint "$FUSEKI" || true
+              pg-collect load "$NT_FILE" --graph "https://packagegraph.github.io/graph/enrichment/github" --endpoint "$FUSEKI"
+              echo "=== Done: $(date -Iseconds) ==="
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+            - secretRef:
+                name: github-token
+                optional: true
+          env:
+            - name: HOME
+              value: /tmp
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: enrich-forge-version-v080
+  namespace: packagegraph
+  labels:
+    phase: "5"
+    ontology: v0.8.0-pre
+spec:
+  activeDeadlineSeconds: 3600
+  backoffLimit: 0
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      restartPolicy: Never
+      containers:
+        - name: enrich
+          image: ghcr.io/packagegraph/etl:v0.8.0-pre
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              FUSEKI="http://fuseki.packagegraph.svc:3030/packagegraph"
+              TAG="v0.8.0-pre"
+              NT_FILE="/tmp/enrich-forge-version.nt"
+              MINIO_PATH="pgraph/packagegraph/nt-output/${TAG}/enrich-forge-version.nt"
+
+              echo "=== Forge Version Enricher (v0.8.0-pre) ==="
+              mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 2>/dev/null
+
+              pg-collect enrich-forge-version \
+                --endpoint "$FUSEKI" \
+                --cache-dir /tmp/cache \
+                -o "$NT_FILE"
+
+              TRIPLES=$(wc -l < "$NT_FILE")
+              echo "Enrichment complete: ${TRIPLES} triples"
+
+              if [ "$TRIPLES" -gt 0 ]; then
+                echo "Saving to Minio..."
+                mc cp "$NT_FILE" "$MINIO_PATH"
+                echo "Saved to Minio ✓"
+
+                echo "Loading to Fuseki..."
+                pg-collect drop --graph "https://packagegraph.github.io/graph/enrichment/forge-version" --endpoint "$FUSEKI" || true
+                pg-collect load "$NT_FILE" --graph "https://packagegraph.github.io/graph/enrichment/forge-version" --endpoint "$FUSEKI"
+              else
+                echo "No forge versions probed (expected if no self-hosted forges in graph yet)"
+              fi
+              echo "=== Done: $(date -Iseconds) ==="
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          env:
+            - name: HOME
+              value: /tmp
+          resources:
+            requests:
+              cpu: "250m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

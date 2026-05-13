@@ -26,11 +26,12 @@ if [ -n "${MINIO_ACCESS_KEY:-}" ]; then
         mc cp "${MINIO_ALIAS}/${MINIO_BUCKET}/${REMOTE_PATH}" /tmp/tdb2.tar.gz
 
         echo "Extracting TDB2..."
-        rm -rf "$TDB2_DIR"
+        rm -rf "$TDB2_DIR" /data/text-index
         mkdir -p "$TDB2_DIR"
         tar -xzf /tmp/tdb2.tar.gz -C /data/
         rm /tmp/tdb2.tar.gz
         echo "$CONTENT_HASH" > "$HASH_FILE"
+        echo "Text index will rebuild on first query."
     fi
 
     echo "TDB2 ready at ${TDB2_DIR} (${CONTENT_HASH})"

@@ -1,0 +1,172 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: collect-cs9-v080
+  namespace: packagegraph
+  labels:
+    phase: "1"
+    ontology: v0.8.0-pre
+spec:
+  activeDeadlineSeconds: 28800
+  backoffLimit: 0
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      restartPolicy: Never
+      volumes:
+        - name: cache
+          hostPath:
+            path: /var/lib/packagegraph/cache
+            type: DirectoryOrCreate
+      containers:
+        - name: collect
+          image: ghcr.io/packagegraph/etl:v0.8.0-pre
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              FUSEKI="http://fuseki.packagegraph.svc:3030/packagegraph"
+              GRAPH="https://packagegraph.github.io/graph/centos-stream/9"
+              TAG="v0.8.0-pre"
+              NT_FILE="/tmp/centos-stream-9.nt"
+              MINIO_PATH="pgraph/packagegraph/nt-output/${TAG}/centos-stream-9.nt"
+
+              echo "=== CentOS Stream 9 (v0.8.0-pre) ==="
+              echo "Phase 1: Collection + spec + Koji"
+
+              # Configure Minio
+              mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 2>/dev/null
+
+              # Collect
+              pg-collect rpm-full \
+                --url https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/ \
+                --url https://mirror.stream.centos.org/9-stream/BaseOS/aarch64/os/ \
+                --distro centos-stream --release 9 \
+                --with-koji --koji-hub https://kojihub.stream.centos.org/kojihub \
+                --with-spec --with-buildrequires \
+                --cache-dir /cache/centos-stream-9 \
+                -o "$NT_FILE"
+
+              TRIPLES=$(wc -l < "$NT_FILE")
+              echo "Collection complete: ${TRIPLES} triples"
+
+              # Persist to Minio BEFORE loading to Fuseki
+              echo "Saving to Minio: ${MINIO_PATH}"
+              mc cp "$NT_FILE" "$MINIO_PATH"
+              echo "Saved to Minio ✓"
+
+              # Load to Fuseki
+              echo "Loading to Fuseki..."
+              pg-collect drop --graph "$GRAPH" --endpoint "$FUSEKI" || true
+              pg-collect load "$NT_FILE" --graph "$GRAPH" --endpoint "$FUSEKI"
+              echo "=== Done: $(date -Iseconds) ==="
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          env:
+            - name: HOME
+              value: /tmp
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: collect-cs10-v080
+  namespace: packagegraph
+  labels:
+    phase: "1"
+    ontology: v0.8.0-pre
+spec:
+  activeDeadlineSeconds: 28800
+  backoffLimit: 0
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      restartPolicy: Never
+      volumes:
+        - name: cache
+          hostPath:
+            path: /var/lib/packagegraph/cache
+            type: DirectoryOrCreate
+      containers:
+        - name: collect
+          image: ghcr.io/packagegraph/etl:v0.8.0-pre
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              FUSEKI="http://fuseki.packagegraph.svc:3030/packagegraph"
+              GRAPH="https://packagegraph.github.io/graph/centos-stream/10"
+              TAG="v0.8.0-pre"
+              NT_FILE="/tmp/centos-stream-10.nt"
+              MINIO_PATH="pgraph/packagegraph/nt-output/${TAG}/centos-stream-10.nt"
+
+              echo "=== CentOS Stream 10 (v0.8.0-pre) ==="
+
+              mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 2>/dev/null
+
+              pg-collect rpm-full \
+                --url https://mirror.stream.centos.org/10-stream/BaseOS/x86_64/os/ \
+                --url https://mirror.stream.centos.org/10-stream/BaseOS/aarch64/os/ \
+                --distro centos-stream --release 10 \
+                --with-koji --koji-hub https://kojihub.stream.centos.org/kojihub \
+                --with-spec --with-buildrequires \
+                --cache-dir /cache/centos-stream-10 \
+                -o "$NT_FILE"
+
+              TRIPLES=$(wc -l < "$NT_FILE")
+              echo "Collection complete: ${TRIPLES} triples"
+
+              echo "Saving to Minio..."
+              mc cp "$NT_FILE" "$MINIO_PATH"
+              echo "Saved to Minio ✓"
+
+              echo "Loading to Fuseki..."
+              pg-collect drop --graph "$GRAPH" --endpoint "$FUSEKI" || true
+              pg-collect load "$NT_FILE" --graph "$GRAPH" --endpoint "$FUSEKI"
+              echo "=== Done: $(date -Iseconds) ==="
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          env:
+            - name: HOME
+              value: /tmp
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

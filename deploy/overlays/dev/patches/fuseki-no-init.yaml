@@ -20,7 +20,12 @@ spec:
           args:
             - |
               mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 &&
-              CONTENT_HASH=$(mc cat pgraph/${MINIO_BUCKET}/tdb2/latest) &&
+              CONTENT_HASH=$(mc cat pgraph/${MINIO_BUCKET}/tdb2/latest 2>/dev/null) || true
+              if [ -z "$CONTENT_HASH" ]; then
+                echo "No tdb2/latest index found in Minio — skipping snapshot load."
+                echo "TDB2 ready (empty or pre-existing data on PVC)."
+                exit 0
+              fi
               echo "Latest snapshot: ${CONTENT_HASH}" &&
               HASH_FILE="/data/.content-hash" &&
               if [ -f "$HASH_FILE" ] && [ "$(cat "$HASH_FILE")" = "$CONTENT_HASH" ]; then
@@ -59,7 +64,7 @@ spec:
           imagePullPolicy: Always
           env:
             - name: JAVA_OPTIONS
-              value: "-Xmx2g"
+              value: "-Xmx4g"
           args:
             - --config
             - /fuseki/config.ttl

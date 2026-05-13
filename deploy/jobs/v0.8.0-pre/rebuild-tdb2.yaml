@@ -1,0 +1,94 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rebuild-tdb2-v080
+  namespace: packagegraph
+spec:
+  activeDeadlineSeconds: 14400
+  backoffLimit: 0
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      serviceAccountName: rebuild-tdb2
+      restartPolicy: Never
+      containers:
+        - name: rebuild
+          image: ghcr.io/packagegraph/etl:v0.8.0-pre
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "=== Offline TDB2 Rebuild (v0.8.0) ==="
+              echo "Started: $(date -Iseconds)"
+
+              mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 2>/dev/null
+
+              # Download graphs manifest
+              mc cat pgraph/packagegraph/nt-output/v0.8.0/graphs.json > /tmp/graphs.json
+              echo "Graphs to load:"
+              cat /tmp/graphs.json | jq .
+
+              TDB2_DIR="/tmp/tdb2"
+              mkdir -p "$TDB2_DIR"
+
+              TOTAL_TRIPLES=0
+
+              # Load each .nt file into TDB2
+              jq -r 'to_entries[] | .key + " " + .value' /tmp/graphs.json | while read filename graph_uri; do
+                echo ""
+                echo "=== Loading $filename → <$graph_uri> ==="
+                mc cp "pgraph/packagegraph/nt-output/v0.8.0/$filename" "/tmp/$filename"
+                TRIPLES=$(wc -l < "/tmp/$filename")
+                echo "  ${TRIPLES} triples"
+
+                /opt/jena/bin/tdb2.tdbloader --loc "$TDB2_DIR" --graph "$graph_uri" "/tmp/$filename"
+                rm -f "/tmp/$filename"
+                echo "  ✓ Loaded"
+              done
+
+              # Load ontology
+              echo ""
+              echo "=== Loading ontology ==="
+              /opt/jena/bin/riot --output=ntriples /app/ontology/*.ttl > /tmp/ontology.nt 2>/dev/null
+              ONTO_TRIPLES=$(wc -l < /tmp/ontology.nt)
+              echo "  ${ONTO_TRIPLES} ontology triples"
+              /opt/jena/bin/tdb2.tdbloader --loc "$TDB2_DIR" --graph "https://packagegraph.github.io/ontology" /tmp/ontology.nt
+
+              # Report
+              echo ""
+              echo "=== TDB2 Build Complete ==="
+              echo "Database size: $(du -sh $TDB2_DIR | cut -f1)"
+              echo "Finished: $(date -Iseconds)"
+
+              # Upload to Minio
+              echo "Uploading TDB2 snapshot to Minio..."
+              CONTENT_HASH=$(find "$TDB2_DIR" -type f | sort | xargs sha256sum | sha256sum | cut -c1-16)
+              echo "Content hash: ${CONTENT_HASH}"
+              tar czf - -C "$TDB2_DIR" . | mc pipe "pgraph/packagegraph/tdb2/v0.8.0-${CONTENT_HASH}.tar.gz"
+              echo "${CONTENT_HASH}" | mc pipe "pgraph/packagegraph/tdb2/tags/latest"
+              echo "${CONTENT_HASH}" | mc pipe "pgraph/packagegraph/tdb2/tags/v0.8.0"
+              echo "✓ Uploaded TDB2 snapshot"
+
+              # Trigger Fuseki restart to pick up new data
+              echo "Triggering Fuseki restart..."
+              kubectl rollout restart deployment/fuseki -n packagegraph 2>/dev/null || \
+                echo "Warning: kubectl not available, restart Fuseki manually"
+
+              echo "=== Done: $(date -Iseconds) ==="
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          env:
+            - name: HOME
+              value: /tmp
+            - name: JAVA_OPTIONS
+              value: "-Xmx5g"
+          resources:
+            requests:
+              cpu: "1"
+              memory: 6Gi
+            limits:
+              cpu: "2"
+              memory: 10Gi

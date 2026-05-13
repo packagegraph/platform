@@ -1,0 +1,183 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: rebuild-tdb2
+  namespace: packagegraph
+spec:
+  schedule: "0 3 * * *"  # 3am daily
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 14400  # 4 hours (tdb2.tdbloader throughput decays with index size)
+      ttlSecondsAfterFinished: 1800
+      template:
+        spec:
+          serviceAccountName: rebuild-tdb2
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: rebuild
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom:
+                - secretRef: {name: minio-credentials}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: JAVA_OPTIONS, value: "-Xmx5g"}
+                - {name: PYTHONUNBUFFERED, value: "1"}
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  echo "=== Offline TDB2 Rebuild ==="
+                  echo "Started: $(date -Iseconds)"
+
+                  # Configure mc
+                  mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
+
+                  # Download graph manifest
+                  echo "Downloading graph manifest..."
+                  mc cat "pgraph/${MINIO_BUCKET}/nt-output/graphs.json" > /tmp/graphs.json
+
+                  # Create TDB2 directory
+                  TDB2_DIR="/tmp/tdb2"
+                  mkdir -p "$TDB2_DIR"
+
+                  # Load each .nt file and build manifest
+                  echo "Running tdb2.tdbloader for each graph..."
+
+                  # Initialize build manifest
+                  BUILT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                  cat > /tmp/build-manifest.json <<JSONEOF
+                  {
+                    "built": "$BUILT",
+                    "etl_image": "ghcr.io/packagegraph/etl:latest",
+                    "ontology_version": "0.7.0",
+                    "graphs": {},
+                    "triple_count": 0,
+                    "errors": []
+                  }
+                  JSONEOF
+
+                  TOTAL_FILES=$(jq 'length' /tmp/graphs.json)
+                  TOTAL_TRIPLES=0
+                  IDX=0
+
+                  # Iterate over graph entries
+                  jq -r 'to_entries[] | .key + " " + .value' /tmp/graphs.json | while IFS=' ' read -r filename graph_uri; do
+                      IDX=$((IDX + 1))
+                      echo "[$IDX/$TOTAL_FILES] Loading $filename into <$graph_uri>..."
+
+                      # Download .nt file from Minio
+                      nt_file="/tmp/$filename"
+                      if ! mc cp "pgraph/${MINIO_BUCKET}/nt-output/$filename" "$nt_file" 2>/tmp/dl-err.txt; then
+                          ERR=$(cat /tmp/dl-err.txt)
+                          echo "  Warning: Failed to download $filename: $ERR"
+                          jq --arg msg "Failed to download $filename: $ERR" '.errors += [$msg]' /tmp/build-manifest.json > /tmp/build-manifest.json.tmp && mv /tmp/build-manifest.json.tmp /tmp/build-manifest.json
+                          continue
+                      fi
+
+                      # Compute sha256 and count lines
+                      FILE_HASH=$(sha256sum "$nt_file" | cut -d' ' -f1 | cut -c1-16)
+                      FILE_SIZE=$(stat -c %s "$nt_file" 2>/dev/null || stat -f %z "$nt_file" 2>/dev/null)
+                      LINE_COUNT=$(wc -l < "$nt_file")
+
+                      # Determine arch from graph URI
+                      ARCH="null"
+                      for a in arm64 aarch64 riscv64 x86_64 amd64; do
+                          if echo "$graph_uri" | grep -q "$a"; then
+                              ARCH="\"$a\""
+                              break
+                          fi
+                      done
+
+                      # Run tdb2.tdbloader
+                      if ! /opt/jena/bin/tdb2.tdbloader --loc /tmp/tdb2 --graph "$graph_uri" "$nt_file" 2>/tmp/load-err.txt; then
+                          ERR=$(tail -c 200 /tmp/load-err.txt)
+                          echo "  ✗ tdb2.tdbloader failed for $filename: $ERR"
+                          jq --arg msg "tdb2.tdbloader failed for $filename: $ERR" '.errors += [$msg]' /tmp/build-manifest.json > /tmp/build-manifest.json.tmp && mv /tmp/build-manifest.json.tmp /tmp/build-manifest.json
+                          rm -f "$nt_file"
+                          continue
+                      fi
+
+                      # Update manifest with graph metadata
+                      jq --arg fname "$filename" \
+                         --arg guri "$graph_uri" \
+                         --arg sha "$FILE_HASH" \
+                         --argjson triples "$LINE_COUNT" \
+                         --argjson size "$FILE_SIZE" \
+                         --argjson arch "$ARCH" \
+                         '.graphs[$fname] = {graph_uri: $guri, sha256: $sha, triples: $triples, size_bytes: $size, arch: $arch} | .triple_count += $triples' \
+                         /tmp/build-manifest.json > /tmp/build-manifest.json.tmp && mv /tmp/build-manifest.json.tmp /tmp/build-manifest.json
+
+                      SIZE_MB=$(awk "BEGIN {printf \"%.1f\", $FILE_SIZE / 1048576}")
+                      echo "  ✓ $filename ($LINE_COUNT triples, ${SIZE_MB} MB)"
+
+                      # Remove downloaded file to save space
+                      rm -f "$nt_file"
+                  done
+
+                  # Report totals
+                  TOTAL_TRIPLES=$(jq -r '.triple_count' /tmp/build-manifest.json)
+                  GRAPH_COUNT=$(jq -r '.graphs | length' /tmp/build-manifest.json)
+                  ERROR_COUNT=$(jq -r '.errors | length' /tmp/build-manifest.json)
+                  echo ""
+                  echo "Total: $TOTAL_TRIPLES triples across $GRAPH_COUNT graphs"
+                  if [ "$ERROR_COUNT" -gt 0 ]; then
+                      echo "Errors: $ERROR_COUNT"
+                  fi
+
+                  # Load ontology
+                  echo "Loading ontology..."
+                  /opt/jena/bin/riot --output=ntriples /app/ontology/*.ttl > /tmp/ontology.nt
+                  /opt/jena/bin/tdb2.tdbloader --loc "$TDB2_DIR" --graph "https://packagegraph.github.io/ontology" /tmp/ontology.nt
+
+                  # Content-hash the TDB2 directory
+                  echo "Computing content hash..."
+                  CONTENT_HASH=$(find "$TDB2_DIR" -type f | sort | xargs sha256sum | sha256sum | cut -c1-16)
+                  echo "Content hash: ${CONTENT_HASH}"
+
+                  # Add hash to manifest
+                  jq --arg hash "$CONTENT_HASH" '.content_hash = $hash' /tmp/build-manifest.json > /tmp/build-manifest.json.tmp && mv /tmp/build-manifest.json.tmp /tmp/build-manifest.json
+
+                  # Check if already archived
+                  EXISTING=$(mc cat "pgraph/${MINIO_BUCKET}/tdb2/latest" 2>/dev/null || echo "none")
+                  if [ "$EXISTING" = "$CONTENT_HASH" ]; then
+                    echo "TDB2 ${CONTENT_HASH} already archived, no changes"
+                    exit 0
+                  fi
+
+                  # Stream tarball directly to Minio (no intermediate file — saves disk)
+                  echo "Streaming tarball to Minio..."
+                  tar -czf - -C /tmp tdb2/ | mc pipe "pgraph/${MINIO_BUCKET}/tdb2/${CONTENT_HASH}/tdb2.tar.gz"
+                  ARCHIVE_SIZE=$(mc stat "pgraph/${MINIO_BUCKET}/tdb2/${CONTENT_HASH}/tdb2.tar.gz" 2>&1 | grep "Size" | awk '{print $3, $4}')
+                  echo "Archive size: ${ARCHIVE_SIZE}"
+
+                  # Upload manifest
+                  mc cp /tmp/build-manifest.json "pgraph/${MINIO_BUCKET}/tdb2/${CONTENT_HASH}/manifest.json"
+
+                  # Update latest pointer
+                  echo "${CONTENT_HASH}" | mc pipe "pgraph/${MINIO_BUCKET}/tdb2/latest"
+
+                  # Create dated tag
+                  DATE_TAG=$(date +%Y-%m-%d)
+                  echo "${CONTENT_HASH}" | mc pipe "pgraph/${MINIO_BUCKET}/tdb2/tags/${DATE_TAG}"
+
+                  echo "✓ Uploaded TDB2 snapshot (${CONTENT_HASH}, ${ARCHIVE_SIZE})"
+                  echo "  Tagged: latest, ${DATE_TAG}"
+
+                  # Trigger Fuseki rollout restart
+                  echo "Triggering Fuseki restart..."
+                  if command -v kubectl >/dev/null 2>&1; then
+                    kubectl rollout restart deployment/fuseki -n packagegraph
+                  else
+                    echo "Warning: kubectl not available, cannot trigger restart"
+                  fi
+
+                  echo "=== Rebuild complete: $(date -Iseconds) ==="
+              resources: {requests: {cpu: 500m, memory: 4Gi}, limits: {cpu: "2", memory: 8Gi}}

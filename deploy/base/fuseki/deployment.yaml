@@ -21,7 +21,7 @@ spec:
     spec:
       initContainers:
         - name: load-tdb2
-          image: packagegraph/fuseki:latest
+          image: ghcr.io/packagegraph/fuseki:v0.10.0
           command: ["/fuseki/entrypoint.sh"]
           args: ["--init-only"]
           envFrom:
