@@ -1,11 +1,33 @@
 use std::fs::File;
 use std::io::{BufWriter, Write, Result};
+use crate::uris::{PKG, SEC, VCS};
+
+/// Look up the inverse predicate for a given forward predicate.
+///
+/// Returns Some(inverse_uri) if the predicate has a mapped inverse, None otherwise.
+/// Matches on the predicate suffix (after #) for efficiency.
+fn lookup_inverse(predicate: &str) -> Option<String> {
+    let suffix = predicate.rsplit('#').next()?;
+    match suffix {
+        "hasVersion" => Some(format!("{PKG}versionOf")),
+        "directlyDependsOn" => Some(format!("{PKG}isDirectDependencyOf")),
+        "isVersionOf" => Some(format!("{PKG}hasPackage")),
+        "maintainedBy" => Some(format!("{PKG}maintains")),
+        "builtFromSource" => Some(format!("{PKG}producedBinary")),
+        "upstreamRepository" => Some(format!("{VCS}hasPackage")),
+        "affectsVersion" => Some(format!("{SEC}vulnerableIn")),
+        "partOfDistribution" => Some(format!("{PKG}hasRelease")),
+        _ => None,
+    }
+}
 
 /// Streaming N-Triples writer.
 ///
 /// Uses BufWriter for I/O buffering. Flush happens automatically on drop.
 pub struct NTriplesWriter {
     writer: BufWriter<File>,
+    /// Count of triples skipped due to invalid IRI characters.
+    pub skipped_invalid_iri: usize,
 }
 
 impl NTriplesWriter {
@@ -13,6 +35,7 @@ impl NTriplesWriter {
     pub fn new(file: File) -> Self {
         Self {
             writer: BufWriter::new(file),
+            skipped_invalid_iri: 0,
         }
     }
 
@@ -20,15 +43,29 @@ impl NTriplesWriter {
     ///
     /// Validates that URIs don't contain characters illegal in N-Triples IRIs.
     /// Skips the triple and warns on stderr if any URI is malformed.
+    ///
+    /// Auto-emits the inverse triple if the predicate has a known inverse mapping.
     pub fn write_triple(&mut self, subject: &str, predicate: &str, object: &str) -> Result<()> {
         if has_invalid_iri_chars(subject) || has_invalid_iri_chars(predicate) || has_invalid_iri_chars(object) {
-            eprintln!("WARNING: skipping triple with invalid URI character: <{}> <{}> <{}>",
-                &subject[..subject.len().min(80)],
-                &predicate[..predicate.len().min(80)],
-                &object[..object.len().min(80)]);
+            self.skipped_invalid_iri += 1;
+            if self.skipped_invalid_iri <= 10 {
+                eprintln!("WARNING: skipping triple with invalid URI character: <{}> <{}> <{}>",
+                    &subject[..subject.len().min(80)],
+                    &predicate[..predicate.len().min(80)],
+                    &object[..object.len().min(80)]);
+            } else if self.skipped_invalid_iri == 11 {
+                eprintln!("WARNING: suppressing further invalid URI warnings (total so far: 11)");
+            }
             return Ok(());
         }
-        writeln!(self.writer, "<{subject}> <{predicate}> <{object}> .")
+        writeln!(self.writer, "<{subject}> <{predicate}> <{object}> .")?;
+
+        // Auto-emit inverse triple if predicate has a known inverse
+        if let Some(inverse_pred) = lookup_inverse(predicate) {
+            writeln!(self.writer, "<{object}> <{inverse_pred}> <{subject}> .")?;
+        }
+
+        Ok(())
     }
 
     /// Write a literal triple: `<subject> <predicate> "value" .\n`
@@ -80,6 +117,15 @@ impl NTriplesWriter {
         )
     }
 
+    /// Write a date literal with xsd:date datatype (format: YYYY-MM-DD).
+    pub fn write_date(&mut self, subject: &str, predicate: &str, value: &str) -> Result<()> {
+        let escaped = escape_literal(value);
+        writeln!(
+            self.writer,
+            "<{subject}> <{predicate}> \"{escaped}\"^^<http://www.w3.org/2001/XMLSchema#date> ."
+        )
+    }
+
     /// Write a blank node triple: `<subject> <predicate> _:bnode .\n`
     pub fn write_bnode_object(&mut self, subject: &str, predicate: &str, bnode: &str) -> Result<()> {
         writeln!(self.writer, "<{subject}> <{predicate}> _:{bnode} .")
@@ -90,10 +136,20 @@ impl NTriplesWriter {
         writeln!(self.writer, "_:{bnode} <{predicate}> <{object}> .")
     }
 
+    /// Write a triple with both blank node subject and blank node object: `_:s <predicate> _:o .\n`
+    pub fn write_bnode_to_bnode(&mut self, subject_bnode: &str, predicate: &str, object_bnode: &str) -> Result<()> {
+        writeln!(self.writer, "_:{subject_bnode} <{predicate}> _:{object_bnode} .")
+    }
+
     /// Write a literal with blank node subject: `_:bnode <predicate> "literal" .\n`
     pub fn write_bnode_literal(&mut self, bnode: &str, predicate: &str, value: &str) -> Result<()> {
         let escaped = escape_literal(value);
         writeln!(self.writer, "_:{bnode} <{predicate}> \"{escaped}\" .")
+    }
+
+    /// Write a raw N-Triple line directly (for pre-formatted triples from format functions).
+    pub fn write_raw_line(&mut self, line: &str) -> Result<()> {
+        writeln!(self.writer, "{}", line)
     }
 
     /// Flush the buffer (called automatically on drop).
@@ -105,7 +161,7 @@ impl NTriplesWriter {
 /// Check if a URI string contains characters that are illegal in N-Triples IRIs.
 /// N-Triples IRIs must not contain: < > " { } | ^ ` \ or unescaped whitespace.
 /// Also rejects bare `%` not followed by two hex digits (invalid percent-encoding).
-fn has_invalid_iri_chars(uri: &str) -> bool {
+pub(crate) fn has_invalid_iri_chars(uri: &str) -> bool {
     let bytes = uri.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
         match b {
@@ -137,7 +193,7 @@ fn has_invalid_iri_chars(uri: &str) -> bool {
 /// - \t (tab)
 ///
 /// Non-ASCII characters are passed through as UTF-8 (N-Triples allows this).
-fn escape_literal(s: &str) -> String {
+pub(crate) fn escape_literal(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -359,6 +415,75 @@ mod tests {
     }
 
     #[test]
+    fn test_write_triple_emits_inverse_for_hasVersion() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut writer = NTriplesWriter::new(temp_file.reopen()?);
+
+        writer.write_triple(
+            "https://packagegraph.github.io/d/pkg/debian/trixie/amd64/libc6/2.36-1",
+            "https://purl.org/packagegraph/ontology/core#hasVersion",
+            "https://packagegraph.github.io/d/ver/debian/trixie/libc6/2.36-1",
+        )?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        temp_file.reopen()?.read_to_string(&mut content)?;
+
+        // Should emit both forward and inverse triples
+        assert_eq!(content.lines().count(), 2, "Should emit forward + inverse");
+        assert!(content.contains("hasVersion"));
+        assert!(content.contains("versionOf"));
+
+        // Verify inverse has swapped subject/object
+        assert!(content.contains("<https://packagegraph.github.io/d/ver/debian/trixie/libc6/2.36-1> <https://purl.org/packagegraph/ontology/core#versionOf> <https://packagegraph.github.io/d/pkg/debian/trixie/amd64/libc6/2.36-1>"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_triple_no_inverse_for_unmapped_predicate() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut writer = NTriplesWriter::new(temp_file.reopen()?);
+
+        writer.write_triple(
+            "https://example.org/subject",
+            "https://example.org/someOtherPredicate",
+            "https://example.org/object",
+        )?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        temp_file.reopen()?.read_to_string(&mut content)?;
+
+        // Should emit only the forward triple (no inverse for unmapped predicate)
+        assert_eq!(content.lines().count(), 1, "Should emit only forward triple");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_all_inverse_predicates_covered() {
+        // Verify all 8 forward predicates have inverses defined
+        let test_cases = vec![
+            ("hasVersion", "versionOf"),
+            ("directlyDependsOn", "isDirectDependencyOf"),
+            ("isVersionOf", "hasPackage"),
+            ("maintainedBy", "maintains"),
+            ("builtFromSource", "producedBinary"),
+            ("upstreamRepository", "hasPackage"), // vcs:hasPackage
+            ("affectsVersion", "vulnerableIn"),
+            ("partOfDistribution", "hasRelease"),
+        ];
+
+        for (forward, inverse) in test_cases {
+            let full_forward = format!("https://purl.org/packagegraph/ontology/core#{}", forward);
+            let result = lookup_inverse(&full_forward);
+            assert!(result.is_some(), "Missing inverse for {}", forward);
+            assert!(result.unwrap().contains(inverse), "Wrong inverse for {}", forward);
+        }
+    }
+
+    #[test]
     fn test_write_boolean() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let mut writer = NTriplesWriter::new(temp_file.reopen()?);
@@ -398,6 +523,64 @@ mod tests {
             content,
             "<https://example.org/att> <https://example.org/timestamp> \"2026-04-13T10:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime> .\n"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_date() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut writer = NTriplesWriter::new(temp_file.reopen()?);
+
+        writer.write_date(
+            "https://example.org/pkg",
+            "https://example.org/releaseDate",
+            "2024-04-18",
+        )?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        temp_file.reopen()?.read_to_string(&mut content)?;
+        assert_eq!(
+            content,
+            "<https://example.org/pkg> <https://example.org/releaseDate> \"2024-04-18\"^^<http://www.w3.org/2001/XMLSchema#date> .\n"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_bnode_to_bnode_produces_correct_syntax() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let mut writer = NTriplesWriter::new(temp.reopen()?);
+
+        writer.write_bnode_to_bnode("dep1", "http://example.org/hasConstraint", "constraint1")?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        temp.reopen()?.read_to_string(&mut content)?;
+
+        assert!(content.contains("_:dep1"), "Subject should be blank node _:dep1, got: {}", content);
+        assert!(content.contains("_:constraint1"), "Object should be blank node _:constraint1, got: {}", content);
+        assert!(!content.contains("<dep1>"), "Subject should NOT be a URI <dep1>");
+        assert!(!content.contains("<constraint1>"), "Object should NOT be a URI <constraint1>");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_bnode_object_does_not_produce_bnode_subject() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let mut writer = NTriplesWriter::new(temp.reopen()?);
+
+        writer.write_bnode_object("http://example.org/pkg1", "http://example.org/hasDep", "dep1")?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        temp.reopen()?.read_to_string(&mut content)?;
+
+        assert!(content.contains("<http://example.org/pkg1>"), "Subject should be a URI");
+        assert!(content.contains("_:dep1"), "Object should be blank node");
 
         Ok(())
     }
