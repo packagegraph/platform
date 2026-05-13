@@ -1,0 +1,66 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-centos-stream-9-full
+  namespace: packagegraph
+  annotations:
+    description: "Consolidated multi-arch CentOS Stream 9 collection with spec enrichment"
+spec:
+  schedule: "0 3 * * 1"  # Weekly Monday 3am
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 7200  # 2 hours (smaller package set than Fedora)
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/centos-stream/9"}
+              resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "2", memory: 2Gi}}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  mkdir -p /tmp/collection
+                  CACHE_DIR=/tmp/cache/rpm-full
+                  MINIO_CACHE="pgraph/${MINIO_BUCKET}/collector-cache/centos-stream-9-full"
+                  mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
+
+                  if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
+                    echo "Syncing cache from Minio..."
+                    mc mirror --overwrite "${MINIO_CACHE}/" "${CACHE_DIR}/" 2>/dev/null || true
+                  fi
+
+                  pg-collect rpm-full \
+                    --url https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/ \
+                    --url https://mirror.stream.centos.org/9-stream/BaseOS/aarch64/os/ \
+                    --distro centos-stream --release 9 \
+                    --with-spec \
+                    --with-maintainers \
+                    --cache-dir "${CACHE_DIR}" \
+                    -o /tmp/collection/centos-stream-9.nt
+
+                  pg-collect load \
+                    --endpoint "$FUSEKI_ENDPOINT" \
+                    --graph "$GRAPH_URI" \
+                    /tmp/collection/centos-stream-9.nt
+
+                  if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
+                    mc mirror --overwrite "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
+                  fi
+
+                  echo "Collection complete"

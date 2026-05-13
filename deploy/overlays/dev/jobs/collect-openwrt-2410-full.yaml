@@ -1,0 +1,108 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-openwrt-2410-full
+  namespace: packagegraph
+  annotations:
+    description: "OpenWrt 24.10 multi-feed source + binary collection with upstream enrichment"
+spec:
+  schedule: "0 5 * * 0"  # Weekly Sunday 5am
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600  # 1 hour
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          initContainers:
+            - name: clone-feeds
+              image: alpine/git:latest
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, runAsNonRoot: true, runAsUser: 65532}
+              resources: {requests: {cpu: 100m, memory: 128Mi}}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  cd /tmp/feeds
+                  git clone --depth 1 --branch openwrt-24.10 https://github.com/openwrt/packages.git
+                  git clone --depth 1 --branch openwrt-24.10 https://github.com/openwrt/luci.git
+                  git clone --depth 1 --branch openwrt-24.10 https://github.com/openwrt/routing.git
+                  git clone --depth 1 --branch openwrt-24.10 https://github.com/openwrt/telephony.git
+                  echo "Cloned 4 feeds"
+              volumeMounts:
+                - name: feeds
+                  mountPath: /tmp/feeds
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom:
+                - secretRef: {name: minio-credentials}
+                - secretRef: {name: github-token, optional: true}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/openwrt/24.10/mips_24kc"}
+              resources: {requests: {cpu: 500m, memory: 512Mi}, limits: {cpu: "1", memory: 1Gi}}
+              volumeMounts:
+                - name: feeds
+                  mountPath: /tmp/feeds
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  mkdir -p /tmp/collection /tmp/cache/openwrt-attestation
+                  CACHE_DIR=/tmp/cache/openwrt-attestation
+                  MINIO_CACHE="pgraph/${MINIO_BUCKET}/collector-cache/openwrt-2410-full"
+                  mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
+
+                  # Warm cache from Minio
+                  if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
+                    echo "Syncing cache from Minio..."
+                    mc mirror --overwrite "${MINIO_CACHE}/" "${CACHE_DIR}/" 2>/dev/null || true
+                    echo "Cache warmed: $(find "${CACHE_DIR}" -type f 2>/dev/null | wc -l) entries"
+                  fi
+
+                  # Consolidated collection
+                  pg-collect openwrt-full \
+                    --feed /tmp/feeds/packages \
+                    --feed /tmp/feeds/luci \
+                    --feed /tmp/feeds/routing \
+                    --feed /tmp/feeds/telephony \
+                    --distro openwrt --release 24.10 \
+                    --release-url https://downloads.openwrt.org/releases/24.10.0 \
+                    --arch mips_24kc \
+                    --with-upstream \
+                    --cache-dir "${CACHE_DIR}" \
+                    --minio-endpoint "${MINIO_ENDPOINT}" \
+                    --minio-bucket "${MINIO_BUCKET}" \
+                    --minio-access-key "${MINIO_ACCESS_KEY}" \
+                    --minio-secret-key "${MINIO_SECRET_KEY}" \
+                    -o /tmp/collection/openwrt-2410.nt
+                  # Note: --with-attestation omitted - OpenWrt does not publish GitHub attestations yet (verified 2026-04-27)
+                  # Enable when openwrt/openwrt adopts actions/attest-build-provenance:
+                  #   --with-attestation --github-token "$GITHUB_TOKEN"
+
+                  # Load to Fuseki
+                  pg-collect load \
+                    --endpoint "$FUSEKI_ENDPOINT" \
+                    --graph "$GRAPH_URI" \
+                    /tmp/collection/openwrt-2410.nt
+
+                  # Sync cache back to Minio
+                  if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
+                    echo "Syncing cache to Minio..."
+                    mc mirror --overwrite "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
+                  fi
+
+                  echo "Collection complete"
+          volumes:
+            - name: feeds
+              emptyDir: {}

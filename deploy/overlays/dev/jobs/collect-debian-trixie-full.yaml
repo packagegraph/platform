@@ -1,0 +1,75 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-debian-trixie-full
+  namespace: packagegraph
+  annotations:
+    description: "Consolidated multi-arch Debian collection with Sources.gz + salsa enrichment"
+spec:
+  schedule: "0 4 * * 0"  # Weekly Sunday 4am (offset from fedora-43-full at 3am)
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 7200  # 2 hours (multi-arch + sources + salsa)
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/debian/trixie"}
+              resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "2", memory: 2Gi}}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  mkdir -p /tmp/collection
+                  CACHE_DIR=/tmp/cache/deb-full
+                  MINIO_CACHE="pgraph/${MINIO_BUCKET}/collector-cache/debian-trixie-full"
+                  mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
+
+                  # Warm cache from Minio
+                  if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
+                    echo "Syncing cache from Minio..."
+                    mc mirror --overwrite "${MINIO_CACHE}/" "${CACHE_DIR}/" 2>/dev/null || true
+                    echo "Cache warmed: $(find "${CACHE_DIR}" -type f 2>/dev/null | wc -l) entries"
+                  fi
+
+                  # Consolidated collection: multi-arch + sources + salsa
+                  pg-collect deb-full \
+                    --repo http://deb.debian.org/debian \
+                    --dist trixie --component main \
+                    --arch amd64 --arch arm64 \
+                    --distro debian \
+                    --with-sources \
+                    --with-builddeps \
+                    --with-maintainers \
+                    --with-salsa \
+                    --cache-dir "${CACHE_DIR}" \
+                    -o /tmp/collection/debian-trixie.nt
+
+                  # Load to Fuseki
+                  pg-collect load \
+                    --endpoint "$FUSEKI_ENDPOINT" \
+                    --graph "$GRAPH_URI" \
+                    /tmp/collection/debian-trixie.nt
+
+                  # Sync cache back to Minio
+                  if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
+                    echo "Syncing cache to Minio..."
+                    mc mirror --overwrite "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
+                  fi
+
+                  echo "Collection complete"

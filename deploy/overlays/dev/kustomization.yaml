@@ -3,15 +3,30 @@ kind: Kustomization
 
 resources:
   - ../../base
-  - jobs/collect-debian-trixie.yaml
-  - jobs/collect-fedora-43.yaml
-  - jobs/collect-fedora-rawhide.yaml
-  - jobs/collect-centos-stream-9.yaml
+  # Consolidated -full collectors (replace per-arch jobs with richer multi-arch + enrichment)
+  - jobs/collect-fedora-43-full.yaml
+  # collect-fedora-43.yaml, collect-fedora-43-aarch64.yaml — superseded by fedora-43-full (multi-arch + koji + spec)
+  - jobs/collect-fedora-44.yaml
+  - jobs/collect-fedora-riscv64.yaml
+  - jobs/collect-debian-trixie-full.yaml
+  # collect-debian-trixie.yaml, collect-debian-trixie-arm64.yaml — superseded by debian-trixie-full (multi-arch + sources + salsa)
+  - jobs/collect-debian-sid-riscv64.yaml
+  - jobs/collect-ubuntu-noble.yaml
+  - jobs/collect-ubuntu-noble-arm64.yaml
+  - jobs/collect-ubuntu-noble-riscv64.yaml
+  - jobs/collect-centos-stream-9-full.yaml
+  # collect-centos-stream-9.yaml, collect-centos-stream-9-aarch64.yaml — superseded by centos-stream-9-full (multi-arch + spec)
   - jobs/collect-centos-stream-10.yaml
+  - jobs/collect-centos-stream-10-aarch64.yaml
   - jobs/collect-opensuse-tw.yaml
+  - jobs/collect-opensuse-tw-aarch64.yaml
+  - jobs/collect-opensuse-tw-riscv64.yaml
   - jobs/collect-alpine-v320.yaml
+  - jobs/collect-alpine-v320-aarch64.yaml
+  - jobs/collect-alpine-edge-riscv64.yaml
   - jobs/collect-homebrew.yaml
   - jobs/collect-arch.yaml
+  - jobs/collect-archarm-aarch64.yaml
   - jobs/collect-npm.yaml
   - jobs/collect-pypi.yaml
   - jobs/collect-cargo.yaml
@@ -32,16 +47,18 @@ resources:
   - jobs/collect-freebsd.yaml
   - jobs/collect-nix.yaml
   - jobs/collect-chocolatey.yaml
+  - jobs/collect-openwrt-2410-full.yaml
+  - jobs/rebuild-tdb2.yaml
   - jobs/snapshot-tdb2.yaml
-  - jobs/enrich-github-vcs.yaml
-  - jobs/enrich-license.yaml
-  - jobs/enrich-metrics.yaml
-  - jobs/enrich-vcs-activity.yaml
-  - jobs/enrich-security-system.yaml
-  - jobs/enrich-security-lang.yaml
+  - rbac/rebuild-tdb2-rbac.yaml
+  - jobs/enrich-github.yaml
+  # enrich-security-system and enrich-security-lang REMOVED — replaced by collect-osv.yaml
+  # The old enrichers hit api.osv.dev per-package (68K+ API calls per ecosystem).
+  # collect-osv-* downloads bulk data from gs://osv-vulnerabilities instead.
   - jobs/enrich-advisory.yaml
   - jobs/enrich-npm-provenance.yaml
   - jobs/enrich-koji.yaml
+  - jobs/enrich-repology.yaml
   - jobs/validate-data.yaml
 
 patches:

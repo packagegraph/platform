@@ -1,0 +1,73 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: collect-fedora-43-full
+  namespace: packagegraph
+  annotations:
+    description: "Consolidated multi-arch RPM collection with Koji + spec enrichment"
+spec:
+  schedule: "0 3 * * 0"  # Weekly Sunday 3am (before old per-arch jobs)
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 14400  # 4 hours (multi-arch + koji + spec)
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: etl
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+                - {name: GRAPH_URI, value: "https://packagegraph.github.io/graph/fedora/43"}
+              resources: {requests: {cpu: 500m, memory: 2Gi}, limits: {cpu: "2", memory: 4Gi}}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  mkdir -p /tmp/collection
+                  CACHE_DIR=/tmp/cache/rpm-full
+                  MINIO_CACHE="pgraph/${MINIO_BUCKET}/collector-cache/fedora-43-full"
+                  mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
+
+                  # Warm cache from Minio
+                  if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
+                    echo "Syncing cache from Minio..."
+                    mc mirror --overwrite "${MINIO_CACHE}/" "${CACHE_DIR}/" 2>/dev/null || true
+                    echo "Cache warmed: $(find "${CACHE_DIR}" -type f 2>/dev/null | wc -l) entries"
+                  fi
+
+                  # Consolidated collection: multi-arch + koji + spec
+                  pg-collect rpm-full \
+                    --url https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Everything/x86_64/os/ \
+                    --url https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Everything/aarch64/os/ \
+                    --distro fedora --release 43 \
+                    --with-koji --koji-hub https://koji.fedoraproject.org/kojihub \
+                    --with-spec \
+                    --with-maintainers \
+                    --cache-dir "${CACHE_DIR}" \
+                    -o /tmp/collection/fedora-43.nt
+
+                  # Load to Fuseki
+                  pg-collect load \
+                    --endpoint "$FUSEKI_ENDPOINT" \
+                    --graph "$GRAPH_URI" \
+                    /tmp/collection/fedora-43.nt
+
+                  # Sync cache back to Minio
+                  if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
+                    echo "Syncing cache to Minio..."
+                    mc mirror --overwrite "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
+                  fi
+
+                  echo "Collection complete"
