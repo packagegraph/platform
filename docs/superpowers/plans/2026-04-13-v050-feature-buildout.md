@@ -445,7 +445,7 @@ git commit -m "feat(fuseki): enable SPARQL Update endpoint for named graph write
 ### Task 5: Add pkg:DataSnapshot to Ontology
 
 **Files:**
-- Modify: `/Users/bharrington/Projects/packagegraph/ontology/core.ttl`
+- Modify: `../ontology/core.ttl`
 
 - [ ] **Step 1: Add DataSnapshot class and properties to core.ttl**
 
@@ -495,7 +495,7 @@ Add before the closing triples of core.ttl (after the last class definition):
 - [ ] **Step 2: Validate the ontology parses**
 
 ```bash
-cd /Users/bharrington/Projects/packagegraph/ontology && uv run python -c "import rdflib; g = rdflib.Graph(); g.parse('core.ttl', format='turtle'); print(f'OK: {len(g)} triples')"
+cd ../ontology && uv run python -c "import rdflib; g = rdflib.Graph(); g.parse('core.ttl', format='turtle'); print(f'OK: {len(g)} triples')"
 ```
 
 Expected: `OK: <number> triples` (higher than before)
@@ -503,13 +503,13 @@ Expected: `OK: <number> triples` (higher than before)
 - [ ] **Step 3: Copy updated ontology to platform ETL build context**
 
 ```bash
-cp /Users/bharrington/Projects/packagegraph/ontology/*.ttl /Users/bharrington/Projects/packagegraph/platform/etl/ontology/
+cp ../ontology/*.ttl etl/ontology/
 ```
 
 - [ ] **Step 4: Commit in ontology repo**
 
 ```bash
-cd /Users/bharrington/Projects/packagegraph/ontology
+cd ../ontology
 git add core.ttl
 git commit -m "feat(core): add pkg:DataSnapshot class for graph provenance metadata"
 ```
@@ -555,7 +555,7 @@ COPY catalog.html /fuseki/webapp/catalog.html
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/bharrington/Projects/packagegraph/platform
+cd .
 git add fuseki/catalog.html fuseki/Containerfile
 git commit -m "feat(fuseki): add SPARQL query catalog page with YASGUI"
 ```
@@ -640,7 +640,7 @@ class TestSparqlQueryClient:
 - [ ] **Step 2: Run test to verify it fails**
 
 ```bash
-cd /Users/bharrington/Projects/packagegraph/platform/etl && uv run pytest tests/test_sparql_client.py -q
+cd etl && uv run pytest tests/test_sparql_client.py -q
 ```
 
 Expected: `ModuleNotFoundError: No module named 'packagegraph.sparql_client'`
@@ -702,7 +702,7 @@ class SparqlQueryClient:
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-cd /Users/bharrington/Projects/packagegraph/platform/etl && uv run pytest tests/test_sparql_client.py -q
+cd etl && uv run pytest tests/test_sparql_client.py -q
 ```
 
 Expected: `3 passed`
@@ -808,7 +808,7 @@ class TestSecurityEnricher:
 - [ ] **Step 2: Run test to verify it fails**
 
 ```bash
-cd /Users/bharrington/Projects/packagegraph/platform/etl && uv run pytest tests/test_enrichers/test_security.py -q
+cd etl && uv run pytest tests/test_enrichers/test_security.py -q
 ```
 
 Expected: `ModuleNotFoundError: No module named 'packagegraph.enrichers'`
@@ -959,7 +959,7 @@ def _write_literal(f, subject_uri: str, predicate_uri: str, value: str):
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd /Users/bharrington/Projects/packagegraph/platform/etl && uv run pytest tests/test_enrichers/test_security.py -q
+cd etl && uv run pytest tests/test_enrichers/test_security.py -q
 ```
 
 Expected: `2 passed`
@@ -1046,7 +1046,7 @@ class TestGitHubEnricher:
 - [ ] **Step 2: Run test to verify it fails**
 
 ```bash
-cd /Users/bharrington/Projects/packagegraph/platform/etl && uv run pytest tests/test_enrichers/test_github.py -q
+cd etl && uv run pytest tests/test_enrichers/test_github.py -q
 ```
 
 Expected: `ModuleNotFoundError`
@@ -1221,7 +1221,7 @@ def _write_integer(f, subject_uri: str, predicate_uri: str, value: int):
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd /Users/bharrington/Projects/packagegraph/platform/etl && uv run pytest tests/test_enrichers/test_github.py -q
+cd etl && uv run pytest tests/test_enrichers/test_github.py -q
 ```
 
 Expected: `1 passed`

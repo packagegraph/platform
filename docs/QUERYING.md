@@ -1,10 +1,11 @@
 # Querying PackageGraph
 
-Three interfaces for exploring PackageGraph's RDF knowledge graph, from visual
-exploration to programmatic access. No Java required.
+Two interfaces for exploring PackageGraph's RDF knowledge graph: a browser-based
+SPARQL editor and a Jupyter notebook. No Java required.
 
-**Current dataset:** 7M+ triples, 286K packages, 6 Linux distributions
-(Debian trixie, Fedora 42/43/Rawhide, CentOS Stream 9/10, openSUSE Tumbleweed).
+**Current dataset:** ~37.5M triples across 10 named graphs (Fedora 43/Rawhide,
+Debian trixie, openSUSE Tumbleweed, RHEL 9/10, CentOS Stream 9/10, Homebrew,
+Gentoo, plus security and enrichment graphs).
 
 ---
 
@@ -13,7 +14,7 @@ exploration to programmatic access. No Java required.
 - [Connecting to Fuseki](#connecting-to-fuseki)
 - [1. YASGUI Web Interface](#1-yasgui-web-interface)
 - [2. Jupyter Notebook](#2-jupyter-notebook)
-- [3. CLI Query Commands](#3-cli-query-commands)
+- [3. curl / SPARQL](#3-curl--sparql)
 - [SPARQL Reference](#sparql-reference)
 - [Administration](#administration)
 
@@ -189,156 +190,64 @@ available without declaration.
 
 ---
 
-## 3. CLI Query Commands
+## 3. curl / SPARQL
 
-**Package:** `packagegraph` (installed via the ETL package)
+Query Fuseki directly with `curl`. Pipe through `jq` for JSON, or use
+tab-separated output for shell scripting.
 
-Canned SPARQL queries as CLI commands. Output is JSON to stdout — pipe to `jq`,
-redirect to files, or use in scripts.
-
-### Setup
+### Distribution Statistics
 
 ```bash
-# Install the ETL package (if not already)
-cd platform/etl
-uv sync
-
-# Set the endpoint (avoids --fuseki-endpoint on every call)
-export FUSEKI_ENDPOINT=http://localhost:3030/packagegraph
+curl -s -H 'Accept: text/tab-separated-values' \
+  'http://localhost:3030/packagegraph/sparql' \
+  --data-urlencode 'query=
+    PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    SELECT ?distro (COUNT(DISTINCT ?p) AS ?packages) WHERE {
+      ?p a pkg:Package ; pkg:partOfRelease ?r .
+      ?r ^pkg:hasRelease/rdfs:label ?distro .
+    } GROUP BY ?distro ORDER BY DESC(?packages)' | column -t
 ```
 
-All commands accept `--fuseki-endpoint` explicitly or read `FUSEKI_ENDPOINT`
-from the environment.
-
-### Commands
-
-#### `query-stats` — Distribution Statistics
-
-Package and version counts per distribution.
+### Search Packages
 
 ```bash
-packagegraph query-stats | jq .
+curl -s -H 'Accept: application/sparql-results+json' \
+  'http://localhost:3030/packagegraph/sparql' \
+  --data-urlencode 'query=
+    PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+    SELECT ?name ?version WHERE {
+      ?p pkg:packageName ?name ; pkg:hasVersion ?v .
+      ?v pkg:versionString ?version .
+      FILTER(CONTAINS(LCASE(?name), "openssl"))
+    } LIMIT 20' | jq '.results.bindings[] | {name: .name.value, version: .version.value}'
 ```
 
-```json
-[
-  {"distro": "debian", "packages": "68757", "versions": "68757"},
-  {"distro": "fedora-43", "packages": "72341", "versions": "72341"}
-]
-```
-
-#### `query-search NAME` — Search Packages
-
-Find packages matching a name substring across all distributions.
+### Named Graph Inventory
 
 ```bash
-# Search for packages containing "curl"
-packagegraph query-search curl | jq .
-
-# Limit results
-packagegraph query-search openssl --limit 10 | jq .
-```
-
-```json
-[
-  {"name": "curl", "version": "7.88.1-10+deb12u8", "distro": "debian"},
-  {"name": "curl", "version": "8.6.0-3.fc42", "distro": "fedora-42"},
-  {"name": "libcurl4", "version": "7.88.1-10+deb12u8", "distro": "debian"}
-]
-```
-
-#### `query-deps NAME` — Dependencies
-
-What a package depends on, or who depends on it.
-
-```bash
-# Forward dependencies: what does bash need?
-packagegraph query-deps bash | jq .
-
-# Reverse dependencies: what needs openssl?
-packagegraph query-deps openssl --reverse | jq .
-```
-
-```json
-[
-  {"dep_name": "libc6", "dep_type": "depends"},
-  {"dep_name": "libtinfo6", "dep_type": "depends"}
-]
-```
-
-#### `query-vulns` — Vulnerabilities
-
-Packages with known CVEs. Optionally filter to a specific package.
-
-```bash
-# All vulnerable packages (most recent first)
-packagegraph query-vulns | jq .
-
-# Vulnerabilities for a specific package
-packagegraph query-vulns --package openssl | jq .
-
-# Top 10 most recent
-packagegraph query-vulns --limit 10 | jq .
-```
-
-```json
-[
-  {
-    "pkg_name": "openssl",
-    "cve_id": "CVE-2024-9143",
-    "severity": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L",
-    "published": "2024-10-16T00:00:00Z"
-  }
-]
-```
-
-#### `query-graphs` — Named Graph Inventory
-
-What named graphs exist and how many triples each contains.
-
-```bash
-packagegraph query-graphs | jq .
-```
-
-```json
-[
-  {"graph": "https://packagegraph.github.io/graph/debian/trixie", "triples": "4362796"},
-  {"graph": "https://packagegraph.github.io/graph/fedora/43", "triples": "1245000"}
-]
-```
-
-#### `query-raw "SPARQL"` — Raw SPARQL
-
-Execute any SPARQL query. Prefixes are NOT added automatically — include them
-in the query string.
-
-```bash
-packagegraph query-raw "
-  PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
-  SELECT ?name WHERE {
-    ?p a pkg:BinaryPackage ; pkg:packageName ?name .
-  }
-  LIMIT 5
-" | jq .
+curl -s -H 'Accept: text/tab-separated-values' \
+  'http://localhost:3030/packagegraph/sparql' \
+  --data-urlencode 'query=
+    SELECT ?graph (COUNT(*) AS ?triples) WHERE {
+      GRAPH ?graph { ?s ?p ?o }
+    } GROUP BY ?graph ORDER BY DESC(?triples)' | column -t
 ```
 
 ### Composing with Shell Tools
 
 ```bash
-# Count packages per distro, format as table
-packagegraph query-stats | jq -r '.[] | [.distro, .packages] | @tsv' | column -t
-
-# Find vulnerable packages and save to CSV
-packagegraph query-vulns --limit 1000 | jq -r '
-  ["package","cve","severity","published"],
-  (.[] | [.pkg_name, .cve_id, .severity, .published])
-  | @csv' > vulns.csv
-
-# Check if a specific package exists
-packagegraph query-search nginx --limit 1 | jq 'length > 0'
-
-# Reverse deps of openssl, sorted by name
-packagegraph query-deps openssl --reverse | jq 'sort_by(.pkg_name)'
+# Export vulnerable packages as CSV
+curl -s -H 'Accept: application/sparql-results+json' \
+  'http://localhost:3030/packagegraph/sparql' \
+  --data-urlencode 'query=
+    PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+    PREFIX sec: <https://purl.org/packagegraph/ontology/security#>
+    SELECT ?pkg ?cve WHERE {
+      ?v sec:cveId ?cve ; sec:affectsPackage ?p .
+      ?p pkg:packageName ?pkg .
+    } LIMIT 1000' \
+  | jq -r '["package","cve"], (.results.bindings[] | [.pkg.value, .cve.value]) | @csv' > vulns.csv
 ```
 
 ---
@@ -356,7 +265,7 @@ PREFIX sec:  <https://purl.org/packagegraph/ontology/security#>
 PREFIX vcs:  <https://purl.org/packagegraph/ontology/vcs#>
 PREFIX slsa: <https://purl.org/packagegraph/ontology/slsa#>
 PREFIX met:  <https://purl.org/packagegraph/ontology/metrics#>
-PREFIX deb:  <https://purl.org/packagegraph/ontology/debian#>
+PREFIX deb:  <https://purl.org/packagegraph/ontology/deb#>
 PREFIX rpm:  <https://purl.org/packagegraph/ontology/rpm#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
 PREFIX foaf: <http://xmlns.com/foaf/0.1/>
@@ -616,17 +525,20 @@ Data is partitioned into named graphs by collection source:
 
 | Graph URI | Source |
 |-----------|--------|
-| `https://packagegraph.github.io/graph/debian/trixie` | Debian trixie (stable) |
-| `https://packagegraph.github.io/graph/fedora/43` | Fedora 43 |
-| `https://packagegraph.github.io/graph/fedora/42` | Fedora 42 |
-| `https://packagegraph.github.io/graph/fedora/rawhide` | Fedora Rawhide |
-| `https://packagegraph.github.io/graph/centos-stream/9` | CentOS Stream 9 |
-| `https://packagegraph.github.io/graph/centos-stream/10` | CentOS Stream 10 |
-| `https://packagegraph.github.io/graph/opensuse/tumbleweed` | openSUSE Tumbleweed |
-| `https://packagegraph.github.io/ontology` | OWL ontology (TBox) |
-| `https://packagegraph.github.io/graph/enrichment/license` | License claims |
-| `https://packagegraph.github.io/graph/enrichment/metrics` | Metrics claims |
-| `https://packagegraph.github.io/graph/enrichment/vcs-activity` | VCS activity claims |
+| `graph/fedora/43` | Fedora 43 (77K packages) |
+| `graph/fedora/rawhide` | Fedora Rawhide (76K packages) |
+| `graph/debian/trixie` | Debian trixie (69K packages) |
+| `graph/opensuse/tumbleweed` | openSUSE Tumbleweed (56K packages) |
+| `graph/rhel/9` | RHEL 9 (31K packages) |
+| `graph/rhel/10` | RHEL 10 (9K packages) |
+| `graph/centos-stream/9` | CentOS Stream 9 |
+| `graph/centos-stream/10` | CentOS Stream 10 |
+| `graph/homebrew` | Homebrew |
+| `graph/gentoo` | Gentoo (dependency-only) |
+| `graph/security/osv` | OSV vulnerability data |
+| `ontology` | OWL ontology (TBox) |
+
+Graph URIs are prefixed with `https://packagegraph.github.io/`.
 
 ### Monitoring
 

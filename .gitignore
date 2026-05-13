@@ -16,3 +16,11 @@ target/
 # Ontology TTLs copied at build time from ontology repo
 etl/ontology/
 .codegraph/
+.worktrees/
+
+# Large collector output / test fixtures
+test-data/collector/*.nt
+etl/snapshots/
+
+# Development plans (workflow artifacts, not project docs)
+docs/plans/

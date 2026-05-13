@@ -1,0 +1,71 @@
+{
+  "generated_at": "1776579488",
+  "endpoint": "http://localhost:3031/packagegraph",
+  "config": "test-corpus.toml",
+  "ontology_dir": "../../../ontology",
+  "depth": 2,
+  "fan_out": 20,
+  "total_triples": 1135652,
+  "files": [
+    {
+      "path": "collector/fedora-44.nt",
+      "graph": "https://packagegraph.github.io/graph/fedora/44",
+      "triples": 223179
+    },
+    {
+      "path": "collector/alpine-v3.20.nt",
+      "graph": "https://packagegraph.github.io/graph/alpine/v3.20",
+      "triples": 15897
+    },
+    {
+      "path": "collector/opensuse-tumbleweed.nt",
+      "graph": "https://packagegraph.github.io/graph/opensuse/tumbleweed",
+      "triples": 120682
+    },
+    {
+      "path": "collector/fedora-43.nt",
+      "graph": "https://packagegraph.github.io/graph/fedora/43",
+      "triples": 224976
+    },
+    {
+      "path": "collector/conda-forge.nt",
+      "graph": "https://packagegraph.github.io/graph/conda-forge",
+      "triples": 155893
+    },
+    {
+      "path": "collector/centos-stream-9.nt",
+      "graph": "https://packagegraph.github.io/graph/centos-stream/9",
+      "triples": 65331
+    },
+    {
+      "path": "collector/fedora-44-riscv64.nt",
+      "graph": "https://packagegraph.github.io/graph/fedora/44/riscv64",
+      "triples": 159023
+    },
+    {
+      "path": "collector/homebrew.nt",
+      "graph": "https://packagegraph.github.io/graph/homebrew",
+      "triples": 22041
+    },
+    {
+      "path": "collector/ubuntu-noble.nt",
+      "graph": "https://packagegraph.github.io/graph/ubuntu/noble",
+      "triples": 33512
+    },
+    {
+      "path": "collector/debian-trixie.nt",
+      "graph": "https://packagegraph.github.io/graph/debian/trixie",
+      "triples": 93092
+    },
+    {
+      "path": "collector/freebsd-14.nt",
+      "graph": "https://packagegraph.github.io/graph/freebsd/14",
+      "triples": 21739
+    },
+    {
+      "path": "collector/gap-fill.nt",
+      "graph": "gap-fill",
+      "triples": 287
+    }
+  ]
+}
