@@ -1,7 +1,28 @@
 use reqwest::blocking::Client;
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Error, ErrorKind, Result};
 use std::time::{Duration, Instant};
+
+/// SPARQL JSON results format (application/sparql-results+json)
+#[derive(Debug, Deserialize)]
+struct SparqlResults {
+    results: SparqlBindings,
+}
+
+#[derive(Debug, Deserialize)]
+struct SparqlBindings {
+    bindings: Vec<HashMap<String, SparqlValue>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SparqlValue {
+    value: String,
+    #[serde(rename = "type")]
+    #[allow(dead_code)]
+    value_type: Option<String>,
+}
 
 pub struct SparqlClient {
     client: Client,
@@ -69,6 +90,249 @@ impl SparqlClient {
         self.update(&sparql)
     }
 
+    /// Execute a SPARQL SELECT query and return bindings as a list of variable→value maps.
+    ///
+    /// Each binding is a HashMap where keys are variable names (without ?) and values
+    /// are the string representations of the bound values (URIs or literals).
+    pub fn query(&self, sparql: &str) -> Result<Vec<HashMap<String, String>>> {
+        let url = format!("{}/sparql", self.endpoint);
+
+        let response = self.client
+            .post(&url)
+            .header("Accept", "application/sparql-results+json")
+            .form(&[("query", sparql)])
+            .send()
+            .map_err(|e| Error::new(ErrorKind::Other, format!("SPARQL query failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("SPARQL query failed with status {}: {}",
+                    response.status(),
+                    response.text().unwrap_or_default())
+            ));
+        }
+
+        let results: SparqlResults = response.json()
+            .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to parse SPARQL JSON: {}", e)))?;
+
+        Ok(results.results.bindings.into_iter().map(|binding| {
+            binding.into_iter().map(|(k, v)| (k, v.value)).collect()
+        }).collect())
+    }
+
+    /// Query for packages of a given RDF type, returning (package_uri, name, version) tuples.
+    pub fn query_packages_by_type(&self, rdf_type: &str) -> Result<Vec<(String, String, String)>> {
+        let sparql = format!(
+            "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\n\
+             SELECT ?pkg ?name ?version WHERE {{\n\
+               ?pkg a <{rdf_type}> ;\n\
+                    pkg:packageName ?name ;\n\
+                    pkg:hasVersion ?v .\n\
+               ?v pkg:versionString ?version .\n\
+             }}"
+        );
+
+        let bindings = self.query(&sparql)?;
+        Ok(bindings.into_iter().filter_map(|b| {
+            Some((
+                b.get("pkg")?.clone(),
+                b.get("name")?.clone(),
+                b.get("version")?.clone(),
+            ))
+        }).collect())
+    }
+
+    /// Graph-scoped variant of query_packages_by_type.
+    pub fn query_packages_by_type_in_graph(&self, rdf_type: &str, graph_uri: &str) -> Result<Vec<(String, String, String)>> {
+        let sparql = format!(
+            "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\n\
+             SELECT ?pkg ?name ?version WHERE {{\n\
+               GRAPH <{graph_uri}> {{\n\
+                 ?pkg a <{rdf_type}> ;\n\
+                      pkg:packageName ?name ;\n\
+                      pkg:hasVersion ?v .\n\
+                 ?v pkg:versionString ?version .\n\
+               }}\n\
+             }}"
+        );
+
+        let bindings = self.query(&sparql)?;
+        Ok(bindings.into_iter().filter_map(|b| {
+            Some((
+                b.get("pkg")?.clone(),
+                b.get("name")?.clone(),
+                b.get("version")?.clone(),
+            ))
+        }).collect())
+    }
+
+    /// Query for packages with GitHub homepages, returning (package_uri, homepage_url, maintainer_uri) tuples.
+    pub fn query_github_homepages(&self) -> Result<Vec<(String, String, Option<String>)>> {
+        let sparql = "\
+            PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\n\
+            SELECT DISTINCT ?pkg ?homepage ?maintainer WHERE {\n\
+              ?pkg pkg:homepage ?homepage .\n\
+              FILTER(CONTAINS(STR(?homepage), \"github.com\"))\n\
+              OPTIONAL { ?pkg pkg:maintainedBy ?maintainer }\n\
+            }";
+
+        let bindings = self.query(sparql)?;
+        Ok(bindings.into_iter().filter_map(|b| {
+            Some((
+                b.get("pkg")?.clone(),
+                b.get("homepage")?.clone(),
+                b.get("maintainer").cloned(),
+            ))
+        }).collect())
+    }
+
+    /// Query for unique (package_name, version_string) pairs.
+    pub fn query_package_names_and_versions(&self) -> Result<Vec<(String, String)>> {
+        let sparql = "\
+            PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\n\
+            SELECT DISTINCT ?name ?version WHERE {\n\
+              ?p a pkg:BinaryPackage .\n\
+              ?p pkg:packageName ?name .\n\
+              ?p pkg:hasVersion ?v .\n\
+              ?v pkg:versionString ?version .\n\
+            }";
+
+        let bindings = self.query(sparql)?;
+        Ok(bindings.into_iter().filter_map(|b| {
+            Some((b.get("name")?.clone(), b.get("version")?.clone()))
+        }).collect())
+    }
+
+    /// Query for GitHub repositories ranked by enrichment value, with maintainer URIs.
+    ///
+    /// Returns repositories ordered by:
+    /// 1. Unenriched repos before already-enriched repos
+    /// 2. Total package coverage count per homepage (DESC)
+    /// 3. Homepage URL (ASC for determinism)
+    ///
+    /// For repos with multiple maintainers, returns all (homepage, maintainer) pairs.
+    /// Package count is computed per homepage (not per homepage+maintainer pair) via subquery,
+    /// so ranking reflects true repo coverage and LIMIT applies to unique repos.
+    ///
+    /// `graph_uri` is the enrichment graph to check for already-enriched repos.
+    /// `limit` bounds the result set by unique repos.
+    ///
+    /// Returns: Vec<(homepage, maintainer_uri_option, repo_package_count)>
+    pub fn query_github_candidates(&self, graph_uri: &str, limit: usize) -> Result<Vec<(String, Option<String>, usize)>> {
+        let sparql = format!(
+            "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\n\
+             PREFIX vcs: <https://purl.org/packagegraph/ontology/vcs#>\n\
+             SELECT DISTINCT ?homepage ?maintainer ?packageCount WHERE {{\n\
+               {{\n\
+                 SELECT ?homepage (COUNT(DISTINCT ?pkg) AS ?packageCount) WHERE {{\n\
+                   ?pkg pkg:homepage ?rawHomepage .\n\
+                   FILTER(CONTAINS(STR(?rawHomepage), \"github.com\"))\n\
+                   BIND(REPLACE(REPLACE(REPLACE(REPLACE(STR(?rawHomepage), \"#.*$\", \"\"), \"^http://\", \"https://\"), \"\\\\.git$\", \"\"), \"/$\", \"\") AS ?homepage)\n\
+                   FILTER NOT EXISTS {{\n\
+                     GRAPH <{graph_uri}> {{\n\
+                       ?enrichedURI vcs:repositoryURL ?enrichedURL .\n\
+                       FILTER(STR(?homepage) = STR(?enrichedURL) || STRSTARTS(STR(?homepage), CONCAT(STR(?enrichedURL), \"/\")))\n\
+                     }}\n\
+                   }}\n\
+                 }}\n\
+                 GROUP BY ?homepage\n\
+                 ORDER BY DESC(?packageCount) ASC(?homepage)\n\
+                 LIMIT {limit}\n\
+               }}\n\
+               ?pkg2 pkg:homepage ?rawHomepage2 .\n\
+               BIND(REPLACE(REPLACE(REPLACE(REPLACE(STR(?rawHomepage2), \"#.*$\", \"\"), \"^http://\", \"https://\"), \"\\\\.git$\", \"\"), \"/$\", \"\") AS ?homepage2)\n\
+               FILTER(?homepage2 = ?homepage)\n\
+               OPTIONAL {{ ?pkg2 pkg:maintainedBy ?maintainer }}\n\
+             }}\n\
+             ORDER BY DESC(?packageCount) ASC(?homepage) ASC(?maintainer)",
+            graph_uri = graph_uri,
+            limit = limit
+        );
+
+        let bindings = self.query(&sparql)?;
+        Ok(bindings.into_iter().filter_map(|b| {
+            let homepage = b.get("homepage")?.clone();
+            let maintainer = b.get("maintainer").cloned();
+            let count = b.get("packageCount")?.parse::<usize>().ok()?;
+            Some((homepage, maintainer, count))
+        }).collect())
+    }
+
+    /// Query for forge instances with their URLs and software types.
+    ///
+    /// Returns (forge_uri, forge_url, forge_software_uri) tuples for all vcs:Forge
+    /// entities in the graph that have both forgeUrl and forgeSoftware properties.
+    pub fn query_forge_instances(&self) -> Result<Vec<(String, String, String)>> {
+        let sparql = "\
+            PREFIX vcs: <https://purl.org/packagegraph/ontology/vcs#>\n\
+            SELECT DISTINCT ?forge ?forgeUrl ?forgeSoftware WHERE {\n\
+              ?forge a vcs:Forge ;\n\
+                     vcs:forgeUrl ?forgeUrl ;\n\
+                     vcs:forgeSoftware ?forgeSoftware .\n\
+            }";
+
+        let bindings = self.query(sparql)?;
+        Ok(bindings.into_iter().filter_map(|b| {
+            Some((
+                b.get("forge")?.clone(),
+                b.get("forgeUrl")?.clone(),
+                b.get("forgeSoftware")?.clone(),
+            ))
+        }).collect())
+    }
+
+    /// Execute a SPARQL CONSTRUCT query and return raw N-Triple lines.
+    ///
+    /// POSTs to the /sparql endpoint with Accept: application/n-triples.
+    /// Returns each non-empty line as a String. Uses the same retry logic
+    /// as update() for transient failures.
+    pub fn query_construct(&self, sparql: &str) -> Result<Vec<String>> {
+        let url = format!("{}/sparql", self.endpoint);
+        let max_retries = 3;
+
+        for attempt in 0..=max_retries {
+            match self.client
+                .post(&url)
+                .header("Accept", "application/n-triples")
+                .form(&[("query", sparql)])
+                .send()
+            {
+                Ok(response) if response.status().is_success() => {
+                    let body = response.text()
+                        .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to read CONSTRUCT response: {}", e)))?;
+                    return Ok(body.lines()
+                        .map(|l| l.trim())
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .map(|l| l.to_string())
+                        .collect());
+                }
+                Ok(response) if response.status().is_server_error() && attempt < max_retries => {
+                    let delay = 5 * (1 << attempt);
+                    eprintln!("    CONSTRUCT query failed ({}), retrying in {}s...", response.status(), delay);
+                    std::thread::sleep(Duration::from_secs(delay));
+                }
+                Ok(response) => {
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        format!("CONSTRUCT query failed with status {}: {}",
+                            response.status(),
+                            response.text().unwrap_or_default())
+                    ));
+                }
+                Err(e) if attempt < max_retries => {
+                    let delay = 5 * (1 << attempt);
+                    eprintln!("    CONSTRUCT query error: {}, retrying in {}s...", e, delay);
+                    std::thread::sleep(Duration::from_secs(delay));
+                }
+                Err(e) => {
+                    return Err(Error::new(ErrorKind::Other, format!("CONSTRUCT query failed: {}", e)));
+                }
+            }
+        }
+        Ok(vec![])
+    }
+
     /// Load an N-Triples file into a named graph via Fuseki's Graph Store Protocol.
     ///
     /// Uses POST to the GSP endpoint with the raw .nt file body, bypassing SPARQL
@@ -92,6 +356,17 @@ impl SparqlClient {
                 self.load_file_batched(file_path, graph_uri, batch_size)
             }
         }
+    }
+
+    /// Upload an N-Triples file to a named graph via Graph Store Protocol POST.
+    ///
+    /// GSP POST is additive — triples are appended to the existing graph, not replaced.
+    /// On failure: logs error with HTTP status code and returns Err to stop the caller.
+    /// The file is left on disk for operator debugging and manual retry via `pg-collect load`.
+    ///
+    /// Chunked upload (10MB per POST) avoids Fuseki JVM memory issues on large files.
+    pub fn gsp_post_file(&self, file_path: &str, graph_uri: &str) -> Result<()> {
+        self.gsp_upload(file_path, graph_uri)
     }
 
     /// Upload an N-Triples file via Graph Store Protocol in chunks.
@@ -232,7 +507,7 @@ impl SparqlClient {
         Ok(total)
     }
 
-    fn insert_batch(&self, triples: &[String], graph_uri: &str) -> Result<()> {
+    pub(crate) fn insert_batch(&self, triples: &[String], graph_uri: &str) -> Result<()> {
         let mut sparql = format!("INSERT DATA {{\n  GRAPH <{}> {{\n", graph_uri);
 
         for triple in triples {
@@ -293,5 +568,250 @@ mod tests {
         let count = count_triples(temp.path().to_str().unwrap())?;
         assert_eq!(count, 2);
         Ok(())
+    }
+
+    #[test]
+    fn test_parse_sparql_json_results() {
+        let json = r#"{
+            "results": {
+                "bindings": [
+                    {
+                        "name": {"type": "literal", "value": "openssl"},
+                        "version": {"type": "literal", "value": "3.1.4"}
+                    },
+                    {
+                        "name": {"type": "literal", "value": "curl"},
+                        "version": {"type": "literal", "value": "8.5.0"}
+                    }
+                ]
+            }
+        }"#;
+
+        let results: SparqlResults = serde_json::from_str(json).unwrap();
+        assert_eq!(results.results.bindings.len(), 2);
+        assert_eq!(results.results.bindings[0]["name"].value, "openssl");
+        assert_eq!(results.results.bindings[0]["version"].value, "3.1.4");
+        assert_eq!(results.results.bindings[1]["name"].value, "curl");
+        assert_eq!(results.results.bindings[1]["version"].value, "8.5.0");
+    }
+
+    #[test]
+    fn test_parse_sparql_json_with_uri_values() {
+        let json = r#"{
+            "results": {
+                "bindings": [
+                    {
+                        "pkg": {"type": "uri", "value": "https://packagegraph.github.io/d/pkg/debian/trixie/amd64/openssl/3.1.4"},
+                        "homepage": {"type": "literal", "value": "https://github.com/openssl/openssl"}
+                    }
+                ]
+            }
+        }"#;
+
+        let results: SparqlResults = serde_json::from_str(json).unwrap();
+        assert_eq!(results.results.bindings.len(), 1);
+        assert_eq!(
+            results.results.bindings[0]["pkg"].value,
+            "https://packagegraph.github.io/d/pkg/debian/trixie/amd64/openssl/3.1.4"
+        );
+        assert_eq!(
+            results.results.bindings[0]["homepage"].value,
+            "https://github.com/openssl/openssl"
+        );
+    }
+
+    #[test]
+    fn test_parse_sparql_json_empty_results() {
+        let json = r#"{"results": {"bindings": []}}"#;
+        let results: SparqlResults = serde_json::from_str(json).unwrap();
+        assert_eq!(results.results.bindings.len(), 0);
+    }
+
+    #[test]
+    fn test_query_with_mockito() {
+        let mut server = mockito::Server::new();
+        let mock = server.mock("POST", "/sparql")
+            .match_header("accept", "application/sparql-results+json")
+            .with_status(200)
+            .with_header("content-type", "application/sparql-results+json")
+            .with_body(r#"{
+                "results": {
+                    "bindings": [
+                        {"name": {"type": "literal", "value": "bash"}, "version": {"type": "literal", "value": "5.2"}}
+                    ]
+                }
+            }"#)
+            .create();
+
+        let client = SparqlClient::new(&server.url());
+        let results = client.query("SELECT ?name ?version WHERE { ?p a pkg:Package }").unwrap();
+
+        mock.assert();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["name"], "bash");
+        assert_eq!(results[0]["version"], "5.2");
+    }
+
+    #[test]
+    fn test_query_construct_returns_ntriples() {
+        let mut server = mockito::Server::new();
+        let mock = server.mock("POST", "/sparql")
+            .match_header("accept", "application/n-triples")
+            .with_status(200)
+            .with_header("content-type", "application/n-triples")
+            .with_body("<http://s1> <http://p1> <http://o1> .\n<http://s2> <http://p2> <http://o2> .\n")
+            .create();
+
+        let client = SparqlClient::new(&server.url());
+        let triples = client.query_construct("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o } LIMIT 2").unwrap();
+
+        mock.assert();
+        assert_eq!(triples.len(), 2);
+        assert_eq!(triples[0], "<http://s1> <http://p1> <http://o1> .");
+        assert_eq!(triples[1], "<http://s2> <http://p2> <http://o2> .");
+    }
+
+    #[test]
+    fn test_query_construct_empty_result() {
+        let mut server = mockito::Server::new();
+        let mock = server.mock("POST", "/sparql")
+            .match_header("accept", "application/n-triples")
+            .with_status(200)
+            .with_body("")
+            .create();
+
+        let client = SparqlClient::new(&server.url());
+        let triples = client.query_construct("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o } LIMIT 0").unwrap();
+
+        mock.assert();
+        assert!(triples.is_empty());
+    }
+
+    #[test]
+    fn test_query_github_candidates_ranking() {
+        let mut server = mockito::Server::new();
+
+        // Mock SPARQL response with ranked homepages (with optional maintainers):
+        // Only unenriched repos returned (FILTER NOT EXISTS excludes enriched)
+        // - url1 (100 packages, with maintainer) should rank 1st
+        // - url2 (50 packages, no maintainer) should rank 2nd
+        let mock_response = r#"{
+            "results": {
+                "bindings": [
+                    {"homepage": {"value": "https://github.com/user1/repo1"}, "maintainer": {"value": "http://pkg.graph/maintainer/1"}, "packageCount": {"value": "100"}},
+                    {"homepage": {"value": "https://github.com/user2/repo2"}, "packageCount": {"value": "50"}}
+                ]
+            }
+        }"#;
+
+        let mock = server.mock("POST", "/sparql")
+            .match_header("accept", "application/sparql-results+json")
+            .with_status(200)
+            .with_header("content-type", "application/sparql-results+json")
+            .with_body(mock_response)
+            .create();
+
+        let client = SparqlClient::new(&server.url());
+        let candidates = client.query_github_candidates("http://example.org/enrichment/github", 10).unwrap();
+
+        mock.assert();
+
+        // Only unenriched repos returned, ordered by package count DESC
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].0, "https://github.com/user1/repo1");
+        assert_eq!(candidates[0].1, Some("http://pkg.graph/maintainer/1".to_string()));
+        assert_eq!(candidates[1].0, "https://github.com/user2/repo2");
+        assert_eq!(candidates[1].1, None);
+    }
+
+    #[test]
+    fn test_query_github_candidates_deterministic_ordering() {
+        let mut server = mockito::Server::new();
+
+        // Two homepages with same package count — SPARQL ORDER BY sorts by homepage ASC
+        let mock_response = r#"{
+            "results": {
+                "bindings": [
+                    {"homepage": {"value": "https://github.com/aaa/first"}, "packageCount": {"value": "10"}},
+                    {"homepage": {"value": "https://github.com/zzz/last"}, "packageCount": {"value": "10"}}
+                ]
+            }
+        }"#;
+
+        let mock = server.mock("POST", "/sparql")
+            .with_status(200)
+            .with_body(mock_response)
+            .create();
+
+        let client = SparqlClient::new(&server.url());
+        let candidates = client.query_github_candidates("http://example.org/enrichment/github", 10).unwrap();
+
+        mock.assert();
+
+        // Should order by homepage ASC when tied
+        assert_eq!(candidates[0].0, "https://github.com/aaa/first");
+        assert_eq!(candidates[1].0, "https://github.com/zzz/last");
+    }
+
+    #[test]
+    fn test_gsp_post_file_propagates_http_errors() {
+        use std::io::Write;
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(temp, "<http://s> <http://p> <http://o> .").unwrap();
+        temp.flush().unwrap();
+
+        let mut server = mockito::Server::new();
+        // GSP POST has retry logic (max 3 retries on server errors) — expect 4 requests
+        // Match any path starting with /data (mockito will match query params)
+        let mock = server.mock("POST", mockito::Matcher::Any)
+            .with_status(500)
+            .with_body("Internal Server Error")
+            .expect(4) // 1 initial + 3 retries
+            .create();
+
+        let client = SparqlClient::new(&server.url());
+        let result = client.gsp_post_file(temp.path().to_str().unwrap(), "http://example.org/graph");
+
+        mock.assert();
+        assert!(result.is_err(), "Should propagate GSP failure as Err");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("500") || err_msg.contains("GSP"), "Error should mention HTTP 500 or GSP");
+    }
+
+    #[test]
+    fn test_query_forge_instances() {
+        let mut server = mockito::Server::new();
+        let mock_response = r#"{
+            "results": {
+                "bindings": [
+                    {
+                        "forge": {"value": "https://packagegraph.github.io/d/forge/gitlab.gnome.org"},
+                        "forgeUrl": {"value": "https://gitlab.gnome.org"},
+                        "forgeSoftware": {"value": "https://purl.org/packagegraph/ontology/vcs#GitLab"}
+                    },
+                    {
+                        "forge": {"value": "https://packagegraph.github.io/d/forge/codeberg.org"},
+                        "forgeUrl": {"value": "https://codeberg.org"},
+                        "forgeSoftware": {"value": "https://purl.org/packagegraph/ontology/vcs#Forgejo"}
+                    }
+                ]
+            }
+        }"#;
+
+        let mock = server.mock("POST", "/sparql")
+            .with_status(200)
+            .with_body(mock_response)
+            .create();
+
+        let client = SparqlClient::new(&server.url());
+        let forges = client.query_forge_instances().unwrap();
+
+        mock.assert();
+
+        assert_eq!(forges.len(), 2);
+        assert_eq!(forges[0].0, "https://packagegraph.github.io/d/forge/gitlab.gnome.org");
+        assert_eq!(forges[0].1, "https://gitlab.gnome.org");
+        assert_eq!(forges[0].2, "https://purl.org/packagegraph/ontology/vcs#GitLab");
+        assert_eq!(forges[1].2, "https://purl.org/packagegraph/ontology/vcs#Forgejo");
     }
 }

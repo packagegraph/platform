@@ -79,7 +79,7 @@ SELECT (COUNT(*) AS ?count) WHERE { ?bin pkg:builtFromSource ?src }
 ### Q7: Dual-Typed Packages (pkg:BinaryPackage AND deb:BinaryPackage)
 ```sparql
 PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
-PREFIX deb: <https://purl.org/packagegraph/ontology/debian#>
+PREFIX deb: <https://purl.org/packagegraph/ontology/deb#>
 SELECT (COUNT(?p) AS ?count) WHERE { ?p a pkg:BinaryPackage . ?p a deb:BinaryPackage }
 ```
 **Result:** 68,757 | **Time:** 1,045ms
@@ -269,3 +269,243 @@ Slow queries are aggregate scans over the full 4.3M triple dataset. Point lookup
 | dpdk | 224 |
 | gcc-12-cross | 211 |
 | gcc-13-cross | 211 |
+
+## Embedded Linux Collectors (Yocto / Buildroot / OpenWRT)
+
+**Date:** 2026-04-17
+**Graphs:**
+- `graph/embedded/yocto` — Yocto/OpenEmbedded recipes from OE layers
+- `graph/embedded/buildroot` — Buildroot packages from `.mk` files
+- `graph/embedded/openwrt` — OpenWRT packages from feed Makefiles
+
+### Q16: All Embedded Packages with Types and Versions
+
+```sparql
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+SELECT ?graph ?name ?version ?type WHERE {
+  VALUES ?g {
+    <https://packagegraph.github.io/graph/embedded/yocto>
+    <https://packagegraph.github.io/graph/embedded/buildroot>
+    <https://packagegraph.github.io/graph/embedded/openwrt>
+  }
+  GRAPH ?g {
+    ?pkg pkg:packageName ?name ;
+         pkg:hasVersion ?v ;
+         rdf:type ?typeUri .
+    ?v pkg:versionString ?version .
+    FILTER(?typeUri IN (
+      <https://purl.org/packagegraph/ontology/bitbake#BitBakeRecipe>,
+      <https://purl.org/packagegraph/ontology/buildroot#BuildrootPackage>,
+      <https://purl.org/packagegraph/ontology/opkg#OpkgPackage>
+    ))
+    BIND(REPLACE(STR(?typeUri), ".*#", "") AS ?type)
+    BIND(REPLACE(STR(?g), ".*/", "") AS ?graph)
+  }
+}
+ORDER BY ?graph ?name
+```
+
+Verifies dual-typing and version node creation across all three embedded distributions.
+
+### Q17: Full Dependency Graph with Types (Per-Graph Scoped)
+
+```sparql
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+
+SELECT ?distro ?consumer ?dependency ?depType WHERE {
+  {
+    GRAPH <https://packagegraph.github.io/graph/embedded/yocto> {
+      ?pkg pkg:packageName ?consumer ; pkg:hasDependency ?d .
+      ?d pkg:dependencyType ?depType ; pkg:dependencyTarget ?t .
+      BIND(REPLACE(STR(?t), ".*/", "") AS ?dependency)
+    }
+    BIND("Yocto" AS ?distro)
+  } UNION {
+    GRAPH <https://packagegraph.github.io/graph/embedded/buildroot> {
+      ?pkg pkg:packageName ?consumer ; pkg:hasDependency ?d .
+      ?d pkg:dependencyType ?depType ; pkg:dependencyTarget ?t .
+      BIND(REPLACE(STR(?t), ".*/", "") AS ?dependency)
+    }
+    BIND("Buildroot" AS ?distro)
+  } UNION {
+    GRAPH <https://packagegraph.github.io/graph/embedded/openwrt> {
+      ?pkg pkg:packageName ?consumer ; pkg:hasDependency ?d .
+      ?d pkg:dependencyType ?depType ; pkg:dependencyTarget ?t .
+      BIND(REPLACE(STR(?t), ".*/", "") AS ?dependency)
+    }
+    BIND("OpenWRT" AS ?distro)
+  }
+}
+ORDER BY ?distro ?consumer ?depType ?dependency
+```
+
+Verifies all dependency types: build, runtime, native (Yocto), host (Buildroot), recommended.
+
+### Q18: Cross-Distribution Package Comparison
+
+```sparql
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+
+SELECT ?name
+  (GROUP_CONCAT(DISTINCT ?distro; separator=", ") AS ?distros)
+  (GROUP_CONCAT(DISTINCT ?ver; separator=", ") AS ?versions)
+WHERE {
+  VALUES (?g ?distro) {
+    (<https://packagegraph.github.io/graph/embedded/yocto> "Yocto")
+    (<https://packagegraph.github.io/graph/embedded/buildroot> "Buildroot")
+    (<https://packagegraph.github.io/graph/embedded/openwrt> "OpenWRT")
+  }
+  GRAPH ?g {
+    ?pkg pkg:packageName ?name ;
+         pkg:hasVersion ?v .
+    ?v pkg:versionString ?ver .
+  }
+}
+GROUP BY ?name
+HAVING(COUNT(DISTINCT ?distro) > 1)
+ORDER BY DESC(COUNT(DISTINCT ?distro)) ?name
+```
+
+Identifies packages present in multiple embedded distributions and their version alignment.
+
+### Q19: Buildroot Build Infrastructure and Download Sites
+
+```sparql
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+PREFIX br: <https://purl.org/packagegraph/ontology/buildroot#>
+
+SELECT ?name ?version ?infrastructure ?site ?staging WHERE {
+  GRAPH <https://packagegraph.github.io/graph/embedded/buildroot> {
+    ?pkg a br:BuildrootPackage ;
+         pkg:packageName ?name ;
+         pkg:hasVersion ?v .
+    ?v pkg:versionString ?version .
+    OPTIONAL { ?pkg br:infrastructure ?infrastructure }
+    OPTIONAL { ?pkg br:site ?site }
+    OPTIONAL { ?pkg br:installStaging ?staging }
+  }
+}
+ORDER BY ?name
+```
+
+Verifies Buildroot-specific properties: infrastructure type (autotools-package, cmake-package, generic-package), download sites, and staging flags.
+
+### Q20: Yocto Layer Composition and Recipe Sections
+
+```sparql
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+PREFIX bitbake: <https://purl.org/packagegraph/ontology/bitbake#>
+
+SELECT ?name ?version ?layer ?section ?license ?inherits WHERE {
+  GRAPH <https://packagegraph.github.io/graph/embedded/yocto> {
+    ?pkg a bitbake:BitBakeRecipe ;
+         pkg:packageName ?name ;
+         pkg:hasVersion ?v .
+    ?v pkg:versionString ?version .
+    ?pkg bitbake:layer ?layer .
+    OPTIONAL { ?pkg bitbake:section ?section }
+    OPTIONAL { ?pkg pkg:licenseName ?license }
+    OPTIONAL { ?pkg bitbake:inherits ?inherits }
+  }
+}
+ORDER BY ?section ?name
+```
+
+Verifies Yocto-specific properties: layer name, recipe section, license (via `licenseName`), inherited bbclasses.
+
+### Q21: OpenWRT Sub-Package Relationships and Source Hashes
+
+```sparql
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+PREFIX opkg: <https://purl.org/packagegraph/ontology/opkg#>
+
+SELECT ?name ?version ?feed ?category ?title ?parentPkg ?hash WHERE {
+  GRAPH <https://packagegraph.github.io/graph/embedded/openwrt> {
+    ?pkg a opkg:OpkgPackage ;
+         pkg:packageName ?name ;
+         opkg:feed ?feed .
+    OPTIONAL { ?pkg pkg:hasVersion ?v . ?v pkg:versionString ?version }
+    OPTIONAL { ?pkg opkg:category ?category }
+    OPTIONAL { ?pkg opkg:title ?title }
+    OPTIONAL { ?pkg opkg:parentPackage ?p . BIND(REPLACE(STR(?p), ".*/", "") AS ?parentPkg) }
+    OPTIONAL { ?pkg opkg:sourceMirrorHash ?hash }
+  }
+}
+ORDER BY ?name
+```
+
+Verifies OpenWRT sub-package parent links (libcurl→curl), feed names, categories, and source integrity hashes.
+
+### Q22: Curl Dependency Comparison Across Embedded Distros
+
+```sparql
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+
+SELECT ?distro ?depName ?depType WHERE {
+  VALUES (?g ?distro) {
+    (<https://packagegraph.github.io/graph/embedded/yocto> "Yocto")
+    (<https://packagegraph.github.io/graph/embedded/buildroot> "Buildroot")
+    (<https://packagegraph.github.io/graph/embedded/openwrt> "OpenWRT")
+  }
+  GRAPH ?g {
+    ?pkg pkg:packageName "curl" ;
+         pkg:hasDependency ?d .
+    ?d pkg:dependencyType ?depType ;
+       pkg:dependencyTarget ?target .
+    BIND(REPLACE(STR(?target), ".*/", "") AS ?depName)
+  }
+}
+ORDER BY ?distro ?depType ?depName
+```
+
+Shows how the same package (curl) has different dependency structures across embedded distros — different packaging strategies visible through dependency types.
+
+### Q23: Host/Native Tool Dependencies (Build Machine Requirements)
+
+```sparql
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+
+SELECT ?distro ?package ?hostDep WHERE {
+  {
+    GRAPH <https://packagegraph.github.io/graph/embedded/yocto> {
+      ?pkg pkg:packageName ?package ; pkg:hasDependency ?d .
+      ?d pkg:dependencyType "native" ; pkg:dependencyTarget ?t .
+      BIND(REPLACE(STR(?t), ".*/", "") AS ?hostDep)
+    }
+    BIND("Yocto" AS ?distro)
+  } UNION {
+    GRAPH <https://packagegraph.github.io/graph/embedded/buildroot> {
+      ?pkg pkg:packageName ?package ; pkg:hasDependency ?d .
+      ?d pkg:dependencyType "host" ; pkg:dependencyTarget ?t .
+      BIND(REPLACE(STR(?t), ".*/", "") AS ?hostDep)
+    }
+    BIND("Buildroot" AS ?distro)
+  }
+}
+ORDER BY ?distro ?package ?hostDep
+```
+
+Identifies build machine tool requirements — Yocto uses "-native" suffix, Buildroot uses "host-" prefix.
+
+### Q24: CPE Vulnerability Identifiers (Buildroot Security Metadata)
+
+```sparql
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+PREFIX br: <https://purl.org/packagegraph/ontology/buildroot#>
+
+SELECT ?name ?version ?cpeVendor ?cpeProduct WHERE {
+  GRAPH <https://packagegraph.github.io/graph/embedded/buildroot> {
+    ?pkg a br:BuildrootPackage ;
+         pkg:packageName ?name ;
+         pkg:hasVersion ?v .
+    ?v pkg:versionString ?version .
+    ?pkg br:cpeVendor ?cpeVendor .
+    OPTIONAL { ?pkg br:cpeProduct ?cpeProduct }
+  }
+}
+ORDER BY ?name
+```
+
+Extracts CPE identifiers from Buildroot packages for CVE matching against NVD. Critical for embedded firmware security analysis.

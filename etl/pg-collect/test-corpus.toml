@@ -1,0 +1,48 @@
+[global]
+max_triples = 3_000_000
+depth = 2
+fan_out = 20
+
+# Anchor packages chosen for: cross-distro presence, security history,
+# deep dependency trees, rich metadata (maintainers, provides/conflicts)
+
+[seeds.linux_distro]
+packages = [
+    "openssl", "curl", "glibc", "systemd", "bash",
+    "coreutils", "gcc", "python3", "git", "openssh",
+    "kernel", "dbus", "glib2", "zlib", "sqlite",
+    "sudo", "vim", "nginx", "postgresql", "httpd",
+]
+
+[seeds.language_ecosystem]
+npm = ["express", "lodash", "react", "typescript", "webpack"]
+pypi = ["requests", "numpy", "flask", "django", "cryptography"]
+cargo = ["serde", "tokio", "clap", "reqwest", "rand"]
+gomod = ["github.com/gin-gonic/gin", "github.com/stretchr/testify"]
+rubygems = ["rails", "rake", "bundler", "rspec", "devise"]
+maven = ["org.apache.commons:commons-lang3", "junit:junit"]
+hex = ["phoenix", "ecto", "plug"]
+nuget = ["Newtonsoft.Json", "Serilog"]
+cpan = ["Moose", "DBI", "DateTime"]
+cran = ["ggplot2", "dplyr", "tidyr"]
+hackage = ["aeson", "lens", "conduit"]
+conda = ["numpy", "pandas", "scipy"]
+
+[seeds.app_store]
+flatpak = ["org.gimp.GIMP", "org.mozilla.firefox"]
+snap = ["firefox", "chromium"]
+homebrew = ["wget", "jq", "tmux", "htop", "ffmpeg"]
+chocolatey = ["git", "nodejs", "python3", "vscode"]
+
+[seeds.embedded]
+yocto = ["busybox", "systemd", "openssh"]
+buildroot = ["busybox", "openssl", "dropbear"]
+openwrt = ["opkg", "busybox", "dnsmasq"]
+
+[seeds.system]
+freebsd = ["curl", "nginx", "python3"]
+nix = ["nixpkgs.hello", "nixpkgs.gcc", "nixpkgs.openssl"]
+void = ["bash", "curl", "python3"]
+gentoo = ["dev-libs/openssl", "sys-apps/systemd"]
+alpine = ["openssl", "curl", "busybox", "musl"]
+arch = ["base", "linux", "openssl", "pacman"]
