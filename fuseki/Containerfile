@@ -1,28 +1,33 @@
-FROM docker.io/stain/jena-fuseki:5.3.0
+FROM docker.io/eclipse-temurin:21-jre-alpine
 
-USER root
-
-# Install mc (Minio client) and extract Fuseki web UI
 ARG JENA_VERSION=5.3.0
-RUN apk add --no-cache curl unzip \
+ARG FUSEKI_HOME=/fuseki
+
+RUN apk add --no-cache bash curl unzip \
+    && curl -fsSL "https://archive.apache.org/dist/jena/binaries/apache-jena-fuseki-${JENA_VERSION}.tar.gz" \
+       | tar -xz -C /opt \
+    && mv "/opt/apache-jena-fuseki-${JENA_VERSION}" "${FUSEKI_HOME}" \
+    && curl -fsSL "https://repo1.maven.org/maven2/org/apache/jena/jena-fuseki-war/${JENA_VERSION}/jena-fuseki-war-${JENA_VERSION}.war" -o /tmp/fuseki.war \
+    && mkdir -p "${FUSEKI_HOME}/webapp" \
+    && unzip -qo /tmp/fuseki.war -d "${FUSEKI_HOME}/webapp" -x 'WEB-INF/lib/*' 'WEB-INF/classes/*' 'META-INF/*' 'DEPENDENCIES' \
+    && rm /tmp/fuseki.war \
     && curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc \
     && chmod +x /usr/local/bin/mc \
-    && curl -fsSL "https://repo1.maven.org/maven2/org/apache/jena/jena-fuseki-war/${JENA_VERSION}/jena-fuseki-war-${JENA_VERSION}.war" -o /tmp/fuseki.war \
-    && mkdir -p /fuseki/webapp \
-    && unzip -qo /tmp/fuseki.war -d /fuseki/webapp -x 'WEB-INF/lib/*' 'WEB-INF/classes/*' 'META-INF/*' 'DEPENDENCIES' \
-    && rm /tmp/fuseki.war \
-    && chown -R fuseki:fuseki /fuseki/webapp \
+    && addgroup -S fuseki && adduser -S -G fuseki fuseki \
+    && chown -R fuseki:fuseki "${FUSEKI_HOME}" \
     && apk del curl unzip
 
-# Copy config and entrypoint
-COPY config.ttl /fuseki/config.ttl
-COPY entrypoint.sh /fuseki/entrypoint.sh
-COPY catalog.html /fuseki/webapp/catalog.html
-RUN chmod +x /fuseki/entrypoint.sh
+ENV FUSEKI_HOME=${FUSEKI_HOME}
+ENV PATH="${FUSEKI_HOME}/bin:${PATH}"
 
-# TDB2 data volume (populated by init container or entrypoint)
+COPY config.ttl ${FUSEKI_HOME}/config.ttl
+COPY entrypoint.sh ${FUSEKI_HOME}/entrypoint.sh
+COPY catalog.html ${FUSEKI_HOME}/webapp/catalog.html
+RUN chmod +x ${FUSEKI_HOME}/entrypoint.sh
+
 VOLUME /data/tdb2
 
 EXPOSE 3030
 
+USER fuseki
 ENTRYPOINT ["/fuseki/entrypoint.sh"]

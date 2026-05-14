@@ -86,9 +86,9 @@ done
 echo "Synced $count ontology files to mirror."
 echo ""
 echo "Mirror contents:"
-ls -1 "$MIRROR_DIR"/*.ttl 2>/dev/null | wc -l | xargs echo "  Total .ttl files:"
-ls -1 "$MIRROR_DIR"/*.shacl.ttl 2>/dev/null | wc -l | xargs echo "  SHACL files (should be 0):"
-ls -1 "$MIRROR_DIR"/*.examples.ttl 2>/dev/null | wc -l | xargs echo "  Example files (should be 0):"
+echo "  Total .ttl files: $(find "$MIRROR_DIR" -maxdepth 1 -name '*.ttl' | wc -l)"
+echo "  SHACL files (should be 0): $(find "$MIRROR_DIR" -maxdepth 1 -name '*.shacl.ttl' | wc -l)"
+echo "  Example files (should be 0): $(find "$MIRROR_DIR" -maxdepth 1 -name '*.examples.ttl' | wc -l)"
 
 # Verify no stale monolithic files
 if [[ -f "$MIRROR_DIR/shacl.ttl" ]] || [[ -f "$MIRROR_DIR/examples.ttl" ]]; then
