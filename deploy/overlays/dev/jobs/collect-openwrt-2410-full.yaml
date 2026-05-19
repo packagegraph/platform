@@ -90,6 +90,9 @@ spec:
                   # Enable when openwrt/openwrt adopts actions/attest-build-provenance:
                   #   --with-attestation --github-token "$GITHUB_TOKEN"
 
+                  # Archive to Minio (for rebuild-tdb2)
+                  /app/scripts/upload-nt.sh /tmp/collection/openwrt-2410.nt "$GRAPH_URI"
+
                   # Load to Fuseki
                   pg-collect load \
                     --endpoint "$FUSEKI_ENDPOINT" \

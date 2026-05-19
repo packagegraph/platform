@@ -58,6 +58,9 @@ spec:
                     --cache-dir "${CACHE_DIR}" \
                     -o /tmp/collection/fedora-43.nt
 
+                  # Archive to Minio (for rebuild-tdb2)
+                  /app/scripts/upload-nt.sh /tmp/collection/fedora-43.nt "$GRAPH_URI"
+
                   # Load to Fuseki
                   pg-collect load \
                     --endpoint "$FUSEKI_ENDPOINT" \

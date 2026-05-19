@@ -54,6 +54,9 @@ spec:
                     --cache-dir "${CACHE_DIR}" \
                     -o /tmp/collection/centos-stream-9.nt
 
+                  # Archive to Minio (for rebuild-tdb2)
+                  /app/scripts/upload-nt.sh /tmp/collection/centos-stream-9.nt "$GRAPH_URI"
+
                   pg-collect load \
                     --endpoint "$FUSEKI_ENDPOINT" \
                     --graph "$GRAPH_URI" \
