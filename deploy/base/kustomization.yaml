@@ -5,7 +5,7 @@ namespace: packagegraph
 
 resources:
   - namespace.yaml
-  - minio/secret.yaml
+  # minio/secret.yaml — managed out-of-band via `oc create secret`
   - minio/pvc.yaml
   - minio/deployment.yaml
   - minio/service.yaml
