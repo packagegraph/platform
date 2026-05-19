@@ -46,6 +46,6 @@ else
 fi
 
 echo "=== Starting Fuseki ==="
-exec "$JAVA_HOME/bin/java" $JAVA_OPTIONS -jar "${FUSEKI_DIR}/${FUSEKI_JAR}" \
-    --config /fuseki/config.ttl \
+exec java ${JAVA_OPTIONS:-} -jar "${FUSEKI_HOME}/fuseki-server.jar" \
+    --config "${FUSEKI_HOME}/config.ttl" \
     --port 3030

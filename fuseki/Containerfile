@@ -18,7 +18,10 @@ RUN apk add --no-cache bash curl unzip \
     && apk del curl unzip
 
 ENV FUSEKI_HOME=${FUSEKI_HOME}
+ENV FUSEKI_BASE=/data/fuseki-base
 ENV PATH="${FUSEKI_HOME}/bin:${PATH}"
+
+RUN mkdir -p /data/fuseki-base && chown fuseki:fuseki /data/fuseki-base
 
 COPY config.ttl ${FUSEKI_HOME}/config.ttl
 COPY entrypoint.sh ${FUSEKI_HOME}/entrypoint.sh
