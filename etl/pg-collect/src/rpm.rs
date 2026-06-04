@@ -761,6 +761,27 @@ impl RpmCollector {
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 
+        // PURL (Package URL)
+        let evr = if epoch != "0" {
+            format!("{}:{}-{}", epoch, ver, rel)
+        } else {
+            format!("{}-{}", ver, rel)
+        };
+        let purl = crate::ntriples::format_purl(
+            "rpm",
+            Some(&self.distro_name),
+            name,
+            Some(&evr),
+            &[("arch", arch)],
+        );
+        writer.write_typed_literal(
+            &identity_uri,
+            &format!("{PKG}purl"),
+            &purl,
+            &format!("{XSD}anyURI"),
+        )?;
+        triples += 1;
+
         // Packaging repository (dist-git — derivable from distro + package name)
         let distgit_uri = fedora_distgit_uri(&self.distro_name, name);
         writer.write_triple(&identity_uri, &format!("{PKG}packagingRepository"), &distgit_uri)?;

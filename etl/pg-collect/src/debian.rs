@@ -700,6 +700,22 @@ impl DebianCollector {
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 
+        // PURL (Package URL)
+        let purl = crate::ntriples::format_purl(
+            "deb",
+            Some(&self.distro_name),
+            pkg_name,
+            Some(pkg_version),
+            &[("arch", arch_name)],
+        );
+        writer.write_typed_literal(
+            &identity_uri,
+            &format!("{PKG}purl"),
+            &purl,
+            &format!("{XSD}anyURI"),
+        )?;
+        triples += 1;
+
         // Core properties
         writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), pkg_name)?;
         triples += 1;
