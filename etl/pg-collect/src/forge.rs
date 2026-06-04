@@ -876,6 +876,30 @@ pub fn emit_upstream_repo(
     writer.write_literal(&r_uri, &format!("{VCS}repositoryURL"), repo_url)?;
     let mut triples = 3;
 
+    // Reified PackageRelationship with upstream verification evidence
+    let rel_uri = package_relationship_uri(identity_uri, &r_uri);
+    writer.write_triple(&rel_uri, RDF_TYPE, &format!("{PKG}PackageRelationship"))?;
+    writer.write_triple(identity_uri, &format!("{PKG}hasPackageRelationship"), &rel_uri)?;
+    writer.write_triple(&rel_uri, &format!("{PKG}relationshipTarget"), &r_uri)?;
+    let (method, confidence) = if validation.map_or(false, |v| v.status_class.should_emit_repo()) {
+        // HTTP validation confirmed the URL is live
+        ("match-upstream-verified", "0.9")
+    } else if matches!(extraction.source_field.as_str(), "homepage" | "url" | "forgeurl" | "vcs-git") {
+        // Direct declaration from package metadata — packager asserted this
+        // URL. No HTTP validation, but the source is authoritative.
+        ("match-upstream-verified", "0.9")
+    } else {
+        ("match-name-heuristic", "0.7")
+    };
+    writer.write_triple(&rel_uri, &format!("{PKG}matchMethod"), &format!("{PKG}{method}"))?;
+    writer.write_typed_literal(
+        &rel_uri,
+        &format!("{PKG}matchConfidence"),
+        confidence,
+        &format!("{XSD}decimal"),
+    )?;
+    triples += 5;
+
     // Emit forge instance triples (v0.8.0)
     triples += emit_forge_triples(writer, &r_uri, repo_url)?;
 
@@ -1532,12 +1556,17 @@ mod tests {
             &extraction, None).unwrap();
         writer.flush().unwrap();
 
-        assert_eq!(count, 7); // 3 repo + 4 forge
+        assert_eq!(count, 12); // 3 repo + 5 reified relationship + 4 forge
         let mut content = String::new();
         std::io::Read::read_to_string(&mut temp.reopen().unwrap(), &mut content).unwrap();
         assert!(content.contains("core#upstreamRepository"));
         assert!(content.contains("vcs#Repository"));
         assert!(content.contains("vcs#repositoryURL"));
+        // Reified relationship — source_field is "forgeurl" → verified
+        assert!(content.contains("PackageRelationship"), "Should have reified relationship");
+        assert!(content.contains("match-upstream-verified"), "forgeurl source → verified");
+        assert!(content.contains("matchConfidence"), "Should have confidence");
+        assert!(content.contains("0.9"), "Verified confidence should be 0.9");
         // Forge triples (v0.8.0)
         assert!(content.contains("vcs#hostedOn"), "Should link repo to forge");
         assert!(content.contains("vcs#Forge"), "Should type forge instance");

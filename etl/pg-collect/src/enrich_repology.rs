@@ -157,6 +157,7 @@ impl RepologyEnricher {
         let mut triples = 0;
         for i in 0..distro_pkgs.len() {
             for j in (i + 1)..distro_pkgs.len() {
+                // Shortcut property (backward compatible)
                 writer.write_triple(
                     &distro_pkgs[i],
                     &format!("{PKG}crossDistributionAlternative"),
@@ -168,6 +169,32 @@ impl RepologyEnricher {
                     &distro_pkgs[i],
                 )?;
                 triples += 2;
+
+                // Reified PackageRelationship with match method + confidence
+                let rel_uri = package_relationship_uri(&distro_pkgs[i], &distro_pkgs[j]);
+                writer.write_triple(&rel_uri, RDF_TYPE, &format!("{PKG}PackageRelationship"))?;
+                writer.write_triple(
+                    &distro_pkgs[i],
+                    &format!("{PKG}hasPackageRelationship"),
+                    &rel_uri,
+                )?;
+                writer.write_triple(
+                    &rel_uri,
+                    &format!("{PKG}relationshipTarget"),
+                    &distro_pkgs[j],
+                )?;
+                writer.write_triple(
+                    &rel_uri,
+                    &format!("{PKG}matchMethod"),
+                    &format!("{PKG}match-repology"),
+                )?;
+                writer.write_typed_literal(
+                    &rel_uri,
+                    &format!("{PKG}matchConfidence"),
+                    "0.95",
+                    &format!("{XSD}decimal"),
+                )?;
+                triples += 5;
             }
         }
 
@@ -222,13 +249,18 @@ mod tests {
         let triples = enricher.emit_equivalence_links(&mut writer, "openssl", &data).unwrap();
         writer.flush().unwrap();
 
-        // 3 known distros → 3 pairs → 6 bidirectional links
-        assert_eq!(triples, 6, "Should emit 6 equivalence triples (3 pairs × 2 directions)");
+        // 3 known distros → 3 pairs → 2 shortcut + 5 reified = 7 per pair → 21 total
+        assert_eq!(triples, 21, "Should emit 21 triples (3 pairs × 7 triples each)");
 
         let mut content = String::new();
         temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
 
         assert!(content.contains("crossDistributionAlternative"), "Should have cross-distribution links");
+        assert!(content.contains("PackageRelationship"), "Should have reified relationships");
+        assert!(content.contains("matchMethod"), "Should have match method");
+        assert!(content.contains("match-repology"), "Should use repology match method");
+        assert!(content.contains("matchConfidence"), "Should have match confidence");
+        assert!(content.contains("0.95"), "Confidence should be 0.95");
         assert!(content.contains("debian/bookworm"), "Should reference Debian");
         assert!(content.contains("fedora/41"), "Should reference Fedora");
         assert!(content.contains("arch/arch"), "Should reference Arch");
