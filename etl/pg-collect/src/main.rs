@@ -28,6 +28,10 @@ use pg_collect::collect_bodhi::BodhiCollector;
 use pg_collect::collect_glsa::GlsaCollector;
 use pg_collect::enrich_nvd::NvdEnricher;
 use pg_collect::enrich_forge_version::ForgeVersionEnricher;
+use pg_collect::enrich_epss::EpssEnricher;
+use pg_collect::enrich_taxonomy::TaxonomyEnricher;
+use pg_collect::enrich_revdeps::RevdepsEnricher;
+use pg_collect::enrich_blast_radius::BlastRadiusEnricher;
 use pg_collect::collect_spec::SpecCollector;
 use pg_collect::collect_sources::SourcesCollector;
 use pg_collect::collect_salsa::SalsaCollector;
@@ -1024,6 +1028,58 @@ enum Commands {
         /// Cache directory
         #[arg(long)]
         cache_dir: Option<String>,
+    },
+
+    /// Enrich CVE entities with EPSS exploit prediction scores from FIRST.org
+    EnrichEpss {
+        /// Fuseki SPARQL endpoint URL
+        #[arg(long, required = true)]
+        endpoint: String,
+
+        /// Output N-Triples file
+        #[arg(short, long, required = true)]
+        output: String,
+
+        /// Minimum EPSS score threshold (skip near-zero CVEs)
+        #[arg(long, default_value = "0.0")]
+        min_score: f64,
+    },
+
+    /// Classify package identities using OSS Taxonomy (technology + role facets)
+    EnrichTaxonomy {
+        /// Fuseki SPARQL endpoint URL
+        #[arg(long, required = true)]
+        endpoint: String,
+
+        /// Output N-Triples file
+        #[arg(short, long, required = true)]
+        output: String,
+    },
+
+    /// Materialize reverse dependency counts on PackageIdentity entities
+    EnrichRevdeps {
+        /// Fuseki SPARQL endpoint URL
+        #[arg(long, required = true)]
+        endpoint: String,
+
+        /// Output N-Triples file
+        #[arg(short, long, required = true)]
+        output: String,
+
+        /// Scope to a specific named graph
+        #[arg(long)]
+        graph: Option<String>,
+    },
+
+    /// Compute blast radius scores for vulnerabilities (log10(revdeps) * CVSS)
+    EnrichBlastRadius {
+        /// Fuseki SPARQL endpoint URL
+        #[arg(long, required = true)]
+        endpoint: String,
+
+        /// Output N-Triples file
+        #[arg(short, long, required = true)]
+        output: String,
     },
 
     /// Derive pkg:lastReleaseDate from ecosystem build timestamps
@@ -2170,6 +2226,50 @@ fn main() {
                 cache_dir.as_deref(),
             );
 
+            enricher.enrich(&output)
+        }
+
+        Commands::EnrichEpss { endpoint, output, min_score } => {
+            eprintln!("=== PackageGraph EPSS Enricher ===");
+            eprintln!("Endpoint: {}", endpoint);
+            eprintln!("Output: {}", output);
+            eprintln!("Min score: {}", min_score);
+            eprintln!();
+
+            let enricher = EpssEnricher::new(&endpoint, min_score);
+            enricher.enrich(&output)
+        }
+
+        Commands::EnrichTaxonomy { endpoint, output } => {
+            eprintln!("=== PackageGraph Taxonomy Enricher ===");
+            eprintln!("Endpoint: {}", endpoint);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let enricher = TaxonomyEnricher::new(&endpoint);
+            enricher.enrich(&output)
+        }
+
+        Commands::EnrichRevdeps { endpoint, output, graph } => {
+            eprintln!("=== PackageGraph Reverse Dependency Count Enricher ===");
+            eprintln!("Endpoint: {}", endpoint);
+            eprintln!("Output: {}", output);
+            if let Some(ref g) = graph {
+                eprintln!("Graph: {}", g);
+            }
+            eprintln!();
+
+            let enricher = RevdepsEnricher::new(&endpoint, graph.as_deref());
+            enricher.enrich(&output)
+        }
+
+        Commands::EnrichBlastRadius { endpoint, output } => {
+            eprintln!("=== PackageGraph Blast Radius Enricher ===");
+            eprintln!("Endpoint: {}", endpoint);
+            eprintln!("Output: {}", output);
+            eprintln!();
+
+            let enricher = BlastRadiusEnricher::new(&endpoint);
             enricher.enrich(&output)
         }
 

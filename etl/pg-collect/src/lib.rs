@@ -56,3 +56,7 @@ pub mod collect_salsa;
 pub mod collect_opkg_index;
 pub mod collect_openwrt_upstream;
 pub mod enrich_openwrt_attestation;
+pub mod enrich_epss;
+pub mod enrich_taxonomy;
+pub mod enrich_revdeps;
+pub mod enrich_blast_radius;
