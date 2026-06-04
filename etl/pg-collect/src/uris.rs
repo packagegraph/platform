@@ -540,6 +540,32 @@ pub fn cve_entity_uri(cve_id: &str) -> String {
     format!("{DATA}cve/{cve_id}")
 }
 
+/// Build an EPSS assessment URI from CVE ID and assessment date.
+/// Example: ("CVE-2024-6119", "2026-06-04") -> "https://packagegraph.github.io/d/epss/CVE-2024-6119/2026-06-04"
+pub fn epss_assessment_uri(cve_id: &str, date: &str) -> String {
+    format!("{DATA}epss/{}/{}", encode(cve_id), date)
+}
+
+/// Build a PackageRelationship URI from two identity URIs.
+/// Uses SHA-256 for deterministic, cross-release-stable hashing.
+pub fn package_relationship_uri(identity_a: &str, identity_b: &str) -> String {
+    use sha2::{Sha256, Digest};
+    let (first, second) = if identity_a < identity_b {
+        (identity_a, identity_b)
+    } else {
+        (identity_b, identity_a)
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(first.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(second.as_bytes());
+    let hash = hasher.finalize();
+    let hex: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("{DATA}pkg-rel/{hex}")
+}
+
+pub const TAX: &str = "https://purl.org/packagegraph/ontology/taxonomy#";
+
 /// Map a severity string to a SKOS concept URI from sec:SeverityScheme.
 ///
 /// Handles multiple naming conventions (RHSA, Debian, CVSS-derived, Bodhi):

@@ -208,6 +208,66 @@ pub(crate) fn escape_literal(s: &str) -> String {
     result
 }
 
+/// Percent-encode a PURL component per purl-spec rules.
+/// Encodes everything except unreserved characters: `[-._~a-zA-Z0-9]`
+fn purl_encode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                result.push(byte as char);
+            }
+            _ => {
+                result.push_str(&format!("%{:02X}", byte));
+            }
+        }
+    }
+    result
+}
+
+/// Format a Package URL (PURL) string according to the purl-spec.
+///
+/// Percent-encodes name, version, namespace, and qualifier values per spec.
+/// Qualifiers are sorted by key for canonical output.
+///
+/// See: https://github.com/package-url/purl-spec
+///
+/// Example: format_purl("rpm", Some("fedora"), "openssl", Some("3.2.2-6.fc43"), &[("arch", "x86_64")])
+///          → "pkg:rpm/fedora/openssl@3.2.2-6.fc43?arch=x86_64"
+pub fn format_purl(
+    purl_type: &str,
+    namespace: Option<&str>,
+    name: &str,
+    version: Option<&str>,
+    qualifiers: &[(&str, &str)],
+) -> String {
+    let mut purl = format!("pkg:{}", purl_type);
+    if let Some(ns) = namespace {
+        purl.push('/');
+        purl.push_str(&purl_encode(ns));
+    }
+    purl.push('/');
+    purl.push_str(&purl_encode(name));
+    if let Some(ver) = version {
+        purl.push('@');
+        purl.push_str(&purl_encode(ver));
+    }
+    if !qualifiers.is_empty() {
+        let mut sorted: Vec<_> = qualifiers.to_vec();
+        sorted.sort_by_key(|(k, _)| *k);
+        purl.push('?');
+        for (i, (k, v)) in sorted.iter().enumerate() {
+            if i > 0 {
+                purl.push('&');
+            }
+            purl.push_str(k);
+            purl.push('=');
+            purl.push_str(&purl_encode(v));
+        }
+    }
+    purl
+}
+
 /// Generate a deterministic blank node ID from content hash.
 ///
 /// Uses format `dep_{hash}` where hash is based on the content.
