@@ -803,16 +803,6 @@ impl RpmCollector {
                 writer.write_triple(&identity_uri, &format!("{PKG}upstreamRepository"), &upstream_uri)?;
                 writer.write_triple(&upstream_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
                 triples += 2;
-
-                // Reified PackageRelationship — RPM URL: field is a direct packager
-                // declaration, so this is verified provenance (confidence 0.9)
-                let rel_uri = package_relationship_uri(&identity_uri, &upstream_uri);
-                writer.write_triple(&rel_uri, RDF_TYPE, &format!("{PKG}PackageRelationship"))?;
-                writer.write_triple(&identity_uri, &format!("{PKG}hasPackageRelationship"), &rel_uri)?;
-                writer.write_triple(&rel_uri, &format!("{PKG}relationshipTarget"), &upstream_uri)?;
-                writer.write_triple(&rel_uri, &format!("{PKG}matchMethod"), &format!("{PKG}match-upstream-verified"))?;
-                writer.write_typed_literal(&rel_uri, &format!("{PKG}matchConfidence"), "0.9", &format!("{XSD}decimal"))?;
-                triples += 5;
             }
         }
 
