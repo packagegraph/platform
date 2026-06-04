@@ -3,6 +3,11 @@
 //! Queries Fuseki for dependency relationships and materializes
 //! met:reverseDependencyCount on PackageIdentity entities for
 //! efficient criticality queries.
+//!
+//! **Gated on ontology:** Requires `met:reverseDependencyCount` to be declared
+//! in the metrics ontology. The enricher will refuse to run until the property
+//! exists in the target graph. Once the ontology term lands, remove the gate
+//! check in `enrich()`.
 
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::SparqlClient;
@@ -25,6 +30,8 @@ impl RevdepsEnricher {
     }
 
     pub fn enrich(&self, output_path: &str) -> Result<(usize, usize)> {
+        self.check_ontology_property()?;
+
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new(file);
 
@@ -44,6 +51,22 @@ impl RevdepsEnricher {
         writer.flush()?;
         eprintln!("Wrote {} triples", total_triples);
         Ok((counts.len(), total_triples))
+    }
+
+    fn check_ontology_property(&self) -> Result<()> {
+        let query = format!(
+            "SELECT ?p WHERE {{ <{MET}reverseDependencyCount> a ?p }} LIMIT 1",
+            MET = MET,
+        );
+        let results = self.sparql.query(&query)?;
+        if results.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "met:reverseDependencyCount is not declared in the ontology. \
+                 Add it to metrics.ttl and load into Fuseki before running this enricher.",
+            ));
+        }
+        Ok(())
     }
 
     fn query_reverse_dep_counts(&self) -> Result<Vec<(String, i64)>> {

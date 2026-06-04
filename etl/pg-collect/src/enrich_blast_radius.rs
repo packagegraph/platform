@@ -5,6 +5,10 @@
 //!
 //! Depends on: met:reverseDependencyCount (from enrich-revdeps) and
 //! sec:hasCVSSScore/sec:baseScore (from enrich-nvd or enrich-security).
+//!
+//! **Gated on ontology:** Requires `sec:blastRadius` to be declared in the
+//! security ontology. The enricher will refuse to run until the property
+//! exists in the target graph.
 
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::SparqlClient;
@@ -23,6 +27,8 @@ impl BlastRadiusEnricher {
     }
 
     pub fn enrich(&self, output_path: &str) -> Result<(usize, usize)> {
+        self.check_ontology_property()?;
+
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new(file);
 
@@ -31,11 +37,11 @@ impl BlastRadiusEnricher {
 
         let mut total_triples = 0usize;
         for (vuln_uri, blast_radius) in &vulns {
-            writer.write_typed_literal(
+            let rounded = blast_radius.round().max(0.0) as i64;
+            writer.write_integer(
                 vuln_uri,
                 &format!("{SEC}blastRadius"),
-                &format!("{blast_radius:.2}"),
-                &format!("{XSD}decimal"),
+                rounded,
             )?;
             total_triples += 1;
         }
@@ -43,6 +49,22 @@ impl BlastRadiusEnricher {
         writer.flush()?;
         eprintln!("Wrote {} blast radius scores", total_triples);
         Ok((vulns.len(), total_triples))
+    }
+
+    fn check_ontology_property(&self) -> Result<()> {
+        let query = format!(
+            "SELECT ?p WHERE {{ <{SEC}blastRadius> a ?p }} LIMIT 1",
+            SEC = SEC,
+        );
+        let results = self.sparql.query(&query)?;
+        if results.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "sec:blastRadius is not declared in the ontology. \
+                 Add it to security.ttl and load into Fuseki before running this enricher.",
+            ));
+        }
+        Ok(())
     }
 
     fn query_vuln_data(&self) -> Result<Vec<(String, f64)>> {
