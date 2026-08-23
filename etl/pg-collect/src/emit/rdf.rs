@@ -354,4 +354,43 @@ mod tests {
         assert!(content.contains("\"Fedora Project\""), "Should emit name");
         assert!(content.contains("mailto:admin@fedoraproject.org"), "Should emit mbox");
     }
+
+    #[test]
+    fn test_emit_maintainer_name_only_uses_name_uri() {
+        // Verifies that the RDF emitter uses maintainer_name_uri() for name-only
+        // MaintainerIr entries, producing URIs consistent with the direct callers
+        // in debian.rs and collect_sources.rs.
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+
+        let mut ir = sample_ir();
+        ir.maintainers = vec![MaintainerIr {
+            name: "Debian QA Group".to_string(),
+            email: None,
+            role_hint: Some("maintainer".to_string()),
+        }];
+        let policy = EmitPolicy::default();
+
+        emit_rdf(&ir, &mut writer, &policy).unwrap();
+        writer.flush().unwrap();
+
+        let mut content = String::new();
+        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+
+        // The URI must use the /maintainer/name/ path from maintainer_name_uri()
+        let expected_uri = maintainer_name_uri("Debian QA Group");
+        assert!(
+            content.contains(&expected_uri),
+            "RDF emitter must use maintainer_name_uri() for name-only entries.\n\
+             Expected URI: {}\nContent:\n{}",
+            expected_uri, content
+        );
+        assert!(content.contains("core#Person"), "Must type as Person");
+        assert!(content.contains("\"Debian QA Group\""), "Must emit name");
+        // Must NOT contain foaf:mbox for name-only
+        assert!(
+            !content.contains("mailto:"),
+            "Name-only maintainer must not have mbox"
+        );
+    }
 }

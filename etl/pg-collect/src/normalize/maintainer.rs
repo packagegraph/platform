@@ -64,20 +64,30 @@ pub fn parse_mailbox_list(input: &str) -> MailboxParseResult {
 /// Rejects emails containing IRI-unsafe characters (spaces, angle brackets,
 /// control characters). Returns true if safe.
 pub fn is_email_iri_safe(email: &str) -> bool {
-    !email.is_empty()
-        && !email.contains(' ')
-        && !email.contains('<')
-        && !email.contains('>')
-        && !email.contains('{')
-        && !email.contains('}')
-        && !email.contains('|')
-        && !email.contains('\\')
-        && !email.contains('^')
-        && !email.contains('`')
-        && !email.contains('"')
-        && !email.bytes().any(|b| b < 0x20) // reject tabs, control chars
-        && email.is_ascii() // non-ASCII needs percent-encoding in IRIs
-        && email.contains('@')
+    if email.is_empty() || !email.is_ascii() || !email.contains('@') {
+        return false;
+    }
+    let bytes = email.as_bytes();
+    let len = bytes.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b' ' | b'<' | b'>' | b'{' | b'}' | b'|' | b'\\' | b'^' | b'`' | b'"' => {
+                return false;
+            }
+            b'%' => {
+                // Must be followed by exactly 2 hex digits for valid percent-encoding
+                if i + 2 >= len
+                    || !bytes[i + 1].is_ascii_hexdigit()
+                    || !bytes[i + 2].is_ascii_hexdigit()
+                {
+                    return false;
+                }
+            }
+            _ if b < 0x20 => return false, // reject control chars
+            _ => {}
+        }
+    }
+    true
 }
 
 enum SingleParseResult {
@@ -400,25 +410,64 @@ mod tests {
 
     #[test]
     fn test_name_only_uri_consistent_across_callers() {
-        // Given the same name-only input, all code paths should produce
-        // identical URIs via maintainer_name_uri().
+        // Verifies that the parse_mailbox_list -> maintainer_name_uri path
+        // (used by debian.rs and collect_sources.rs direct emitters) produces
+        // the same URI that the normalize pipeline would generate.
+        //
+        // The RDF emitter path (emit/rdf.rs) is tested separately in
+        // emit::rdf::tests::test_emit_maintainer_name_only_uses_name_uri
+        // which verifies the actual emitter calls maintainer_name_uri().
         use crate::uris::maintainer_name_uri;
+        use crate::ir::MaintainerIr;
 
         let name = "Debian QA Group";
 
-        // Path 1: direct parse_mailbox_list -> maintainer_name_uri (debian.rs, collect_sources.rs)
+        // Path 1: parse_mailbox_list -> maintainer_name_uri (debian.rs, collect_sources.rs)
         let parsed = parse_mailbox_list(name);
         assert_eq!(parsed.mailboxes.len(), 1);
         assert!(parsed.mailboxes[0].email.is_none());
         let uri_direct = maintainer_name_uri(&parsed.mailboxes[0].name);
 
-        // Path 2: normalize pipeline -> MaintainerIr with email=None -> maintainer_name_uri
-        // (emit/rdf.rs uses maintainer_name_uri when email is None)
-        let uri_normalize = maintainer_name_uri(name);
+        // Path 2: normalize pipeline builds MaintainerIr with email=None
+        // -> emit/rdf.rs uses maintainer_name_uri(&maint.name)
+        let maint_ir = MaintainerIr {
+            name: name.to_string(),
+            email: None,
+            role_hint: Some("maintainer".to_string()),
+        };
+        let uri_from_ir = maintainer_name_uri(&maint_ir.name);
 
-        assert_eq!(uri_direct, uri_normalize,
-            "Name-only URIs must be identical across all callers");
+        assert_eq!(uri_direct, uri_from_ir,
+            "Name-only URIs must be identical across direct and normalize paths");
         assert!(uri_direct.contains("/maintainer/name/"),
             "Name-only URIs must use the /maintainer/name/ path");
+        assert!(!uri_direct.contains("/maintainer/debian"),
+            "Name-only URIs must NOT use the old slugified format");
+    }
+
+    // --- Percent-encoding in emails ---
+
+    #[test]
+    fn test_is_email_iri_safe_rejects_bare_percent() {
+        // %zz is not valid percent-encoding
+        assert!(!is_email_iri_safe("user%zz@example.org"));
+    }
+
+    #[test]
+    fn test_is_email_iri_safe_accepts_valid_percent_encoding() {
+        // %2B is valid percent-encoding for '+'
+        assert!(is_email_iri_safe("user%2B@example.org"));
+    }
+
+    #[test]
+    fn test_is_email_iri_safe_rejects_percent_at_end() {
+        // % at end of string — not followed by 2 hex digits
+        assert!(!is_email_iri_safe("user%@example.org"));
+    }
+
+    #[test]
+    fn test_is_email_iri_safe_rejects_percent_one_hex() {
+        // %2 — only one hex digit after %
+        assert!(!is_email_iri_safe("user%2@example.org"));
     }
 }

@@ -808,14 +808,16 @@ impl DebianCollector {
 
         let mut iri_unsafe_count = 0usize;
         for mailbox in &parsed.mailboxes {
-            let maint_uri = if let Some(ref email) = mailbox.email {
-                if !is_email_iri_safe(email) {
+            let (maint_uri, safe_email) = if let Some(ref email) = mailbox.email {
+                if is_email_iri_safe(email) {
+                    (maintainer_uri(email), Some(email.as_str()))
+                } else {
                     iri_unsafe_count += 1;
-                    continue;
+                    // Demote to name-only: keep the person, discard the bad email
+                    (maintainer_name_uri(&mailbox.name), None)
                 }
-                maintainer_uri(email)
             } else {
-                maintainer_name_uri(&mailbox.name)
+                (maintainer_name_uri(&mailbox.name), None)
             };
 
             // Type as Person (canonical agent identity per SD-3 data contract)
@@ -824,7 +826,7 @@ impl DebianCollector {
             writer.write_literal(&maint_uri, RDFS_LABEL, &mailbox.name)?;
             triples += 3;
 
-            if let Some(ref email) = mailbox.email {
+            if let Some(email) = safe_email {
                 writer.write_triple(&maint_uri, &format!("{FOAF}mbox"), &format!("mailto:{email}"))?;
                 triples += 1;
             }
