@@ -34,7 +34,7 @@ pub fn parse_mailbox_list(input: &str) -> MailboxParseResult {
     if input.is_empty() {
         return MailboxParseResult {
             mailboxes: vec![],
-            malformed_count: 0,
+            malformed_count: 1,
         };
     }
 
@@ -74,6 +74,8 @@ pub fn is_email_iri_safe(email: &str) -> bool {
         && !email.contains('\\')
         && !email.contains('^')
         && !email.contains('`')
+        && !email.contains('"')
+        && !email.bytes().any(|b| b < 0x20) // reject tabs, control chars
         && email.is_ascii() // non-ASCII needs percent-encoding in IRIs
         && email.contains('@')
 }
@@ -268,7 +270,7 @@ mod tests {
     fn test_empty_string() {
         let result = parse_mailbox_list("");
         assert_eq!(result.mailboxes.len(), 0);
-        assert_eq!(result.malformed_count, 0);
+        assert_eq!(result.malformed_count, 1);
     }
 
     #[test]
@@ -339,7 +341,7 @@ mod tests {
     fn test_whitespace_only() {
         let result = parse_mailbox_list("   ");
         assert_eq!(result.mailboxes.len(), 0);
-        assert_eq!(result.malformed_count, 0);
+        assert_eq!(result.malformed_count, 1);
     }
 
     #[test]
@@ -369,5 +371,54 @@ mod tests {
         );
         assert_eq!(result.mailboxes.len(), 2);
         assert_eq!(result.malformed_count, 1);
+    }
+
+    // --- IRI safety: additional rejections ---
+
+    #[test]
+    fn test_is_email_iri_safe_rejects_double_quotes() {
+        assert!(!is_email_iri_safe("\"user\"@example.org"));
+    }
+
+    #[test]
+    fn test_is_email_iri_safe_rejects_tab() {
+        assert!(!is_email_iri_safe("user\t@example.org"));
+    }
+
+    #[test]
+    fn test_is_email_iri_safe_rejects_control_chars() {
+        assert!(!is_email_iri_safe("user\x01@example.org"));
+        assert!(!is_email_iri_safe("user\x00@example.org"));
+    }
+
+    #[test]
+    fn test_is_email_iri_safe_rejects_backslash() {
+        assert!(!is_email_iri_safe("user\\name@example.org"));
+    }
+
+    // --- Cross-caller consistency: name-only URI identity ---
+
+    #[test]
+    fn test_name_only_uri_consistent_across_callers() {
+        // Given the same name-only input, all code paths should produce
+        // identical URIs via maintainer_name_uri().
+        use crate::uris::maintainer_name_uri;
+
+        let name = "Debian QA Group";
+
+        // Path 1: direct parse_mailbox_list -> maintainer_name_uri (debian.rs, collect_sources.rs)
+        let parsed = parse_mailbox_list(name);
+        assert_eq!(parsed.mailboxes.len(), 1);
+        assert!(parsed.mailboxes[0].email.is_none());
+        let uri_direct = maintainer_name_uri(&parsed.mailboxes[0].name);
+
+        // Path 2: normalize pipeline -> MaintainerIr with email=None -> maintainer_name_uri
+        // (emit/rdf.rs uses maintainer_name_uri when email is None)
+        let uri_normalize = maintainer_name_uri(name);
+
+        assert_eq!(uri_direct, uri_normalize,
+            "Name-only URIs must be identical across all callers");
+        assert!(uri_direct.contains("/maintainer/name/"),
+            "Name-only URIs must use the /maintainer/name/ path");
     }
 }

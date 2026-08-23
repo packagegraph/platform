@@ -802,9 +802,15 @@ impl DebianCollector {
         let parsed = parse_mailbox_list(maintainer_str);
         let mut triples = 0;
 
+        if parsed.malformed_count > 0 {
+            eprintln!("WARNING: {} malformed maintainer entries in: {}", parsed.malformed_count, maintainer_str);
+        }
+
+        let mut iri_unsafe_count = 0usize;
         for mailbox in &parsed.mailboxes {
             let maint_uri = if let Some(ref email) = mailbox.email {
                 if !is_email_iri_safe(email) {
+                    iri_unsafe_count += 1;
                     continue;
                 }
                 maintainer_uri(email)
@@ -825,6 +831,10 @@ impl DebianCollector {
 
             writer.write_triple(pkg_uri, &format!("{PKG}maintainedBy"), &maint_uri)?;
             triples += 1;
+        }
+
+        if iri_unsafe_count > 0 {
+            eprintln!("WARNING: {} IRI-unsafe email addresses skipped in: {}", iri_unsafe_count, maintainer_str);
         }
 
         Ok(triples)

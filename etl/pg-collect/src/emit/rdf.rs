@@ -164,16 +164,11 @@ fn emit_maintainer(
     pkg_uri: &str,
     maint: &MaintainerIr,
 ) -> Result<usize> {
-    let email_or_id = maint.email.as_deref().unwrap_or_else(|| {
-        // Stable ID from name
-        &maint.name
-    });
-    let maint_uri_val = maintainer_uri(
-        maint
-            .email
-            .as_deref()
-            .unwrap_or(&maint.name.to_lowercase().replace(' ', "-")),
-    );
+    let maint_uri_val = if let Some(ref email) = maint.email {
+        maintainer_uri(email)
+    } else {
+        maintainer_name_uri(&maint.name)
+    };
     let mut triples = 0;
 
     // Type as Person (SD-3 data contract)

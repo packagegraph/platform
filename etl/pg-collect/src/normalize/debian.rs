@@ -183,18 +183,36 @@ fn parse_maintainer(maint: &str) -> Vec<MaintainerIr> {
     use super::maintainer::{parse_mailbox_list, is_email_iri_safe};
 
     let parsed = parse_mailbox_list(maint);
-    parsed
-        .mailboxes
-        .into_iter()
-        .map(|m| {
-            let email = m.email.filter(|e| is_email_iri_safe(e));
-            MaintainerIr {
-                name: m.name,
-                email,
-                role_hint: Some("maintainer".to_string()),
+
+    if parsed.malformed_count > 0 {
+        eprintln!("WARNING: {} malformed maintainer entries in: {}", parsed.malformed_count, maint);
+    }
+
+    let mut iri_unsafe_count = 0usize;
+    let mut result = Vec::with_capacity(parsed.mailboxes.len());
+    for m in parsed.mailboxes {
+        let email = if let Some(e) = m.email {
+            if is_email_iri_safe(&e) {
+                Some(e)
+            } else {
+                iri_unsafe_count += 1;
+                None
             }
-        })
-        .collect()
+        } else {
+            None
+        };
+        result.push(MaintainerIr {
+            name: m.name,
+            email,
+            role_hint: Some("maintainer".to_string()),
+        });
+    }
+
+    if iri_unsafe_count > 0 {
+        eprintln!("WARNING: {} IRI-unsafe email addresses skipped in: {}", iri_unsafe_count, maint);
+    }
+
+    result
 }
 
 fn parse_debian_deps(dep_str: &str, dep_type: &str) -> Vec<DependencyIr> {
