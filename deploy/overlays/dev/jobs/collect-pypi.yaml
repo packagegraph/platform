@@ -31,8 +31,39 @@ spec:
               command: ["/bin/sh", "-c"]
               args:
                 - |
+                  CACHE_DIR=/tmp/cache/pypi
+                  MINIO_CACHE="pgraph/${MINIO_BUCKET}/collector-cache/pypi"
+
+                  # Initialize Minio alias
+                  mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
+
+                  # Warm cache
+                  mkdir -p "${CACHE_DIR}"
+                  if mc ls "${MINIO_CACHE}/" >/dev/null 2>&1; then
+                    echo "Syncing cache from Minio..."
+                    mc mirror --overwrite "${MINIO_CACHE}/" "${CACHE_DIR}/" || echo "Cache warm failed, continuing without cache"
+                  fi
+
+                  # Run collector with cache
                   pg-collect pypi \
                     --endpoint "$FUSEKI_ENDPOINT" \
-                    -o /tmp/pypi.nt && \
-                  /app/scripts/upload-nt.sh /tmp/pypi.nt "$GRAPH_URI"
+                    --cache-dir "${CACHE_DIR}" \
+                    --cache-ttl-hours 24 \
+                    -o /tmp/pypi.nt
+
+                  COLLECT_EXIT=$?
+
+                  # Save cache only on success
+                  if [ $COLLECT_EXIT -eq 0 ]; then
+                    echo "Syncing cache to Minio..."
+                    mc mirror --overwrite --exclude "*.tmp" --exclude "*.lock" "${CACHE_DIR}/" "${MINIO_CACHE}/" || echo "Cache save failed"
+                  fi
+
+                  # Upload only on success
+                  if [ $COLLECT_EXIT -eq 0 ]; then
+                    /app/scripts/upload-nt.sh /tmp/pypi.nt "$GRAPH_URI"
+                    exit $?
+                  fi
+
+                  exit $COLLECT_EXIT
               resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "1", memory: 2Gi}}
