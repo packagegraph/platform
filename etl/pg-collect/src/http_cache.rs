@@ -120,6 +120,31 @@ impl HttpCache {
         })
     }
 
+    /// Return the root cache directory (parent of the collector-specific dir).
+    ///
+    /// Useful when a collector needs to create sibling cache instances
+    /// for different content types (e.g. `maven-search` and `maven-pom`).
+    pub fn base_dir_str(&self) -> &str {
+        self.base_dir
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
+    }
+
+    /// Create a sibling cache sharing the same root dir and clock.
+    ///
+    /// Useful when a collector needs separate namespaces for different
+    /// content types (e.g. `maven-search` vs `maven-pom`) but must
+    /// share the clock for deterministic testing.
+    pub fn sibling(&self, collector: &str) -> io::Result<Self> {
+        let parent = self.base_dir.parent().unwrap_or(&self.base_dir);
+        Self::with_clock(
+            parent.to_str().unwrap_or(""),
+            collector,
+            self.clock.clone(),
+        )
+    }
+
     /// Return a fresh (non-expired) cached entry, or None.
     ///
     /// Entries that fail integrity checks are evicted automatically.

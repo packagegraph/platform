@@ -19,6 +19,7 @@ pub mod sparql;
 pub mod osv;
 pub mod rubygems;
 pub mod maven;
+pub mod maven_version;
 pub mod cpan;
 pub mod cran;
 pub mod hackage;
