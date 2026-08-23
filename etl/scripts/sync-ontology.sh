@@ -19,7 +19,7 @@
 #   source-ontology-dir  Path to ontology repo root (default: ../../ontology)
 #
 # Output:
-#   Populates etl/ontology/ with 36 ontology .ttl files (one per module)
+#   Populates etl/ontology/ with 37 ontology .ttl files (one per module)
 
 set -euo pipefail
 
@@ -94,6 +94,62 @@ echo "  Example files (should be 0): $(find "$MIRROR_DIR" -maxdepth 1 -name '*.e
 if [[ -f "$MIRROR_DIR/shacl.ttl" ]] || [[ -f "$MIRROR_DIR/examples.ttl" ]]; then
     echo "  WARNING: Stale monolithic files found and removed"
     rm -f "$MIRROR_DIR/shacl.ttl" "$MIRROR_DIR/examples.ttl"
+fi
+
+# Verify exact allowlist (v0.12.0: 37 modules)
+EXPECTED_FILES="apk.ttl
+attestation.ttl
+bitbake.ttl
+bsdpkg.ttl
+buildroot.ttl
+cargo.ttl
+chocolatey.ttl
+conda.ttl
+core.ttl
+cpan.ttl
+cran.ttl
+deb.ttl
+dq.ttl
+flatpak.ttl
+gomod.ttl
+hackage.ttl
+hex.ttl
+homebrew.ttl
+maven.ttl
+metrics.ttl
+nix.ttl
+npm.ttl
+nuget.ttl
+opkg.ttl
+pacman.ttl
+portage.ttl
+pypi.ttl
+redhat.ttl
+rpm.ttl
+rubygems.ttl
+security.ttl
+skos-schemes.ttl
+slsa.ttl
+snap.ttl
+taxonomy.ttl
+vcs.ttl
+xbps.ttl"
+
+ACTUAL_FILES=$(find "$MIRROR_DIR" -maxdepth 1 -name '*.ttl' -exec basename {} \; | sort)
+
+MISSING=$(comm -23 <(echo "$EXPECTED_FILES") <(echo "$ACTUAL_FILES"))
+UNEXPECTED=$(comm -13 <(echo "$EXPECTED_FILES") <(echo "$ACTUAL_FILES"))
+
+if [[ -n "$MISSING" ]]; then
+    echo "ERROR: Missing expected ontology modules:"
+    echo "$MISSING" | sed 's/^/  - /'
+    exit 1
+fi
+
+if [[ -n "$UNEXPECTED" ]]; then
+    echo "ERROR: Unexpected ontology modules (update allowlist in this script if intentional):"
+    echo "$UNEXPECTED" | sed 's/^/  - /'
+    exit 1
 fi
 
 echo "Sync complete."

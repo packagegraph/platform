@@ -14,7 +14,7 @@ bash etl/scripts/sync-ontology.sh /path/to/ontology
 
 **Run before every container build.** The ontology repo has files in `core/`, `extensions/*/`, `ecosystems/*/` — this script collects only the module `.ttl` files (not `.shacl.ttl` or `.examples.ttl`) into the flat mirror.
 
-Output: 34 `.ttl` files in `etl/ontology/`.
+Output: 37 `.ttl` files in `etl/ontology/`.
 
 ## upload-nt.sh
 
