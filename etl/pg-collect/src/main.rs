@@ -597,7 +597,10 @@ enum Commands {
         output: String,
     },
 
-    /// Collect Maven artifacts from Maven Central
+    /// Collect Maven artifacts from Maven Central.
+    ///
+    /// Emits raw POM declarations, NOT effective Maven resolution.
+    /// When --max-depth > 0, performs recursive BFS traversal of dependency graphs.
     Maven {
         /// Seed file with groupId:artifactId coordinates (one per line). Omit with --endpoint to auto-discover.
         #[arg(long)]
@@ -626,6 +629,22 @@ enum Commands {
         /// Force cache refresh (bypass fresh entries, re-fetch from network)
         #[arg(long)]
         cache_refresh: bool,
+
+        /// Maximum traversal depth (0 = seed-only, no recursion)
+        #[arg(long, default_value = "3")]
+        max_depth: u32,
+
+        /// Maximum number of seed roots to process
+        #[arg(long, default_value = "10000")]
+        max_roots: usize,
+
+        /// Maximum total packages to schedule for fetching
+        #[arg(long, default_value = "5000")]
+        max_packages: usize,
+
+        /// Courtesy delay between network requests in milliseconds
+        #[arg(long, default_value = "500")]
+        delay_ms: u64,
     },
 
     /// Collect CPAN distributions from MetaCPAN
@@ -1901,19 +1920,27 @@ fn main() {
             }
         }
 
-        Commands::Maven { packages_file, endpoint, search_base, repo_base, output, cache_dir, cache_refresh } => {
+        Commands::Maven { packages_file, endpoint, search_base, repo_base, output, cache_dir, cache_refresh, max_depth, max_roots, max_packages, delay_ms } => {
             eprintln!("=== PackageGraph Maven Collector ===");
             eprintln!("Output: {}", output);
             eprintln!();
 
-            // Central-only enforcement: reject non-Central --repo-base values
-            if !pg_collect::maven::is_maven_central(&repo_base) {
+            if max_packages == 0 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "max-packages must be > 0",
+                ))
+            } else if max_roots == 0 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "max-roots must be > 0",
+                ))
+            } else if !pg_collect::maven::is_maven_central(&repo_base) {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("Only Maven Central is supported. Got: {}", repo_base),
                 ))
             } else {
-                // Build cache separately to avoid move issues on init failure
                 let http_cache = cache_dir.as_ref().and_then(|dir| {
                     match pg_collect::http_cache::HttpCache::new(dir, "maven") {
                         Ok(c) => {
@@ -1930,8 +1957,17 @@ fn main() {
                 if let Some(cache) = http_cache {
                     collector.set_cache(cache);
                 }
-                let collector = collector.with_refresh(cache_refresh);
+                let mut collector = collector.with_refresh(cache_refresh);
+                collector.max_depth = max_depth;
+                collector.max_roots = max_roots;
+                collector.max_packages = max_packages;
+                collector.delay_ms = delay_ms;
 
+                if max_depth > 0 {
+                    eprintln!("Traversal: depth={}, max_roots={}, max_packages={}, delay={}ms", max_depth, max_roots, max_packages, delay_ms);
+                }
+
+                // All modes route through collect_recursive
                 if let Some(ref seed) = packages_file {
                     eprintln!("Seed: {}", seed);
                     collector.collect(seed, &output)

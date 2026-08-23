@@ -8,6 +8,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use reqwest::blocking::Client;
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
 use std::time::Duration;
@@ -18,6 +19,10 @@ pub struct MavenCollector {
     repo_base: String,
     http_cache: Option<HttpCache>,
     refresh: bool,
+    pub max_depth: u32,
+    pub max_roots: usize,
+    pub max_packages: usize,
+    pub delay_ms: u64,
 }
 
 /// Check whether a URL points to Maven Central over HTTPS.
@@ -53,27 +58,61 @@ struct SearchDoc {
     latest_version: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ParentCoordinate {
+    pub(crate) group_id: String,
+    pub(crate) artifact_id: String,
+    pub(crate) version: String,
+}
+
 #[derive(Debug, Default)]
-struct PomMetadata {
-    group_id: String,
-    artifact_id: String,
-    version: String,
-    description: Option<String>,
-    url: Option<String>,
-    licenses: Vec<String>,
-    dependencies: Vec<PomDependency>,
-    scm_url: Option<String>,
-    scm_connection: Option<String>,
-    scm_tag: Option<String>,
+pub(crate) struct PomMetadata {
+    pub(crate) group_id: String,
+    pub(crate) artifact_id: String,
+    pub(crate) version: String,
+    pub(crate) description: Option<String>,
+    pub(crate) url: Option<String>,
+    pub(crate) licenses: Vec<String>,
+    pub(crate) dependencies: Vec<PomDependency>,
+    pub(crate) dependency_management: Vec<PomDependency>,
+    pub(crate) parent: Option<ParentCoordinate>,
+    pub(crate) properties: HashMap<String, String>,
+    pub(crate) scm_url: Option<String>,
+    pub(crate) scm_connection: Option<String>,
+    pub(crate) scm_tag: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-struct PomDependency {
-    group_id: String,
-    artifact_id: String,
-    version: Option<String>,
-    scope: Option<String>,
-    optional: bool,
+pub(crate) struct PomDependency {
+    pub(crate) group_id: String,
+    pub(crate) artifact_id: String,
+    pub(crate) version: Option<String>,
+    pub(crate) scope: Option<String>,
+    pub(crate) optional: bool,
+    pub(crate) dependency_type: Option<String>,
+    pub(crate) classifier: Option<String>,
+    /// Exclusions as `(groupId, artifactId)` pairs.
+    pub(crate) exclusions: Vec<(String, String)>,
+}
+
+/// A dependency with all coordinates fully resolved (interpolated).
+///
+/// Both emission AND traversal consume this single struct -- no separate
+/// interpolation paths.
+#[derive(Debug)]
+pub(crate) struct ResolvedDependency {
+    pub(crate) group_id: String,
+    pub(crate) artifact_id: String,
+    pub(crate) version: Option<String>,
+    pub(crate) dependency_type: String,
+    pub(crate) classifier: String,
+    pub(crate) scope: String,
+    pub(crate) optional: bool,
+    pub(crate) exclusions: Vec<(String, String)>,
+    #[allow(dead_code)] // retained for diagnostics/logging
+    pub(crate) raw_version_expr: Option<String>,
+    pub(crate) version_class: VersionClass,
+    pub(crate) is_emittable: bool,
 }
 
 impl MavenCollector {
@@ -86,6 +125,10 @@ impl MavenCollector {
             repo_base,
             http_cache: None,
             refresh: false,
+            max_depth: 3,
+            max_roots: 10_000,
+            max_packages: 5_000,
+            delay_ms: 500,
         }
     }
 
@@ -109,63 +152,34 @@ impl MavenCollector {
     pub fn collect_discover(&self, endpoint: &str, output_path: &str) -> Result<(usize, usize)> {
         let raw_names = crate::seed::discover_by_ecosystem(endpoint, "maven")?;
         let raw_count = raw_names.len();
-        // Normalize: strip version/classifier from old-format entries (g:a:v:c → g:a),
-        // keep only valid groupId:artifactId pairs, deduplicate
-        let mut seen = std::collections::HashSet::new();
-        let names: Vec<String> = raw_names.into_iter().filter_map(|n| {
-            let parts: Vec<&str> = n.splitn(3, ':').collect();
-            if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                let coord = format!("{}:{}", parts[0], parts[1]);
-                if seen.insert(coord.clone()) { Some(coord) } else { None }
-            } else {
-                None
-            }
-        }).collect();
-        eprintln!("Normalized {} raw → {} unique Maven coordinates", raw_count, names.len());
-        let seed_path = "/tmp/seed-maven-discover.txt";
-        std::fs::write(seed_path, names.join("\n"))?;
-        self.collect(seed_path, output_path)
+        let mut seen = HashSet::new();
+        let seeds: Vec<(String, String)> = raw_names
+            .into_iter()
+            .filter_map(|n| {
+                let parts: Vec<&str> = n.splitn(3, ':').collect();
+                if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                    let key = (parts[0].to_string(), parts[1].to_string());
+                    if seen.insert(key.clone()) {
+                        Some(key)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+        eprintln!(
+            "Normalized {} raw -> {} unique Maven coordinates",
+            raw_count,
+            seeds.len()
+        );
+        self.collect_recursive(seeds, output_path)
     }
 
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
-        let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
-
-        self.emit_distribution_metadata(&mut writer)?;
-
-        let coordinates = read_maven_seed_file(packages_file)?;
-        eprintln!("Loaded {} Maven coordinates from seed file", coordinates.len());
-
-        let mut total_packages = 0;
-        let mut total_triples = 0;
-        let mut base_delay_ms = 500;
-
-        for (idx, coord) in coordinates.iter().enumerate() {
-            if (idx + 1) % 100 == 0 {
-                eprintln!("Progress: {}/{}", idx + 1, coordinates.len());
-            }
-
-            let (group_id, artifact_id) = coord;
-            match self.fetch_artifact_with_retry(group_id, artifact_id, &mut base_delay_ms) {
-                Ok((pom, was_network_hit)) => {
-                    total_triples += self.emit_artifact_triples(&mut writer, &pom)?;
-                    total_packages += 1;
-                    if was_network_hit {
-                        std::thread::sleep(Duration::from_millis(base_delay_ms));
-                    }
-                }
-                Err((e, was_network_hit)) => {
-                    eprintln!("  Error fetching {}:{}: {}", group_id, artifact_id, e);
-                    // Apply courtesy delay even on failed network requests
-                    if was_network_hit {
-                        std::thread::sleep(Duration::from_millis(base_delay_ms));
-                    }
-                }
-            }
-        }
-
-        writer.flush()?;
-        Ok((total_packages, total_triples))
+        let seeds = read_maven_seed_file(packages_file)?;
+        self.collect_recursive(seeds, output_path)
     }
 
     fn emit_distribution_metadata(&self, writer: &mut NTriplesWriter) -> Result<usize> {
@@ -191,6 +205,7 @@ impl MavenCollector {
     /// `Err((FetchError, was_network_hit))` on failure -- the bool is
     /// always available so the caller can apply a courtesy delay even
     /// on failed network requests.
+    #[allow(dead_code)] // used by tests
     fn fetch_artifact_with_retry(
         &self,
         group_id: &str,
@@ -704,119 +719,27 @@ impl MavenCollector {
         artifact_id: &str,
         version: &str,
     ) -> std::result::Result<PomMetadata, String> {
-        let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
-
-        let mut pom = PomMetadata {
-            group_id: group_id.to_string(),
-            artifact_id: artifact_id.to_string(),
-            version: version.to_string(),
-            ..Default::default()
-        };
-
-        let mut buf = Vec::new();
-        let mut current_element = String::new();
-        let mut in_dependencies = false;
-        let mut in_licenses = false;
-        let mut in_scm = false;
-        let mut current_dep = PomDependency {
-            group_id: String::new(),
-            artifact_id: String::new(),
-            version: None,
-            scope: None,
-            optional: false,
-        };
-
-        loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(e)) => {
-                    let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                    current_element = name.clone();
-                    if name == "dependencies" {
-                        in_dependencies = true;
-                    } else if name == "licenses" {
-                        in_licenses = true;
-                    } else if name == "scm" && !in_dependencies {
-                        in_scm = true;
-                    } else if in_dependencies && name == "dependency" {
-                        current_dep = PomDependency {
-                            group_id: String::new(),
-                            artifact_id: String::new(),
-                            version: None,
-                            scope: None,
-                            optional: false,
-                        };
-                    }
-                }
-                Ok(Event::End(e)) => {
-                    let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                    if name == "dependencies" {
-                        in_dependencies = false;
-                    } else if name == "licenses" {
-                        in_licenses = false;
-                    } else if name == "scm" {
-                        in_scm = false;
-                    } else if in_dependencies && name == "dependency" {
-                        if !current_dep.group_id.is_empty() && !current_dep.artifact_id.is_empty() {
-                            pom.dependencies.push(current_dep.clone());
-                        }
-                    }
-                    current_element.clear();
-                }
-                Ok(Event::Text(e)) => {
-                    let text = e.unescape().unwrap_or_default().trim().to_string();
-                    if text.is_empty() {
-                        continue;
-                    }
-
-                    match current_element.as_str() {
-                        "description" if !in_dependencies => pom.description = Some(text),
-                        "url" if !in_dependencies && !in_licenses && !in_scm => pom.url = Some(text),
-                        "name" if in_licenses => {
-                            if !pom.licenses.contains(&text) {
-                                pom.licenses.push(text);
-                            }
-                        }
-                        "groupId" if in_dependencies => current_dep.group_id = text,
-                        "artifactId" if in_dependencies => current_dep.artifact_id = text,
-                        "version" if in_dependencies => current_dep.version = Some(text),
-                        "scope" if in_dependencies => current_dep.scope = Some(text),
-                        "optional" if in_dependencies => current_dep.optional = text == "true",
-                        "url" if in_scm => pom.scm_url = Some(text),
-                        "connection" if in_scm => pom.scm_connection = Some(text),
-                        "tag" if in_scm => pom.scm_tag = Some(text),
-                        _ => {}
-                    }
-                }
-                Ok(Event::Eof) => break,
-                Err(e) => return Err(format!("XML parse error: {}", e)),
-                _ => {}
-            }
-            buf.clear();
-        }
-
-        Ok(pom)
+        parse_pom(xml, group_id, artifact_id, version)
     }
 
-    fn emit_artifact_triples(&self, writer: &mut NTriplesWriter, pom: &PomMetadata) -> Result<usize> {
+    /// Emit package metadata triples (everything except dependencies).
+    /// Returns (triples_count, pkg_uri) so callers can emit deps separately.
+    fn emit_package_metadata(&self, writer: &mut NTriplesWriter, pom: &PomMetadata) -> Result<(usize, String)> {
         let name = format!("{}/{}", pom.group_id, pom.artifact_id);
         let identity_name = format!("{}:{}", pom.group_id, pom.artifact_id);
         let pkg_uri = package_uri("maven", "central", "any", &name, &pom.version);
         let identity_uri = package_identity_uri("maven", "central", "any", &name);
         let mut triples = 0;
 
-        // Dual typing
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{PKG}Package"))?;
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{MAVEN}MavenArtifact"))?;
         triples += 2;
 
-        // Identity
         writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
         writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &identity_name)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 
-        // Canonical identity name (colon form for OSV join) and PURL
         writer.write_literal(&identity_uri, &format!("{PKG}identityName"), &identity_name)?;
         triples += 1;
 
@@ -827,24 +750,20 @@ impl MavenCollector {
         writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), &identity_name)?;
         triples += 1;
 
-        // Maven-specific coordinates
         writer.write_literal(&pkg_uri, &format!("{MAVEN}groupId"), &pom.group_id)?;
         writer.write_literal(&pkg_uri, &format!("{MAVEN}artifactId"), &pom.artifact_id)?;
         triples += 2;
 
-        // Version
         let ver_uri = version_uri("maven", "central", &name, &pom.version);
         writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
         writer.write_literal(&ver_uri, &format!("{PKG}versionString"), &pom.version)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
         triples += 3;
 
-        // Distribution
         let dist_uri = distro_uri("maven");
         writer.write_triple(&pkg_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         triples += 1;
 
-        // Optional properties
         if let Some(desc) = &pom.description {
             writer.write_literal(&pkg_uri, &format!("{PKG}description"), desc)?;
             triples += 1;
@@ -856,14 +775,12 @@ impl MavenCollector {
         for license in &pom.licenses {
             writer.write_literal(&pkg_uri, &format!("{PKG}licenseName"), license)?;
             triples += 1;
-            // License entity (SPDX)
             let license_uri = crate::uris::spdx_license_uri(license);
             writer.write_triple(&pkg_uri, &format!("{PKG}hasLicense"), &license_uri)?;
             writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))?;
             triples += 2;
         }
 
-        // SCM → upstream repository
         if let Some(scm_url) = &pom.scm_url {
             if let Some(repo_uri) = crate::uris::normalize_forge_url(scm_url) {
                 writer.write_triple(&identity_uri, &format!("{PKG}upstreamRepository"), &repo_uri)?;
@@ -878,7 +795,6 @@ impl MavenCollector {
             }
         }
 
-        // SCM tag → packagedFromTag
         if let Some(tag) = &pom.scm_tag {
             if tag != "HEAD" && !tag.is_empty() {
                 let tag_uri = format!("{DATA}tag/maven/{}/{}/{}", pom.group_id, pom.artifact_id, tag);
@@ -889,43 +805,79 @@ impl MavenCollector {
             }
         }
 
-        // Dependencies
-        for dep in &pom.dependencies {
-            triples += self.emit_maven_dependency(writer, &pkg_uri, dep)?;
+        Ok((triples, pkg_uri))
+    }
+
+    /// Emit all triples for an artifact (package metadata + all dependencies).
+    /// Dependencies are resolved through pom.properties before emission.
+    #[allow(dead_code)] // used by tests
+    fn emit_artifact_triples(&self, writer: &mut NTriplesWriter, pom: &PomMetadata) -> Result<usize> {
+        let (mut triples, pkg_uri) = self.emit_package_metadata(writer, pom)?;
+
+        for (ordinal, dep) in pom.dependencies.iter().enumerate() {
+            let resolved = resolve_dependency(pom, dep);
+            if !resolved.is_emittable {
+                continue;
+            }
+            triples += self.emit_resolved_dep(writer, &pkg_uri, ordinal, dep, &resolved)?;
         }
 
         Ok(triples)
     }
 
-    fn emit_maven_dependency(
+    /// Emit dependency triples using resolved coordinates for the target URI.
+    ///
+    /// Takes both the raw `PomDependency` (for dep_identity blank node key)
+    /// and the `ResolvedDependency` (for target URI and emitted values).
+    fn emit_resolved_dep(
         &self,
         writer: &mut NTriplesWriter,
         pkg_uri: &str,
-        dep: &PomDependency,
+        ordinal: usize,
+        raw_dep: &PomDependency,
+        resolved: &ResolvedDependency,
     ) -> Result<usize> {
-        let dep_name = format!("{}/{}", dep.group_id, dep.artifact_id);
+        let dep_name = format!("{}/{}", resolved.group_id, resolved.artifact_id);
         let target_uri = package_identity_uri("maven", "central", "any", &dep_name);
         let mut triples = 0;
+
+        // Target identity typing
+        let identity_name = format!("{}:{}", resolved.group_id, resolved.artifact_id);
+        writer.write_triple(&target_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
+        writer.write_literal(&target_uri, &format!("{PKG}identityName"), &identity_name)?;
+        let purl = format!("pkg:maven/{}/{}", resolved.group_id, resolved.artifact_id);
+        writer.write_literal(&target_uri, &format!("{PKG}purl"), &purl)?;
+        triples += 3;
 
         writer.write_triple(pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
         triples += 1;
 
-        let scope = dep.scope.as_deref().unwrap_or("compile");
-        let bnode = bnode_id(scope, &format!("{}-{}", pkg_uri, &dep_name));
+        let dep_key = dep_identity(pkg_uri, ordinal, raw_dep);
+        let bnode = bnode_id("dep", &dep_key);
         writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
         writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
         writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-        writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri(scope))?;
-        writer.write_bnode_literal(&bnode, &format!("{MAVEN}scope"), scope)?;
+        writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri(&resolved.scope))?;
+        writer.write_bnode_literal(&bnode, &format!("{MAVEN}scope"), &resolved.scope)?;
         triples += 5;
 
-        if dep.optional {
+        if resolved.optional {
             writer.write_bnode_literal(&bnode, &format!("{MAVEN}optional"), "true")?;
             triples += 1;
         }
 
-        if let Some(version_constraint) = &dep.version {
-            let cb = bnode_id("constraint", &format!("{}-{}", pkg_uri, &dep_name));
+        if resolved.dependency_type != "jar" {
+            writer.write_bnode_literal(&bnode, &format!("{MAVEN}type"), &resolved.dependency_type)?;
+            triples += 1;
+        }
+
+        if !resolved.classifier.is_empty() {
+            writer.write_bnode_literal(&bnode, &format!("{MAVEN}classifier"), &resolved.classifier)?;
+            triples += 1;
+        }
+
+        if let Some(version_constraint) = &resolved.version {
+            let cb = bnode_id("constraint", &dep_key);
             writer.write_bnode_to_bnode(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
             writer.write_bnode_subject(&cb, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
             writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintOperator"), "maven")?;
@@ -933,7 +885,878 @@ impl MavenCollector {
             triples += 4;
         }
 
+        for (excl_idx, (excl_g, excl_a)) in resolved.exclusions.iter().enumerate() {
+            let excl_key = format!("{}#{}", dep_key, excl_idx);
+            let excl_bnode = bnode_id("excl", &excl_key);
+            writer.write_bnode_to_bnode(&bnode, &format!("{MAVEN}hasExclusion"), &excl_bnode)?;
+            writer.write_bnode_subject(&excl_bnode, RDF_TYPE, &format!("{MAVEN}DependencyExclusion"))?;
+            writer.write_bnode_literal(&excl_bnode, &format!("{MAVEN}excludedGroupId"), excl_g)?;
+            writer.write_bnode_literal(&excl_bnode, &format!("{MAVEN}excludedArtifactId"), excl_a)?;
+            triples += 4;
+        }
+
         Ok(triples)
+    }
+
+    /// Recursive BFS traversal of Maven dependency graph.
+    ///
+    /// Emits raw POM declarations, NOT effective Maven resolution.
+    /// Dependencies are traversed only when they have compile/runtime scope,
+    /// are non-optional, and have concrete (non-SNAPSHOT, non-range) versions.
+    pub fn collect_recursive(
+        &self,
+        seeds: Vec<(String, String)>,
+        output_path: &str,
+    ) -> Result<(usize, usize)> {
+        // Finding 4: empty seed → truly empty output
+        if seeds.is_empty() {
+            eprintln!("WARNING: no seed coordinates provided, nothing to collect");
+            let file = File::create(output_path)?;
+            let mut writer = NTriplesWriter::new(file);
+            writer.flush()?;
+            return Ok((0, 0));
+        }
+
+        let file = File::create(output_path)?;
+        let mut writer = NTriplesWriter::new(file);
+
+        self.emit_distribution_metadata(&mut writer)?;
+
+        let mut state = TraversalState {
+            queue: VecDeque::new(),
+            scheduled: HashSet::new(),
+            roots_provided: seeds.len(),
+            roots_unique: 0,
+            roots_resolved: 0,
+            root_resolution_failures: 0,
+            fetched_ok: 0,
+            fetch_errors: HashMap::new(),
+            non_emittable_unresolved: 0,
+            non_traversable_snapshot: 0,
+            non_traversable_range: 0,
+            non_traversable_unresolved: 0,
+            non_traversable_special: 0,
+            skipped_depth: 0,
+            skipped_limit: 0,
+            skipped_roots: 0,
+        };
+
+        // Deduplicate roots preserving order
+        let mut seen_roots = HashSet::new();
+        let unique_seeds: Vec<_> = seeds
+            .into_iter()
+            .filter(|c| seen_roots.insert((c.0.clone(), c.1.clone())))
+            .collect();
+        state.roots_unique = unique_seeds.len();
+        eprintln!(
+            "Loaded {} Maven coordinates ({} unique)",
+            state.roots_provided, state.roots_unique
+        );
+
+        let mut base_delay_ms = self.delay_ms;
+
+        // Root resolution phase
+        for (idx, (group, artifact)) in unique_seeds.iter().enumerate() {
+            if idx >= self.max_roots {
+                state.skipped_roots += unique_seeds.len() - idx;
+                break;
+            }
+            // Finding 5: count ALL remaining roots when limit hit
+            if state.scheduled.len() >= self.max_packages {
+                state.skipped_limit += unique_seeds.len() - idx;
+                break;
+            }
+            match self.get_latest_version(group, artifact, &mut base_delay_ms) {
+                Ok((version, was_hit)) => {
+                    state.roots_resolved += 1;
+                    try_enqueue(
+                        &mut state,
+                        group,
+                        artifact,
+                        &version,
+                        0,
+                        self.max_depth,
+                        self.max_packages,
+                    );
+                    if was_hit && self.delay_ms > 0 {
+                        std::thread::sleep(Duration::from_millis(self.delay_ms));
+                    }
+                }
+                Err((_e, was_hit)) => {
+                    state.root_resolution_failures += 1;
+                    state.roots_resolved += 1;
+                    eprintln!(
+                        "  Root resolution failed for {}:{}: {}",
+                        group, artifact, _e
+                    );
+                    if was_hit && self.delay_ms > 0 {
+                        std::thread::sleep(Duration::from_millis(self.delay_ms));
+                    }
+                }
+            }
+        }
+
+        let mut total_packages = 0usize;
+        let mut total_triples = 0usize;
+
+        // BFS traversal loop
+        while let Some((g, a, v, depth)) = state.queue.pop_front() {
+            if (total_packages + 1) % 100 == 0 {
+                eprintln!(
+                    "Progress: {} fetched, {} scheduled, queue={}",
+                    total_packages,
+                    state.scheduled.len(),
+                    state.queue.len()
+                );
+            }
+
+            match self.fetch_pom(&g, &a, &v, &mut base_delay_ms) {
+                Ok((pom, was_hit)) => {
+                    state.fetched_ok += 1;
+
+                    // Emit package metadata (without deps)
+                    let (pkg_triples, pkg_uri) =
+                        self.emit_package_metadata(&mut writer, &pom)?;
+                    total_triples += pkg_triples;
+                    total_packages += 1;
+
+                    // Process dependencies via ResolvedDependency
+                    for (ordinal, dep) in pom.dependencies.iter().enumerate() {
+                        let resolved = resolve_dependency(&pom, dep);
+
+                        if !resolved.is_emittable {
+                            state.non_emittable_unresolved += 1;
+                            continue;
+                        }
+
+                        // Emit dependency triples
+                        total_triples += self.emit_resolved_dep(
+                            &mut writer,
+                            &pkg_uri,
+                            ordinal,
+                            dep,
+                            &resolved,
+                        )?;
+
+                        // Traverse only compile/runtime, non-optional
+                        if !should_traverse_resolved(&resolved) {
+                            continue;
+                        }
+
+                        match &resolved.version_class {
+                            VersionClass::ConcreteVersion(cv) => {
+                                try_enqueue(
+                                    &mut state,
+                                    &resolved.group_id,
+                                    &resolved.artifact_id,
+                                    cv,
+                                    depth + 1,
+                                    self.max_depth,
+                                    self.max_packages,
+                                );
+                            }
+                            VersionClass::Snapshot(_) => {
+                                state.non_traversable_snapshot += 1;
+                            }
+                            VersionClass::VersionRange(_) => {
+                                state.non_traversable_range += 1;
+                            }
+                            VersionClass::UnresolvedProperty(_) => {
+                                state.non_traversable_unresolved += 1;
+                            }
+                            VersionClass::SpecialToken(_) => {
+                                state.non_traversable_special += 1;
+                            }
+                            VersionClass::NoVersion => {
+                                state.non_traversable_unresolved += 1;
+                            }
+                        }
+                    }
+
+                    if was_hit && self.delay_ms > 0 {
+                        std::thread::sleep(Duration::from_millis(self.delay_ms));
+                    }
+                }
+                Err((e, was_hit)) => {
+                    *state
+                        .fetch_errors
+                        .entry(e.classification().to_string())
+                        .or_insert(0) += 1;
+                    eprintln!("  Error fetching {}:{}:{}: {}", g, a, v, e);
+                    if was_hit && self.delay_ms > 0 {
+                        std::thread::sleep(Duration::from_millis(self.delay_ms));
+                    }
+                }
+            }
+        }
+
+        writer.flush()?;
+
+        // Summary
+        let total_fetch_errors: usize = state.fetch_errors.values().sum();
+        let error_breakdown: String = state
+            .fetch_errors
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let non_traversable_sum = state.non_traversable_snapshot
+            + state.non_traversable_range
+            + state.non_traversable_unresolved
+            + state.non_traversable_special;
+        let non_traversable_breakdown = format!(
+            "snapshot={}, range={}, unresolved={}, special={}",
+            state.non_traversable_snapshot,
+            state.non_traversable_range,
+            state.non_traversable_unresolved,
+            state.non_traversable_special,
+        );
+
+        eprintln!("\n=== Maven Collection Summary ===");
+        eprintln!("Roots provided:       {}", state.roots_provided);
+        eprintln!("Roots unique:         {}", state.roots_unique);
+        eprintln!("Roots resolved:       {}", state.roots_resolved);
+        eprintln!("Root failures:        {}", state.root_resolution_failures);
+        eprintln!("Scheduled:            {}", state.scheduled.len());
+        eprintln!("Fetched OK:           {}", state.fetched_ok);
+        eprintln!("Fetch errors:         {} ({})", total_fetch_errors, error_breakdown);
+        eprintln!("Non-emittable:        {}", state.non_emittable_unresolved);
+        eprintln!("Non-traversable:      {} ({})", non_traversable_sum, non_traversable_breakdown);
+        eprintln!("Skipped (depth):      {}", state.skipped_depth);
+        eprintln!("Skipped (limit):      {}", state.skipped_limit);
+        eprintln!("Skipped (roots):      {}", state.skipped_roots);
+
+        // Error rate check (threshold 20%)
+        let root_rate = if state.roots_resolved > 0 {
+            state.root_resolution_failures as f64 / state.roots_resolved as f64
+        } else {
+            0.0
+        };
+        let scheduled_count = state.scheduled.len();
+        let pom_rate = if scheduled_count > 0 {
+            total_fetch_errors as f64 / scheduled_count as f64
+        } else {
+            0.0
+        };
+        if root_rate > 0.2 || pom_rate > 0.2 {
+            return Err(std::io::Error::other(format!(
+                "error rate exceeded threshold (root: {:.1}%, pom: {:.1}%)",
+                root_rate * 100.0,
+                pom_rate * 100.0,
+            )));
+        }
+
+        Ok((total_packages, total_triples))
+    }
+}
+
+struct TraversalState {
+    queue: VecDeque<(String, String, String, u32)>,
+    scheduled: HashSet<(String, String, String)>,
+    roots_provided: usize,
+    roots_unique: usize,
+    roots_resolved: usize,
+    root_resolution_failures: usize,
+    fetched_ok: usize,
+    fetch_errors: HashMap<String, usize>,
+    non_emittable_unresolved: usize,
+    non_traversable_snapshot: usize,
+    non_traversable_range: usize,
+    non_traversable_unresolved: usize,
+    non_traversable_special: usize,
+    skipped_depth: usize,
+    skipped_limit: usize,
+    skipped_roots: usize,
+}
+
+fn try_enqueue(
+    state: &mut TraversalState,
+    g: &str,
+    a: &str,
+    v: &str,
+    depth: u32,
+    max_depth: u32,
+    max_packages: usize,
+) {
+    if depth > max_depth {
+        state.skipped_depth += 1;
+        return;
+    }
+    let key = (g.to_string(), a.to_string(), v.to_string());
+    if !state.scheduled.insert(key) {
+        return;
+    }
+    if state.scheduled.len() > max_packages {
+        state
+            .scheduled
+            .remove(&(g.to_string(), a.to_string(), v.to_string()));
+        state.skipped_limit += 1;
+        return;
+    }
+    state
+        .queue
+        .push_back((g.to_string(), a.to_string(), v.to_string(), depth));
+}
+
+fn should_traverse_resolved(resolved: &ResolvedDependency) -> bool {
+    if resolved.optional {
+        return false;
+    }
+    matches!(resolved.scope.as_str(), "compile" | "runtime")
+}
+
+fn contains_unresolved(s: &str) -> bool {
+    s.contains("${")
+}
+
+/// Resolve a PomDependency through pom.properties and dependency management.
+///
+/// Both emission AND traversal consume the resulting ResolvedDependency.
+fn resolve_dependency(pom: &PomMetadata, dep: &PomDependency) -> ResolvedDependency {
+    let interp = |field: &str| -> String {
+        interpolate_or_raw(
+            field,
+            &pom.properties,
+            &pom.group_id,
+            &pom.artifact_id,
+            &pom.version,
+        )
+    };
+
+    let group_id = interp(&dep.group_id);
+    let artifact_id = interp(&dep.artifact_id);
+    let dependency_type = interp(dep.dependency_type.as_deref().unwrap_or("jar"));
+    let classifier = interp(dep.classifier.as_deref().unwrap_or(""));
+    let scope = dep.scope.as_deref().unwrap_or("compile").to_string();
+
+    let raw_version_expr = dep.version.clone();
+
+    // Version resolution: dep.version -> interpolate -> management fallback -> interpolate
+    // Use resolved fields for the management lookup so ${...} coordinates match
+    let resolved_dep_for_lookup = PomDependency {
+        group_id: group_id.clone(),
+        artifact_id: artifact_id.clone(),
+        dependency_type: Some(dependency_type.clone()),
+        classifier: if classifier.is_empty() { None } else { Some(classifier.clone()) },
+        ..dep.clone()
+    };
+    let mgmt_version = lookup_in_dependency_management(pom, &resolved_dep_for_lookup);
+    let base_version = dep.version.as_deref().or(mgmt_version.as_deref());
+    let version = base_version.map(interp);
+
+    let version_class = classify_version(version.as_deref());
+    let is_emittable = !contains_unresolved(&group_id) && !contains_unresolved(&artifact_id);
+
+    ResolvedDependency {
+        group_id,
+        artifact_id,
+        version,
+        dependency_type,
+        classifier,
+        scope,
+        optional: dep.optional,
+        exclusions: dep.exclusions.clone(),
+        raw_version_expr,
+        version_class,
+        is_emittable,
+    }
+}
+
+/// Build a length-delimited, injective blank-node identity string for a Maven dependency.
+fn dep_identity(pkg_uri: &str, ordinal: usize, dep: &PomDependency) -> String {
+    let fields = [
+        pkg_uri,
+        &ordinal.to_string(),
+        &dep.group_id,
+        &dep.artifact_id,
+        dep.version.as_deref().unwrap_or(""),
+        dep.dependency_type.as_deref().unwrap_or("jar"),
+        dep.classifier.as_deref().unwrap_or(""),
+        dep.scope.as_deref().unwrap_or("compile"),
+        if dep.optional { "true" } else { "false" },
+    ];
+    fields
+        .iter()
+        .map(|f| format!("{}:{}", f.len(), f))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Parse a POM XML string into a `PomMetadata` struct.
+///
+/// Uses a path stack to distinguish between different `<dependencies>` contexts:
+/// - `/project/dependencies/dependency` -> `pom.dependencies`
+/// - `/project/dependencyManagement/dependencies/dependency` -> `pom.dependency_management`
+/// - Plugin and profile dependencies are ignored.
+///
+/// Also parses `<properties>`, `<parent>`, `<type>`, `<classifier>`, and `<exclusions>`.
+fn parse_pom(
+    xml: &str,
+    group_id: &str,
+    artifact_id: &str,
+    version: &str,
+) -> std::result::Result<PomMetadata, String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut pom = PomMetadata {
+        group_id: group_id.to_string(),
+        artifact_id: artifact_id.to_string(),
+        version: version.to_string(),
+        ..Default::default()
+    };
+
+    let mut buf = Vec::new();
+    // Path stack tracks the full element path, e.g. ["project", "dependencies", "dependency"]
+    let mut path_stack: Vec<String> = Vec::new();
+
+    // Current dependency being built (used for both project deps and depMgmt deps)
+    let mut current_dep = PomDependency {
+        group_id: String::new(),
+        artifact_id: String::new(),
+        version: None,
+        scope: None,
+        optional: false,
+        dependency_type: None,
+        classifier: None,
+        exclusions: Vec::new(),
+    };
+
+    // Current exclusion being built
+    let mut current_exclusion_group_id = String::new();
+    let mut current_exclusion_artifact_id = String::new();
+
+    // Current property name being parsed
+    let mut current_property_name = String::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                path_stack.push(name.clone());
+
+                let path = path_stack.join("/");
+
+                // Reset dependency when entering a dependency element in recognized contexts
+                if name == "dependency"
+                    && (path == "project/dependencies/dependency"
+                        || path == "project/dependencyManagement/dependencies/dependency")
+                {
+                    current_dep = PomDependency {
+                        group_id: String::new(),
+                        artifact_id: String::new(),
+                        version: None,
+                        scope: None,
+                        optional: false,
+                        dependency_type: None,
+                        classifier: None,
+                        exclusions: Vec::new(),
+                    };
+                }
+
+                // Reset exclusion fields when entering an exclusion element
+                if name == "exclusion" && path.ends_with("/exclusions/exclusion") {
+                    let dep_path_prefix_a = "project/dependencies/dependency/exclusions/exclusion";
+                    let dep_path_prefix_b = "project/dependencyManagement/dependencies/dependency/exclusions/exclusion";
+                    if path == dep_path_prefix_a || path == dep_path_prefix_b {
+                        current_exclusion_group_id.clear();
+                        current_exclusion_artifact_id.clear();
+                    }
+                }
+
+                // Track property name
+                if path_stack.len() == 3
+                    && path_stack[0] == "project"
+                    && path_stack[1] == "properties"
+                {
+                    current_property_name = name;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let path = path_stack.join("/");
+
+                // Finalize dependency
+                if name == "dependency"
+                    && !current_dep.group_id.is_empty()
+                    && !current_dep.artifact_id.is_empty()
+                {
+                    if path == "project/dependencies/dependency" {
+                        pom.dependencies.push(current_dep.clone());
+                    } else if path
+                        == "project/dependencyManagement/dependencies/dependency"
+                    {
+                        pom.dependency_management.push(current_dep.clone());
+                    }
+                }
+
+                // Finalize exclusion
+                if name == "exclusion" {
+                    let dep_path_prefix_a =
+                        "project/dependencies/dependency/exclusions/exclusion";
+                    let dep_path_prefix_b =
+                        "project/dependencyManagement/dependencies/dependency/exclusions/exclusion";
+                    if (path == dep_path_prefix_a || path == dep_path_prefix_b)
+                        && !current_exclusion_group_id.is_empty()
+                        && !current_exclusion_artifact_id.is_empty()
+                    {
+                        current_dep.exclusions.push((
+                            current_exclusion_group_id.clone(),
+                            current_exclusion_artifact_id.clone(),
+                        ));
+                    }
+                }
+
+                // Clear property name when leaving property element
+                if name == current_property_name
+                    && path_stack.len() == 3
+                    && path_stack[0] == "project"
+                    && path_stack[1] == "properties"
+                {
+                    current_property_name.clear();
+                }
+
+                path_stack.pop();
+            }
+            Ok(Event::Text(e)) => {
+                let text = e.unescape().unwrap_or_default().trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+
+                let path = path_stack.join("/");
+                let current_element = path_stack.last().map(|s| s.as_str()).unwrap_or("");
+
+                match current_element {
+                    // Project-level fields (only at /project/description, etc.)
+                    "description" if path == "project/description" => {
+                        pom.description = Some(text);
+                    }
+                    "url" if path == "project/url" => {
+                        pom.url = Some(text);
+                    }
+
+                    // License names
+                    "name" if path == "project/licenses/license/name" => {
+                        if !pom.licenses.contains(&text) {
+                            pom.licenses.push(text);
+                        }
+                    }
+
+                    // SCM fields (at /project/scm/*)
+                    "url" if path == "project/scm/url" => {
+                        pom.scm_url = Some(text);
+                    }
+                    "connection" if path == "project/scm/connection" => {
+                        pom.scm_connection = Some(text);
+                    }
+                    "tag" if path == "project/scm/tag" => {
+                        pom.scm_tag = Some(text);
+                    }
+
+                    // Parent coordinates
+                    "groupId" if path == "project/parent/groupId" => {
+                        pom.parent
+                            .get_or_insert_with(ParentCoordinate::default)
+                            .group_id = text;
+                    }
+                    "artifactId" if path == "project/parent/artifactId" => {
+                        pom.parent
+                            .get_or_insert_with(ParentCoordinate::default)
+                            .artifact_id = text;
+                    }
+                    "version" if path == "project/parent/version" => {
+                        pom.parent
+                            .get_or_insert_with(ParentCoordinate::default)
+                            .version = text;
+                    }
+
+                    // Properties
+                    _ if path_stack.len() == 3
+                        && path_stack[0] == "project"
+                        && path_stack[1] == "properties"
+                        && !current_property_name.is_empty() =>
+                    {
+                        pom.properties
+                            .insert(current_property_name.clone(), text);
+                    }
+
+                    // Dependency fields — only for recognized dependency paths
+                    "groupId"
+                        if is_dep_child_path(&path, "groupId") =>
+                    {
+                        current_dep.group_id = text;
+                    }
+                    "artifactId"
+                        if is_dep_child_path(&path, "artifactId") =>
+                    {
+                        current_dep.artifact_id = text;
+                    }
+                    "version"
+                        if is_dep_child_path(&path, "version") =>
+                    {
+                        current_dep.version = Some(text);
+                    }
+                    "scope"
+                        if is_dep_child_path(&path, "scope") =>
+                    {
+                        current_dep.scope = Some(text);
+                    }
+                    "optional"
+                        if is_dep_child_path(&path, "optional") =>
+                    {
+                        current_dep.optional = text == "true";
+                    }
+                    "type"
+                        if is_dep_child_path(&path, "type") =>
+                    {
+                        current_dep.dependency_type = Some(text);
+                    }
+                    "classifier"
+                        if is_dep_child_path(&path, "classifier") =>
+                    {
+                        current_dep.classifier = Some(text);
+                    }
+
+                    // Exclusion fields
+                    "groupId"
+                        if is_exclusion_child_path(&path, "groupId") =>
+                    {
+                        current_exclusion_group_id = text;
+                    }
+                    "artifactId"
+                        if is_exclusion_child_path(&path, "artifactId") =>
+                    {
+                        current_exclusion_artifact_id = text;
+                    }
+
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(format!("XML parse error: {}", e)),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(pom)
+}
+
+/// Check if a path is a direct child of a recognized dependency element.
+/// Recognized dependency paths:
+/// - `project/dependencies/dependency/<field>`
+/// - `project/dependencyManagement/dependencies/dependency/<field>`
+fn is_dep_child_path(path: &str, field: &str) -> bool {
+    path == format!("project/dependencies/dependency/{}", field)
+        || path
+            == format!(
+                "project/dependencyManagement/dependencies/dependency/{}",
+                field
+            )
+}
+
+/// Check if a path is a direct child of a recognized exclusion element.
+fn is_exclusion_child_path(path: &str, field: &str) -> bool {
+    path == format!(
+        "project/dependencies/dependency/exclusions/exclusion/{}",
+        field
+    ) || path
+        == format!(
+            "project/dependencyManagement/dependencies/dependency/exclusions/exclusion/{}",
+            field
+        )
+}
+
+/// Interpolate `${...}` property references in a value string.
+///
+/// Handles:
+/// - `${project.version}` -> pom.version
+/// - `${project.groupId}` -> pom.group_id
+/// - `${project.artifactId}` -> pom.artifact_id
+/// - `${custom.prop}` -> lookup in properties map
+///
+/// Supports nested property references (e.g. `${dep.group}` -> `${base.group}` -> `org.example`)
+/// up to 10 levels deep. Detects cycles via an active expansion chain — a property can be
+/// referenced multiple times without being a cycle (e.g. `${name}-${name}` works).
+///
+/// Returns `None` if a cycle is found or if any property cannot be resolved.
+///
+/// Used by the dependency traversal pipeline (Unit 6c) to resolve all coordinate fields.
+pub(crate) fn interpolate_property(
+    value: &str,
+    properties: &HashMap<String, String>,
+    pom_group_id: &str,
+    pom_artifact_id: &str,
+    pom_version: &str,
+) -> Option<String> {
+    interpolate_recursive(
+        value,
+        properties,
+        pom_group_id,
+        pom_artifact_id,
+        pom_version,
+        &mut std::collections::HashSet::new(),
+        0,
+    )
+}
+
+/// Recursive property interpolation with active-chain cycle detection.
+///
+/// `active_chain` tracks which keys are currently being expanded up the call stack.
+/// A key is added before recursing into its resolved value and removed after, so the
+/// same key can appear multiple times in the input without triggering a false cycle.
+fn interpolate_recursive(
+    value: &str,
+    properties: &HashMap<String, String>,
+    pom_group_id: &str,
+    pom_artifact_id: &str,
+    pom_version: &str,
+    active_chain: &mut std::collections::HashSet<String>,
+    depth: usize,
+) -> Option<String> {
+    if depth > 10 {
+        return None;
+    }
+    if !value.contains("${") {
+        return Some(value.to_string());
+    }
+
+    let mut result = value.to_string();
+    let mut pos = 0;
+
+    while let Some(start) = result[pos..].find("${") {
+        let abs_start = pos + start;
+        let end = result[abs_start..].find('}')?;
+        let abs_end = abs_start + end;
+        let key = result[abs_start + 2..abs_end].to_string();
+
+        // Cycle: this key is already being expanded up the call stack
+        if active_chain.contains(&key) {
+            return None;
+        }
+
+        // Resolve the key to its raw value
+        let resolved = match key.as_str() {
+            "project.version" | "pom.version" => Some(pom_version.to_string()),
+            "project.groupId" | "pom.groupId" => Some(pom_group_id.to_string()),
+            "project.artifactId" | "pom.artifactId" => {
+                Some(pom_artifact_id.to_string())
+            }
+            other => properties.get(other).cloned(),
+        }?;
+
+        // If the resolved value itself contains ${...}, expand recursively
+        let expanded = if resolved.contains("${") {
+            active_chain.insert(key.clone());
+            let r = interpolate_recursive(
+                &resolved,
+                properties,
+                pom_group_id,
+                pom_artifact_id,
+                pom_version,
+                active_chain,
+                depth + 1,
+            )?;
+            active_chain.remove(&key);
+            r
+        } else {
+            resolved
+        };
+
+        result = format!(
+            "{}{}{}",
+            &result[..abs_start],
+            expanded,
+            &result[abs_end + 1..]
+        );
+        pos = abs_start + expanded.len();
+    }
+
+    Some(result)
+}
+
+/// Look up a dependency's version in the dependency management section.
+///
+/// Matches on the full key `(groupId, artifactId, type, classifier)` with defaults
+/// (`"jar"` for type, `""` for classifier). Management entry coordinates are
+/// interpolated before comparison so `<groupId>${managed.group}</groupId>` matches
+/// a resolved `org.example` dependency.
+///
+/// Returns the raw version from the matching management entry (which may itself
+/// need interpolation by the caller).
+///
+/// Used by the dependency traversal pipeline (Unit 6c) to resolve managed versions.
+pub(crate) fn lookup_in_dependency_management(
+    pom: &PomMetadata,
+    dep: &PomDependency,
+) -> Option<String> {
+    let dep_type = dep
+        .dependency_type
+        .as_deref()
+        .unwrap_or("jar");
+    let dep_classifier = dep.classifier.as_deref().unwrap_or("");
+
+    for mgmt in &pom.dependency_management {
+        let mgmt_g = interpolate_or_raw(
+            &mgmt.group_id,
+            &pom.properties,
+            &pom.group_id,
+            &pom.artifact_id,
+            &pom.version,
+        );
+        let mgmt_a = interpolate_or_raw(
+            &mgmt.artifact_id,
+            &pom.properties,
+            &pom.group_id,
+            &pom.artifact_id,
+            &pom.version,
+        );
+        let mgmt_type_raw = mgmt
+            .dependency_type
+            .as_deref()
+            .unwrap_or("jar");
+        let mgmt_type = interpolate_or_raw(
+            mgmt_type_raw,
+            &pom.properties,
+            &pom.group_id,
+            &pom.artifact_id,
+            &pom.version,
+        );
+        let mgmt_classifier_raw = mgmt.classifier.as_deref().unwrap_or("");
+        let mgmt_classifier = interpolate_or_raw(
+            mgmt_classifier_raw,
+            &pom.properties,
+            &pom.group_id,
+            &pom.artifact_id,
+            &pom.version,
+        );
+
+        if mgmt_g == dep.group_id
+            && mgmt_a == dep.artifact_id
+            && mgmt_type == dep_type
+            && mgmt_classifier == dep_classifier
+        {
+            return mgmt.version.clone();
+        }
+    }
+
+    None
+}
+
+/// Interpolate a field value, falling back to the raw string if resolution fails.
+fn interpolate_or_raw(
+    field: &str,
+    properties: &HashMap<String, String>,
+    pom_group_id: &str,
+    pom_artifact_id: &str,
+    pom_version: &str,
+) -> String {
+    if field.contains("${") {
+        interpolate_property(field, properties, pom_group_id, pom_artifact_id, pom_version)
+            .unwrap_or_else(|| field.to_string())
+    } else {
+        field.to_string()
     }
 }
 
@@ -1239,6 +2062,9 @@ mod tests {
             url: Some("https://commons.apache.org/proper/commons-lang/".to_string()),
             licenses: vec!["Apache-2.0".to_string()],
             dependencies: vec![],
+            dependency_management: vec![],
+            parent: None,
+            properties: HashMap::new(),
             scm_url: None,
             scm_connection: None,
             scm_tag: None,
@@ -1380,6 +2206,10 @@ mod tests {
                 HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap(),
             ),
             refresh: false,
+            max_depth: 3,
+            max_roots: 10_000,
+            max_packages: 5_000,
+            delay_ms: 0,
         };
 
         let mut delay = 1u64;
@@ -1422,6 +2252,10 @@ mod tests {
                 HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap(),
             ),
             refresh: false,
+            max_depth: 3,
+            max_roots: 10_000,
+            max_packages: 5_000,
+            delay_ms: 0,
         };
 
         let mut delay = 1u64;
@@ -1462,6 +2296,10 @@ mod tests {
                 HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap(),
             ),
             refresh: false,
+            max_depth: 3,
+            max_roots: 10_000,
+            max_packages: 5_000,
+            delay_ms: 0,
         };
 
         let mut delay = 1u64;
@@ -2007,6 +2845,10 @@ mod tests {
                 HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap(),
             ),
             refresh: false,
+            max_depth: 3,
+            max_roots: 10_000,
+            max_packages: 5_000,
+            delay_ms: 0,
         };
 
         let mut delay = 1u64;
@@ -2155,6 +2997,10 @@ mod tests {
                 HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap(),
             ),
             refresh: false,
+            max_depth: 3,
+            max_roots: 10_000,
+            max_packages: 5_000,
+            delay_ms: 0,
         };
 
         let mut delay = 1u64;
@@ -2304,5 +3150,2170 @@ mod tests {
             "expected HttpStatus 403, got: {}",
             err
         );
+    }
+
+    // ── Path stack tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_pom_dependencies_vs_dependency_management() {
+        let pom_xml = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework</groupId>
+        <artifactId>spring-core</artifactId>
+        <version>6.0.0</version>
+      </dependency>
+      <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-api</artifactId>
+        <version>2.0.0</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>junit</groupId>
+      <artifactId>junit</artifactId>
+      <version>4.13.2</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>"#;
+
+        let pom = parse_pom(pom_xml, "org.example", "my-app", "1.0.0").unwrap();
+
+        // Project dependencies
+        assert_eq!(pom.dependencies.len(), 2);
+        assert_eq!(pom.dependencies[0].group_id, "org.springframework");
+        assert_eq!(pom.dependencies[0].artifact_id, "spring-core");
+        assert!(pom.dependencies[0].version.is_none());
+        assert_eq!(pom.dependencies[1].group_id, "junit");
+        assert_eq!(pom.dependencies[1].scope.as_deref(), Some("test"));
+
+        // Dependency management
+        assert_eq!(pom.dependency_management.len(), 2);
+        assert_eq!(pom.dependency_management[0].group_id, "org.springframework");
+        assert_eq!(
+            pom.dependency_management[0].version.as_deref(),
+            Some("6.0.0")
+        );
+        assert_eq!(pom.dependency_management[1].group_id, "org.slf4j");
+        assert_eq!(
+            pom.dependency_management[1].version.as_deref(),
+            Some("2.0.0")
+        );
+    }
+
+    #[test]
+    fn test_parse_pom_plugin_dependencies_ignored() {
+        let pom_xml = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.11.0</version>
+        <dependencies>
+          <dependency>
+            <groupId>org.plugin.dep</groupId>
+            <artifactId>plugin-lib</artifactId>
+            <version>1.0</version>
+          </dependency>
+        </dependencies>
+      </plugin>
+    </plugins>
+  </build>
+  <dependencies>
+    <dependency>
+      <groupId>org.real</groupId>
+      <artifactId>real-dep</artifactId>
+      <version>2.0</version>
+    </dependency>
+  </dependencies>
+</project>"#;
+
+        let pom = parse_pom(pom_xml, "org.example", "my-app", "1.0.0").unwrap();
+
+        // Only the real project dependency should be present
+        assert_eq!(pom.dependencies.len(), 1);
+        assert_eq!(pom.dependencies[0].group_id, "org.real");
+        assert_eq!(pom.dependencies[0].artifact_id, "real-dep");
+
+        // Plugin dependency should NOT appear
+        assert!(pom.dependency_management.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pom_profile_dependencies_ignored() {
+        let pom_xml = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+  <profiles>
+    <profile>
+      <id>dev</id>
+      <dependencies>
+        <dependency>
+          <groupId>org.profile</groupId>
+          <artifactId>profile-dep</artifactId>
+          <version>1.0</version>
+        </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+  <dependencies>
+    <dependency>
+      <groupId>org.real</groupId>
+      <artifactId>real-dep</artifactId>
+      <version>2.0</version>
+    </dependency>
+  </dependencies>
+</project>"#;
+
+        let pom = parse_pom(pom_xml, "org.example", "my-app", "1.0.0").unwrap();
+
+        // Only the real project dependency
+        assert_eq!(pom.dependencies.len(), 1);
+        assert_eq!(pom.dependencies[0].group_id, "org.real");
+    }
+
+    // ── Property interpolation tests ───────────────────────────────────
+
+    #[test]
+    fn test_interpolate_project_version() {
+        let props = HashMap::new();
+        let result =
+            interpolate_property("${project.version}", &props, "g", "a", "1.2.3");
+        assert_eq!(result, Some("1.2.3".to_string()));
+    }
+
+    #[test]
+    fn test_interpolate_project_group_id() {
+        let props = HashMap::new();
+        let result =
+            interpolate_property("${project.groupId}", &props, "org.example", "a", "1.0");
+        assert_eq!(result, Some("org.example".to_string()));
+    }
+
+    #[test]
+    fn test_interpolate_project_artifact_id() {
+        let props = HashMap::new();
+        let result = interpolate_property(
+            "${project.artifactId}",
+            &props,
+            "g",
+            "my-lib",
+            "1.0",
+        );
+        assert_eq!(result, Some("my-lib".to_string()));
+    }
+
+    #[test]
+    fn test_interpolate_custom_property() {
+        let mut props = HashMap::new();
+        props.insert("spring.version".to_string(), "6.0.0".to_string());
+        let result =
+            interpolate_property("${spring.version}", &props, "g", "a", "1.0");
+        assert_eq!(result, Some("6.0.0".to_string()));
+    }
+
+    #[test]
+    fn test_interpolate_unresolvable_returns_none() {
+        let props = HashMap::new();
+        let result =
+            interpolate_property("${parent.version}", &props, "g", "a", "1.0");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_interpolate_no_placeholder() {
+        let props = HashMap::new();
+        let result =
+            interpolate_property("1.2.3", &props, "g", "a", "1.0");
+        assert_eq!(result, Some("1.2.3".to_string()));
+    }
+
+    #[test]
+    fn test_interpolate_all_five_fields() {
+        // Verify interpolation works on all coordinate fields
+        let mut props = HashMap::new();
+        props.insert("my.type".to_string(), "test-jar".to_string());
+        props.insert("my.classifier".to_string(), "sources".to_string());
+
+        assert_eq!(
+            interpolate_property("${project.groupId}", &props, "org.ex", "lib", "1.0"),
+            Some("org.ex".to_string())
+        );
+        assert_eq!(
+            interpolate_property("${project.artifactId}", &props, "org.ex", "lib", "1.0"),
+            Some("lib".to_string())
+        );
+        assert_eq!(
+            interpolate_property("${project.version}", &props, "org.ex", "lib", "1.0"),
+            Some("1.0".to_string())
+        );
+        assert_eq!(
+            interpolate_property("${my.type}", &props, "org.ex", "lib", "1.0"),
+            Some("test-jar".to_string())
+        );
+        assert_eq!(
+            interpolate_property("${my.classifier}", &props, "org.ex", "lib", "1.0"),
+            Some("sources".to_string())
+        );
+    }
+
+    #[test]
+    fn test_interpolate_pom_version_alias() {
+        let props = HashMap::new();
+        let result =
+            interpolate_property("${pom.version}", &props, "g", "a", "3.0.0");
+        assert_eq!(result, Some("3.0.0".to_string()));
+    }
+
+    // ── Exclusion parsing tests ────────────────────────────────────────
+
+    #[test]
+    fn test_parse_pom_exclusions() {
+        let pom_xml = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+      <version>6.0.0</version>
+      <exclusions>
+        <exclusion>
+          <groupId>commons-logging</groupId>
+          <artifactId>commons-logging</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>log4j</groupId>
+          <artifactId>log4j</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+  </dependencies>
+</project>"#;
+
+        let pom = parse_pom(pom_xml, "org.example", "my-app", "1.0.0").unwrap();
+
+        assert_eq!(pom.dependencies.len(), 1);
+        let dep = &pom.dependencies[0];
+        assert_eq!(dep.exclusions.len(), 2);
+        assert_eq!(
+            dep.exclusions[0],
+            ("commons-logging".to_string(), "commons-logging".to_string())
+        );
+        assert_eq!(
+            dep.exclusions[1],
+            ("log4j".to_string(), "log4j".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_pom_exclusion_wildcard() {
+        let pom_xml = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>org.heavy</groupId>
+      <artifactId>heavy-lib</artifactId>
+      <version>1.0</version>
+      <exclusions>
+        <exclusion>
+          <groupId>*</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+  </dependencies>
+</project>"#;
+
+        let pom = parse_pom(pom_xml, "org.example", "my-app", "1.0.0").unwrap();
+
+        assert_eq!(pom.dependencies[0].exclusions.len(), 1);
+        assert_eq!(
+            pom.dependencies[0].exclusions[0],
+            ("*".to_string(), "*".to_string())
+        );
+    }
+
+    // ── Dependency management lookup tests ─────────────────────────────
+
+    #[test]
+    fn test_lookup_dependency_management_full_key_matching() {
+        let pom = PomMetadata {
+            group_id: "org.example".to_string(),
+            artifact_id: "my-app".to_string(),
+            version: "1.0.0".to_string(),
+            dependency_management: vec![
+                PomDependency {
+                    group_id: "org.test".to_string(),
+                    artifact_id: "test-lib".to_string(),
+                    version: Some("1.0".to_string()),
+                    dependency_type: None, // defaults to "jar"
+                    classifier: None,
+                    scope: None,
+                    optional: false,
+                    exclusions: vec![],
+                },
+                PomDependency {
+                    group_id: "org.test".to_string(),
+                    artifact_id: "test-lib".to_string(),
+                    version: Some("2.0".to_string()),
+                    dependency_type: Some("test-jar".to_string()),
+                    classifier: None,
+                    scope: None,
+                    optional: false,
+                    exclusions: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Lookup with default type (jar) -> matches first entry
+        let dep_jar = PomDependency {
+            group_id: "org.test".to_string(),
+            artifact_id: "test-lib".to_string(),
+            version: None,
+            dependency_type: None, // defaults to "jar"
+            classifier: None,
+            scope: None,
+            optional: false,
+            exclusions: vec![],
+        };
+        assert_eq!(
+            lookup_in_dependency_management(&pom, &dep_jar),
+            Some("1.0".to_string())
+        );
+
+        // Lookup with type=test-jar -> matches second entry
+        let dep_test_jar = PomDependency {
+            group_id: "org.test".to_string(),
+            artifact_id: "test-lib".to_string(),
+            version: None,
+            dependency_type: Some("test-jar".to_string()),
+            classifier: None,
+            scope: None,
+            optional: false,
+            exclusions: vec![],
+        };
+        assert_eq!(
+            lookup_in_dependency_management(&pom, &dep_test_jar),
+            Some("2.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_lookup_dependency_management_returns_uninterpolated_version() {
+        let pom = PomMetadata {
+            group_id: "org.example".to_string(),
+            artifact_id: "my-app".to_string(),
+            version: "1.0.0".to_string(),
+            dependency_management: vec![PomDependency {
+                group_id: "org.dep".to_string(),
+                artifact_id: "dep-lib".to_string(),
+                version: Some("${foo.version}".to_string()),
+                dependency_type: None,
+                classifier: None,
+                scope: None,
+                optional: false,
+                exclusions: vec![],
+            }],
+            ..Default::default()
+        };
+
+        let dep = PomDependency {
+            group_id: "org.dep".to_string(),
+            artifact_id: "dep-lib".to_string(),
+            version: None,
+            dependency_type: None,
+            classifier: None,
+            scope: None,
+            optional: false,
+            exclusions: vec![],
+        };
+
+        // Returns the raw expression — interpolation is caller's responsibility
+        assert_eq!(
+            lookup_in_dependency_management(&pom, &dep),
+            Some("${foo.version}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_lookup_dependency_management_no_match() {
+        let pom = PomMetadata {
+            group_id: "org.example".to_string(),
+            artifact_id: "my-app".to_string(),
+            version: "1.0.0".to_string(),
+            dependency_management: vec![PomDependency {
+                group_id: "org.other".to_string(),
+                artifact_id: "other-lib".to_string(),
+                version: Some("1.0".to_string()),
+                dependency_type: None,
+                classifier: None,
+                scope: None,
+                optional: false,
+                exclusions: vec![],
+            }],
+            ..Default::default()
+        };
+
+        let dep = PomDependency {
+            group_id: "org.missing".to_string(),
+            artifact_id: "missing-lib".to_string(),
+            version: None,
+            dependency_type: None,
+            classifier: None,
+            scope: None,
+            optional: false,
+            exclusions: vec![],
+        };
+
+        assert_eq!(lookup_in_dependency_management(&pom, &dep), None);
+    }
+
+    // ── New PomDependency field tests ──────────────────────────────────
+
+    #[test]
+    fn test_parse_pom_dependency_type_and_classifier() {
+        let pom_xml = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>org.test</groupId>
+      <artifactId>test-lib</artifactId>
+      <version>1.0</version>
+      <type>test-jar</type>
+      <classifier>sources</classifier>
+    </dependency>
+    <dependency>
+      <groupId>org.plain</groupId>
+      <artifactId>plain-lib</artifactId>
+      <version>2.0</version>
+    </dependency>
+  </dependencies>
+</project>"#;
+
+        let pom = parse_pom(pom_xml, "org.example", "my-app", "1.0.0").unwrap();
+
+        assert_eq!(pom.dependencies.len(), 2);
+
+        // First dep: explicit type and classifier
+        assert_eq!(
+            pom.dependencies[0].dependency_type.as_deref(),
+            Some("test-jar")
+        );
+        assert_eq!(
+            pom.dependencies[0].classifier.as_deref(),
+            Some("sources")
+        );
+
+        // Second dep: no type or classifier -> None (caller defaults)
+        assert!(pom.dependencies[1].dependency_type.is_none());
+        assert!(pom.dependencies[1].classifier.is_none());
+    }
+
+    // ── Properties parsing tests ───────────────────────────────────────
+
+    #[test]
+    fn test_parse_pom_properties() {
+        let pom_xml = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+  <properties>
+    <spring.version>6.0.0</spring.version>
+    <java.version>17</java.version>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+</project>"#;
+
+        let pom = parse_pom(pom_xml, "org.example", "my-app", "1.0.0").unwrap();
+
+        assert_eq!(pom.properties.len(), 3);
+        assert_eq!(pom.properties.get("spring.version").unwrap(), "6.0.0");
+        assert_eq!(pom.properties.get("java.version").unwrap(), "17");
+        assert_eq!(
+            pom.properties
+                .get("project.build.sourceEncoding")
+                .unwrap(),
+            "UTF-8"
+        );
+    }
+
+    // ── Parent coordinate tests ────────────────────────────────────────
+
+    #[test]
+    fn test_parse_pom_parent() {
+        let pom_xml = r#"<?xml version="1.0"?>
+<project>
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.2.0</version>
+  </parent>
+  <groupId>org.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+</project>"#;
+
+        let pom = parse_pom(pom_xml, "org.example", "my-app", "1.0.0").unwrap();
+
+        let parent = pom.parent.unwrap();
+        assert_eq!(parent.group_id, "org.springframework.boot");
+        assert_eq!(parent.artifact_id, "spring-boot-starter-parent");
+        assert_eq!(parent.version, "3.2.0");
+    }
+
+    #[test]
+    fn test_parse_pom_no_parent() {
+        let pom_xml = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+</project>"#;
+
+        let pom = parse_pom(pom_xml, "org.example", "my-app", "1.0.0").unwrap();
+        assert!(pom.parent.is_none());
+    }
+
+    // ── Integration: properties + depMgmt in parsed POM ────────────────
+
+    #[test]
+    fn test_parse_pom_with_properties_and_dep_mgmt_version_ref() {
+        let pom_xml = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+  <properties>
+    <spring.version>6.1.0</spring.version>
+  </properties>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework</groupId>
+        <artifactId>spring-core</artifactId>
+        <version>${spring.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>"#;
+
+        let pom = parse_pom(pom_xml, "org.example", "my-app", "1.0.0").unwrap();
+
+        // depMgmt has the raw ${spring.version}
+        assert_eq!(
+            pom.dependency_management[0].version.as_deref(),
+            Some("${spring.version}")
+        );
+
+        // Interpolation resolves it
+        let resolved = interpolate_property(
+            pom.dependency_management[0].version.as_deref().unwrap(),
+            &pom.properties,
+            &pom.group_id,
+            &pom.artifact_id,
+            &pom.version,
+        );
+        assert_eq!(resolved, Some("6.1.0".to_string()));
+
+        // lookup_in_dependency_management returns the raw version
+        let ver = lookup_in_dependency_management(&pom, &pom.dependencies[0]);
+        assert_eq!(ver, Some("${spring.version}".to_string()));
+    }
+
+    // ── Exclusions in dependency management ────────────────────────────
+
+    #[test]
+    fn test_parse_pom_exclusions_in_dep_mgmt() {
+        let pom_xml = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.heavy</groupId>
+        <artifactId>heavy-lib</artifactId>
+        <version>1.0</version>
+        <exclusions>
+          <exclusion>
+            <groupId>org.unwanted</groupId>
+            <artifactId>unwanted-dep</artifactId>
+          </exclusion>
+        </exclusions>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>"#;
+
+        let pom = parse_pom(pom_xml, "org.example", "my-app", "1.0.0").unwrap();
+
+        assert_eq!(pom.dependency_management.len(), 1);
+        assert_eq!(pom.dependency_management[0].exclusions.len(), 1);
+        assert_eq!(
+            pom.dependency_management[0].exclusions[0],
+            ("org.unwanted".to_string(), "unwanted-dep".to_string())
+        );
+    }
+
+    // ── End-to-end composed resolution test ────────────────────────────
+
+    #[test]
+    fn test_end_to_end_composed_resolution() {
+        let pom_xml = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+  <properties>
+    <my.group>org.example</my.group>
+    <my.artifact>my-lib</my.artifact>
+    <foo.version>2.0.0</foo.version>
+    <dep.type>test-jar</dep.type>
+  </properties>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.example</groupId>
+        <artifactId>my-lib</artifactId>
+        <version>${foo.version}</version>
+        <type>test-jar</type>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>${my.group}</groupId>
+      <artifactId>${my.artifact}</artifactId>
+      <type>${dep.type}</type>
+    </dependency>
+  </dependencies>
+</project>"#;
+
+        let pom = parse_pom(pom_xml, "org.example", "my-app", "1.0.0").unwrap();
+
+        let dep = &pom.dependencies[0];
+
+        // Raw dependency has unresolved property references
+        assert_eq!(dep.group_id, "${my.group}");
+        assert_eq!(dep.artifact_id, "${my.artifact}");
+        assert_eq!(dep.dependency_type.as_deref(), Some("${dep.type}"));
+        assert!(dep.version.is_none());
+
+        // Step 1: Interpolate all coordinate fields
+        let resolved_group = interpolate_property(
+            &dep.group_id, &pom.properties, &pom.group_id, &pom.artifact_id, &pom.version,
+        ).unwrap();
+        let resolved_artifact = interpolate_property(
+            &dep.artifact_id, &pom.properties, &pom.group_id, &pom.artifact_id, &pom.version,
+        ).unwrap();
+        let resolved_type = interpolate_property(
+            dep.dependency_type.as_deref().unwrap(),
+            &pom.properties, &pom.group_id, &pom.artifact_id, &pom.version,
+        ).unwrap();
+
+        assert_eq!(resolved_group, "org.example");
+        assert_eq!(resolved_artifact, "my-lib");
+        assert_eq!(resolved_type, "test-jar");
+
+        // Step 2: Build a resolved dependency for depMgmt lookup
+        let resolved_dep = PomDependency {
+            group_id: resolved_group.clone(),
+            artifact_id: resolved_artifact.clone(),
+            version: None,
+            scope: None,
+            optional: false,
+            dependency_type: Some(resolved_type.clone()),
+            classifier: None,
+            exclusions: vec![],
+        };
+
+        // Step 3: Look up version in dependency management
+        let mgmt_version = lookup_in_dependency_management(&pom, &resolved_dep);
+        assert_eq!(mgmt_version, Some("${foo.version}".to_string()));
+
+        // Step 4: Interpolate the management version
+        let resolved_version = interpolate_property(
+            mgmt_version.as_deref().unwrap(),
+            &pom.properties, &pom.group_id, &pom.artifact_id, &pom.version,
+        ).unwrap();
+
+        // Final result: fully resolved, no ${...} values remain
+        assert_eq!(resolved_group, "org.example");
+        assert_eq!(resolved_artifact, "my-lib");
+        assert_eq!(resolved_version, "2.0.0");
+        assert_eq!(resolved_type, "test-jar");
+        assert!(!resolved_group.contains("${"));
+        assert!(!resolved_artifact.contains("${"));
+        assert!(!resolved_version.contains("${"));
+        assert!(!resolved_type.contains("${"));
+    }
+
+    // ── Nested property interpolation tests ────────────────────────────
+
+    #[test]
+    fn test_interpolate_nested_two_levels() {
+        let mut props = HashMap::new();
+        props.insert("base.group".to_string(), "org.example".to_string());
+        props.insert("dep.group".to_string(), "${base.group}".to_string());
+
+        let result = interpolate_property("${dep.group}", &props, "g", "a", "1.0");
+        assert_eq!(result, Some("org.example".to_string()));
+    }
+
+    #[test]
+    fn test_interpolate_cycle_returns_none() {
+        let mut props = HashMap::new();
+        props.insert("a".to_string(), "${b}".to_string());
+        props.insert("b".to_string(), "${a}".to_string());
+
+        let result = interpolate_property("${a}", &props, "g", "a", "1.0");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_interpolate_direct_still_works() {
+        let mut props = HashMap::new();
+        props.insert("ver".to_string(), "3.0.0".to_string());
+
+        let result = interpolate_property("${ver}", &props, "g", "a", "1.0");
+        assert_eq!(result, Some("3.0.0".to_string()));
+    }
+
+    #[test]
+    fn test_interpolate_three_level_nesting() {
+        let mut props = HashMap::new();
+        props.insert("level3".to_string(), "resolved".to_string());
+        props.insert("level2".to_string(), "${level3}".to_string());
+        props.insert("level1".to_string(), "${level2}".to_string());
+
+        let result = interpolate_property("${level1}", &props, "g", "a", "1.0");
+        assert_eq!(result, Some("resolved".to_string()));
+    }
+
+    // ── Exclusion validation: require both fields ──────────────────────
+
+    #[test]
+    fn test_parse_pom_exclusion_missing_artifact_ignored() {
+        let pom_xml = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>org.dep</groupId>
+      <artifactId>dep-lib</artifactId>
+      <version>1.0</version>
+      <exclusions>
+        <exclusion>
+          <groupId>org.partial</groupId>
+        </exclusion>
+        <exclusion>
+          <groupId>org.complete</groupId>
+          <artifactId>complete-lib</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+  </dependencies>
+</project>"#;
+
+        let pom = parse_pom(pom_xml, "org.example", "my-app", "1.0.0").unwrap();
+
+        // Only the complete exclusion (with both fields) should be kept
+        assert_eq!(pom.dependencies[0].exclusions.len(), 1);
+        assert_eq!(
+            pom.dependencies[0].exclusions[0],
+            ("org.complete".to_string(), "complete-lib".to_string())
+        );
+    }
+
+    // ── Repeated property references (not cycles) ─────────────────────
+
+    #[test]
+    fn test_interpolate_repeated_ref_not_a_cycle() {
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), "resolved".to_string());
+
+        let result = interpolate_property("${name}-${name}", &props, "g", "a", "1.0");
+        assert_eq!(result, Some("resolved-resolved".to_string()));
+    }
+
+    #[test]
+    fn test_interpolate_multiple_distinct_refs() {
+        let mut props = HashMap::new();
+        props.insert("a".to_string(), "x".to_string());
+        props.insert("b".to_string(), "y".to_string());
+
+        let result = interpolate_property("${a}-${b}", &props, "g", "a", "1.0");
+        assert_eq!(result, Some("x-y".to_string()));
+    }
+
+    // ── Management lookup with interpolated keys ──────────────────────
+
+    #[test]
+    fn test_lookup_dep_mgmt_interpolates_management_keys() {
+        let mut props = HashMap::new();
+        props.insert("managed.group".to_string(), "org.example".to_string());
+        props.insert("managed.artifact".to_string(), "my-lib".to_string());
+
+        let pom = PomMetadata {
+            group_id: "org.parent".to_string(),
+            artifact_id: "parent-app".to_string(),
+            version: "1.0.0".to_string(),
+            properties: props,
+            dependency_management: vec![PomDependency {
+                group_id: "${managed.group}".to_string(),
+                artifact_id: "${managed.artifact}".to_string(),
+                version: Some("3.0.0".to_string()),
+                dependency_type: None,
+                classifier: None,
+                scope: None,
+                optional: false,
+                exclusions: vec![],
+            }],
+            ..Default::default()
+        };
+
+        // Dependency has already-resolved coordinates
+        let dep = PomDependency {
+            group_id: "org.example".to_string(),
+            artifact_id: "my-lib".to_string(),
+            version: None,
+            dependency_type: None,
+            classifier: None,
+            scope: None,
+            optional: false,
+            exclusions: vec![],
+        };
+
+        // Should match after interpolating management entry keys
+        assert_eq!(
+            lookup_in_dependency_management(&pom, &dep),
+            Some("3.0.0".to_string())
+        );
+    }
+
+    // ── dep_identity + bnode uniqueness tests ──────────────────────────
+
+    #[test]
+    fn test_dep_identity_different_types_produce_distinct_bnodes() {
+        let dep_jar = PomDependency {
+            group_id: "org.example".into(),
+            artifact_id: "lib".into(),
+            version: Some("1.0".into()),
+            scope: Some("compile".into()),
+            optional: false,
+            dependency_type: Some("jar".into()),
+            classifier: None,
+            exclusions: vec![],
+        };
+        let dep_test_jar = PomDependency {
+            group_id: "org.example".into(),
+            artifact_id: "lib".into(),
+            version: Some("1.0".into()),
+            scope: Some("compile".into()),
+            optional: false,
+            dependency_type: Some("test-jar".into()),
+            classifier: None,
+            exclusions: vec![],
+        };
+        let pkg = "https://example.org/pkg/1";
+        let id_jar = dep_identity(pkg, 0, &dep_jar);
+        let id_test_jar = dep_identity(pkg, 1, &dep_test_jar);
+        assert_ne!(id_jar, id_test_jar, "jar vs test-jar must produce distinct identities");
+
+        let bnode_jar = bnode_id("dep", &id_jar);
+        let bnode_test_jar = bnode_id("dep", &id_test_jar);
+        assert_ne!(bnode_jar, bnode_test_jar);
+    }
+
+    #[test]
+    fn test_dep_identity_different_scopes_produce_distinct_bnodes() {
+        let dep_compile = PomDependency {
+            group_id: "org.example".into(),
+            artifact_id: "lib".into(),
+            version: Some("1.0".into()),
+            scope: Some("compile".into()),
+            optional: false,
+            dependency_type: None,
+            classifier: None,
+            exclusions: vec![],
+        };
+        let dep_test = PomDependency {
+            group_id: "org.example".into(),
+            artifact_id: "lib".into(),
+            version: Some("1.0".into()),
+            scope: Some("test".into()),
+            optional: false,
+            dependency_type: None,
+            classifier: None,
+            exclusions: vec![],
+        };
+        let pkg = "https://example.org/pkg/1";
+        let id_compile = dep_identity(pkg, 0, &dep_compile);
+        let id_test = dep_identity(pkg, 1, &dep_test);
+        assert_ne!(id_compile, id_test);
+    }
+
+    #[test]
+    fn test_dep_identity_different_ordinals_produce_distinct_bnodes() {
+        let dep = PomDependency {
+            group_id: "org.example".into(),
+            artifact_id: "lib".into(),
+            version: Some("1.0".into()),
+            scope: None,
+            optional: false,
+            dependency_type: None,
+            classifier: None,
+            exclusions: vec![("com.unwanted".into(), "bad-lib".into())],
+        };
+        let pkg = "https://example.org/pkg/1";
+        let id_0 = dep_identity(pkg, 0, &dep);
+        let id_1 = dep_identity(pkg, 1, &dep);
+        assert_ne!(id_0, id_1, "different ordinals must produce distinct identities");
+    }
+
+    #[test]
+    fn test_dep_identity_delimiter_bearing_values() {
+        let dep_slash = PomDependency {
+            group_id: "org/example".into(),
+            artifact_id: "lib".into(),
+            version: None,
+            scope: None,
+            optional: false,
+            dependency_type: None,
+            classifier: None,
+            exclusions: vec![],
+        };
+        let dep_colon = PomDependency {
+            group_id: "org:example".into(),
+            artifact_id: "lib".into(),
+            version: None,
+            scope: None,
+            optional: false,
+            dependency_type: None,
+            classifier: None,
+            exclusions: vec![],
+        };
+        let dep_normal = PomDependency {
+            group_id: "org.example".into(),
+            artifact_id: "lib".into(),
+            version: None,
+            scope: None,
+            optional: false,
+            dependency_type: None,
+            classifier: None,
+            exclusions: vec![],
+        };
+        let pkg = "https://example.org/pkg/1";
+        let id_slash = dep_identity(pkg, 0, &dep_slash);
+        let id_colon = dep_identity(pkg, 0, &dep_colon);
+        let id_normal = dep_identity(pkg, 0, &dep_normal);
+        assert_ne!(id_slash, id_colon);
+        assert_ne!(id_slash, id_normal);
+        assert_ne!(id_colon, id_normal);
+    }
+
+    #[test]
+    fn test_emit_exclusion_triples() {
+        let collector = MavenCollector::new(
+            "https://search.maven.org".into(),
+            "https://repo1.maven.org/maven2".into(),
+        );
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+
+        let pom = PomMetadata {
+            group_id: "org.example".to_string(),
+            artifact_id: "app".to_string(),
+            version: "2.0.0".to_string(),
+            dependencies: vec![PomDependency {
+                group_id: "org.unwanted".into(),
+                artifact_id: "core".into(),
+                version: Some("1.0".into()),
+                scope: Some("compile".into()),
+                optional: false,
+                dependency_type: None,
+                classifier: None,
+                exclusions: vec![
+                    ("com.excluded".into(), "bad-lib".into()),
+                    ("*".into(), "*".into()),
+                ],
+            }],
+            ..Default::default()
+        };
+
+        let triples = collector.emit_artifact_triples(&mut writer, &pom).unwrap();
+        writer.flush().unwrap();
+
+        let mut content = String::new();
+        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+
+        assert!(content.contains("maven#hasExclusion"), "missing hasExclusion predicate");
+        assert!(content.contains("maven#DependencyExclusion"), "missing DependencyExclusion type");
+        assert!(content.contains("maven#excludedGroupId"), "missing excludedGroupId");
+        assert!(content.contains("maven#excludedArtifactId"), "missing excludedArtifactId");
+        assert!(content.contains("\"com.excluded\""), "missing excluded groupId value");
+        assert!(content.contains("\"bad-lib\""), "missing excluded artifactId value");
+        assert!(content.contains("\"*\""), "wildcard exclusion must be emitted as literal '*'");
+
+        let excl_count = content.lines()
+            .filter(|l| l.contains("maven#hasExclusion"))
+            .count();
+        assert_eq!(excl_count, 2, "expected 2 hasExclusion triples, got {}", excl_count);
+        assert!(triples > 10, "expected at least base + exclusion triples, got {}", triples);
+    }
+
+    #[test]
+    fn test_emit_type_and_classifier_triples() {
+        let collector = MavenCollector::new(
+            "https://search.maven.org".into(),
+            "https://repo1.maven.org/maven2".into(),
+        );
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+
+        let pom = PomMetadata {
+            group_id: "org.example".to_string(),
+            artifact_id: "app".to_string(),
+            version: "1.0.0".to_string(),
+            dependencies: vec![
+                PomDependency {
+                    group_id: "org.example".into(),
+                    artifact_id: "lib".into(),
+                    version: Some("1.0".into()),
+                    scope: None,
+                    optional: false,
+                    dependency_type: Some("test-jar".into()),
+                    classifier: Some("sources".into()),
+                    exclusions: vec![],
+                },
+                PomDependency {
+                    group_id: "org.example".into(),
+                    artifact_id: "other".into(),
+                    version: Some("2.0".into()),
+                    scope: None,
+                    optional: false,
+                    dependency_type: Some("jar".into()),
+                    classifier: None,
+                    exclusions: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+
+        collector.emit_artifact_triples(&mut writer, &pom).unwrap();
+        writer.flush().unwrap();
+
+        let mut content = String::new();
+        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+
+        assert!(content.contains("maven#type"), "missing type predicate for test-jar");
+        assert!(content.contains("\"test-jar\""), "missing test-jar literal");
+        assert!(content.contains("maven#classifier"), "missing classifier predicate");
+        assert!(content.contains("\"sources\""), "missing sources classifier literal");
+
+        let type_count = content.lines()
+            .filter(|l| l.contains("maven#type"))
+            .count();
+        assert_eq!(type_count, 1, "jar type should not be emitted, got {} type triples", type_count);
+    }
+
+    #[test]
+    fn test_same_ga_different_types_produce_distinct_dep_nodes() {
+        let collector = MavenCollector::new(
+            "https://search.maven.org".into(),
+            "https://repo1.maven.org/maven2".into(),
+        );
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+
+        let pom = PomMetadata {
+            group_id: "com.app".to_string(),
+            artifact_id: "main".to_string(),
+            version: "3.0.0".to_string(),
+            dependencies: vec![
+                PomDependency {
+                    group_id: "org.example".into(),
+                    artifact_id: "lib".into(),
+                    version: Some("1.0".into()),
+                    scope: Some("compile".into()),
+                    optional: false,
+                    dependency_type: Some("jar".into()),
+                    classifier: None,
+                    exclusions: vec![("com.x".into(), "y".into())],
+                },
+                PomDependency {
+                    group_id: "org.example".into(),
+                    artifact_id: "lib".into(),
+                    version: Some("1.0".into()),
+                    scope: Some("test".into()),
+                    optional: false,
+                    dependency_type: Some("test-jar".into()),
+                    classifier: Some("tests".into()),
+                    exclusions: vec![("com.z".into(), "w".into())],
+                },
+            ],
+            ..Default::default()
+        };
+
+        collector.emit_artifact_triples(&mut writer, &pom).unwrap();
+        writer.flush().unwrap();
+
+        let mut content = String::new();
+        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+
+        let dep_triples: Vec<&str> = content.lines()
+            .filter(|l| l.contains("core#hasDependency"))
+            .collect();
+        assert_eq!(dep_triples.len(), 2, "expected 2 hasDependency triples");
+        assert_ne!(dep_triples[0], dep_triples[1], "dependency blank nodes must be distinct");
+        assert!(content.contains("\"com.x\""), "missing first dep's exclusion groupId");
+        assert!(content.contains("\"com.z\""), "missing second dep's exclusion groupId");
+    }
+
+    #[test]
+    fn test_parse_pom_with_exclusions_and_type() {
+        let pom_xml = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.example</groupId>
+  <artifactId>app</artifactId>
+  <version>1.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>org.dep</groupId>
+      <artifactId>lib</artifactId>
+      <version>2.0</version>
+      <type>test-jar</type>
+      <classifier>sources</classifier>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>com.unwanted</groupId>
+          <artifactId>bad</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>*</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+  </dependencies>
+</project>"#;
+
+        let pom = parse_pom(pom_xml, "org.example", "app", "1.0.0").unwrap();
+
+        assert_eq!(pom.dependencies.len(), 1);
+        let dep = &pom.dependencies[0];
+        assert_eq!(dep.group_id, "org.dep");
+        assert_eq!(dep.artifact_id, "lib");
+        assert_eq!(dep.version.as_deref(), Some("2.0"));
+        assert_eq!(dep.scope.as_deref(), Some("test"));
+        assert_eq!(dep.dependency_type.as_deref(), Some("test-jar"));
+        assert_eq!(dep.classifier.as_deref(), Some("sources"));
+        assert_eq!(dep.exclusions.len(), 2);
+        assert_eq!(dep.exclusions[0], ("com.unwanted".to_string(), "bad".to_string()));
+        assert_eq!(dep.exclusions[1], ("*".to_string(), "*".to_string()));
+    }
+
+    #[test]
+    fn test_two_identical_exclusions_produce_distinct_nodes() {
+        let collector = MavenCollector::new(
+            "https://search.maven.org".into(),
+            "https://repo1.maven.org/maven2".into(),
+        );
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+
+        let pom = PomMetadata {
+            group_id: "org.example".to_string(),
+            artifact_id: "app".to_string(),
+            version: "1.0.0".to_string(),
+            dependencies: vec![PomDependency {
+                group_id: "org.dep".into(),
+                artifact_id: "lib".into(),
+                version: Some("1.0".into()),
+                scope: None,
+                optional: false,
+                dependency_type: None,
+                classifier: None,
+                exclusions: vec![
+                    ("com.dup".into(), "same".into()),
+                    ("com.dup".into(), "same".into()),
+                ],
+            }],
+            ..Default::default()
+        };
+
+        collector.emit_artifact_triples(&mut writer, &pom).unwrap();
+        writer.flush().unwrap();
+
+        let mut content = String::new();
+        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+
+        let excl_count = content.lines()
+            .filter(|l| l.contains("maven#hasExclusion"))
+            .count();
+        assert_eq!(excl_count, 2, "identical exclusions must produce 2 distinct nodes");
+
+        let type_count = content.lines()
+            .filter(|l| l.contains("maven#DependencyExclusion"))
+            .count();
+        assert_eq!(type_count, 2, "expected 2 DependencyExclusion type triples");
+    }
+
+    // ── ResolvedDependency unit tests ─────────────────────────────────
+
+    #[test]
+    fn test_resolve_dependency_interpolates_group_and_artifact() {
+        let pom = PomMetadata {
+            group_id: "org.parent".into(),
+            artifact_id: "parent-app".into(),
+            version: "3.0".into(),
+            properties: {
+                let mut m = HashMap::new();
+                m.insert("my.group".into(), "com.resolved".into());
+                m
+            },
+            ..Default::default()
+        };
+        let dep = PomDependency {
+            group_id: "${my.group}".into(),
+            artifact_id: "lib".into(),
+            version: Some("1.0".into()),
+            scope: None,
+            optional: false,
+            dependency_type: None,
+            classifier: None,
+            exclusions: vec![],
+        };
+        let resolved = resolve_dependency(&pom, &dep);
+        assert_eq!(resolved.group_id, "com.resolved");
+        assert!(resolved.is_emittable);
+    }
+
+    #[test]
+    fn test_resolve_dependency_unresolvable_not_emittable() {
+        let pom = PomMetadata {
+            group_id: "org.a".into(),
+            artifact_id: "a".into(),
+            version: "1.0".into(),
+            ..Default::default()
+        };
+        let dep = PomDependency {
+            group_id: "${unknown.group}".into(),
+            artifact_id: "lib".into(),
+            version: Some("1.0".into()),
+            scope: None,
+            optional: false,
+            dependency_type: None,
+            classifier: None,
+            exclusions: vec![],
+        };
+        let resolved = resolve_dependency(&pom, &dep);
+        assert!(!resolved.is_emittable);
+    }
+
+    #[test]
+    fn test_resolve_dependency_managed_version() {
+        let pom = PomMetadata {
+            group_id: "org.a".into(),
+            artifact_id: "a".into(),
+            version: "1.0".into(),
+            dependency_management: vec![PomDependency {
+                group_id: "org.dep".into(),
+                artifact_id: "lib".into(),
+                version: Some("2.5.0".into()),
+                scope: None,
+                optional: false,
+                dependency_type: None,
+                classifier: None,
+                exclusions: vec![],
+            }],
+            ..Default::default()
+        };
+        let dep = PomDependency {
+            group_id: "org.dep".into(),
+            artifact_id: "lib".into(),
+            version: None, // no version, should come from management
+            scope: None,
+            optional: false,
+            dependency_type: None,
+            classifier: None,
+            exclusions: vec![],
+        };
+        let resolved = resolve_dependency(&pom, &dep);
+        assert_eq!(resolved.version.as_deref(), Some("2.5.0"));
+        assert!(matches!(resolved.version_class, VersionClass::ConcreteVersion(_)));
+    }
+
+    #[test]
+    fn test_resolve_dependency_interpolated_coords_match_management() {
+        // Direct dep has ${dep.group}/${dep.artifact}, management has ${managed.group}/mylib.
+        // Both resolve to org.dep/mylib. Management version must be found.
+        let pom = PomMetadata {
+            group_id: "org.a".into(),
+            artifact_id: "a".into(),
+            version: "1.0".into(),
+            properties: {
+                let mut m = HashMap::new();
+                m.insert("dep.group".into(), "org.dep".into());
+                m.insert("dep.artifact".into(), "mylib".into());
+                m.insert("managed.group".into(), "org.dep".into());
+                m
+            },
+            dependency_management: vec![PomDependency {
+                group_id: "${managed.group}".into(),
+                artifact_id: "mylib".into(),
+                version: Some("2.5.0".into()),
+                scope: None,
+                optional: false,
+                dependency_type: None,
+                classifier: None,
+                exclusions: vec![],
+            }],
+            ..Default::default()
+        };
+        let dep = PomDependency {
+            group_id: "${dep.group}".into(),
+            artifact_id: "${dep.artifact}".into(),
+            version: None, // must come from management
+            scope: None,
+            optional: false,
+            dependency_type: None,
+            classifier: None,
+            exclusions: vec![],
+        };
+        let resolved = resolve_dependency(&pom, &dep);
+        assert_eq!(resolved.group_id, "org.dep");
+        assert_eq!(resolved.artifact_id, "mylib");
+        assert_eq!(
+            resolved.version.as_deref(),
+            Some("2.5.0"),
+            "management version must be found via interpolated coordinates"
+        );
+        assert!(resolved.is_emittable);
+    }
+
+    #[test]
+    fn test_resolve_dependency_property_version() {
+        let pom = PomMetadata {
+            group_id: "org.a".into(),
+            artifact_id: "a".into(),
+            version: "1.0".into(),
+            properties: {
+                let mut m = HashMap::new();
+                m.insert("foo.version".into(), "3.2.1".into());
+                m
+            },
+            ..Default::default()
+        };
+        let dep = PomDependency {
+            group_id: "org.dep".into(),
+            artifact_id: "lib".into(),
+            version: Some("${foo.version}".into()),
+            scope: None,
+            optional: false,
+            dependency_type: None,
+            classifier: None,
+            exclusions: vec![],
+        };
+        let resolved = resolve_dependency(&pom, &dep);
+        assert_eq!(resolved.version.as_deref(), Some("3.2.1"));
+        assert!(matches!(resolved.version_class, VersionClass::ConcreteVersion(_)));
+    }
+
+    #[test]
+    fn test_resolve_dependency_interpolates_type_and_classifier() {
+        let pom = PomMetadata {
+            group_id: "org.a".into(),
+            artifact_id: "a".into(),
+            version: "1.0".into(),
+            properties: {
+                let mut m = HashMap::new();
+                m.insert("dep.type".into(), "test-jar".into());
+                m.insert("dep.classifier".into(), "tests".into());
+                m
+            },
+            ..Default::default()
+        };
+        let dep = PomDependency {
+            group_id: "org.dep".into(),
+            artifact_id: "lib".into(),
+            version: Some("1.0".into()),
+            scope: None,
+            optional: false,
+            dependency_type: Some("${dep.type}".into()),
+            classifier: Some("${dep.classifier}".into()),
+            exclusions: vec![],
+        };
+        let resolved = resolve_dependency(&pom, &dep);
+        assert_eq!(resolved.dependency_type, "test-jar");
+        assert_eq!(resolved.classifier, "tests");
+    }
+
+    #[test]
+    fn test_should_traverse_resolved() {
+        let base = ResolvedDependency {
+            group_id: "g".into(),
+            artifact_id: "a".into(),
+            version: Some("1.0".into()),
+            dependency_type: "jar".into(),
+            classifier: String::new(),
+            scope: "compile".into(),
+            optional: false,
+            exclusions: vec![],
+            raw_version_expr: None,
+            version_class: VersionClass::ConcreteVersion("1.0".into()),
+            is_emittable: true,
+        };
+        assert!(should_traverse_resolved(&base));
+
+        let test_scope = ResolvedDependency {
+            group_id: "g".into(), artifact_id: "a".into(), version: Some("1.0".into()),
+            dependency_type: "jar".into(), classifier: String::new(), scope: "test".into(),
+            optional: false, exclusions: vec![], raw_version_expr: None,
+            version_class: VersionClass::ConcreteVersion("1.0".into()), is_emittable: true,
+        };
+        assert!(!should_traverse_resolved(&test_scope));
+
+        let optional = ResolvedDependency {
+            group_id: "g".into(), artifact_id: "a".into(), version: Some("1.0".into()),
+            dependency_type: "jar".into(), classifier: String::new(), scope: "compile".into(),
+            optional: true, exclusions: vec![], raw_version_expr: None,
+            version_class: VersionClass::ConcreteVersion("1.0".into()), is_emittable: true,
+        };
+        assert!(!should_traverse_resolved(&optional));
+    }
+
+    #[test]
+    fn test_contains_unresolved() {
+        assert!(contains_unresolved("${project.groupId}"));
+        assert!(contains_unresolved("org.${x}.core"));
+        assert!(!contains_unresolved("org.example"));
+        assert!(!contains_unresolved(""));
+    }
+
+    // ── Traversal unit tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_try_enqueue_respects_depth_limit() {
+        let mut state = TraversalState {
+            queue: VecDeque::new(), scheduled: HashSet::new(),
+            roots_provided: 0, roots_unique: 0, roots_resolved: 0,
+            root_resolution_failures: 0, fetched_ok: 0,
+            fetch_errors: HashMap::new(), non_emittable_unresolved: 0,
+            non_traversable_snapshot: 0, non_traversable_range: 0,
+            non_traversable_unresolved: 0, non_traversable_special: 0,
+            skipped_depth: 0, skipped_limit: 0, skipped_roots: 0,
+        };
+        try_enqueue(&mut state, "g", "a", "1.0", 1, 1, 100);
+        assert_eq!(state.queue.len(), 1);
+        try_enqueue(&mut state, "g", "b", "1.0", 2, 1, 100);
+        assert_eq!(state.queue.len(), 1);
+        assert_eq!(state.skipped_depth, 1);
+    }
+
+    #[test]
+    fn test_try_enqueue_deduplicates() {
+        let mut state = TraversalState {
+            queue: VecDeque::new(), scheduled: HashSet::new(),
+            roots_provided: 0, roots_unique: 0, roots_resolved: 0,
+            root_resolution_failures: 0, fetched_ok: 0,
+            fetch_errors: HashMap::new(), non_emittable_unresolved: 0,
+            non_traversable_snapshot: 0, non_traversable_range: 0,
+            non_traversable_unresolved: 0, non_traversable_special: 0,
+            skipped_depth: 0, skipped_limit: 0, skipped_roots: 0,
+        };
+        try_enqueue(&mut state, "g", "a", "1.0", 0, 3, 100);
+        try_enqueue(&mut state, "g", "a", "1.0", 0, 3, 100);
+        assert_eq!(state.queue.len(), 1);
+        assert_eq!(state.scheduled.len(), 1);
+    }
+
+    #[test]
+    fn test_try_enqueue_respects_max_packages() {
+        let mut state = TraversalState {
+            queue: VecDeque::new(), scheduled: HashSet::new(),
+            roots_provided: 0, roots_unique: 0, roots_resolved: 0,
+            root_resolution_failures: 0, fetched_ok: 0,
+            fetch_errors: HashMap::new(), non_emittable_unresolved: 0,
+            non_traversable_snapshot: 0, non_traversable_range: 0,
+            non_traversable_unresolved: 0, non_traversable_special: 0,
+            skipped_depth: 0, skipped_limit: 0, skipped_roots: 0,
+        };
+        try_enqueue(&mut state, "g", "a", "1.0", 0, 3, 2);
+        try_enqueue(&mut state, "g", "b", "1.0", 0, 3, 2);
+        assert_eq!(state.queue.len(), 2);
+        try_enqueue(&mut state, "g", "c", "1.0", 0, 3, 2);
+        assert_eq!(state.queue.len(), 2);
+        assert_eq!(state.skipped_limit, 1);
+    }
+
+    #[test]
+    fn test_max_depth_zero_is_seed_only() {
+        let mut state = TraversalState {
+            queue: VecDeque::new(), scheduled: HashSet::new(),
+            roots_provided: 0, roots_unique: 0, roots_resolved: 0,
+            root_resolution_failures: 0, fetched_ok: 0,
+            fetch_errors: HashMap::new(), non_emittable_unresolved: 0,
+            non_traversable_snapshot: 0, non_traversable_range: 0,
+            non_traversable_unresolved: 0, non_traversable_special: 0,
+            skipped_depth: 0, skipped_limit: 0, skipped_roots: 0,
+        };
+        try_enqueue(&mut state, "g", "a", "1.0", 0, 0, 100);
+        assert_eq!(state.queue.len(), 1);
+        try_enqueue(&mut state, "g", "b", "1.0", 1, 0, 100);
+        assert_eq!(state.queue.len(), 1);
+        assert_eq!(state.skipped_depth, 1);
+    }
+
+    #[test]
+    fn test_cycle_detection_via_scheduled_set() {
+        let mut state = TraversalState {
+            queue: VecDeque::new(), scheduled: HashSet::new(),
+            roots_provided: 0, roots_unique: 0, roots_resolved: 0,
+            root_resolution_failures: 0, fetched_ok: 0,
+            fetch_errors: HashMap::new(), non_emittable_unresolved: 0,
+            non_traversable_snapshot: 0, non_traversable_range: 0,
+            non_traversable_unresolved: 0, non_traversable_special: 0,
+            skipped_depth: 0, skipped_limit: 0, skipped_roots: 0,
+        };
+        try_enqueue(&mut state, "g", "A", "1.0", 0, 3, 100);
+        try_enqueue(&mut state, "g", "B", "1.0", 1, 3, 100);
+        try_enqueue(&mut state, "g", "A", "1.0", 2, 3, 100);
+        assert_eq!(state.queue.len(), 2);
+        assert_eq!(state.scheduled.len(), 2);
+    }
+
+    #[test]
+    fn test_dense_fan_out_bounded() {
+        let mut state = TraversalState {
+            queue: VecDeque::new(), scheduled: HashSet::new(),
+            roots_provided: 0, roots_unique: 0, roots_resolved: 0,
+            root_resolution_failures: 0, fetched_ok: 0,
+            fetch_errors: HashMap::new(), non_emittable_unresolved: 0,
+            non_traversable_snapshot: 0, non_traversable_range: 0,
+            non_traversable_unresolved: 0, non_traversable_special: 0,
+            skipped_depth: 0, skipped_limit: 0, skipped_roots: 0,
+        };
+        for i in 0..100 {
+            try_enqueue(&mut state, "g", &format!("dep-{}", i), "1.0", 1, 3, 5);
+        }
+        assert_eq!(state.scheduled.len(), 5);
+        assert_eq!(state.skipped_limit, 95);
+    }
+
+    // ── Traversal integration tests (mockito) ─────────────────────────
+
+    fn make_pom_xml(group: &str, artifact: &str, version: &str, deps: &[(&str, &str, &str, &str, bool)]) -> String {
+        let dep_xml: String = deps.iter().map(|(dg, da, dv, scope, optional)| {
+            let opt = if *optional { "<optional>true</optional>" } else { "" };
+            format!(
+                "<dependency><groupId>{}</groupId><artifactId>{}</artifactId><version>{}</version><scope>{}</scope>{}</dependency>",
+                dg, da, dv, scope, opt
+            )
+        }).collect();
+        format!(
+            r#"<?xml version="1.0"?><project><groupId>{}</groupId><artifactId>{}</artifactId><version>{}</version><dependencies>{}</dependencies></project>"#,
+            group, artifact, version, dep_xml
+        )
+    }
+
+    fn make_search_json(version: &str) -> String {
+        format!(r#"{{"response":{{"docs":[{{"latestVersion":"{}"}}]}}}}"#, version)
+    }
+
+    #[test]
+    fn test_recursive_depth_limit_a_b_c() {
+        let mut server = mockito::Server::new();
+
+        let _sa = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .with_status(200)
+            .with_body(make_search_json("1.0"))
+            .create();
+        let _pa = server
+            .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
+            .with_status(200)
+            .with_body(make_pom_xml("org.a", "art-a", "1.0", &[("org.b", "art-b", "1.0", "compile", false)]))
+            .create();
+        let _pb = server
+            .mock("GET", "/maven2/org/b/art-b/1.0/art-b-1.0.pom")
+            .with_status(200)
+            .with_body(make_pom_xml("org.b", "art-b", "1.0", &[("org.c", "art-c", "1.0", "compile", false)]))
+            .create();
+        let pc = server
+            .mock("GET", "/maven2/org/c/art-c/1.0/art-c-1.0.pom")
+            .with_status(200)
+            .with_body(make_pom_xml("org.c", "art-c", "1.0", &[]))
+            .expect(0)
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 1;
+        collector.delay_ms = 0;
+
+        let seeds = vec![("org.a".into(), "art-a".into())];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+        assert!(result.is_ok(), "collect_recursive failed: {:?}", result.err());
+        let (packages, _) = result.unwrap();
+        assert_eq!(packages, 2, "should fetch A and B (depth=0 and 1)");
+        pc.assert();
+    }
+
+    #[test]
+    fn test_recursive_cycle_detection() {
+        let mut server = mockito::Server::new();
+        let _sa = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .with_status(200)
+            .with_body(make_search_json("1.0"))
+            .create();
+        let pa = server
+            .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
+            .with_status(200)
+            .with_body(make_pom_xml("org.a", "art-a", "1.0", &[("org.b", "art-b", "1.0", "compile", false)]))
+            .expect(1)
+            .create();
+        let pb = server
+            .mock("GET", "/maven2/org/b/art-b/1.0/art-b-1.0.pom")
+            .with_status(200)
+            .with_body(make_pom_xml("org.b", "art-b", "1.0", &[("org.a", "art-a", "1.0", "compile", false)]))
+            .expect(1)
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 5;
+        collector.delay_ms = 0;
+
+        let seeds = vec![("org.a".into(), "art-a".into())];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+        assert!(result.is_ok());
+        let (packages, _) = result.unwrap();
+        assert_eq!(packages, 2);
+        pa.assert();
+        pb.assert();
+    }
+
+    #[test]
+    fn test_recursive_test_scope_emitted_not_traversed() {
+        let mut server = mockito::Server::new();
+        let _sa = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .with_status(200)
+            .with_body(make_search_json("1.0"))
+            .create();
+        let _pa = server
+            .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
+            .with_status(200)
+            .with_body(make_pom_xml("org.a", "art-a", "1.0", &[
+                ("org.b", "art-b", "1.0", "compile", false),
+                ("org.c", "art-c", "1.0", "test", false),
+            ]))
+            .create();
+        let _pb = server
+            .mock("GET", "/maven2/org/b/art-b/1.0/art-b-1.0.pom")
+            .with_status(200)
+            .with_body(make_pom_xml("org.b", "art-b", "1.0", &[]))
+            .expect(1)
+            .create();
+        let pc = server
+            .mock("GET", "/maven2/org/c/art-c/1.0/art-c-1.0.pom")
+            .expect(0)
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 3;
+        collector.delay_ms = 0;
+
+        let seeds = vec![("org.a".into(), "art-a".into())];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+        assert!(result.is_ok());
+
+        let mut content = String::new();
+        out.reopen().unwrap().read_to_string(&mut content).unwrap();
+        assert!(content.contains("art-c"), "test dep should be emitted");
+        pc.assert();
+    }
+
+    #[test]
+    fn test_recursive_optional_emitted_not_traversed() {
+        let mut server = mockito::Server::new();
+        let _sa = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .with_status(200)
+            .with_body(make_search_json("1.0"))
+            .create();
+        let _pa = server
+            .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
+            .with_status(200)
+            .with_body(make_pom_xml("org.a", "art-a", "1.0", &[
+                ("org.opt", "opt-lib", "1.0", "compile", true),
+            ]))
+            .create();
+        let popt = server
+            .mock("GET", "/maven2/org/opt/opt-lib/1.0/opt-lib-1.0.pom")
+            .expect(0)
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 3;
+        collector.delay_ms = 0;
+
+        let seeds = vec![("org.a".into(), "art-a".into())];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+        assert!(result.is_ok());
+
+        let mut content = String::new();
+        out.reopen().unwrap().read_to_string(&mut content).unwrap();
+        assert!(content.contains("opt-lib"), "optional dep emitted");
+        popt.assert();
+    }
+
+    #[test]
+    fn test_recursive_snapshot_not_traversed() {
+        let mut server = mockito::Server::new();
+        let _sa = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .with_status(200)
+            .with_body(make_search_json("1.0"))
+            .create();
+        let _pa = server
+            .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
+            .with_status(200)
+            .with_body(make_pom_xml("org.a", "art-a", "1.0", &[
+                ("org.snap", "snap-lib", "2.0-SNAPSHOT", "compile", false),
+            ]))
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 3;
+        collector.delay_ms = 0;
+
+        let seeds = vec![("org.a".into(), "art-a".into())];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+        assert!(result.is_ok());
+        let (packages, _) = result.unwrap();
+        assert_eq!(packages, 1);
+
+        let mut content = String::new();
+        out.reopen().unwrap().read_to_string(&mut content).unwrap();
+        assert!(content.contains("snap-lib"), "snapshot dep is emitted");
+    }
+
+    #[test]
+    fn test_recursive_duplicate_roots_deduplicated() {
+        let mut server = mockito::Server::new();
+        let sa = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .with_status(200)
+            .with_body(make_search_json("1.0"))
+            .expect(1)
+            .create();
+        let _pa = server
+            .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
+            .with_status(200)
+            .with_body(make_pom_xml("org.a", "art-a", "1.0", &[]))
+            .expect(1)
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 0;
+        collector.delay_ms = 0;
+
+        let seeds = vec![
+            ("org.a".into(), "art-a".into()),
+            ("org.a".into(), "art-a".into()),
+            ("org.a".into(), "art-a".into()),
+        ];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+        assert!(result.is_ok());
+        let (packages, _) = result.unwrap();
+        assert_eq!(packages, 1);
+        sa.assert();
+    }
+
+    #[test]
+    fn test_recursive_all_roots_fail_error() {
+        let mut server = mockito::Server::new();
+        let _sa = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch".into()))
+            .with_status(200)
+            .with_body(r#"{"response":{"docs":[]}}"#)
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 1;
+        collector.delay_ms = 0;
+
+        let seeds = vec![
+            ("org.missing".into(), "lib1".into()),
+            ("org.missing".into(), "lib2".into()),
+        ];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+        assert!(result.is_err(), "100% root failure should return error");
+        assert!(result.err().unwrap().to_string().contains("error rate exceeded threshold"));
+    }
+
+    #[test]
+    fn test_recursive_empty_seed_empty_output() {
+        let mut collector = MavenCollector::new(
+            "https://search.maven.org".into(),
+            "https://repo1.maven.org/maven2".into(),
+        );
+        collector.delay_ms = 0;
+
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(vec![], out.path().to_str().unwrap());
+        assert!(result.is_ok());
+        let (packages, triples) = result.unwrap();
+        assert_eq!(packages, 0);
+        assert_eq!(triples, 0);
+
+        // Output file should be empty (no distribution metadata)
+        let mut content = String::new();
+        out.reopen().unwrap().read_to_string(&mut content).unwrap();
+        assert!(content.is_empty(), "empty seed should produce empty output, got: {}", content);
+    }
+
+    #[test]
+    fn test_recursive_max_roots_boundary() {
+        let mut server = mockito::Server::new();
+        let _s = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch".into()))
+            .with_status(200)
+            .with_body(make_search_json("1.0"))
+            .expect(2)
+            .create();
+        let _p1 = server
+            .mock("GET", "/maven2/org/a/a1/1.0/a1-1.0.pom")
+            .with_status(200)
+            .with_body(make_pom_xml("org.a", "a1", "1.0", &[]))
+            .create();
+        let _p2 = server
+            .mock("GET", "/maven2/org/a/a2/1.0/a2-1.0.pom")
+            .with_status(200)
+            .with_body(make_pom_xml("org.a", "a2", "1.0", &[]))
+            .create();
+        let p3 = server
+            .mock("GET", "/maven2/org/a/a3/1.0/a3-1.0.pom")
+            .expect(0)
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 0;
+        collector.max_roots = 2;
+        collector.delay_ms = 0;
+
+        let seeds = vec![
+            ("org.a".into(), "a1".into()),
+            ("org.a".into(), "a2".into()),
+            ("org.a".into(), "a3".into()),
+        ];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+        assert!(result.is_ok());
+        let (packages, _) = result.unwrap();
+        assert_eq!(packages, 2);
+        p3.assert();
+    }
+
+    #[test]
+    fn test_recursive_skipped_roots_count_all_remaining() {
+        // Finding 5: 10 roots, max_packages=2 → skipped count should be 8
+        let mut server = mockito::Server::new();
+        let _s = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch".into()))
+            .with_status(200)
+            .with_body(make_search_json("1.0"))
+            .create();
+        for i in 0..2 {
+            let art = format!("a{}", i);
+            server
+                .mock("GET", format!("/maven2/org/a/{}/1.0/{}-1.0.pom", art, art).as_str())
+                .with_status(200)
+                .with_body(make_pom_xml("org.a", &art, "1.0", &[]))
+                .create();
+        }
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 0;
+        collector.max_packages = 2;
+        collector.delay_ms = 0;
+
+        let seeds: Vec<_> = (0..10).map(|i| ("org.a".into(), format!("a{}", i))).collect();
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+        assert!(result.is_ok());
+        let (packages, _) = result.unwrap();
+        assert_eq!(packages, 2, "only 2 of 10 roots should be fetched");
+    }
+
+    #[test]
+    fn test_recursive_unresolved_groupid_not_emitted() {
+        let mut server = mockito::Server::new();
+        let pom_with_unresolved = r#"<?xml version="1.0"?><project>
+            <groupId>org.a</groupId><artifactId>art-a</artifactId><version>1.0</version>
+            <dependencies>
+                <dependency>
+                    <groupId>${unresolvable.group}</groupId>
+                    <artifactId>lib</artifactId>
+                    <version>1.0</version>
+                    <scope>compile</scope>
+                </dependency>
+            </dependencies>
+        </project>"#;
+
+        let _sa = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .with_status(200)
+            .with_body(make_search_json("1.0"))
+            .create();
+        let _pa = server
+            .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
+            .with_status(200)
+            .with_body(pom_with_unresolved)
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 3;
+        collector.delay_ms = 0;
+
+        let seeds = vec![("org.a".into(), "art-a".into())];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+        assert!(result.is_ok());
+
+        let mut content = String::new();
+        out.reopen().unwrap().read_to_string(&mut content).unwrap();
+        assert!(!content.contains("${unresolvable.group}"), "unresolved groupId dep should not be emitted");
+    }
+
+    #[test]
+    fn test_recursive_resolved_groupid_is_traversed() {
+        let mut server = mockito::Server::new();
+        let pom_with_prop = r#"<?xml version="1.0"?><project>
+            <groupId>org.a</groupId><artifactId>art-a</artifactId><version>1.0</version>
+            <properties><dep.group>org.b</dep.group></properties>
+            <dependencies>
+                <dependency>
+                    <groupId>${dep.group}</groupId>
+                    <artifactId>art-b</artifactId>
+                    <version>2.0</version>
+                    <scope>compile</scope>
+                </dependency>
+            </dependencies>
+        </project>"#;
+
+        let _sa = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .with_status(200)
+            .with_body(make_search_json("1.0"))
+            .create();
+        let _pa = server
+            .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
+            .with_status(200)
+            .with_body(pom_with_prop)
+            .create();
+        let pb = server
+            .mock("GET", "/maven2/org/b/art-b/2.0/art-b-2.0.pom")
+            .with_status(200)
+            .with_body(make_pom_xml("org.b", "art-b", "2.0", &[]))
+            .expect(1)
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 3;
+        collector.delay_ms = 0;
+
+        let seeds = vec![("org.a".into(), "art-a".into())];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+        assert!(result.is_ok());
+        let (packages, _) = result.unwrap();
+        assert_eq!(packages, 2);
+        pb.assert();
+    }
+
+    #[test]
+    fn test_managed_version_in_rdf() {
+        // Dep missing version, management provides it → emitted triple contains resolved version
+        let mut server = mockito::Server::new();
+        let pom_xml = r#"<?xml version="1.0"?><project>
+            <groupId>org.a</groupId><artifactId>art-a</artifactId><version>1.0</version>
+            <dependencyManagement><dependencies>
+                <dependency>
+                    <groupId>org.dep</groupId><artifactId>lib</artifactId><version>4.2.0</version>
+                </dependency>
+            </dependencies></dependencyManagement>
+            <dependencies>
+                <dependency>
+                    <groupId>org.dep</groupId><artifactId>lib</artifactId><scope>compile</scope>
+                </dependency>
+            </dependencies>
+        </project>"#;
+
+        let _sa = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .with_status(200)
+            .with_body(make_search_json("1.0"))
+            .create();
+        let _pa = server
+            .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
+            .with_status(200)
+            .with_body(pom_xml)
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 0;
+        collector.delay_ms = 0;
+
+        let seeds = vec![("org.a".into(), "art-a".into())];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+        assert!(result.is_ok());
+
+        let mut content = String::new();
+        out.reopen().unwrap().read_to_string(&mut content).unwrap();
+        assert!(content.contains("\"4.2.0\""), "managed version 4.2.0 should appear in emitted triples");
+    }
+
+    #[test]
+    fn test_property_version_resolved_in_rdf() {
+        // Dep with ${foo.version}, property foo.version=1.0 → emitted triple contains 1.0
+        let mut server = mockito::Server::new();
+        let pom_xml = r#"<?xml version="1.0"?><project>
+            <groupId>org.a</groupId><artifactId>art-a</artifactId><version>1.0</version>
+            <properties><foo.version>5.3.1</foo.version></properties>
+            <dependencies>
+                <dependency>
+                    <groupId>org.dep</groupId><artifactId>lib</artifactId>
+                    <version>${foo.version}</version><scope>compile</scope>
+                </dependency>
+            </dependencies>
+        </project>"#;
+
+        let _sa = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .with_status(200)
+            .with_body(make_search_json("1.0"))
+            .create();
+        let _pa = server
+            .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
+            .with_status(200)
+            .with_body(pom_xml)
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 0;
+        collector.delay_ms = 0;
+
+        let seeds = vec![("org.a".into(), "art-a".into())];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+        assert!(result.is_ok());
+
+        let mut content = String::new();
+        out.reopen().unwrap().read_to_string(&mut content).unwrap();
+        assert!(content.contains("\"5.3.1\""), "interpolated version should appear in emitted triples");
+        assert!(!content.contains("${foo.version}"), "raw property ref should not appear");
+    }
+
+    #[test]
+    fn test_depth_zero_through_collect_recursive() {
+        // Same as flat collect: seeds processed, no traversal
+        let mut server = mockito::Server::new();
+        let _s = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch".into()))
+            .with_status(200)
+            .with_body(make_search_json("1.0"))
+            .create();
+        let _p = server
+            .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
+            .with_status(200)
+            .with_body(make_pom_xml("org.a", "art-a", "1.0", &[("org.b", "art-b", "1.0", "compile", false)]))
+            .create();
+        let pb = server
+            .mock("GET", "/maven2/org/b/art-b/1.0/art-b-1.0.pom")
+            .expect(0) // depth=0 means no traversal
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 0;
+        collector.delay_ms = 0;
+
+        let seeds = vec![("org.a".into(), "art-a".into())];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+        assert!(result.is_ok());
+        let (packages, _) = result.unwrap();
+        assert_eq!(packages, 1, "depth=0 should only fetch seed");
+        pb.assert();
+    }
+
+    #[test]
+    fn test_traversal_fields_wired_to_collector() {
+        let mut collector = MavenCollector::new(
+            "https://search.maven.org".into(),
+            "https://repo1.maven.org/maven2".into(),
+        );
+        assert_eq!(collector.max_depth, 3);
+        assert_eq!(collector.max_roots, 10_000);
+        assert_eq!(collector.max_packages, 5_000);
+        assert_eq!(collector.delay_ms, 500);
+
+        collector.max_depth = 0;
+        collector.max_roots = 50;
+        collector.max_packages = 100;
+        collector.delay_ms = 10;
+        assert_eq!(collector.max_depth, 0);
+        assert_eq!(collector.max_roots, 50);
+        assert_eq!(collector.max_packages, 100);
+        assert_eq!(collector.delay_ms, 10);
     }
 }
