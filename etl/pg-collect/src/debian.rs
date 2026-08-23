@@ -990,45 +990,77 @@ mod tests {
         assert_eq!(rdf_identity2, "i386");
     }
 
+    /// Build a minimal valid gzipped Packages file for mock tests.
+    fn make_test_packages_gz() -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let packages_text = "\
+Package: hello
+Version: 2.10-3
+Architecture: amd64
+Maintainer: Test <test@example.com>
+Installed-Size: 280
+Description: example package
+
+";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(packages_text.as_bytes()).unwrap();
+        encoder.finish().unwrap()
+    }
+
     #[test]
     fn test_collect_with_writer_single_arch() {
-        // RED: This test will fail because collect_with_writer doesn't exist yet
+        use std::io::Read as _;
+
+        // Mock server replaces the live Debian mirror
+        let mut server = mockito::Server::new();
+
+        // Mock the Release file
+        let release_body = "Origin: Debian\nSuite: stable\nCodename: trixie\n";
+        let release_mock = server.mock("GET", "/dists/trixie/Release")
+            .with_status(200)
+            .with_body(release_body)
+            .create();
+
+        // Mock the Packages.gz at the CORRECT binary-prefixed path.
+        // The collector receives bare "amd64" and must request "binary-amd64".
+        let packages_gz = make_test_packages_gz();
+        let packages_mock = server.mock("GET", "/dists/trixie/main/binary-amd64/Packages.gz")
+            .with_status(200)
+            .with_header("content-type", "application/gzip")
+            .with_body(packages_gz)
+            .create();
+
+        // Create collector pointing at mock server, passing bare "amd64"
         let collector = DebianCollector::new(
-            "http://deb.debian.org/debian".to_string(),
+            server.url(),
             "debian".to_string(),
             "trixie".to_string(),
             "main".to_string(),
         );
 
-        let temp_file = NamedTempFile::new().unwrap();
-        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+        let temp = NamedTempFile::new().unwrap();
+        let output_path = temp.path().to_str().unwrap().to_string();
 
-        let mut all_arch_seen: HashSet<(String, String)> = HashSet::new();
-        let mut source_names: HashSet<String> = HashSet::new();
-        let mut source_identity_map: HashMap<String, Vec<String>> = HashMap::new();
-        let mut vcs_urls: HashMap<String, String> = HashMap::new();
-        let mut source_pkg_uris: HashMap<String, String> = HashMap::new();
+        // collect() receives bare arch and must normalize to binary-amd64 for the URL
+        let result = collector.collect(&["amd64".to_string()], &output_path);
 
-        // Test that collect_with_writer exists and handles single arch
-        let result = collector.collect_with_writer(
-            &mut writer,
-            "binary-amd64",
-            "amd64",
-            "trixie",
-            "stable",
-            &mut all_arch_seen,
-            &mut source_names,
-            &mut source_identity_map,
-            &mut vcs_urls,
-            &mut source_pkg_uris,
-            false,
-            Some(5),
-        );
+        assert!(result.is_ok(), "collect() should succeed: {:?}", result.err());
+        let (pkg_count, triple_count) = result.unwrap();
+        assert_eq!(pkg_count, 1, "Should collect exactly one package");
+        assert!(triple_count > 0, "Should emit triples");
 
-        // Verify it succeeds
-        assert!(result.is_ok(), "collect_with_writer should succeed");
-        let (pkg_count, _triples) = result.unwrap();
-        assert!(pkg_count > 0, "Should collect at least one package");
+        // Verify the mock was called — proves the URL used binary-amd64
+        release_mock.assert();
+        packages_mock.assert();
+
+        // Verify output contains expected triples
+        let mut content = String::new();
+        std::fs::File::open(&output_path).unwrap().read_to_string(&mut content).unwrap();
+        assert!(content.contains("hello"), "Output should mention package name");
+        assert!(content.contains("amd64"), "Output should reference amd64 arch");
     }
 
     #[test]

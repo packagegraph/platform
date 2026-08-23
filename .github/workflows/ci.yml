@@ -19,7 +19,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: etl/pg-collect
-      - run: cargo test --quiet -- --skip test_collect_with_writer_single_arch
+      - run: cargo test --quiet
 
   build-etl:
     runs-on: ubuntu-latest
