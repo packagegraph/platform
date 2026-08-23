@@ -618,6 +618,14 @@ enum Commands {
         /// Output file path
         #[arg(short, long, required = true)]
         output: String,
+
+        /// Cache directory for HTTP responses
+        #[arg(long)]
+        cache_dir: Option<String>,
+
+        /// Force cache refresh (bypass fresh entries, re-fetch from network)
+        #[arg(long)]
+        cache_refresh: bool,
     },
 
     /// Collect CPAN distributions from MetaCPAN
@@ -1893,20 +1901,46 @@ fn main() {
             }
         }
 
-        Commands::Maven { packages_file, endpoint, search_base, repo_base, output } => {
+        Commands::Maven { packages_file, endpoint, search_base, repo_base, output, cache_dir, cache_refresh } => {
             eprintln!("=== PackageGraph Maven Collector ===");
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = MavenCollector::new(search_base, repo_base);
-            if let Some(ref seed) = packages_file {
-                eprintln!("Seed: {}", seed);
-                collector.collect(seed, &output)
-            } else if let Some(ref ep) = endpoint {
-                eprintln!("Mode: auto-discover from Fuseki at {}", ep);
-                collector.collect_discover(ep, &output)
+            // Central-only enforcement: reject non-Central --repo-base values
+            if !pg_collect::maven::is_maven_central(&repo_base) {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Only Maven Central is supported. Got: {}", repo_base),
+                ))
             } else {
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Either --packages-file or --endpoint required"))
+                // Build cache separately to avoid move issues on init failure
+                let http_cache = cache_dir.as_ref().and_then(|dir| {
+                    match pg_collect::http_cache::HttpCache::new(dir, "maven") {
+                        Ok(c) => {
+                            eprintln!("Cache: {} (refresh={})", dir, cache_refresh);
+                            Some(c)
+                        }
+                        Err(e) => {
+                            eprintln!("WARNING: cache init failed for {}: {}, proceeding without cache", dir, e);
+                            None
+                        }
+                    }
+                });
+                let mut collector = MavenCollector::new(search_base, repo_base);
+                if let Some(cache) = http_cache {
+                    collector.set_cache(cache);
+                }
+                let collector = collector.with_refresh(cache_refresh);
+
+                if let Some(ref seed) = packages_file {
+                    eprintln!("Seed: {}", seed);
+                    collector.collect(seed, &output)
+                } else if let Some(ref ep) = endpoint {
+                    eprintln!("Mode: auto-discover from Fuseki at {}", ep);
+                    collector.collect_discover(ep, &output)
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Either --packages-file or --endpoint required"))
+                }
             }
         }
 

@@ -31,8 +31,33 @@ spec:
               command: ["/bin/sh", "-c"]
               args:
                 - |
+                  set -eu
+                  CACHE_DIR=/tmp/cache/maven
+                  mkdir -p "${CACHE_DIR}"
+                  MINIO_CACHE="pgraph/${MINIO_BUCKET:-}/collector-cache/maven"
+
+                  # Remote cache operations are best-effort — collection must not depend on Minio
+                  CACHE_AVAILABLE=false
+                  if mc alias set pgraph "${MINIO_ENDPOINT:-}" "${MINIO_ACCESS_KEY:-}" "${MINIO_SECRET_KEY:-}" --api S3v4 2>/dev/null; then
+                    CACHE_AVAILABLE=true
+                    echo "Warming cache from Minio..."
+                    mc mirror --overwrite "${MINIO_CACHE}/" "${CACHE_DIR}/" 2>/dev/null || echo "Cache warm failed, continuing"
+                    echo "Cache warmed: $(find "${CACHE_DIR}" -type f 2>/dev/null | wc -l) entries"
+                  else
+                    echo "WARNING: Minio alias setup failed, proceeding without remote cache"
+                  fi
+
                   pg-collect maven \
                     --endpoint "$FUSEKI_ENDPOINT" \
-                    -o /tmp/maven.nt && \
-                  /app/scripts/upload-nt.sh /tmp/maven.nt "$GRAPH_URI"
+                    --cache-dir "${CACHE_DIR}" \
+                    -o /tmp/maven.nt
+                  COLLECT_EXIT=$?
+
+                  # Save cache only if Minio is available
+                  if [ "$CACHE_AVAILABLE" = "true" ]; then
+                    echo "Saving cache to Minio..."
+                    mc mirror --overwrite --exclude "*.tmp" --exclude "*.lock" "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || echo "Cache save failed"
+                  fi
+
+                  [ $COLLECT_EXIT -eq 0 ] && /app/scripts/upload-nt.sh /tmp/maven.nt "$GRAPH_URI"
               resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "2", memory: 2Gi}}
