@@ -3,4 +3,5 @@
 pub mod alpine;
 pub mod arch;
 pub mod debian;
+pub mod maintainer;
 pub mod rpm;

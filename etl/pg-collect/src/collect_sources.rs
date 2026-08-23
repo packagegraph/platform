@@ -305,6 +305,8 @@ impl SourcesCollector {
         uploaders_str: &str,
         vcs_urls: &HashMap<String, String>,
     ) -> Result<usize> {
+        use crate::normalize::maintainer::{parse_mailbox_list, is_email_iri_safe};
+
         let mut triples = 0;
 
         // Get packaging repository URI from vcs_urls (tracked in Phase 1)
@@ -314,20 +316,36 @@ impl SourcesCollector {
             None
         };
 
-        // Parse "Name <email>, Name2 <email2>"
-        let re = Regex::new(r"([^<,]+?)\s*<(.+?)>").unwrap();
-        for caps in re.captures_iter(uploaders_str) {
-            let name = caps.get(1).unwrap().as_str().trim();
-            let email = caps.get(2).unwrap().as_str().trim();
+        let parsed = parse_mailbox_list(uploaders_str);
 
-            let maint_uri = maintainer_uri(email);
+        if parsed.malformed_count > 0 {
+            eprintln!("WARNING: {} malformed maintainer entries in: {}", parsed.malformed_count, uploaders_str);
+        }
+
+        let mut iri_unsafe_count = 0usize;
+        for mailbox in &parsed.mailboxes {
+            let (maint_uri, safe_email) = if let Some(ref email) = mailbox.email {
+                if is_email_iri_safe(email) {
+                    (maintainer_uri(email), Some(email.as_str()))
+                } else {
+                    iri_unsafe_count += 1;
+                    // Demote to name-only: keep the person, discard the bad email
+                    (maintainer_name_uri(&mailbox.name), None)
+                }
+            } else {
+                (maintainer_name_uri(&mailbox.name), None)
+            };
 
             // Type as Person
             writer.write_triple(&maint_uri, RDF_TYPE, &format!("{PKG}Person"))?;
-            writer.write_literal(&maint_uri, &format!("{FOAF}name"), name)?;
-            writer.write_literal(&maint_uri, RDFS_LABEL, name)?;
-            writer.write_triple(&maint_uri, &format!("{FOAF}mbox"), &format!("mailto:{email}"))?;
-            triples += 4;
+            writer.write_literal(&maint_uri, &format!("{FOAF}name"), &mailbox.name)?;
+            writer.write_literal(&maint_uri, RDFS_LABEL, &mailbox.name)?;
+            triples += 3;
+
+            if let Some(email) = safe_email {
+                writer.write_triple(&maint_uri, &format!("{FOAF}mbox"), &format!("mailto:{email}"))?;
+                triples += 1;
+            }
 
             // Link to packaging repository (if Vcs-Git available from Phase 1)
             if let Some(ref repo_uri_str) = pkg_repo_uri {
@@ -335,6 +353,10 @@ impl SourcesCollector {
                 writer.write_triple(&maint_uri, &format!("{PKG}contributesTo"), repo_uri_str)?;
                 triples += 2;
             }
+        }
+
+        if iri_unsafe_count > 0 {
+            eprintln!("WARNING: {} IRI-unsafe email addresses skipped in: {}", iri_unsafe_count, uploaders_str);
         }
 
         Ok(triples)
