@@ -1,7 +1,6 @@
 //! Debian normalizer — converts parsed Packages.gz data into PackageIr records.
 
 use crate::ir::*;
-use regex::Regex;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Result};
 use std::path::Path;
@@ -181,27 +180,21 @@ pub fn normalize_debian_shard(
 }
 
 fn parse_maintainer(maint: &str) -> Vec<MaintainerIr> {
-    let re = Regex::new(r"^(.+?)\s*<(.+?)>$").unwrap();
-    if let Some(caps) = re.captures(maint) {
-        let name = caps.get(1).unwrap().as_str().trim().to_string();
-        let email = caps.get(2).unwrap().as_str().trim().to_string();
-        vec![MaintainerIr {
-            name,
-            email: Some(email),
-            role_hint: Some("maintainer".to_string()),
-        }]
-    } else {
-        let name = maint.trim();
-        if name.is_empty() {
-            vec![]
-        } else {
-            vec![MaintainerIr {
-                name: name.to_string(),
-                email: None,
+    use super::maintainer::{parse_mailbox_list, is_email_iri_safe};
+
+    let parsed = parse_mailbox_list(maint);
+    parsed
+        .mailboxes
+        .into_iter()
+        .map(|m| {
+            let email = m.email.filter(|e| is_email_iri_safe(e));
+            MaintainerIr {
+                name: m.name,
+                email,
                 role_hint: Some("maintainer".to_string()),
-            }]
-        }
-    }
+            }
+        })
+        .collect()
 }
 
 fn parse_debian_deps(dep_str: &str, dep_type: &str) -> Vec<DependencyIr> {
@@ -319,5 +312,58 @@ mod tests {
         assert_eq!(ir.package.epoch, 1);
         assert_eq!(ir.package.version, "29.1+1-4");
         assert_eq!(ir.package.full_version, "1:29.1+1-4");
+    }
+
+    #[test]
+    fn test_parse_maintainer_multi() {
+        let maintainers = parse_maintainer(
+            "Steve Langasek <vorlon@debian.org>, Michael Vogt <michael.vogt@ubuntu.com>",
+        );
+        assert_eq!(maintainers.len(), 2);
+        assert_eq!(maintainers[0].name, "Steve Langasek");
+        assert_eq!(maintainers[0].email.as_deref(), Some("vorlon@debian.org"));
+        assert_eq!(maintainers[1].name, "Michael Vogt");
+        assert_eq!(
+            maintainers[1].email.as_deref(),
+            Some("michael.vogt@ubuntu.com")
+        );
+    }
+
+    #[test]
+    fn test_parse_maintainer_name_only() {
+        let maintainers = parse_maintainer("Debian QA Group");
+        assert_eq!(maintainers.len(), 1);
+        assert_eq!(maintainers[0].name, "Debian QA Group");
+        assert!(maintainers[0].email.is_none());
+        assert_eq!(maintainers[0].role_hint.as_deref(), Some("maintainer"));
+    }
+
+    #[test]
+    fn test_parse_maintainer_quoted_comma() {
+        let maintainers = parse_maintainer("\"Doe, Jane\" <jane@example.org>");
+        assert_eq!(maintainers.len(), 1);
+        assert_eq!(maintainers[0].name, "Doe, Jane");
+        assert_eq!(
+            maintainers[0].email.as_deref(),
+            Some("jane@example.org")
+        );
+    }
+
+    #[test]
+    fn test_normalize_multi_maintainer_package() {
+        let mut fields = HashMap::new();
+        fields.insert("Package".to_string(), "apt".to_string());
+        fields.insert("Version".to_string(), "2.7.14".to_string());
+        fields.insert("Architecture".to_string(), "amd64".to_string());
+        fields.insert(
+            "Maintainer".to_string(),
+            "APT Development Team <deity@lists.debian.org>, John Doe <john@example.org>"
+                .to_string(),
+        );
+
+        let ir = normalize_debian_package(&fields, &sample_scope(), "sha256:xyz").unwrap();
+        assert_eq!(ir.maintainers.len(), 2);
+        assert_eq!(ir.maintainers[0].name, "APT Development Team");
+        assert_eq!(ir.maintainers[1].name, "John Doe");
     }
 }

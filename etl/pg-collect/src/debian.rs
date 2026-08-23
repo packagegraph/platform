@@ -797,25 +797,37 @@ impl DebianCollector {
         pkg_uri: &str,
         maintainer_str: &str,
     ) -> Result<usize> {
-        // Parse "Name <email>"
-        let re = Regex::new(r"^(.+?)\s*<(.+?)>$").unwrap();
-        if let Some(caps) = re.captures(maintainer_str) {
-            let name = caps.get(1).unwrap().as_str().trim();
-            let email = caps.get(2).unwrap().as_str().trim();
+        use crate::normalize::maintainer::{parse_mailbox_list, is_email_iri_safe};
 
-            let maint_uri = maintainer_uri(email);
+        let parsed = parse_mailbox_list(maintainer_str);
+        let mut triples = 0;
+
+        for mailbox in &parsed.mailboxes {
+            let maint_uri = if let Some(ref email) = mailbox.email {
+                if !is_email_iri_safe(email) {
+                    continue;
+                }
+                maintainer_uri(email)
+            } else {
+                maintainer_name_uri(&mailbox.name)
+            };
 
             // Type as Person (canonical agent identity per SD-3 data contract)
             writer.write_triple(&maint_uri, RDF_TYPE, &format!("{PKG}Person"))?;
-            writer.write_literal(&maint_uri, &format!("{FOAF}name"), name)?;
-            writer.write_literal(&maint_uri, RDFS_LABEL, name)?;
-            writer.write_triple(&maint_uri, &format!("{FOAF}mbox"), &format!("mailto:{email}"))?;
-            writer.write_triple(pkg_uri, &format!("{PKG}maintainedBy"), &maint_uri)?;
+            writer.write_literal(&maint_uri, &format!("{FOAF}name"), &mailbox.name)?;
+            writer.write_literal(&maint_uri, RDFS_LABEL, &mailbox.name)?;
+            triples += 3;
 
-            return Ok(5);
+            if let Some(ref email) = mailbox.email {
+                writer.write_triple(&maint_uri, &format!("{FOAF}mbox"), &format!("mailto:{email}"))?;
+                triples += 1;
+            }
+
+            writer.write_triple(pkg_uri, &format!("{PKG}maintainedBy"), &maint_uri)?;
+            triples += 1;
         }
 
-        Ok(0)
+        Ok(triples)
     }
 
     fn emit_source_package_triples(

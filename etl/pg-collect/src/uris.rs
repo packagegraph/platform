@@ -1,4 +1,5 @@
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use unicode_normalization::UnicodeNormalization;
 
 // Namespace constants (must match Python exactly)
 pub const PKG: &str = "https://purl.org/packagegraph/ontology/core#";
@@ -136,6 +137,26 @@ pub fn version_uri(distro: &str, release: &str, name: &str, version: &str) -> St
 /// EXCEPTION: Does NOT percent-encode — matches Python namespaces.py:44-49.
 pub fn maintainer_uri(email: &str) -> String {
     format!("{DATA}maintainer/{email}")
+}
+
+/// Build a Maintainer URI from a display name (when no email is available).
+///
+/// The name is canonicalized: trimmed, NFC-normalized, and internal whitespace
+/// collapsed to single spaces. The canonical name is then percent-encoded
+/// (preserving only unreserved URI chars) to produce a stable IRI.
+///
+/// Uses path `{DATA}maintainer/name/{encoded}`, distinct from email-based
+/// `maintainer_uri()` which uses `{DATA}maintainer/{email}`.
+///
+/// Case-sensitive: `"Foo Bar"` and `"foo-bar"` produce different URIs.
+pub fn maintainer_name_uri(name: &str) -> String {
+    // Canonicalize: trim, NFC normalize, collapse internal whitespace
+    let nfc: String = name.trim().nfc().collect();
+    let canonical: String = nfc
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ");
+    format!("{DATA}maintainer/name/{}", encode(&canonical))
 }
 
 /// Normalize obfuscated email addresses.
@@ -968,5 +989,56 @@ mod tests {
     fn test_person_uri_from_email_invalid() {
         assert!(person_uri_from_email("kkeithle at redhat-com").is_none());
         assert!(person_uri_from_email("not-an-email").is_none());
+    }
+
+    #[test]
+    fn test_maintainer_name_uri_basic() {
+        let uri = maintainer_name_uri("Foo Bar");
+        assert_eq!(
+            uri,
+            "https://packagegraph.github.io/d/maintainer/name/Foo%20Bar"
+        );
+    }
+
+    #[test]
+    fn test_maintainer_name_uri_case_sensitive() {
+        // "Foo Bar" and "foo-bar" MUST produce different URIs
+        let uri1 = maintainer_name_uri("Foo Bar");
+        let uri2 = maintainer_name_uri("foo-bar");
+        assert_ne!(uri1, uri2);
+    }
+
+    #[test]
+    fn test_maintainer_name_uri_whitespace_collapse() {
+        // Extra whitespace is collapsed
+        let uri1 = maintainer_name_uri("Foo Bar");
+        let uri2 = maintainer_name_uri("Foo  Bar");
+        assert_eq!(uri1, uri2);
+    }
+
+    #[test]
+    fn test_maintainer_name_uri_trim() {
+        let uri1 = maintainer_name_uri("Foo Bar");
+        let uri2 = maintainer_name_uri("  Foo Bar  ");
+        assert_eq!(uri1, uri2);
+    }
+
+    #[test]
+    fn test_maintainer_name_uri_unicode() {
+        // Unicode names should produce valid, stable IRIs
+        let uri = maintainer_name_uri("Jos\u{00e9} Garc\u{00ed}a");
+        assert!(uri.starts_with("https://packagegraph.github.io/d/maintainer/name/"));
+        assert!(!uri.contains(' '), "URI must not contain raw spaces");
+        // Same input produces same output (stability)
+        assert_eq!(uri, maintainer_name_uri("Jos\u{00e9} Garc\u{00ed}a"));
+    }
+
+    #[test]
+    fn test_maintainer_name_uri_distinct_from_email_uri() {
+        // Name-based and email-based URIs use different path segments
+        let name_uri = maintainer_name_uri("someone");
+        let email_uri = maintainer_uri("someone@example.org");
+        assert!(name_uri.contains("/maintainer/name/"));
+        assert!(!email_uri.contains("/maintainer/name/"));
     }
 }
