@@ -92,6 +92,7 @@ pub struct CacheEntry {
 /// HTTP response cache with hash-sharded file storage.
 ///
 /// Storage layout: `{base_dir}/{collector}/{hash[0..2]}/{sha256}.entry`
+#[derive(Clone)]
 pub struct HttpCache {
     base_dir: PathBuf,
     #[allow(dead_code)]

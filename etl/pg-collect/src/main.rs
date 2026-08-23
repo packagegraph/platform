@@ -242,6 +242,14 @@ enum Commands {
         /// Output file path
         #[arg(short, long, required = true)]
         output: String,
+
+        /// Cache directory for HTTP responses
+        #[arg(long)]
+        cache_dir: Option<String>,
+
+        /// TTL for cached successful responses (hours)
+        #[arg(long, default_value = "24")]
+        cache_ttl_hours: u64,
     },
 
     /// Collect Rust crates from crates.io
@@ -1505,13 +1513,28 @@ fn main() {
             }
         }
 
-        Commands::Pypi { packages_file, endpoint, max_depth, max_packages, output } => {
+        Commands::Pypi { packages_file, endpoint, max_depth, max_packages, output, cache_dir, cache_ttl_hours } => {
             eprintln!("=== PackageGraph PyPI Collector ===");
             eprintln!("Spider: max_depth={}, max_packages={}", max_depth, max_packages);
             eprintln!("Output: {}", output);
+            if let Some(ref cd) = cache_dir {
+                eprintln!("Cache: {} (TTL={}h)", cd, cache_ttl_hours);
+            }
             eprintln!();
 
-            let collector = pg_collect::pypi::PypiCollector::new();
+            let collector = pg_collect::pypi::PypiCollector::new()
+                .with_cache_ttl_hours(cache_ttl_hours);
+            let collector = match cache_dir {
+                Some(ref cd) => match collector.with_cache(cd) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("WARNING: cache init failed for {}: {}, proceeding without cache", cd, e);
+                        pg_collect::pypi::PypiCollector::new()
+                            .with_cache_ttl_hours(cache_ttl_hours)
+                    }
+                },
+                None => collector,
+            };
             if let Some(ref seed) = packages_file {
                 eprintln!("Seed: {}", seed);
                 collector.collect(seed, max_depth, max_packages, &output)
