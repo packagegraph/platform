@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use pg_collect::alpine::AlpineCollector;
 use pg_collect::arch::ArchCollector;
-use pg_collect::debian::DebianCollector;
+use pg_collect::debian::{DebianCollector, normalize_arch};
 use pg_collect::homebrew::HomebrewCollector;
 use pg_collect::rpm::RpmCollector;
 use pg_collect::rubygems::RubyGemsCollector;
@@ -2674,11 +2674,8 @@ fn main() {
 
                 // Normalize arch args (amd64 → binary-amd64)
                 let normalized_arches: Vec<String> = arch.iter().map(|a| {
-                    if a.contains('-') {
-                        a.clone()
-                    } else {
-                        format!("binary-{}", a)
-                    }
+                    let (repo_path, _) = normalize_arch(a);
+                    repo_path
                 }).collect();
 
                 // Get release info and emit distribution metadata once
@@ -2704,11 +2701,8 @@ fn main() {
                     eprintln!("\n--- Arch {} of {} ---", i + 1, normalized_arches.len());
 
                     // Extract arch_name (binary-amd64 → amd64)
-                    let arch_name = if arch_arg.contains('-') {
-                        arch_arg.split('-').next_back().unwrap()
-                    } else {
-                        arch_arg.as_str()
-                    };
+                    let (_, arch_name_owned) = normalize_arch(arch_arg);
+                    let arch_name = arch_name_owned.as_str();
 
                     let (pkgs, triples) = collector.collect_with_writer(
                         &mut writer,
