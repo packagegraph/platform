@@ -10,6 +10,21 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
 use std::time::Duration;
 
+/// Normalize an architecture argument to (repo_path, rdf_identity).
+///
+/// Debian repository URLs use `binary-{arch}` in the path (e.g. `binary-amd64`),
+/// while RDF identity URIs use the bare arch name (e.g. `amd64`).
+/// This function accepts both forms:
+///   - `"amd64"`        → `("binary-amd64", "amd64")`
+///   - `"binary-amd64"` → `("binary-amd64", "amd64")`
+pub fn normalize_arch(arch: &str) -> (String, String) {
+    if let Some(bare) = arch.strip_prefix("binary-") {
+        (arch.to_string(), bare.to_string())
+    } else {
+        (format!("binary-{}", arch), arch.to_string())
+    }
+}
+
 /// Map distribution ID to human-readable display name.
 fn distro_display_name(distro_id: &str) -> &str {
     match distro_id {
@@ -97,19 +112,13 @@ impl DebianCollector {
 
         // Process each architecture
         for (i, arch) in arches.iter().enumerate() {
-            eprintln!("\nProcessing architecture: {}", arch);
-
-            // Strip "binary-" prefix for URI building
-            let arch_name = if arch.contains('-') {
-                arch.split('-').next_back().unwrap()
-            } else {
-                arch.as_str()
-            };
+            let (repo_path, rdf_identity) = normalize_arch(arch);
+            eprintln!("\nProcessing architecture: {} (repo path: {})", rdf_identity, repo_path);
 
             let (pkg_count, triple_count) = self.collect_with_writer(
                 &mut writer,
-                arch,
-                arch_name,
+                &repo_path,
+                &rdf_identity,
                 &release_info.codename,
                 &release_info.suite,
                 &mut all_arch_seen,
@@ -124,7 +133,7 @@ impl DebianCollector {
             total_packages += pkg_count;
             total_triples += triple_count;
 
-            eprintln!("Processed {} packages for {}", pkg_count, arch);
+            eprintln!("Processed {} packages for {}", pkg_count, rdf_identity);
         }
 
         writer.flush()?;
@@ -296,15 +305,11 @@ impl DebianCollector {
 
         // Architectures
         for arch in arches {
-            let arch_name = if arch.contains('-') {
-                arch.split('-').next_back().unwrap()
-            } else {
-                arch.as_str()
-            };
+            let (_repo_path, rdf_identity) = normalize_arch(arch);
 
-            let arch_uri_val = arch_uri(arch_name);
+            let arch_uri_val = arch_uri(&rdf_identity);
             writer.write_triple(&arch_uri_val, RDF_TYPE, &format!("{PKG}Architecture"))?;
-            writer.write_literal(&arch_uri_val, &format!("{PKG}architectureName"), arch_name)?;
+            writer.write_literal(&arch_uri_val, &format!("{PKG}architectureName"), &rdf_identity)?;
         }
 
         Ok(())
@@ -450,84 +455,6 @@ impl DebianCollector {
                     pkg_count += 1;
                 }
             }
-        }
-
-        Ok((pkg_count, triple_count))
-    }
-
-    fn process_arch(
-        &self,
-        writer: &mut NTriplesWriter,
-        arch: &str,
-        arch_name: &str,
-        codename: &str,
-        suite: &str,
-    ) -> Result<(usize, usize)> {
-        let packages_url = format!(
-            "{}/dists/{}/{}/{}/Packages.gz",
-            self.repo_url.trim_end_matches('/'),
-            self.distribution,
-            self.component,
-            arch
-        );
-
-        let logical_name = format!("Packages-{}.gz", arch_name);
-        let raw_bytes = self.fetch_raw_bytes(&packages_url, &logical_name, Some(arch_name))?;
-
-        // Decompress from raw bytes (cached or fresh)
-        let decoder = GzDecoder::new(&raw_bytes[..]);
-        let reader = BufReader::new(decoder);
-
-        let mut pkg_count = 0;
-        let mut triple_count = 0;
-
-        // Parse packages line-by-line as a state machine
-        let mut current_pkg: HashMap<String, String> = HashMap::new();
-        let mut last_key = String::new();
-
-        for line in reader.lines() {
-            let line = line?;
-
-            if line.is_empty() {
-                // End of package entry
-                if !current_pkg.is_empty() && current_pkg.contains_key("Package") && current_pkg.contains_key("Version") {
-                    triple_count += self.emit_package_triples(
-                        writer,
-                        &current_pkg,
-                        codename,
-                        suite,
-                        arch_name,
-                    )?;
-                    pkg_count += 1;
-                }
-                current_pkg.clear();
-                last_key.clear();
-            } else if line.starts_with(' ') || line.starts_with('\t') {
-                // Continuation of previous field
-                if !last_key.is_empty() {
-                    if let Some(value) = current_pkg.get_mut(&last_key) {
-                        value.push(' ');
-                        value.push_str(line.trim());
-                    }
-                }
-            } else if let Some((key, value)) = line.split_once(':') {
-                // New field
-                let key = key.trim().to_string();
-                last_key = key.clone();
-                current_pkg.insert(key, value.trim().to_string());
-            }
-        }
-
-        // Process last package if file doesn't end with blank line
-        if !current_pkg.is_empty() && current_pkg.contains_key("Package") && current_pkg.contains_key("Version") {
-            triple_count += self.emit_package_triples(
-                writer,
-                &current_pkg,
-                codename,
-                suite,
-                arch_name,
-            )?;
-            pkg_count += 1;
         }
 
         Ok((pkg_count, triple_count))
@@ -1030,6 +957,38 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_normalize_arch_bare_input() {
+        let (repo_path, rdf_identity) = normalize_arch("amd64");
+        assert_eq!(repo_path, "binary-amd64");
+        assert_eq!(rdf_identity, "amd64");
+    }
+
+    #[test]
+    fn test_normalize_arch_prefixed_input() {
+        let (repo_path, rdf_identity) = normalize_arch("binary-amd64");
+        assert_eq!(repo_path, "binary-amd64");
+        assert_eq!(rdf_identity, "amd64");
+    }
+
+    #[test]
+    fn test_normalize_arch_both_forms_produce_identical_output() {
+        let from_bare = normalize_arch("arm64");
+        let from_prefixed = normalize_arch("binary-arm64");
+        assert_eq!(from_bare, from_prefixed);
+    }
+
+    #[test]
+    fn test_normalize_arch_i386() {
+        let (repo_path, rdf_identity) = normalize_arch("i386");
+        assert_eq!(repo_path, "binary-i386");
+        assert_eq!(rdf_identity, "i386");
+
+        let (repo_path2, rdf_identity2) = normalize_arch("binary-i386");
+        assert_eq!(repo_path2, "binary-i386");
+        assert_eq!(rdf_identity2, "i386");
+    }
 
     #[test]
     fn test_collect_with_writer_single_arch() {
