@@ -20,6 +20,7 @@ pub struct ArchCollector {
     release_name: String,
     arch_name: String,
     source_cache: Option<SourceCache>,
+    pub graph_uri: Option<String>,
 }
 
 impl ArchCollector {
@@ -42,7 +43,14 @@ impl ArchCollector {
             release_name,
             arch_name,
             source_cache: None,
+            graph_uri: None,
         }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
@@ -52,7 +60,7 @@ impl ArchCollector {
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         self.emit_distribution_metadata(&mut writer)?;
 
@@ -112,11 +120,7 @@ impl ArchCollector {
         Ok(triples)
     }
 
-    fn process_repo(
-        &self,
-        writer: &mut NTriplesWriter,
-        repo: &str,
-    ) -> Result<(usize, usize)> {
+    fn process_repo(&self, writer: &mut NTriplesWriter, repo: &str) -> Result<(usize, usize)> {
         // Standard Arch: {mirror}/{repo}/os/x86_64/{repo}.db.tar.gz
         // ArchLinux ARM: {mirror}/{repo}/{repo}.db (flat layout, no os/arch subpath)
         let base = self.mirror_url.trim_end_matches('/');
@@ -196,8 +200,19 @@ impl ArchCollector {
             None => return Ok(0),
         };
 
-        let pkg_uri = package_uri(&self.distro_name, &self.release_name, &self.arch_name, &name, &version);
-        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, &self.arch_name, &name);
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            &self.release_name,
+            &self.arch_name,
+            &name,
+            &version,
+        );
+        let identity_uri = package_identity_uri(
+            &self.distro_name,
+            &self.release_name,
+            &self.arch_name,
+            &name,
+        );
         let mut triples = 0;
 
         // Dual typing
@@ -313,8 +328,10 @@ impl ArchCollector {
         }
         if let Some(deps) = fields.get("%CONFLICTS%") {
             for dep in deps {
-                let dep_name = dep.split(|c: char| c == '>' || c == '<' || c == '=')
-                    .next().unwrap_or(dep);
+                let dep_name = dep
+                    .split(|c: char| c == '>' || c == '<' || c == '=')
+                    .next()
+                    .unwrap_or(dep);
                 writer.write_literal(&pkg_uri, &format!("{PKG}conflicts"), dep_name)?;
                 triples += 1;
             }
@@ -363,7 +380,12 @@ impl ArchCollector {
                 dep_name = dep_entry;
             }
 
-            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, &self.arch_name, dep_name);
+            let target_uri = package_identity_uri(
+                &self.distro_name,
+                &self.release_name,
+                &self.arch_name,
+                dep_name,
+            );
 
             writer.write_triple(pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
@@ -372,7 +394,11 @@ impl ArchCollector {
             writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri(dep_type))?;
+            writer.write_bnode_subject(
+                &bnode,
+                &format!("{PKG}dependencyType"),
+                &dep_type_uri(dep_type),
+            )?;
             triples += 4;
 
             if let (Some(op), Some(val)) = (&constraint_op, &constraint_val) {
@@ -469,8 +495,15 @@ impl ArchCollector {
         pkg: &AurPackage,
     ) -> Result<usize> {
         let version = pkg.version.as_deref().unwrap_or("unknown");
-        let pkg_uri = package_uri(&self.distro_name, "aur", &self.arch_name, &pkg.name, version);
-        let identity_uri = package_identity_uri(&self.distro_name, "aur", &self.arch_name, &pkg.name);
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            "aur",
+            &self.arch_name,
+            &pkg.name,
+            version,
+        );
+        let identity_uri =
+            package_identity_uri(&self.distro_name, "aur", &self.arch_name, &pkg.name);
         let mut triples = 0;
 
         // Dual typing + AUR type
@@ -690,15 +723,24 @@ libnghttp3: HTTP/3 support
         let sections = parse_desc_file(SAMPLE_DESC);
 
         assert_eq!(
-            sections.get("%NAME%").and_then(|v| v.first()).map(|s| s.as_str()),
+            sections
+                .get("%NAME%")
+                .and_then(|v| v.first())
+                .map(|s| s.as_str()),
             Some("curl")
         );
         assert_eq!(
-            sections.get("%VERSION%").and_then(|v| v.first()).map(|s| s.as_str()),
+            sections
+                .get("%VERSION%")
+                .and_then(|v| v.first())
+                .map(|s| s.as_str()),
             Some("8.7.1-3")
         );
         assert_eq!(
-            sections.get("%LICENSE%").and_then(|v| v.first()).map(|s| s.as_str()),
+            sections
+                .get("%LICENSE%")
+                .and_then(|v| v.first())
+                .map(|s| s.as_str()),
             Some("MIT")
         );
     }
@@ -744,7 +786,11 @@ libnghttp3: HTTP/3 support
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#BinaryPackage"));
         assert!(content.contains("pacman#PacmanPackage"));
@@ -810,11 +856,17 @@ libnghttp3: HTTP/3 support
             license: Some(vec!["GPL-3.0-or-later".into()]),
         };
 
-        let triples = collector.emit_aur_package_triples(&mut writer, &pkg).unwrap();
+        let triples = collector
+            .emit_aur_package_triples(&mut writer, &pkg)
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // AUR packages get triple typing
         assert!(content.contains("core#BinaryPackage"));
@@ -854,18 +906,31 @@ libnghttp3: HTTP/3 support
             license: Some(vec!["GPL-3.0-or-later".into()]),
         };
 
-        collector.emit_aur_package_triples(&mut writer, &pkg).unwrap();
+        collector
+            .emit_aur_package_triples(&mut writer, &pkg)
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Verify the AUR package URI itself uses "aur" as release
-        assert!(content.contains("/d/pkg/testdistro/aur/x86_64/yay/"), "AUR package URI should use '/testdistro/aur/', got: {}", content);
+        assert!(
+            content.contains("/d/pkg/testdistro/aur/x86_64/yay/"),
+            "AUR package URI should use '/testdistro/aur/', got: {}",
+            content
+        );
 
         // Verify dependencies point to the main repo (rolling), not AUR
         // (AUR packages depend on packages from the main Arch repos, not other AUR packages)
-        assert!(content.contains("/d/pkg/testdistro/rolling/x86_64/pacman"), "Dependencies should point to main repo (/testdistro/rolling/)");
+        assert!(
+            content.contains("/d/pkg/testdistro/rolling/x86_64/pacman"),
+            "Dependencies should point to main repo (/testdistro/rolling/)"
+        );
     }
 
     #[test]
@@ -873,9 +938,15 @@ libnghttp3: HTTP/3 support
         let fields = parse_desc_file(SAMPLE_DESC);
 
         // Verify %ARCH% field is present in sample Arch package data
-        assert!(fields.contains_key("%ARCH%"), "%ARCH% field must be present in package data");
+        assert!(
+            fields.contains_key("%ARCH%"),
+            "%ARCH% field must be present in package data"
+        );
         let arch_values = fields.get("%ARCH%").unwrap();
         assert_eq!(arch_values.len(), 1, "%ARCH% should have one value");
-        assert_eq!(arch_values[0], "x86_64", "%ARCH% field should contain architecture value");
+        assert_eq!(
+            arch_values[0], "x86_64",
+            "%ARCH% field should contain architecture value"
+        );
     }
 }

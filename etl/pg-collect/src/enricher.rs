@@ -16,9 +16,8 @@ use std::time::Duration;
 ///
 /// Matches: https://github.com/{owner}/{repo}[.git][/...]
 /// Repo names may contain dots (e.g., docopt.cpp, vue.js, socket.io).
-static GITHUB_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?(?:/.*)?$").unwrap()
-});
+static GITHUB_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?(?:/.*)?$").unwrap());
 
 /// Extract (owner, repo) from a GitHub URL.
 ///
@@ -121,7 +120,10 @@ mod tests {
     fn test_github_owner_repo_with_dotted_name() {
         // Repos with dots in the name (docopt.cpp, vue.js, socket.io)
         let result = github_owner_repo("https://github.com/docopt/docopt.cpp");
-        assert_eq!(result, Some(("docopt".to_string(), "docopt.cpp".to_string())));
+        assert_eq!(
+            result,
+            Some(("docopt".to_string(), "docopt.cpp".to_string()))
+        );
 
         let result = github_owner_repo("https://github.com/vuejs/vue.js");
         assert_eq!(result, Some(("vuejs".to_string(), "vue.js".to_string())));
@@ -131,12 +133,18 @@ mod tests {
     fn test_github_owner_repo_dotted_with_git_suffix() {
         // Repo with dot in name AND .git suffix
         let result = github_owner_repo("https://github.com/docopt/docopt.cpp.git");
-        assert_eq!(result, Some(("docopt".to_string(), "docopt.cpp".to_string())));
+        assert_eq!(
+            result,
+            Some(("docopt".to_string(), "docopt.cpp".to_string()))
+        );
     }
 
     #[test]
     fn test_github_owner_repo_dotted_with_fragment() {
         let result = github_owner_repo("https://github.com/docopt/docopt.cpp#readme");
-        assert_eq!(result, Some(("docopt".to_string(), "docopt.cpp".to_string())));
+        assert_eq!(
+            result,
+            Some(("docopt".to_string(), "docopt.cpp".to_string()))
+        );
     }
 }

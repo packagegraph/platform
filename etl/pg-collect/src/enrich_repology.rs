@@ -8,7 +8,7 @@
 use crate::cache::FileCache;
 use crate::enricher::{rate_limit, SLOW_RATE_LIMIT};
 use crate::ntriples::NTriplesWriter;
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use reqwest::blocking::Client;
 use std::fs::File;
@@ -38,11 +38,17 @@ pub struct RepologyEnricher {
     sparql: SparqlClient,
     client: Client,
     cache: Option<FileCache>,
+    pub graph_uri: Option<String>,
 }
 
 impl RepologyEnricher {
-    pub fn new(endpoint: &str, cache_dir: Option<&str>) -> Self {
-        let sparql = SparqlClient::new(endpoint);
+    pub fn new(
+        endpoint: &str,
+        cache_dir: Option<&str>,
+        auth: SparqlAuth,
+        backend: SparqlBackend,
+    ) -> Self {
+        let sparql = make_sparql_client(endpoint, &auth, backend);
         let client = crate::enricher::default_http_client();
 
         let cache = cache_dir.map(|dir| {
@@ -50,12 +56,23 @@ impl RepologyEnricher {
                 .expect("Failed to create cache")
         });
 
-        Self { sparql, client, cache }
+        Self {
+            sparql,
+            client,
+            cache,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn enrich(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         // Get unique package names from the graph
         let packages = self.sparql.query_package_names_and_versions()?;
@@ -63,7 +80,10 @@ impl RepologyEnricher {
         unique_names.sort();
         unique_names.dedup();
 
-        eprintln!("Found {} unique package names to check Repology", unique_names.len());
+        eprintln!(
+            "Found {} unique package names to check Repology",
+            unique_names.len()
+        );
 
         let mut total_links = 0;
         let mut total_triples = 0;
@@ -96,9 +116,10 @@ impl RepologyEnricher {
             Some(d) => d,
             None => {
                 let url = format!("https://repology.org/api/v1/project/{}", name);
-                let resp = self.client.get(&url)
-                    .send()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let resp =
+                    self.client.get(&url).send().map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    })?;
 
                 if resp.status() == reqwest::StatusCode::NOT_FOUND {
                     return Ok(0);
@@ -111,7 +132,8 @@ impl RepologyEnricher {
                     ));
                 }
 
-                let data: serde_json::Value = resp.json()
+                let data: serde_json::Value = resp
+                    .json()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
                 self.cache_put(&cache_key, &data);
@@ -229,12 +251,13 @@ mod tests {
     #[test]
     fn test_emit_equivalence_links() {
         let mut server = mockito::Server::new();
-        let _mock = server.mock("POST", "/sparql")
+        let _mock = server
+            .mock("POST", "/sparql")
             .with_status(200)
             .with_body(r#"{"results": {"bindings": []}}"#)
             .create();
 
-        let enricher = RepologyEnricher::new(&server.url(), None);
+        let enricher = RepologyEnricher::new(&server.url(), None, None, SparqlBackend::Fuseki);
 
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
@@ -246,42 +269,72 @@ mod tests {
             {"repo": "unknown_repo", "version": "1.0"}
         ]);
 
-        let triples = enricher.emit_equivalence_links(&mut writer, "openssl", &data).unwrap();
+        let triples = enricher
+            .emit_equivalence_links(&mut writer, "openssl", &data)
+            .unwrap();
         writer.flush().unwrap();
 
         // 3 known distros → 3 pairs → 2 shortcut + 5 reified = 7 per pair → 21 total
-        assert_eq!(triples, 21, "Should emit 21 triples (3 pairs × 7 triples each)");
+        assert_eq!(
+            triples, 21,
+            "Should emit 21 triples (3 pairs × 7 triples each)"
+        );
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("crossDistributionAlternative"), "Should have cross-distribution links");
-        assert!(content.contains("PackageRelationship"), "Should have reified relationships");
+        assert!(
+            content.contains("crossDistributionAlternative"),
+            "Should have cross-distribution links"
+        );
+        assert!(
+            content.contains("PackageRelationship"),
+            "Should have reified relationships"
+        );
         assert!(content.contains("matchMethod"), "Should have match method");
-        assert!(content.contains("match-repology"), "Should use repology match method");
-        assert!(content.contains("matchConfidence"), "Should have match confidence");
+        assert!(
+            content.contains("match-repology"),
+            "Should use repology match method"
+        );
+        assert!(
+            content.contains("matchConfidence"),
+            "Should have match confidence"
+        );
         assert!(content.contains("0.95"), "Confidence should be 0.95");
-        assert!(content.contains("debian/bookworm"), "Should reference Debian");
+        assert!(
+            content.contains("debian/bookworm"),
+            "Should reference Debian"
+        );
         assert!(content.contains("fedora/41"), "Should reference Fedora");
         assert!(content.contains("arch/arch"), "Should reference Arch");
-        assert!(!content.contains("unknown_repo"), "Should NOT include unknown repos");
+        assert!(
+            !content.contains("unknown_repo"),
+            "Should NOT include unknown repos"
+        );
     }
 
     #[test]
     fn test_emit_equivalence_empty_data() {
         let mut server = mockito::Server::new();
-        let _mock = server.mock("POST", "/sparql")
+        let _mock = server
+            .mock("POST", "/sparql")
             .with_status(200)
             .with_body(r#"{"results": {"bindings": []}}"#)
             .create();
 
-        let enricher = RepologyEnricher::new(&server.url(), None);
+        let enricher = RepologyEnricher::new(&server.url(), None, None, SparqlBackend::Fuseki);
 
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 
         let data = serde_json::json!([]);
-        let triples = enricher.emit_equivalence_links(&mut writer, "nonexistent", &data).unwrap();
+        let triples = enricher
+            .emit_equivalence_links(&mut writer, "nonexistent", &data)
+            .unwrap();
 
         assert_eq!(triples, 0);
     }

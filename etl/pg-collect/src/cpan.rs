@@ -1,4 +1,5 @@
 use crate::ntriples::NTriplesWriter;
+use crate::sparql::{SparqlAuth, SparqlBackend};
 use crate::uris::*;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -10,6 +11,7 @@ use std::time::Duration;
 pub struct CpanCollector {
     client: Client,
     api_base: String,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,11 +51,27 @@ impl CpanCollector {
     pub fn new(api_base: String) -> Self {
         let client = crate::enricher::default_http_client();
 
-        Self { client, api_base }
+        Self {
+            client,
+            api_base,
+            graph_uri: None,
+        }
     }
 
-    pub fn collect_discover(&self, endpoint: &str, output_path: &str) -> Result<(usize, usize)> {
-        let names = crate::seed::discover_by_ecosystem(endpoint, "cpan")?;
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
+    }
+
+    pub fn collect_discover(
+        &self,
+        endpoint: &str,
+        auth: &SparqlAuth,
+        backend: SparqlBackend,
+        output_path: &str,
+    ) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "cpan", auth, backend.clone())?;
         let seed_path = "/tmp/seed-cpan-discover.txt";
         std::fs::write(seed_path, names.join("\n"))?;
         self.collect(seed_path, output_path)
@@ -61,12 +79,15 @@ impl CpanCollector {
 
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         self.emit_distribution_metadata(&mut writer)?;
 
         let package_names = read_cpan_seed_file(packages_file)?;
-        eprintln!("Loaded {} CPAN distribution names from seed file", package_names.len());
+        eprintln!(
+            "Loaded {} CPAN distribution names from seed file",
+            package_names.len()
+        );
 
         let mut total_packages = 0;
         let mut total_triples = 0;
@@ -128,7 +149,10 @@ impl CpanCollector {
                             .and_then(|s| s.parse::<u64>().ok())
                             .unwrap_or_else(|| 2u64.pow(attempt as u32));
 
-                        eprintln!("  Rate limited on {}, waiting {}s...", name, retry_after_secs);
+                        eprintln!(
+                            "  Rate limited on {}, waiting {}s...",
+                            name, retry_after_secs
+                        );
                         std::thread::sleep(Duration::from_secs(retry_after_secs));
                         *base_delay_ms = (*base_delay_ms * 2).min(5000);
                         continue;
@@ -161,7 +185,13 @@ impl CpanCollector {
         writer: &mut NTriplesWriter,
         release: &MetaCpanRelease,
     ) -> Result<usize> {
-        let pkg_uri = package_uri("cpan", "cpan", "any", &release.distribution, &release.version);
+        let pkg_uri = package_uri(
+            "cpan",
+            "cpan",
+            "any",
+            &release.distribution,
+            &release.version,
+        );
         let identity_uri = package_identity_uri("cpan", "cpan", "any", &release.distribution);
         let mut triples = 0;
 
@@ -172,11 +202,19 @@ impl CpanCollector {
 
         // Identity
         writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &release.distribution)?;
+        writer.write_literal(
+            &identity_uri,
+            &format!("{PKG}packageName"),
+            &release.distribution,
+        )?;
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 
-        writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), &release.distribution)?;
+        writer.write_literal(
+            &pkg_uri,
+            &format!("{PKG}packageName"),
+            &release.distribution,
+        )?;
         triples += 1;
 
         // Version
@@ -319,11 +357,17 @@ mod tests {
             resources: None,
         };
 
-        let triples = collector.emit_distribution_triples(&mut writer, &release).unwrap();
+        let triples = collector
+            .emit_distribution_triples(&mut writer, &release)
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("cpan#Distribution"));

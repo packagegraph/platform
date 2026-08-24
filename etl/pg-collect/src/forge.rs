@@ -37,11 +37,7 @@ pub struct ForgeExtraction {
 // ─── Known forge hosts ──────────────────────────────────────────────────
 
 /// Hosts that are known forges (owner/repo pattern).
-const FORGE_HOSTS: &[&str] = &[
-    "github.com",
-    "codeberg.org",
-    "sr.ht",
-];
+const FORGE_HOSTS: &[&str] = &["github.com", "codeberg.org", "sr.ht"];
 
 /// Hosts that are known GitLab instances.
 const GITLAB_HOSTS: &[&str] = &[
@@ -55,21 +51,14 @@ const GITLAB_HOSTS: &[&str] = &[
 ];
 
 /// Hosts that are known Gitea/Forgejo instances.
-const GITEA_HOSTS: &[&str] = &[
-    "gitea.com",
-    "forgejo.org",
-    "notabug.org",
-];
+const GITEA_HOSTS: &[&str] = &["gitea.com", "forgejo.org", "notabug.org"];
 
 /// Regex for git-describe output: name-VERSION-COUNT-gHASH
-static GIT_DESCRIBE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"-g([0-9a-f]{7,40})$").unwrap()
-});
+static GIT_DESCRIBE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"-g([0-9a-f]{7,40})$").unwrap());
 
 /// Regex for extracting owner/repo from forge URLs (handles dots in repo names).
-static FORGE_OWNER_REPO_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^([^/]+)/([^/]+?)(?:\.git)?(?:/.*)?$").unwrap()
-});
+static FORGE_OWNER_REPO_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^([^/]+)/([^/]+?)(?:\.git)?(?:/.*)?$").unwrap());
 
 // ─── Extraction (pure, no I/O) ──────────────────────────────────────────
 
@@ -289,7 +278,10 @@ fn normalize_direct_forge(url: &str) -> Option<String> {
     if path.starts_with("salsa.debian.org/") {
         let parts: Vec<&str> = path.splitn(4, '/').collect();
         if parts.len() >= 3 {
-            return Some(format!("https://salsa.debian.org/{}/{}", parts[1], parts[2]));
+            return Some(format!(
+                "https://salsa.debian.org/{}/{}",
+                parts[1], parts[2]
+            ));
         }
     }
 
@@ -305,13 +297,20 @@ fn normalize_direct_forge(url: &str) -> Option<String> {
     if path.starts_with("src.fedoraproject.org/") {
         let parts: Vec<&str> = path.splitn(4, '/').collect();
         if parts.len() >= 3 {
-            return Some(format!("https://src.fedoraproject.org/{}/{}", parts[1], parts[2]));
+            return Some(format!(
+                "https://src.fedoraproject.org/{}/{}",
+                parts[1], parts[2]
+            ));
         }
     }
 
     // Savannah (GNU/non-GNU): git.savannah.gnu.org, savannah.gnu.org
     if path.starts_with("git.savannah.gnu.org/") || path.starts_with("git.savannah.nongnu.org/") {
-        let host = if path.contains("nongnu") { "savannah.nongnu.org" } else { "savannah.gnu.org" };
+        let host = if path.contains("nongnu") {
+            "savannah.nongnu.org"
+        } else {
+            "savannah.gnu.org"
+        };
         if let Some(rest) = path.split_once('/').map(|(_, r)| r) {
             let rest = rest.trim_start_matches("git/").trim_start_matches("cgit/");
             if !rest.is_empty() {
@@ -375,7 +374,11 @@ fn normalize_archive_url_inner(url: &str) -> Option<String> {
         let parts: Vec<&str> = path.splitn(5, '/').collect();
         if parts.len() >= 4 {
             let subpath = parts[3];
-            if subpath == "archive" || subpath == "releases" || subpath == "tarball" || subpath == "zipball" {
+            if subpath == "archive"
+                || subpath == "releases"
+                || subpath == "tarball"
+                || subpath == "zipball"
+            {
                 let owner = parts[1];
                 let repo = parts[2].trim_end_matches(".git");
                 return Some(format!("https://github.com/{}/{}", owner, repo));
@@ -468,7 +471,9 @@ pub fn extract_owner_repo(url: &str) -> Option<(String, String)> {
 
     // Codeberg and other simple forges
     for host in FORGE_HOSTS.iter().chain(GITEA_HOSTS.iter()) {
-        if *host == "sr.ht" { continue; } // sr.ht uses ~user prefix
+        if *host == "sr.ht" {
+            continue;
+        } // sr.ht uses ~user prefix
         if path.starts_with(&format!("{}/", host)) {
             let rest = path.strip_prefix(&format!("{}/", host))?;
             let caps = FORGE_OWNER_REPO_RE.captures(rest)?;
@@ -539,17 +544,29 @@ pub struct ValidationResult {
 impl StatusClass {
     /// Whether this status should be cached (permanent or negative).
     pub fn is_cacheable(&self) -> bool {
-        matches!(self, StatusClass::Alive | StatusClass::Moved | StatusClass::NotFound | StatusClass::AccessDenied)
+        matches!(
+            self,
+            StatusClass::Alive
+                | StatusClass::Moved
+                | StatusClass::NotFound
+                | StatusClass::AccessDenied
+        )
     }
 
     /// Whether this status indicates the URL should be retried later.
     pub fn is_transient(&self) -> bool {
-        matches!(self, StatusClass::RateLimited | StatusClass::ServerError | StatusClass::NetworkError)
+        matches!(
+            self,
+            StatusClass::RateLimited | StatusClass::ServerError | StatusClass::NetworkError
+        )
     }
 
     /// Whether a valid upstreamRepository edge should be emitted.
     pub fn should_emit_repo(&self) -> bool {
-        matches!(self, StatusClass::Alive | StatusClass::Moved | StatusClass::TemporaryRedirect)
+        matches!(
+            self,
+            StatusClass::Alive | StatusClass::Moved | StatusClass::TemporaryRedirect
+        )
     }
 
     /// DQ issue type for this status, if applicable.
@@ -615,18 +632,26 @@ pub fn validate_url(
                 let status_class = classify_status(status);
 
                 // Extract headers before consuming response
-                let last_modified = response.headers().get("last-modified")
+                let last_modified = response
+                    .headers()
+                    .get("last-modified")
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
-                let etag = response.headers().get("etag")
+                let etag = response
+                    .headers()
+                    .get("etag")
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
-                let location = response.headers().get("location")
+                let location = response
+                    .headers()
+                    .get("location")
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
 
                 match status_class {
-                    StatusClass::Moved | StatusClass::TemporaryRedirect if redirect_count < max_redirects => {
+                    StatusClass::Moved | StatusClass::TemporaryRedirect
+                        if redirect_count < max_redirects =>
+                    {
                         if let Some(ref loc) = location {
                             redirect_count += 1;
                             // Handle relative redirects
@@ -634,7 +659,14 @@ pub fn validate_url(
                                 loc.clone()
                             } else {
                                 // Relative redirect — resolve against current URL
-                                format!("{}/{}", current_url.rsplit_once('/').map(|(base, _)| base).unwrap_or(&current_url), loc.trim_start_matches('/'))
+                                format!(
+                                    "{}/{}",
+                                    current_url
+                                        .rsplit_once('/')
+                                        .map(|(base, _)| base)
+                                        .unwrap_or(&current_url),
+                                    loc.trim_start_matches('/')
+                                )
                             };
                             current_url = next_url;
                             continue;
@@ -689,10 +721,7 @@ pub fn validate_url(
 /// Validate a URL and return the canonical form.
 ///
 /// Returns the redirect target for 301s, the original for 200s, or None for errors.
-pub fn resolve_canonical(
-    client: &reqwest::blocking::Client,
-    url: &str,
-) -> Option<String> {
+pub fn resolve_canonical(client: &reqwest::blocking::Client, url: &str) -> Option<String> {
     let result = validate_url(client, url, 10);
     match result.status_class {
         StatusClass::Alive => Some(result.original_url),
@@ -754,8 +783,14 @@ pub fn emit_validation_dq(
         validation.original_url.clone()
     };
 
-    emit_dq_issue(writer, detector, "repository-url", &raw_value, issue_type,
-        validation.status_class.dq_severity())
+    emit_dq_issue(
+        writer,
+        detector,
+        "repository-url",
+        &raw_value,
+        issue_type,
+        validation.status_class.dq_severity(),
+    )
 }
 
 // ─── Forge Software Mapping (ontology v0.8.0) ──────────────────────────
@@ -790,8 +825,10 @@ pub fn detect_forge_software(host: &str) -> Option<&'static str> {
         return Some("https://purl.org/packagegraph/ontology/vcs#BitbucketDataCenter");
     }
     // GNU Savannah
-    if host == "savannah.gnu.org" || host == "savannah.nongnu.org"
-        || host == "git.savannah.gnu.org" || host == "git.savannah.nongnu.org"
+    if host == "savannah.gnu.org"
+        || host == "savannah.nongnu.org"
+        || host == "git.savannah.gnu.org"
+        || host == "git.savannah.nongnu.org"
     {
         return Some("https://purl.org/packagegraph/ontology/vcs#Savannah");
     }
@@ -808,7 +845,11 @@ fn forge_host_from_url(repo_url: &str) -> Option<String> {
         .strip_prefix("https://")
         .or_else(|| repo_url.strip_prefix("http://"))?;
     let host = stripped.split('/').next()?;
-    if host.contains('.') { Some(host.to_string()) } else { None }
+    if host.contains('.') {
+        Some(host.to_string())
+    } else {
+        None
+    }
 }
 
 // ─── RDF Emission ───────────────────────────────────────────────────────
@@ -843,7 +884,11 @@ pub fn emit_forge_triples(
 
     writer.write_triple(repo_uri, &format!("{VCS}hostedOn"), &f_uri)?;
     writer.write_triple(&f_uri, RDF_TYPE, &format!("{VCS}Forge"))?;
-    writer.write_literal(&f_uri, &format!("{VCS}forgeUrl"), &format!("https://{host}"))?;
+    writer.write_literal(
+        &f_uri,
+        &format!("{VCS}forgeUrl"),
+        &format!("https://{host}"),
+    )?;
     writer.write_triple(&f_uri, &format!("{VCS}forgeSoftware"), software)?;
 
     Ok(4)
@@ -891,19 +936,28 @@ mod tests {
     #[test]
     fn test_pre_normalize_strips_fragment() {
         let result = pre_normalize("https://github.com/openssl/openssl#readme");
-        assert_eq!(result, Some("https://github.com/openssl/openssl".to_string()));
+        assert_eq!(
+            result,
+            Some("https://github.com/openssl/openssl".to_string())
+        );
     }
 
     #[test]
     fn test_pre_normalize_strips_git_suffix() {
         let result = pre_normalize("https://github.com/openssl/openssl.git");
-        assert_eq!(result, Some("https://github.com/openssl/openssl".to_string()));
+        assert_eq!(
+            result,
+            Some("https://github.com/openssl/openssl".to_string())
+        );
     }
 
     #[test]
     fn test_pre_normalize_git_protocol() {
         let result = pre_normalize("git://github.com/openssl/openssl.git");
-        assert_eq!(result, Some("https://github.com/openssl/openssl".to_string()));
+        assert_eq!(
+            result,
+            Some("https://github.com/openssl/openssl".to_string())
+        );
     }
 
     #[test]
@@ -914,8 +968,12 @@ mod tests {
 
     #[test]
     fn test_pre_normalize_yocto_params() {
-        let result = pre_normalize("git://github.com/openembedded/meta-oe.git;branch=master;protocol=https");
-        assert_eq!(result, Some("https://github.com/openembedded/meta-oe".to_string()));
+        let result =
+            pre_normalize("git://github.com/openembedded/meta-oe.git;branch=master;protocol=https");
+        assert_eq!(
+            result,
+            Some("https://github.com/openembedded/meta-oe".to_string())
+        );
     }
 
     #[test]
@@ -987,7 +1045,10 @@ mod tests {
     #[test]
     fn test_extract_gitlab_freedesktop() {
         let result = extract_forge_url("https://gitlab.freedesktop.org/xorg/lib/libx11").unwrap();
-        assert_eq!(result.repo_url, "https://gitlab.freedesktop.org/xorg/lib/libx11");
+        assert_eq!(
+            result.repo_url,
+            "https://gitlab.freedesktop.org/xorg/lib/libx11"
+        );
         assert_eq!(result.confidence, Confidence::High);
     }
 
@@ -1000,7 +1061,10 @@ mod tests {
     #[test]
     fn test_extract_codeberg() {
         let result = extract_forge_url("https://codeberg.org/Freeyourgadget/Gadgetbridge").unwrap();
-        assert_eq!(result.repo_url, "https://codeberg.org/Freeyourgadget/Gadgetbridge");
+        assert_eq!(
+            result.repo_url,
+            "https://codeberg.org/Freeyourgadget/Gadgetbridge"
+        );
         assert_eq!(result.confidence, Confidence::High);
     }
 
@@ -1021,7 +1085,10 @@ mod tests {
     #[test]
     fn test_extract_fedora_distgit() {
         let result = extract_forge_url("https://src.fedoraproject.org/rpms/openssl").unwrap();
-        assert_eq!(result.repo_url, "https://src.fedoraproject.org/rpms/openssl");
+        assert_eq!(
+            result.repo_url,
+            "https://src.fedoraproject.org/rpms/openssl"
+        );
     }
 
     #[test]
@@ -1038,8 +1105,13 @@ mod tests {
 
     #[test]
     fn test_extract_kernel_org() {
-        let result = extract_forge_url("https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux").unwrap();
-        assert_eq!(result.repo_url, "https://git.kernel.org/linux/kernel/git/torvalds/linux");
+        let result =
+            extract_forge_url("https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux")
+                .unwrap();
+        assert_eq!(
+            result.repo_url,
+            "https://git.kernel.org/linux/kernel/git/torvalds/linux"
+        );
     }
 
     #[test]
@@ -1060,13 +1132,18 @@ mod tests {
 
     #[test]
     fn test_archive_github_refs_tags() {
-        let result = normalize_archive_url("https://github.com/openssl/openssl/archive/refs/tags/openssl-3.2.2.tar.gz").unwrap();
+        let result = normalize_archive_url(
+            "https://github.com/openssl/openssl/archive/refs/tags/openssl-3.2.2.tar.gz",
+        )
+        .unwrap();
         assert_eq!(result, "https://github.com/openssl/openssl");
     }
 
     #[test]
     fn test_archive_github_releases_download() {
-        let result = normalize_archive_url("https://github.com/x/y/releases/download/v1.0/y-1.0.tar.gz").unwrap();
+        let result =
+            normalize_archive_url("https://github.com/x/y/releases/download/v1.0/y-1.0.tar.gz")
+                .unwrap();
         assert_eq!(result, "https://github.com/x/y");
     }
 
@@ -1175,14 +1252,16 @@ mod tests {
 
     #[test]
     fn test_owner_repo_gitlab_nested() {
-        let (owner, repo) = extract_owner_repo("https://gitlab.freedesktop.org/xorg/lib/libx11").unwrap();
+        let (owner, repo) =
+            extract_owner_repo("https://gitlab.freedesktop.org/xorg/lib/libx11").unwrap();
         assert_eq!(owner, "xorg/lib");
         assert_eq!(repo, "libx11");
     }
 
     #[test]
     fn test_owner_repo_codeberg() {
-        let (owner, repo) = extract_owner_repo("https://codeberg.org/Freeyourgadget/Gadgetbridge").unwrap();
+        let (owner, repo) =
+            extract_owner_repo("https://codeberg.org/Freeyourgadget/Gadgetbridge").unwrap();
         assert_eq!(owner, "Freeyourgadget");
         assert_eq!(repo, "Gadgetbridge");
     }
@@ -1216,14 +1295,20 @@ mod tests {
 
     #[test]
     fn test_yocto_git_src_uri() {
-        let result = extract_forge_url("git://github.com/openembedded/meta-openembedded.git;branch=master").unwrap();
-        assert_eq!(result.repo_url, "https://github.com/openembedded/meta-openembedded");
+        let result =
+            extract_forge_url("git://github.com/openembedded/meta-openembedded.git;branch=master")
+                .unwrap();
+        assert_eq!(
+            result.repo_url,
+            "https://github.com/openembedded/meta-openembedded"
+        );
         assert_eq!(result.confidence, Confidence::High);
     }
 
     #[test]
     fn test_yocto_git_src_uri_with_protocol() {
-        let result = extract_forge_url("git://github.com/foo/bar.git;branch=main;protocol=https").unwrap();
+        let result =
+            extract_forge_url("git://github.com/foo/bar.git;branch=main;protocol=https").unwrap();
         assert_eq!(result.repo_url, "https://github.com/foo/bar");
     }
 
@@ -1290,9 +1375,18 @@ mod tests {
 
     #[test]
     fn test_status_class_dq_issue_type() {
-        assert_eq!(StatusClass::NotFound.dq_issue_type(), Some("dead-repository"));
-        assert_eq!(StatusClass::AccessDenied.dq_issue_type(), Some("private-repository"));
-        assert_eq!(StatusClass::Moved.dq_issue_type(), Some("repository-redirect"));
+        assert_eq!(
+            StatusClass::NotFound.dq_issue_type(),
+            Some("dead-repository")
+        );
+        assert_eq!(
+            StatusClass::AccessDenied.dq_issue_type(),
+            Some("private-repository")
+        );
+        assert_eq!(
+            StatusClass::Moved.dq_issue_type(),
+            Some("repository-redirect")
+        );
         assert_eq!(StatusClass::Alive.dq_issue_type(), None);
     }
 
@@ -1301,7 +1395,8 @@ mod tests {
     #[test]
     fn test_validate_url_200() {
         let mut server = mockito::Server::new();
-        let mock = server.mock("HEAD", "/openssl/openssl")
+        let mock = server
+            .mock("HEAD", "/openssl/openssl")
             .with_status(200)
             .with_header("last-modified", "Thu, 01 Jan 2026 00:00:00 GMT")
             .with_header("etag", "\"abc123\"")
@@ -1310,7 +1405,8 @@ mod tests {
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(5))
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let url = format!("{}/openssl/openssl", server.url());
         let result = validate_url(&client, &url, 10);
@@ -1320,7 +1416,10 @@ mod tests {
         assert_eq!(result.status_class, StatusClass::Alive);
         assert_eq!(result.redirect_count, 0);
         assert!(result.canonical_url.is_none());
-        assert_eq!(result.last_modified.as_deref(), Some("Thu, 01 Jan 2026 00:00:00 GMT"));
+        assert_eq!(
+            result.last_modified.as_deref(),
+            Some("Thu, 01 Jan 2026 00:00:00 GMT")
+        );
         assert_eq!(result.etag.as_deref(), Some("\"abc123\""));
     }
 
@@ -1329,20 +1428,20 @@ mod tests {
         let mut server = mockito::Server::new();
 
         // First request returns 301 → /new/repo
-        let mock1 = server.mock("HEAD", "/old/repo")
+        let mock1 = server
+            .mock("HEAD", "/old/repo")
             .with_status(301)
             .with_header("location", &format!("{}/new/repo", server.url()))
             .create();
 
         // Redirect target returns 200
-        let mock2 = server.mock("HEAD", "/new/repo")
-            .with_status(200)
-            .create();
+        let mock2 = server.mock("HEAD", "/new/repo").with_status(200).create();
 
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(5))
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let url = format!("{}/old/repo", server.url());
         let result = validate_url(&client, &url, 10);
@@ -1359,14 +1458,16 @@ mod tests {
     #[test]
     fn test_validate_url_404() {
         let mut server = mockito::Server::new();
-        let mock = server.mock("HEAD", "/deleted/repo")
+        let mock = server
+            .mock("HEAD", "/deleted/repo")
             .with_status(404)
             .create();
 
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(5))
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let url = format!("{}/deleted/repo", server.url());
         let result = validate_url(&client, &url, 10);
@@ -1384,7 +1485,8 @@ mod tests {
 
         // Create an infinite redirect loop
         let url = format!("{}/loop", server.url());
-        let _mock = server.mock("HEAD", "/loop")
+        let _mock = server
+            .mock("HEAD", "/loop")
             .with_status(301)
             .with_header("location", &url)
             .expect_at_least(3)
@@ -1393,7 +1495,8 @@ mod tests {
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(5))
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let result = validate_url(&client, &url, 3);
 
@@ -1406,14 +1509,13 @@ mod tests {
     #[test]
     fn test_resolve_canonical_200() {
         let mut server = mockito::Server::new();
-        let _mock = server.mock("HEAD", "/repo")
-            .with_status(200)
-            .create();
+        let _mock = server.mock("HEAD", "/repo").with_status(200).create();
 
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(5))
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let url = format!("{}/repo", server.url());
         let canonical = resolve_canonical(&client, &url);
@@ -1427,8 +1529,15 @@ mod tests {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp.reopen().unwrap());
 
-        let count = emit_dq_issue(&mut writer, "collect-rpm", "homepage",
-            "https://example.com/broken", "no-forge-url-extractable", "info").unwrap();
+        let count = emit_dq_issue(
+            &mut writer,
+            "collect-rpm",
+            "homepage",
+            "https://example.com/broken",
+            "no-forge-url-extractable",
+            "info",
+        )
+        .unwrap();
         writer.flush().unwrap();
 
         assert_eq!(count, 7);
@@ -1527,9 +1636,13 @@ mod tests {
             extractor: "direct-forge",
         };
 
-        let count = emit_upstream_repo(&mut writer,
+        let count = emit_upstream_repo(
+            &mut writer,
             "https://packagegraph.github.io/d/pkgid/rpm/fedora/openssl",
-            &extraction, None).unwrap();
+            &extraction,
+            None,
+        )
+        .unwrap();
         writer.flush().unwrap();
 
         assert_eq!(count, 7); // 3 repo + 4 forge
@@ -1539,12 +1652,24 @@ mod tests {
         assert!(content.contains("vcs#Repository"));
         assert!(content.contains("vcs#repositoryURL"));
         // No PackageRelationship — upstream repo links use pkg:upstreamRepository directly
-        assert!(!content.contains("PackageRelationship"), "Upstream repo links should NOT use PackageRelationship");
+        assert!(
+            !content.contains("PackageRelationship"),
+            "Upstream repo links should NOT use PackageRelationship"
+        );
         // Forge triples (v0.8.0)
-        assert!(content.contains("vcs#hostedOn"), "Should link repo to forge");
+        assert!(
+            content.contains("vcs#hostedOn"),
+            "Should link repo to forge"
+        );
         assert!(content.contains("vcs#Forge"), "Should type forge instance");
-        assert!(content.contains("vcs#forgeSoftware"), "Should link to software");
-        assert!(content.contains("vcs#GitHub"), "Should identify GitHub software");
+        assert!(
+            content.contains("vcs#forgeSoftware"),
+            "Should link to software"
+        );
+        assert!(
+            content.contains("vcs#GitHub"),
+            "Should identify GitHub software"
+        );
     }
 
     #[test]
@@ -1570,28 +1695,34 @@ mod tests {
             status_class: StatusClass::Alive,
         };
 
-        emit_upstream_repo(&mut writer,
+        emit_upstream_repo(
+            &mut writer,
             "https://packagegraph.github.io/d/pkgid/rpm/fedora/test",
-            &extraction, Some(&validation)).unwrap();
+            &extraction,
+            Some(&validation),
+        )
+        .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
         std::io::Read::read_to_string(&mut temp.reopen().unwrap(), &mut content).unwrap();
         // Should use the canonical URL from the redirect, not the original
-        assert!(content.contains("new/repo"), "Should use canonical URL from redirect");
+        assert!(
+            content.contains("new/repo"),
+            "Should use canonical URL from redirect"
+        );
     }
 
     #[test]
     fn test_resolve_canonical_404_returns_none() {
         let mut server = mockito::Server::new();
-        let _mock = server.mock("HEAD", "/gone")
-            .with_status(404)
-            .create();
+        let _mock = server.mock("HEAD", "/gone").with_status(404).create();
 
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(5))
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let url = format!("{}/gone", server.url());
         assert!(resolve_canonical(&client, &url).is_none());
@@ -1601,47 +1732,68 @@ mod tests {
 
     #[test]
     fn test_detect_forge_software_github() {
-        assert_eq!(detect_forge_software("github.com"),
-            Some("https://purl.org/packagegraph/ontology/vcs#GitHub"));
+        assert_eq!(
+            detect_forge_software("github.com"),
+            Some("https://purl.org/packagegraph/ontology/vcs#GitHub")
+        );
     }
 
     #[test]
     fn test_detect_forge_software_gitlab_instances() {
-        for host in &["gitlab.com", "gitlab.freedesktop.org", "gitlab.gnome.org", "invent.kde.org"] {
-            assert_eq!(detect_forge_software(host),
+        for host in &[
+            "gitlab.com",
+            "gitlab.freedesktop.org",
+            "gitlab.gnome.org",
+            "invent.kde.org",
+        ] {
+            assert_eq!(
+                detect_forge_software(host),
                 Some("https://purl.org/packagegraph/ontology/vcs#GitLab"),
-                "Failed for {}", host);
+                "Failed for {}",
+                host
+            );
         }
     }
 
     #[test]
     fn test_detect_forge_software_codeberg_is_forgejo() {
         // v0.8.0: Codeberg is a Forge instance running Forgejo, not a software product
-        assert_eq!(detect_forge_software("codeberg.org"),
-            Some("https://purl.org/packagegraph/ontology/vcs#Forgejo"));
+        assert_eq!(
+            detect_forge_software("codeberg.org"),
+            Some("https://purl.org/packagegraph/ontology/vcs#Forgejo")
+        );
     }
 
     #[test]
     fn test_detect_forge_software_gitea_forgejo() {
         for host in &["gitea.com", "forgejo.org", "notabug.org"] {
-            assert_eq!(detect_forge_software(host),
+            assert_eq!(
+                detect_forge_software(host),
                 Some("https://purl.org/packagegraph/ontology/vcs#Forgejo"),
-                "Failed for {}", host);
+                "Failed for {}",
+                host
+            );
         }
     }
 
     #[test]
     fn test_detect_forge_software_sourcehut() {
-        assert_eq!(detect_forge_software("sr.ht"),
-            Some("https://purl.org/packagegraph/ontology/vcs#SourceHut"));
+        assert_eq!(
+            detect_forge_software("sr.ht"),
+            Some("https://purl.org/packagegraph/ontology/vcs#SourceHut")
+        );
     }
 
     #[test]
     fn test_detect_forge_software_cgit() {
-        assert_eq!(detect_forge_software("git.kernel.org"),
-            Some("https://purl.org/packagegraph/ontology/vcs#cgit"));
-        assert_eq!(detect_forge_software("sourceware.org"),
-            Some("https://purl.org/packagegraph/ontology/vcs#cgit"));
+        assert_eq!(
+            detect_forge_software("git.kernel.org"),
+            Some("https://purl.org/packagegraph/ontology/vcs#cgit")
+        );
+        assert_eq!(
+            detect_forge_software("sourceware.org"),
+            Some("https://purl.org/packagegraph/ontology/vcs#cgit")
+        );
     }
 
     #[test]

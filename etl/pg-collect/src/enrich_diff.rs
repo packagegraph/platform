@@ -1,11 +1,11 @@
 use crate::cache::FileCache;
 use crate::enricher::{github_owner_repo, rate_limit};
 use crate::ntriples::NTriplesWriter;
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
+use percent_encoding::percent_decode_str;
 use reqwest::blocking::Client;
 use serde::Deserialize;
-use percent_encoding::percent_decode_str;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Result;
@@ -16,6 +16,7 @@ pub struct DiffEnricher {
     client: Client,
     cache: Option<FileCache>,
     token: Option<String>,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,26 +51,33 @@ impl DiffEnricher {
         endpoint: &str,
         github_token: Option<String>,
         cache_dir: Option<&str>,
+        auth: SparqlAuth,
+        backend: SparqlBackend,
     ) -> Self {
-        let sparql = SparqlClient::new(endpoint);
+        let sparql = make_sparql_client(endpoint, &auth, backend);
         let client = crate::enricher::default_http_client();
 
-        let cache = cache_dir.map(|dir| {
-            FileCache::new(dir, "diff", 168, None)
-                .expect("Failed to create cache")
-        });
+        let cache = cache_dir
+            .map(|dir| FileCache::new(dir, "diff", 168, None).expect("Failed to create cache"));
 
         Self {
             sparql,
             client,
             cache,
             token: github_token,
+            graph_uri: None,
         }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn enrich(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         let repos = self.query_maven_repos()?;
         eprintln!(
@@ -93,11 +101,7 @@ impl DiffEnricher {
 
             total_repos += 1;
             if total_repos % 10 == 0 {
-                eprintln!(
-                    "Progress: {}/{} repos processed",
-                    total_repos,
-                    repos.len()
-                );
+                eprintln!("Progress: {}/{} repos processed", total_repos, repos.len());
             }
 
             match self.process_repo(&mut writer, repo_uri, &owner, &repo_name) {
@@ -131,9 +135,7 @@ impl DiffEnricher {
 
         let repos: Vec<(String, String)> = bindings
             .into_iter()
-            .filter_map(|b| {
-                Some((b.get("repo")?.clone(), b.get("cloneUrl")?.clone()))
-            })
+            .filter_map(|b| Some((b.get("repo")?.clone(), b.get("cloneUrl")?.clone())))
             .collect();
 
         // Deduplicate by repo URI
@@ -147,16 +149,20 @@ impl DiffEnricher {
     }
 
     fn query_versions_for_repo(&self, repo_uri: &str) -> Result<HashMap<String, Vec<String>>> {
-        let sparql = format!("\
+        let sparql = format!(
+            "\
             PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\n\
             SELECT ?versionString ?versionUri WHERE {{\n\
               ?identity pkg:upstreamRepository <{repo_uri}> .\n\
               ?pkg pkg:isVersionOf ?identity ;\n\
                    pkg:hasVersion ?versionUri .\n\
               ?versionUri pkg:versionString ?versionString .\n\
-            }}");
+            }}"
+        );
 
-        let bindings = self.sparql.query(&sparql)
+        let bindings = self
+            .sparql
+            .query(&sparql)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         let mut versions: HashMap<String, Vec<String>> = HashMap::new();
@@ -203,11 +209,7 @@ impl DiffEnricher {
             // Newer release
             writer.write_triple(&newer_release_uri, RDF_TYPE, &format!("{VCS}Release"))?;
             writer.write_triple(&newer_release_uri, RDF_TYPE, &format!("{VCS}Tag"))?;
-            writer.write_literal(
-                &newer_release_uri,
-                &format!("{VCS}tagName"),
-                &newer.name,
-            )?;
+            writer.write_literal(&newer_release_uri, &format!("{VCS}tagName"), &newer.name)?;
             writer.write_triple(
                 &newer_release_uri,
                 &format!("{VCS}pointsTo"),
@@ -235,11 +237,7 @@ impl DiffEnricher {
             // Older release
             writer.write_triple(&older_release_uri, RDF_TYPE, &format!("{VCS}Release"))?;
             writer.write_triple(&older_release_uri, RDF_TYPE, &format!("{VCS}Tag"))?;
-            writer.write_literal(
-                &older_release_uri,
-                &format!("{VCS}tagName"),
-                &older.name,
-            )?;
+            writer.write_literal(&older_release_uri, &format!("{VCS}tagName"), &older.name)?;
             writer.write_triple(
                 &older_release_uri,
                 &format!("{VCS}pointsTo"),
@@ -287,16 +285,8 @@ impl DiffEnricher {
                     );
 
                     writer.write_triple(&diff_uri, RDF_TYPE, &format!("{VCS}Diff"))?;
-                    writer.write_triple(
-                        &diff_uri,
-                        &format!("{VCS}diffFrom"),
-                        &older_commit_uri,
-                    )?;
-                    writer.write_triple(
-                        &diff_uri,
-                        &format!("{VCS}diffTo"),
-                        &newer_commit_uri,
-                    )?;
+                    writer.write_triple(&diff_uri, &format!("{VCS}diffFrom"), &older_commit_uri)?;
+                    writer.write_triple(&diff_uri, &format!("{VCS}diffTo"), &newer_commit_uri)?;
                     writer.write_typed_literal(
                         &diff_uri,
                         &format!("{VCS}diffUrl"),
@@ -309,15 +299,12 @@ impl DiffEnricher {
                         .files
                         .as_ref()
                         .map(|files| {
-                            files
-                                .iter()
-                                .fold((0usize, 0usize), |(a, d), f| {
-                                    (a + f.additions, d + f.deletions)
-                                })
+                            files.iter().fold((0usize, 0usize), |(a, d), f| {
+                                (a + f.additions, d + f.deletions)
+                            })
                         })
                         .unwrap_or((0, 0));
-                    let files_changed =
-                        compare.files.as_ref().map(|f| f.len()).unwrap_or(0);
+                    let files_changed = compare.files.as_ref().map(|f| f.len()).unwrap_or(0);
 
                     writer.write_typed_literal(
                         &diff_uri,
@@ -340,11 +327,7 @@ impl DiffEnricher {
                     triples += 3;
 
                     // Link release to diff
-                    writer.write_triple(
-                        &newer_release_uri,
-                        &format!("{VCS}hasDiff"),
-                        &diff_uri,
-                    )?;
+                    writer.write_triple(&newer_release_uri, &format!("{VCS}hasDiff"), &diff_uri)?;
                     triples += 1;
                 }
                 Err(e) => {
@@ -407,10 +390,7 @@ impl DiffEnricher {
         serde_json::from_value(val).map_err(|e| e.to_string())
     }
 
-    fn api_get(
-        &self,
-        url: &str,
-    ) -> std::result::Result<serde_json::Value, String> {
+    fn api_get(&self, url: &str) -> std::result::Result<serde_json::Value, String> {
         let mut req = self
             .client
             .get(url)
@@ -431,8 +411,7 @@ impl DiffEnricher {
 
     fn extract_github_from_repo_uri(repo_uri: &str) -> Option<(String, String)> {
         let decoded = percent_decode_str(repo_uri).decode_utf8().ok()?;
-        let path = decoded
-            .strip_prefix("https://packagegraph.github.io/d/repo/")?;
+        let path = decoded.strip_prefix("https://packagegraph.github.io/d/repo/")?;
         if !path.starts_with("github.com/") {
             return None;
         }
@@ -496,7 +475,13 @@ mod tests {
 
     #[test]
     fn test_diff_enricher_creation() {
-        let enricher = DiffEnricher::new("http://localhost:3030/test", None, None);
+        let enricher = DiffEnricher::new(
+            "http://localhost:3030/test",
+            None,
+            None,
+            None,
+            SparqlBackend::Fuseki,
+        );
         assert!(enricher.cache.is_none());
         assert!(enricher.token.is_none());
     }
@@ -507,6 +492,8 @@ mod tests {
             "http://localhost:3030/test",
             Some("ghp_test123".to_string()),
             None,
+            None,
+            SparqlBackend::Fuseki,
         );
         assert_eq!(enricher.token, Some("ghp_test123".to_string()));
     }

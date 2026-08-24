@@ -1,4 +1,5 @@
 use crate::ntriples::NTriplesWriter;
+use crate::sparql::{SparqlAuth, SparqlBackend};
 use crate::uris::*;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -10,6 +11,7 @@ use std::time::Duration;
 pub struct HackageCollector {
     client: Client,
     base_url: String,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,11 +43,27 @@ impl HackageCollector {
             .build()
             .expect("Failed to create HTTP client");
 
-        Self { client, base_url }
+        Self {
+            client,
+            base_url,
+            graph_uri: None,
+        }
     }
 
-    pub fn collect_discover(&self, endpoint: &str, output_path: &str) -> Result<(usize, usize)> {
-        let names = crate::seed::discover_by_ecosystem(endpoint, "hackage")?;
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
+    }
+
+    pub fn collect_discover(
+        &self,
+        endpoint: &str,
+        auth: &SparqlAuth,
+        backend: SparqlBackend,
+        output_path: &str,
+    ) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "hackage", auth, backend.clone())?;
         let seed_path = "/tmp/seed-hackage-discover.txt";
         std::fs::write(seed_path, names.join("\n"))?;
         self.collect(seed_path, output_path)
@@ -53,12 +71,15 @@ impl HackageCollector {
 
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         self.emit_distribution_metadata(&mut writer)?;
 
         let package_names = read_hackage_seed_file(packages_file)?;
-        eprintln!("Loaded {} Hackage package names from seed file", package_names.len());
+        eprintln!(
+            "Loaded {} Hackage package names from seed file",
+            package_names.len()
+        );
 
         let mut total_packages = 0;
         let mut total_triples = 0;
@@ -112,15 +133,19 @@ impl HackageCollector {
         // Get preferred version
         let mut version = String::new();
         for attempt in 0..max_attempts {
-            match self.client.get(&preferred_url)
+            match self
+                .client
+                .get(&preferred_url)
                 .header("Accept", "application/json")
-                .send() {
+                .send()
+            {
                 Ok(response) => {
                     if response.status() == StatusCode::NOT_FOUND {
                         return Err(format!("404: {}", name));
                     }
                     let text = response.text().map_err(|e| e.to_string())?;
-                    let pref: PreferredInfo = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                    let pref: PreferredInfo =
+                        serde_json::from_str(&text).map_err(|e| e.to_string())?;
                     if let Some(ver) = pref.normal.first() {
                         version = ver.clone();
                         break;
@@ -143,7 +168,10 @@ impl HackageCollector {
         }
 
         // Fetch .cabal file
-        let cabal_url = format!("{}/package/{}-{}/{}.cabal", self.base_url, name, version, name);
+        let cabal_url = format!(
+            "{}/package/{}-{}/{}.cabal",
+            self.base_url, name, version, name
+        );
 
         for attempt in 0..max_attempts {
             match self.client.get(&cabal_url).send() {
@@ -172,7 +200,12 @@ impl HackageCollector {
         Err(format!("Max retries exceeded for {}", name))
     }
 
-    fn parse_cabal(&self, cabal_text: &str, name: &str, version: &str) -> std::result::Result<CabalMetadata, String> {
+    fn parse_cabal(
+        &self,
+        cabal_text: &str,
+        name: &str,
+        version: &str,
+    ) -> std::result::Result<CabalMetadata, String> {
         let mut cabal = CabalMetadata {
             name: name.to_string(),
             version: version.to_string(),
@@ -240,7 +273,11 @@ impl HackageCollector {
             .collect()
     }
 
-    fn emit_package_triples(&self, writer: &mut NTriplesWriter, cabal: &CabalMetadata) -> Result<usize> {
+    fn emit_package_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        cabal: &CabalMetadata,
+    ) -> Result<usize> {
         let pkg_uri = package_uri("hackage", "hackage", "any", &cabal.name, &cabal.version);
         let identity_uri = package_identity_uri("hackage", "hackage", "any", &cabal.name);
         let mut triples = 0;
@@ -353,7 +390,9 @@ mod tests {
         let cabal_text = "name: aeson\nversion: 2.2.1.0\nsynopsis: Fast JSON parsing\nlicense: BSD3\nhomepage: https://github.com/haskell/aeson\ncategory: Web\nmaintainer: Adam Bergmark\nbuild-depends: base >=4.12, text, bytestring\n";
 
         let collector = HackageCollector::new("https://hackage.haskell.org".into());
-        let cabal = collector.parse_cabal(cabal_text, "aeson", "2.2.1.0").unwrap();
+        let cabal = collector
+            .parse_cabal(cabal_text, "aeson", "2.2.1.0")
+            .unwrap();
 
         assert_eq!(cabal.name, "aeson");
         assert_eq!(cabal.version, "2.2.1.0");
@@ -382,7 +421,11 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("hackage#HackagePackage"));

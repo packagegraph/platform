@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: fuseki
+  namespace: packagegraph
+  labels:
+    app: fuseki
+spec:
+  selector:
+    app: fuseki
+  ports:
+    - port: 3030
+      targetPort: 3030
+      name: http

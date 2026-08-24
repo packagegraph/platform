@@ -1,5 +1,5 @@
 use crate::forge::emit_dq_issue;
-use crate::ntriples::{NTriplesWriter, bnode_id};
+use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use flate2::read::GzDecoder;
@@ -14,9 +14,7 @@ use std::io::{BufReader, Result};
 use std::time::Duration;
 
 /// CVE identifier regex: CVE-YYYY-NNNNN
-static CVE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"CVE-\d{4}-\d{4,}").unwrap()
-});
+static CVE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"CVE-\d{4}-\d{4,}").unwrap());
 
 /// Map distribution ID to human-readable display name.
 fn distro_display_name(distro_id: &str) -> &str {
@@ -59,6 +57,7 @@ pub struct RpmCollector {
     release_name: String,
     repo_type: String,
     source_cache: Option<SourceCache>,
+    pub graph_uri: Option<String>,
 }
 
 fn infer_repo_type(url: &str) -> String {
@@ -83,6 +82,12 @@ impl RpmCollector {
         Self::new_with_repo_type(repo_url, distro_name, release_name, None)
     }
 
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
+    }
+
     pub fn new_with_repo_type(
         repo_url: String,
         distro_name: String,
@@ -97,8 +102,11 @@ impl RpmCollector {
 
         let is_explicit = repo_type_override.is_some();
         let repo_type = repo_type_override.unwrap_or_else(|| infer_repo_type(&repo_url));
-        eprintln!("Repo type: '{}' ({})", repo_type,
-            if is_explicit { "explicit" } else { "inferred" });
+        eprintln!(
+            "Repo type: '{}' ({})",
+            repo_type,
+            if is_explicit { "explicit" } else { "inferred" }
+        );
 
         Self {
             client,
@@ -107,6 +115,7 @@ impl RpmCollector {
             release_name,
             repo_type,
             source_cache: None,
+            graph_uri: None,
         }
     }
 
@@ -124,7 +133,15 @@ impl RpmCollector {
         client_key_path: &str,
         ca_cert_path: &str,
     ) -> Self {
-        Self::new_with_tls_and_repo_type(repo_url, distro_name, release_name, client_cert_path, client_key_path, ca_cert_path, None)
+        Self::new_with_tls_and_repo_type(
+            repo_url,
+            distro_name,
+            release_name,
+            client_cert_path,
+            client_key_path,
+            ca_cert_path,
+            None,
+        )
     }
 
     pub fn new_with_tls_and_repo_type(
@@ -149,8 +166,8 @@ impl RpmCollector {
 
         let ca_pem = std::fs::read(ca_cert_path)
             .unwrap_or_else(|e| panic!("Failed to read CA cert {}: {}", ca_cert_path, e));
-        let ca_cert = reqwest::Certificate::from_pem(&ca_pem)
-            .expect("Failed to parse CA certificate");
+        let ca_cert =
+            reqwest::Certificate::from_pem(&ca_pem).expect("Failed to parse CA certificate");
 
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
@@ -169,12 +186,13 @@ impl RpmCollector {
             release_name,
             repo_type,
             source_cache: None,
+            graph_uri: None,
         }
     }
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
         let mut noarch_seen: HashSet<(String, String, String, String)> = HashSet::new();
         let mut srpm_seen: HashSet<String> = HashSet::new();
         let mut srpm_nvrs: HashSet<String> = HashSet::new();
@@ -182,8 +200,12 @@ impl RpmCollector {
         let mut srpm_identity_map: HashMap<String, Vec<String>> = HashMap::new();
 
         let result = self.collect_with_writer(
-            &mut writer, &mut noarch_seen, &mut srpm_seen,
-            &mut srpm_nvrs, &mut srpm_names, &mut srpm_identity_map,
+            &mut writer,
+            &mut noarch_seen,
+            &mut srpm_seen,
+            &mut srpm_nvrs,
+            &mut srpm_names,
+            &mut srpm_identity_map,
             false,
         )?;
         writer.flush()?;
@@ -204,7 +226,16 @@ impl RpmCollector {
         srpm_identity_map: &mut HashMap<String, Vec<String>>,
         is_secondary: bool,
     ) -> Result<(usize, usize)> {
-        self.collect_with_writer_limit(writer, noarch_seen, srpm_seen, srpm_nvrs, srpm_names, srpm_identity_map, is_secondary, None)
+        self.collect_with_writer_limit(
+            writer,
+            noarch_seen,
+            srpm_seen,
+            srpm_nvrs,
+            srpm_names,
+            srpm_identity_map,
+            is_secondary,
+            None,
+        )
     }
 
     /// Like collect_with_writer but with an optional package limit for testing.
@@ -235,22 +266,40 @@ impl RpmCollector {
         // Get filelists for phantom detection (optional)
         let packages_with_files = match self.parse_filelists_metadata() {
             Ok(set) => {
-                eprintln!("Found {} packages with files (phantom detection enabled)", set.len());
+                eprintln!(
+                    "Found {} packages with files (phantom detection enabled)",
+                    set.len()
+                );
                 Some(set)
             }
             Err(e) => {
-                eprintln!("Warning: filelists.xml not available, skipping phantom detection: {}", e);
-                emit_dq_issue(writer, "rpm-collector", "filelists", &e.to_string(), "missing-filelists", "info")?;
+                eprintln!(
+                    "Warning: filelists.xml not available, skipping phantom detection: {}",
+                    e
+                );
+                emit_dq_issue(
+                    writer,
+                    "rpm-collector",
+                    "filelists",
+                    &e.to_string(),
+                    "missing-filelists",
+                    "info",
+                )?;
                 None
             }
         };
 
         // Build lookup set for advisory-package resolution
-        let mut emitted_packages: HashSet<(String, String, String, String, String)> = HashSet::new();
+        let mut emitted_packages: HashSet<(String, String, String, String, String)> =
+            HashSet::new();
         let mut total_packages = 0;
         let mut total_triples = 0;
 
-        let release_name = if self.release_name.is_empty() { "unknown" } else { &self.release_name };
+        let release_name = if self.release_name.is_empty() {
+            "unknown"
+        } else {
+            &self.release_name
+        };
 
         for (idx, pkg_data) in packages_data.iter().enumerate() {
             if let Some(max) = limit {
@@ -264,9 +313,11 @@ impl RpmCollector {
             // Check for noarch dedup on secondary arches
             if is_secondary {
                 if let (Some(name), Some(arch), Some(epoch), Some(ver), Some(rel)) = (
-                    fields.get("name"), fields.get("arch"),
+                    fields.get("name"),
+                    fields.get("arch"),
                     fields.get("epoch").or(Some(&"0".to_string())),
-                    fields.get("ver"), fields.get("rel"),
+                    fields.get("ver"),
+                    fields.get("rel"),
                 ) {
                     if arch == "noarch" {
                         let key = (name.clone(), epoch.clone(), ver.clone(), rel.clone());
@@ -278,18 +329,29 @@ impl RpmCollector {
             } else {
                 // Track noarch from primary arch for future dedup
                 if let (Some(name), Some(arch), Some(ver), Some(rel)) = (
-                    fields.get("name"), fields.get("arch"), fields.get("ver"), fields.get("rel"),
+                    fields.get("name"),
+                    fields.get("arch"),
+                    fields.get("ver"),
+                    fields.get("rel"),
                 ) {
                     if arch == "noarch" {
-                        let epoch = fields.get("epoch").map(|s| s.clone()).unwrap_or_else(|| "0".to_string());
+                        let epoch = fields
+                            .get("epoch")
+                            .map(|s| s.clone())
+                            .unwrap_or_else(|| "0".to_string());
                         noarch_seen.insert((name.clone(), epoch, ver.clone(), rel.clone()));
                     }
                 }
             }
 
             // Track SRPM data (for downstream spec/koji enrichment)
-            if let Some(sourcerpm) = fields.get("rpm:sourcerpm").or_else(|| fields.get("sourcerpm")) {
-                let srpm = sourcerpm.trim_end_matches(".src.rpm").trim_end_matches(".rpm");
+            if let Some(sourcerpm) = fields
+                .get("rpm:sourcerpm")
+                .or_else(|| fields.get("sourcerpm"))
+            {
+                let srpm = sourcerpm
+                    .trim_end_matches(".src.rpm")
+                    .trim_end_matches(".rpm");
                 if !srpm.is_empty() {
                     // Extract source name and NVR
                     let parts: Vec<&str> = srpm.rsplitn(3, '-').collect();
@@ -306,8 +368,16 @@ impl RpmCollector {
                                 let ver = fields.get("ver").map(|s| s.as_str()).unwrap_or("");
                                 let rel = fields.get("rel").map(|s| s.as_str()).unwrap_or("");
                                 let version_str = format!("{}-{}.{}", ver, rel, arch);
-                                let identity = package_identity_uri(&self.distro_name, release_name, arch, name);
-                                srpm_identity_map.entry(source_name).or_default().push(identity);
+                                let identity = package_identity_uri(
+                                    &self.distro_name,
+                                    release_name,
+                                    arch,
+                                    name,
+                                );
+                                srpm_identity_map
+                                    .entry(source_name)
+                                    .or_default()
+                                    .push(identity);
                             }
                         }
                     }
@@ -321,7 +391,12 @@ impl RpmCollector {
                 }
             }
 
-            total_triples += self.emit_package_triples(writer, pkg_data, packages_with_files.as_ref(), &mut emitted_packages)?;
+            total_triples += self.emit_package_triples(
+                writer,
+                pkg_data,
+                packages_with_files.as_ref(),
+                &mut emitted_packages,
+            )?;
             total_packages += 1;
 
             if (idx + 1) % 1000 == 0 {
@@ -332,7 +407,8 @@ impl RpmCollector {
         // Parse updateinfo and emit advisory triples
         let advisories = self.parse_updateinfo()?;
         if !advisories.is_empty() {
-            let advisory_triples = self.emit_advisory_triples(writer, &advisories, &emitted_packages)?;
+            let advisory_triples =
+                self.emit_advisory_triples(writer, &advisories, &emitted_packages)?;
             total_triples += advisory_triples;
         }
 
@@ -414,11 +490,7 @@ impl RpmCollector {
                     for attr in e.attributes().flatten() {
                         if attr.key.as_ref() == b"href" {
                             let href = String::from_utf8_lossy(&attr.value).to_string();
-                            return Ok(format!(
-                                "{}/{}",
-                                self.repo_url.trim_end_matches('/'),
-                                href
-                            ));
+                            return Ok(format!("{}/{}", self.repo_url.trim_end_matches('/'), href));
                         }
                     }
                 }
@@ -426,9 +498,7 @@ impl RpmCollector {
                     in_correct_data = false;
                 }
                 Ok(Event::Eof) => break,
-                Err(e) => {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-                }
+                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
                 _ => {}
             }
             buf.clear();
@@ -436,10 +506,7 @@ impl RpmCollector {
 
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!(
-                "Metadata type '{}' not found in repomd.xml",
-                metadata_type
-            ),
+            format!("Metadata type '{}' not found in repomd.xml", metadata_type),
         ))
     }
 
@@ -528,13 +595,10 @@ impl RpmCollector {
 
                         // Check for dependency section start
                         match name.as_str() {
-                            "rpm:requires" | "rpm:provides" | "rpm:conflicts"
-                            | "rpm:obsoletes" => {
+                            "rpm:requires" | "rpm:provides" | "rpm:conflicts" | "rpm:obsoletes" => {
                                 // Map XML element name to our dep_type label
-                                let dep_type = name
-                                    .strip_prefix("rpm:")
-                                    .unwrap_or(&name)
-                                    .to_string();
+                                let dep_type =
+                                    name.strip_prefix("rpm:").unwrap_or(&name).to_string();
                                 current_dep_section = Some(dep_type);
                             }
                             "rpm:entry" => {
@@ -549,8 +613,8 @@ impl RpmCollector {
                                         dep_type: dep_type.clone(),
                                     };
                                     for attr in e.attributes().flatten() {
-                                        let key = String::from_utf8_lossy(attr.key.as_ref())
-                                            .to_string();
+                                        let key =
+                                            String::from_utf8_lossy(attr.key.as_ref()).to_string();
                                         let value =
                                             String::from_utf8_lossy(&attr.value).to_string();
                                         match key.as_str() {
@@ -570,10 +634,9 @@ impl RpmCollector {
                             _ => {
                                 // version, location, size, time — capture attributes
                                 for attr in e.attributes().flatten() {
-                                    let key = String::from_utf8_lossy(attr.key.as_ref())
-                                        .to_string();
-                                    let value =
-                                        String::from_utf8_lossy(&attr.value).to_string();
+                                    let key =
+                                        String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                                    let value = String::from_utf8_lossy(&attr.value).to_string();
                                     if name == "version"
                                         || name == "location"
                                         || name == "size"
@@ -582,8 +645,7 @@ impl RpmCollector {
                                         current_fields.insert(key.clone(), value.clone());
                                     }
                                     if name == "checksum" && key == "type" {
-                                        current_fields
-                                            .insert("checksum_type".to_string(), value);
+                                        current_fields.insert("checksum_type".to_string(), value);
                                     }
                                 }
                             }
@@ -614,9 +676,7 @@ impl RpmCollector {
                     }
                 }
                 Ok(Event::Eof) => break,
-                Err(e) => {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-                }
+                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
                 _ => {}
             }
             buf.clear();
@@ -644,9 +704,17 @@ impl RpmCollector {
 
             // Numbered releases get releaseVersion; named/rolling get releaseCodename
             if is_numeric_release(&self.release_name) {
-                writer.write_literal(&rel_uri, &format!("{PKG}releaseVersion"), &self.release_name)?;
+                writer.write_literal(
+                    &rel_uri,
+                    &format!("{PKG}releaseVersion"),
+                    &self.release_name,
+                )?;
             } else {
-                writer.write_literal(&rel_uri, &format!("{PKG}releaseCodename"), &self.release_name)?;
+                writer.write_literal(
+                    &rel_uri,
+                    &format!("{PKG}releaseCodename"),
+                    &self.release_name,
+                )?;
             }
 
             // partOfDistribution also auto-emits hasRelease inverse via ntriples.rs
@@ -680,7 +748,8 @@ impl RpmCollector {
                         // Extract package name attribute
                         for attr in e.attributes().flatten() {
                             if attr.key.as_ref() == b"name" {
-                                current_package_name = Some(String::from_utf8_lossy(&attr.value).to_string());
+                                current_package_name =
+                                    Some(String::from_utf8_lossy(&attr.value).to_string());
                                 break;
                             }
                         }
@@ -720,9 +789,9 @@ impl RpmCollector {
         let name = fields.get("name").ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing package name")
         })?;
-        let arch = fields.get("arch").ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing arch")
-        })?;
+        let arch = fields
+            .get("arch")
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing arch"))?;
         let ver = fields.get("ver").ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing version")
         })?;
@@ -786,7 +855,11 @@ impl RpmCollector {
 
         // Packaging repository (dist-git — derivable from distro + package name)
         let distgit_uri = fedora_distgit_uri(&self.distro_name, name);
-        writer.write_triple(&identity_uri, &format!("{PKG}packagingRepository"), &distgit_uri)?;
+        writer.write_triple(
+            &identity_uri,
+            &format!("{PKG}packagingRepository"),
+            &distgit_uri,
+        )?;
         writer.write_triple(&distgit_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
         triples += 2;
 
@@ -802,7 +875,11 @@ impl RpmCollector {
         // Upstream repository (from Homepage/URL if it matches a forge)
         if let Some(url) = fields.get("url") {
             if let Some(upstream_uri) = normalize_forge_url(url) {
-                writer.write_triple(&identity_uri, &format!("{PKG}upstreamRepository"), &upstream_uri)?;
+                writer.write_triple(
+                    &identity_uri,
+                    &format!("{PKG}upstreamRepository"),
+                    &upstream_uri,
+                )?;
                 writer.write_triple(&upstream_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
                 triples += 2;
             }
@@ -844,16 +921,16 @@ impl RpmCollector {
         }
 
         // Description
-        if let Some(desc) = fields
-            .get("description")
-            .or_else(|| fields.get("summary"))
-        {
+        if let Some(desc) = fields.get("description").or_else(|| fields.get("summary")) {
             writer.write_literal(&pkg_uri, &format!("{PKG}description"), desc)?;
             triples += 1;
         }
 
         // RPM-specific properties
-        if let Some(sourcerpm) = fields.get("rpm:sourcerpm").or_else(|| fields.get("sourcerpm")) {
+        if let Some(sourcerpm) = fields
+            .get("rpm:sourcerpm")
+            .or_else(|| fields.get("sourcerpm"))
+        {
             writer.write_literal(&pkg_uri, &format!("{RPM}sourceRPM"), sourcerpm)?;
             triples += 1;
             triples += self.emit_source_package_triples(writer, &pkg_uri, sourcerpm)?;
@@ -927,12 +1004,17 @@ impl RpmCollector {
         }
 
         // Upstream ecosystem identification from Provides entries
-        triples +=
-            self.emit_ecosystem_triples(writer, &pkg_uri, &pkg_data.deps)?;
+        triples += self.emit_ecosystem_triples(writer, &pkg_uri, &pkg_data.deps)?;
 
         // Dependencies
-        triples +=
-            self.emit_dependency_triples(writer, &pkg_uri, &pkg_data.deps, release_name, arch, name)?;
+        triples += self.emit_dependency_triples(
+            writer,
+            &pkg_uri,
+            &pkg_data.deps,
+            release_name,
+            arch,
+            name,
+        )?;
 
         Ok(triples)
     }
@@ -962,26 +1044,48 @@ impl RpmCollector {
         for dep in &provides {
             let name = &dep.name;
 
-            let (ecosystem, upstream_name) = if let Some(crate_name) = name.strip_prefix("crate(").and_then(|s| s.strip_suffix(')')) {
+            let (ecosystem, upstream_name) = if let Some(crate_name) = name
+                .strip_prefix("crate(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 ("cargo", crate_name.to_string())
-            } else if let Some(py_name) = name.strip_prefix("python3dist(").and_then(|s| s.strip_suffix(')')) {
+            } else if let Some(py_name) = name
+                .strip_prefix("python3dist(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 ("pypi", py_name.to_string())
             } else if let Some(py_name) = name.strip_prefix("python3.").and_then(|s| {
                 // python3.12dist(name) format
                 s.find("dist(").map(|pos| &s[pos + 5..s.len() - 1])
             }) {
                 ("pypi", py_name.to_string())
-            } else if let Some(go_path) = name.strip_prefix("golang(").and_then(|s| s.strip_suffix(')')) {
+            } else if let Some(go_path) = name
+                .strip_prefix("golang(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 ("gomod", go_path.to_string())
-            } else if let Some(node_name) = name.strip_prefix("nodejs(").and_then(|s| s.strip_suffix(')')) {
+            } else if let Some(node_name) = name
+                .strip_prefix("nodejs(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 ("npm", node_name.to_string())
-            } else if let Some(perl_name) = name.strip_prefix("perl(").and_then(|s| s.strip_suffix(')')) {
+            } else if let Some(perl_name) =
+                name.strip_prefix("perl(").and_then(|s| s.strip_suffix(')'))
+            {
                 ("cpan", perl_name.to_string())
-            } else if let Some(gem_name) = name.strip_prefix("rubygem(").and_then(|s| s.strip_suffix(')')) {
+            } else if let Some(gem_name) = name
+                .strip_prefix("rubygem(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 ("rubygems", gem_name.to_string())
-            } else if let Some(ghc_name) = name.strip_prefix("ghc-pkg(").and_then(|s| s.strip_suffix(')')) {
+            } else if let Some(ghc_name) = name
+                .strip_prefix("ghc-pkg(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 ("hackage", ghc_name.to_string())
-            } else if let Some(mvn_coord) = name.strip_prefix("mvn(").and_then(|s| s.strip_suffix(')')) {
+            } else if let Some(mvn_coord) =
+                name.strip_prefix("mvn(").and_then(|s| s.strip_suffix(')'))
+            {
                 // mvn() provides format: groupId:artifactId[:version[:classifier]]
                 // Strip version/classifier — Maven Central needs just groupId:artifactId
                 let parts: Vec<&str> = mvn_coord.splitn(3, ':').collect();
@@ -1006,7 +1110,11 @@ impl RpmCollector {
                 emitted_ecosystem = true;
                 triples += 2;
             }
-            writer.write_literal(pkg_uri, &format!("{PKG}upstreamPackageName"), &upstream_name)?;
+            writer.write_literal(
+                pkg_uri,
+                &format!("{PKG}upstreamPackageName"),
+                &upstream_name,
+            )?;
             triples += 1;
 
             // Emit upstream version if available
@@ -1095,8 +1203,12 @@ impl RpmCollector {
             &self.release_name
         };
 
-        let src_uri =
-            source_uri(&self.distro_name, release_name, source_name, &source_version);
+        let src_uri = source_uri(
+            &self.distro_name,
+            release_name,
+            source_name,
+            &source_version,
+        );
 
         writer.write_triple(&src_uri, RDF_TYPE, &format!("{PKG}SourcePackage"))?;
         writer.write_triple(&src_uri, RDF_TYPE, &format!("{RPM}SourceRPM"))?;
@@ -1145,12 +1257,7 @@ impl RpmCollector {
             }
 
             // Dependency targets point to canonical identity URI (no version)
-            let dep_uri = package_identity_uri(
-                &self.distro_name,
-                release_name,
-                arch,
-                &dep.name,
-            );
+            let dep_uri = package_identity_uri(&self.distro_name, release_name, arch, &dep.name);
 
             // Identity properties for graph traversal
             writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
@@ -1167,12 +1274,12 @@ impl RpmCollector {
             let dep_bnode = bnode_id("dep", &format!("{pkg_uri}_{}", dep.name));
 
             writer.write_bnode_subject(&dep_bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
+            writer.write_bnode_subject(&dep_bnode, &format!("{PKG}dependencyTarget"), &dep_uri)?;
             writer.write_bnode_subject(
                 &dep_bnode,
-                &format!("{PKG}dependencyTarget"),
-                &dep_uri,
+                &format!("{PKG}dependencyType"),
+                &dep_type_uri("runtime"),
             )?;
-            writer.write_bnode_subject(&dep_bnode, &format!("{PKG}dependencyType"), &dep_type_uri("runtime"))?;
             writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &dep_bnode)?;
             triples += 4;
 
@@ -1224,20 +1331,11 @@ impl RpmCollector {
         // Emit conflicts
         let conflicts: Vec<&RpmDep> = deps.iter().filter(|d| d.dep_type == "conflicts").collect();
         for dep in &conflicts {
-            let dep_uri = package_identity_uri(
-                &self.distro_name,
-                release_name,
-                arch,
-                &dep.name,
-            );
+            let dep_uri = package_identity_uri(&self.distro_name, release_name, arch, &dep.name);
 
             writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
             writer.write_literal(&dep_uri, &format!("{PKG}packageName"), &dep.name)?;
-            writer.write_triple(
-                pkg_uri,
-                &format!("{PKG}directlyConflictsWith"),
-                &dep_uri,
-            )?;
+            writer.write_triple(pkg_uri, &format!("{PKG}directlyConflictsWith"), &dep_uri)?;
             writer.write_triple(pkg_uri, &format!("{RPM}rpmConflicts"), &dep_uri)?;
             triples += 4;
         }
@@ -1245,12 +1343,7 @@ impl RpmCollector {
         // Emit obsoletes
         let obsoletes: Vec<&RpmDep> = deps.iter().filter(|d| d.dep_type == "obsoletes").collect();
         for dep in &obsoletes {
-            let dep_uri = package_identity_uri(
-                &self.distro_name,
-                release_name,
-                arch,
-                &dep.name,
-            );
+            let dep_uri = package_identity_uri(&self.distro_name, release_name, arch, &dep.name);
 
             writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
             writer.write_literal(&dep_uri, &format!("{PKG}packageName"), &dep.name)?;
@@ -1274,12 +1367,7 @@ impl RpmCollector {
                 continue;
             }
 
-            let dep_uri = package_identity_uri(
-                &self.distro_name,
-                release_name,
-                arch,
-                &dep.name,
-            );
+            let dep_uri = package_identity_uri(&self.distro_name, release_name, arch, &dep.name);
 
             // Definition triples for the provided identity are a pure function of
             // dep_uri; emit them once per distinct identity rather than once per
@@ -1347,7 +1435,8 @@ impl RpmCollector {
                             let mut update_type: Option<String> = None;
                             for attr in e.attributes().flatten() {
                                 if attr.key.as_ref() == b"type" {
-                                    update_type = Some(String::from_utf8_lossy(&attr.value).to_string());
+                                    update_type =
+                                        Some(String::from_utf8_lossy(&attr.value).to_string());
                                 }
                             }
 
@@ -1372,7 +1461,8 @@ impl RpmCollector {
                         b"severity" if current_update.is_some() => {
                             if let Ok(Event::Text(text)) = reader.read_event_into(&mut buf) {
                                 if let Some(ref mut adv) = current_update {
-                                    adv.severity = Some(text.unescape().unwrap_or_default().to_string());
+                                    adv.severity =
+                                        Some(text.unescape().unwrap_or_default().to_string());
                                 }
                             }
                         }
@@ -1380,7 +1470,8 @@ impl RpmCollector {
                             for attr in e.attributes().flatten() {
                                 if attr.key.as_ref() == b"date" {
                                     if let Some(ref mut adv) = current_update {
-                                        adv.issued_date = String::from_utf8_lossy(&attr.value).to_string();
+                                        adv.issued_date =
+                                            String::from_utf8_lossy(&attr.value).to_string();
                                     }
                                 }
                             }
@@ -1394,7 +1485,8 @@ impl RpmCollector {
                             ref_title = None;
                             for attr in e.attributes().flatten() {
                                 if attr.key.as_ref() == b"title" {
-                                    ref_title = Some(String::from_utf8_lossy(&attr.value).to_string());
+                                    ref_title =
+                                        Some(String::from_utf8_lossy(&attr.value).to_string());
                                 }
                             }
 
@@ -1421,11 +1513,23 @@ impl RpmCollector {
 
                             for attr in e.attributes().flatten() {
                                 match attr.key.as_ref() {
-                                    b"name" => pkg.name = String::from_utf8_lossy(&attr.value).to_string(),
-                                    b"version" => pkg.version = String::from_utf8_lossy(&attr.value).to_string(),
-                                    b"release" => pkg.release = String::from_utf8_lossy(&attr.value).to_string(),
-                                    b"epoch" => pkg.epoch = String::from_utf8_lossy(&attr.value).to_string(),
-                                    b"arch" => pkg.arch = String::from_utf8_lossy(&attr.value).to_string(),
+                                    b"name" => {
+                                        pkg.name = String::from_utf8_lossy(&attr.value).to_string()
+                                    }
+                                    b"version" => {
+                                        pkg.version =
+                                            String::from_utf8_lossy(&attr.value).to_string()
+                                    }
+                                    b"release" => {
+                                        pkg.release =
+                                            String::from_utf8_lossy(&attr.value).to_string()
+                                    }
+                                    b"epoch" => {
+                                        pkg.epoch = String::from_utf8_lossy(&attr.value).to_string()
+                                    }
+                                    b"arch" => {
+                                        pkg.arch = String::from_utf8_lossy(&attr.value).to_string()
+                                    }
                                     _ => {}
                                 }
                             }
@@ -1496,7 +1600,10 @@ impl RpmCollector {
             buf.clear();
         }
 
-        eprintln!("Parsed {} security advisories from updateinfo", advisories.len());
+        eprintln!(
+            "Parsed {} security advisories from updateinfo",
+            advisories.len()
+        );
         Ok(advisories)
     }
 
@@ -1524,7 +1631,11 @@ impl RpmCollector {
             // Advisory entity
             writer.write_triple(&advisory_uri, RDF_TYPE, &format!("{SEC}SecurityAdvisory"))?;
             writer.write_literal(&advisory_uri, &format!("{SEC}advisoryId"), &advisory.id)?;
-            writer.write_triple(&advisory_uri, &format!("{SEC}advisoryType"), &advisory_category_uri(&advisory.advisory_type))?;
+            writer.write_triple(
+                &advisory_uri,
+                &format!("{SEC}advisoryType"),
+                &advisory_category_uri(&advisory.advisory_type),
+            )?;
             advisory_triples += 3;
 
             // Advisory date (convert "2025-11-26 20:40:36" to ISO 8601)
@@ -1535,7 +1646,11 @@ impl RpmCollector {
             // Severity
             if let Some(ref sev) = advisory.severity {
                 if let Some(sev_uri) = severity_concept_uri(sev) {
-                    writer.write_triple(&advisory_uri, &format!("{SEC}advisorySeverity"), &sev_uri)?;
+                    writer.write_triple(
+                        &advisory_uri,
+                        &format!("{SEC}advisorySeverity"),
+                        &sev_uri,
+                    )?;
                     advisory_triples += 1;
                 }
             }
@@ -1543,7 +1658,8 @@ impl RpmCollector {
             // Package links - match against emitted packages
             for pkg_ref in &advisory.packages {
                 // Reconstruct the same URI as emit_package_triples
-                let version_str = format!("{}-{}.{}", pkg_ref.version, pkg_ref.release, pkg_ref.arch);
+                let version_str =
+                    format!("{}-{}.{}", pkg_ref.version, pkg_ref.release, pkg_ref.arch);
 
                 let release_name = if self.release_name.is_empty() {
                     "unknown"
@@ -1561,13 +1677,33 @@ impl RpmCollector {
                 );
 
                 if emitted_packages.contains(&nevra_key) {
-                    let pkg_uri = package_uri(&self.distro_name, release_name, &pkg_ref.arch, &pkg_ref.name, &version_str);
-                    writer.write_triple(&advisory_uri, &format!("{SEC}advisoryForPackage"), &pkg_uri)?;
+                    let pkg_uri = package_uri(
+                        &self.distro_name,
+                        release_name,
+                        &pkg_ref.arch,
+                        &pkg_ref.name,
+                        &version_str,
+                    );
+                    writer.write_triple(
+                        &advisory_uri,
+                        &format!("{SEC}advisoryForPackage"),
+                        &pkg_uri,
+                    )?;
                     advisory_triples += 1;
                     total_resolved_packages += 1;
                 } else {
-                    let nevra = format!("{}-{}:{}-{}.{}", pkg_ref.name, pkg_ref.epoch, pkg_ref.version, pkg_ref.release, pkg_ref.arch);
-                    emit_dq_issue(writer, "rpm-collector", "advisory-package", &nevra, "advisory-package-unresolved", "info")?;
+                    let nevra = format!(
+                        "{}-{}:{}-{}.{}",
+                        pkg_ref.name, pkg_ref.epoch, pkg_ref.version, pkg_ref.release, pkg_ref.arch
+                    );
+                    emit_dq_issue(
+                        writer,
+                        "rpm-collector",
+                        "advisory-package",
+                        &nevra,
+                        "advisory-package-unresolved",
+                        "info",
+                    )?;
                     unresolved_packages += 1;
                 }
             }
@@ -1575,7 +1711,11 @@ impl RpmCollector {
             // CVE cross-references
             for cve_id in &advisory.cves {
                 let cve_uri = cve_entity_uri(cve_id);
-                writer.write_triple(&advisory_uri, &format!("{SEC}addressesVulnerability"), &cve_uri)?;
+                writer.write_triple(
+                    &advisory_uri,
+                    &format!("{SEC}addressesVulnerability"),
+                    &cve_uri,
+                )?;
                 advisory_triples += 1;
             }
 
@@ -1583,9 +1723,15 @@ impl RpmCollector {
         }
 
         eprintln!("Emitted {} security advisories", advisories.len());
-        eprintln!("Resolved {} advisory-package links", total_resolved_packages);
+        eprintln!(
+            "Resolved {} advisory-package links",
+            total_resolved_packages
+        );
         if unresolved_packages > 0 {
-            eprintln!("Warning: {} advisory packages not in emitted package set", unresolved_packages);
+            eprintln!(
+                "Warning: {} advisory packages not in emitted package set",
+                unresolved_packages
+            );
         }
 
         Ok(total_triples)
@@ -1674,7 +1820,8 @@ mod tests {
                             let mut update_type: Option<String> = None;
                             for attr in e.attributes().flatten() {
                                 if attr.key.as_ref() == b"type" {
-                                    update_type = Some(String::from_utf8_lossy(&attr.value).to_string());
+                                    update_type =
+                                        Some(String::from_utf8_lossy(&attr.value).to_string());
                                 }
                             }
 
@@ -1699,7 +1846,8 @@ mod tests {
                         b"severity" if current_update.is_some() => {
                             if let Ok(Event::Text(text)) = reader.read_event_into(&mut buf) {
                                 if let Some(ref mut adv) = current_update {
-                                    adv.severity = Some(text.unescape().unwrap_or_default().to_string());
+                                    adv.severity =
+                                        Some(text.unescape().unwrap_or_default().to_string());
                                 }
                             }
                         }
@@ -1707,7 +1855,8 @@ mod tests {
                             for attr in e.attributes().flatten() {
                                 if attr.key.as_ref() == b"date" {
                                     if let Some(ref mut adv) = current_update {
-                                        adv.issued_date = String::from_utf8_lossy(&attr.value).to_string();
+                                        adv.issued_date =
+                                            String::from_utf8_lossy(&attr.value).to_string();
                                     }
                                 }
                             }
@@ -1720,7 +1869,8 @@ mod tests {
                             ref_title = None;
                             for attr in e.attributes().flatten() {
                                 if attr.key.as_ref() == b"title" {
-                                    ref_title = Some(String::from_utf8_lossy(&attr.value).to_string());
+                                    ref_title =
+                                        Some(String::from_utf8_lossy(&attr.value).to_string());
                                 }
                             }
 
@@ -1747,11 +1897,23 @@ mod tests {
 
                             for attr in e.attributes().flatten() {
                                 match attr.key.as_ref() {
-                                    b"name" => pkg.name = String::from_utf8_lossy(&attr.value).to_string(),
-                                    b"version" => pkg.version = String::from_utf8_lossy(&attr.value).to_string(),
-                                    b"release" => pkg.release = String::from_utf8_lossy(&attr.value).to_string(),
-                                    b"epoch" => pkg.epoch = String::from_utf8_lossy(&attr.value).to_string(),
-                                    b"arch" => pkg.arch = String::from_utf8_lossy(&attr.value).to_string(),
+                                    b"name" => {
+                                        pkg.name = String::from_utf8_lossy(&attr.value).to_string()
+                                    }
+                                    b"version" => {
+                                        pkg.version =
+                                            String::from_utf8_lossy(&attr.value).to_string()
+                                    }
+                                    b"release" => {
+                                        pkg.release =
+                                            String::from_utf8_lossy(&attr.value).to_string()
+                                    }
+                                    b"epoch" => {
+                                        pkg.epoch = String::from_utf8_lossy(&attr.value).to_string()
+                                    }
+                                    b"arch" => {
+                                        pkg.arch = String::from_utf8_lossy(&attr.value).to_string()
+                                    }
                                     _ => {}
                                 }
                             }
@@ -1814,7 +1976,11 @@ mod tests {
         }
 
         // Verify parsing results
-        assert_eq!(advisories.len(), 1, "Should parse one security advisory, filtering out bugfix");
+        assert_eq!(
+            advisories.len(),
+            1,
+            "Should parse one security advisory, filtering out bugfix"
+        );
         let adv = &advisories[0];
         assert_eq!(adv.id, "FEDORA-2025-d2b7d94014");
         assert_eq!(adv.advisory_type, "security");
@@ -1831,7 +1997,8 @@ mod tests {
     #[test]
     fn test_cve_extraction_from_reference_title() {
         let title = "CVE-2025-26794 & CWE-122 in Exim 4.99";
-        let cves: Vec<String> = CVE_RE.find_iter(title)
+        let cves: Vec<String> = CVE_RE
+            .find_iter(title)
             .map(|m| m.as_str().to_string())
             .collect();
         assert_eq!(cves, vec!["CVE-2025-26794"]);
@@ -1839,12 +2006,19 @@ mod tests {
 
     #[test]
     fn test_advisory_emission_with_lookup_set() {
-        use tempfile::NamedTempFile;
         use std::io::Read;
+        use tempfile::NamedTempFile;
 
         // Build a lookup set
-        let mut emitted_packages: HashSet<(String, String, String, String, String)> = HashSet::new();
-        emitted_packages.insert(("timg".to_string(), "0".to_string(), "1.6.3".to_string(), "5.fc43".to_string(), "x86_64".to_string()));
+        let mut emitted_packages: HashSet<(String, String, String, String, String)> =
+            HashSet::new();
+        emitted_packages.insert((
+            "timg".to_string(),
+            "0".to_string(),
+            "1.6.3".to_string(),
+            "5.fc43".to_string(),
+            "x86_64".to_string(),
+        ));
 
         // Create mock advisory
         let advisory = UpdateInfoAdvisory {
@@ -1876,15 +2050,21 @@ mod tests {
         let mut writer = NTriplesWriter::new(file);
 
         let collector = RpmCollector {
-            client: Client::builder().timeout(Duration::from_secs(10)).build().unwrap(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
             repo_url: "https://example.com".to_string(),
             distro_name: "fedora".to_string(),
             release_name: "43".to_string(),
             repo_type: "updates".to_string(),
             source_cache: None,
+            graph_uri: None,
         };
 
-        let triples = collector.emit_advisory_triples(&mut writer, &[advisory], &emitted_packages).unwrap();
+        let triples = collector
+            .emit_advisory_triples(&mut writer, &[advisory], &emitted_packages)
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
@@ -1895,7 +2075,10 @@ mod tests {
         assert!(content.contains("FEDORA-2025-test"));
         assert!(content.contains("advisoryForPackage"));
         assert!(content.contains("/pkg/fedora/43/x86_64/timg/"));
-        assert!(!content.contains("/pkg/fedora/43/x86_64/other-pkg/"), "Should not emit unmatched package");
+        assert!(
+            !content.contains("/pkg/fedora/43/x86_64/other-pkg/"),
+            "Should not emit unmatched package"
+        );
         assert!(content.contains("CVE-2025-1234"));
         assert!(triples > 0);
     }
@@ -1948,6 +2131,7 @@ mod tests {
             release_name: "9".to_string(),
             repo_type: "release".to_string(),
             source_cache: None,
+            graph_uri: None,
         };
 
         let mut emitted_packages: HashSet<(String, String, String, String, String)> = HashSet::new();

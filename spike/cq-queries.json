@@ -1,0 +1,327 @@
+[
+  {
+    "id": "CQ-PM-01",
+    "title": "Distribution Package Listing",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?package ?name ?version\nWHERE {\n  ?release ^pkg:hasRelease/rdfs:label \"Fedora\" ;\n           pkg:releaseVersion \"43\" .\n  ?package a pkg:BinaryPackage ;\n           pkg:partOfRelease ?release ;\n           pkg:targetArchitecture ?arch ;\n           pkg:packageName ?name ;\n           pkg:hasVersion/pkg:versionString ?version .\n  ?arch rdfs:label \"x86_64\" .\n}\nORDER BY ?name\nLIMIT 100"
+  },
+  {
+    "id": "CQ-PM-02",
+    "title": "Source-to-Binary Mapping",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?binary ?binaryName\nWHERE {\n  ?source a pkg:SourcePackage ;\n          pkg:packageName \"glibc\" ;\n          pkg:partOfRelease ?release .\n  ?release ^pkg:hasRelease/rdfs:label \"Fedora\" ;\n           pkg:releaseVersion \"43\" .\n  ?binary pkg:builtFromSource ?source ;\n          pkg:packageName ?binaryName .\n}"
+  },
+  {
+    "id": "CQ-PM-03",
+    "title": "Virtual Package Providers",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?provider ?providerName\nWHERE {\n  ?capability a pkg:Capability ;\n              pkg:capabilityName \"libssl.so.3\" .\n  ?provider pkg:providesCapability ?capability ;\n            pkg:packageName ?providerName ;\n            pkg:partOfRelease ?release .\n  ?release ^pkg:hasRelease/rdfs:label \"Debian\" ;\n           pkg:releaseCodename \"trixie\" .\n}"
+  },
+  {
+    "id": "CQ-PM-03b",
+    "title": "Virtual Package and Capability Providers (UNION)",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT DISTINCT ?provider ?providerName\nWHERE {\n  {\n    # Path 1: Package provides another Package\n    ?virtual pkg:packageName \"mail-transport-agent\" .\n    ?provider pkg:provides ?virtual ;\n              pkg:packageName ?providerName .\n  }\n  UNION\n  {\n    # Path 2: Package provides a Capability\n    ?capability pkg:capabilityName \"mail-transport-agent\" .\n    ?provider pkg:providesCapability ?capability ;\n              pkg:packageName ?providerName .\n  }\n}\nORDER BY ?providerName"
+  },
+  {
+    "id": "CQ-PM-04",
+    "title": "Dependency Chain Depth",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT (COUNT(?dep) AS ?depth)\nWHERE {\n  ?package pkg:packageName \"openssl\" ;\n           pkg:partOfRelease ?release .\n  ?release ^pkg:hasRelease/rdfs:label \"Fedora\" ;\n           pkg:releaseVersion \"43\" .\n  ?package pkg:directlyDependsOn+ ?dep .\n}"
+  },
+  {
+    "id": "CQ-PM-05",
+    "title": "Packages by Maintainer",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX foaf: <http://xmlns.com/foaf/0.1/>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT DISTINCT ?package ?packageName ?distro\nWHERE {\n  ?person foaf:mbox <mailto:maintainer@example.org> .\n  ?role a pkg:Maintainer ;\n        pkg:heldBy ?person .\n  ?package pkg:maintainedBy ?role ;\n           pkg:packageName ?packageName ;\n           pkg:partOfRelease/^pkg:hasRelease/rdfs:label ?distro .\n}\nORDER BY ?distro ?packageName"
+  },
+  {
+    "id": "CQ-PM-06",
+    "title": "Architecture Support Coverage",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT (COUNT(DISTINCT ?package) AS ?count)\nWHERE {\n  ?release ^pkg:hasRelease/rdfs:label \"Fedora\" ;\n           pkg:releaseVersion \"43\" .\n  ?package pkg:partOfRelease ?release ;\n           pkg:targetArchitecture ?arch .\n  ?arch rdfs:label \"aarch64\" .\n}"
+  },
+  {
+    "id": "CQ-PM-07",
+    "title": "License Distribution",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?license (COUNT(?package) AS ?count)\nWHERE {\n  ?release ^pkg:hasRelease/rdfs:label \"Debian\" ;\n           pkg:releaseCodename \"trixie\" .\n  ?package pkg:partOfRelease ?release ;\n           pkg:hasLicense ?licenseEntity .\n  ?licenseEntity rdfs:label ?license .\n}\nGROUP BY ?license\nORDER BY DESC(?count)\nLIMIT 20"
+  },
+  {
+    "id": "CQ-PM-08",
+    "title": "Installed File Overlap",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?filepath (COUNT(DISTINCT ?package) AS ?packageCount) (GROUP_CONCAT(?pkgName; separator=\", \") AS ?packages)\nWHERE {\n  ?release ^pkg:hasRelease/rdfs:label \"RHEL\" ;\n           pkg:releaseVersion \"9\" .\n  ?package pkg:partOfRelease ?release ;\n           pkg:installsFile ?file ;\n           pkg:packageName ?pkgName .\n  ?file pkg:installedFilePath ?filepath .\n}\nGROUP BY ?filepath\nHAVING (COUNT(DISTINCT ?package) > 1)\nORDER BY DESC(?packageCount)\nLIMIT 50"
+  },
+  {
+    "id": "CQ-PM-09",
+    "title": "Package Size Distribution",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rpm: <https://purl.org/packagegraph/ontology/rpm#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT (AVG(?size) AS ?avgSize) (MIN(?size) AS ?minSize) (MAX(?size) AS ?maxSize)\nWHERE {\n  ?release ^pkg:hasRelease/rdfs:label \"openSUSE\" ;\n           pkg:releaseCodename \"Tumbleweed\" .\n  ?package a rpm:BinaryRPM ;\n           pkg:partOfRelease ?release ;\n           rpm:installedSize ?size .\n}"
+  },
+  {
+    "id": "CQ-PM-10",
+    "title": "Package Update Frequency",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?packageName (COUNT(DISTINCT ?version) AS ?versionCount)\nWHERE {\n  ?release ^pkg:hasRelease ?dist .\n  ?dist rdfs:label \"Fedora\" .\n  ?package pkg:packageName ?packageName ;\n           pkg:partOfRelease ?release ;\n           pkg:hasVersion ?versionEntity .\n  ?versionEntity pkg:versionString ?version .\n}\nGROUP BY ?packageName\nORDER BY DESC(?versionCount)\nLIMIT 20"
+  },
+  {
+    "id": "CQ-LIC-01",
+    "title": "License Distribution by SPDX Identifier",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?spdxId (COUNT(?package) AS ?count)\nWHERE {\n  ?package pkg:partOfRelease ?release ;\n           pkg:hasLicense ?license .\n  ?release ^pkg:hasRelease/rdfs:label \"Fedora\" ;\n           pkg:releaseVersion \"43\" .\n  ?license pkg:spdxId ?spdxId .\n}\nGROUP BY ?spdxId\nORDER BY DESC(?count)\nLIMIT 20"
+  },
+  {
+    "id": "CQ-LIC-02",
+    "title": "Packages with Non-SPDX Licenses",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?packageName ?licenseLabel\nWHERE {\n  ?package pkg:packageName ?packageName ;\n           pkg:hasLicense ?license .\n  ?license rdfs:label ?licenseLabel .\n  FILTER NOT EXISTS { ?license pkg:spdxId ?id }\n}\nLIMIT 100"
+  },
+  {
+    "id": "CQ-LIC-03",
+    "title": "Cross-Release License Changes",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?packageName ?oldSpdx ?newSpdx\nWHERE {\n  ?identity pkg:identityName ?packageName .\n\n  ?pkg42 pkg:isVersionOf ?identity ;\n         pkg:partOfRelease ?release42 ;\n         pkg:hasLicense/pkg:spdxId ?oldSpdx .\n  ?release42 ^pkg:hasRelease/rdfs:label \"Fedora\" ;\n             pkg:releaseVersion \"42\" .\n\n  ?pkg43 pkg:isVersionOf ?identity ;\n         pkg:partOfRelease ?release43 ;\n         pkg:hasLicense/pkg:spdxId ?newSpdx .\n  ?release43 ^pkg:hasRelease/rdfs:label \"Fedora\" ;\n             pkg:releaseVersion \"43\" .\n\n  FILTER(?oldSpdx != ?newSpdx)\n}\nLIMIT 100"
+  },
+  {
+    "id": "CQ-SEC-01",
+    "title": "Affected Packages by CVE",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT DISTINCT ?package ?packageName ?ecosystem\nWHERE {\n  ?vuln sec:cveId \"CVE-2024-1234\" ;\n        sec:hasAffectedRange ?range .\n  ?range sec:affectsEcosystem ?eco ;\n         sec:affectsPackageName ?packageName .\n  ?eco rdfs:label ?ecosystem .\n  OPTIONAL {\n    ?package a pkg:Package ;\n             pkg:packageName ?packageName ;\n             pkg:partOfRelease/^pkg:hasRelease/pkg:partOfEcosystem ?eco .\n  }\n}"
+  },
+  {
+    "id": "CQ-SEC-02",
+    "title": "Unpatched Vulnerabilities",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT DISTINCT ?cveId ?packageName ?cvssScore\nWHERE {\n  ?vuln sec:cveId ?cveId ;\n        sec:affectsPackage ?identity ;\n        sec:hasCVSSScore ?cvss .\n  ?cvss sec:baseScore ?cvssScore .\n  FILTER(?cvssScore >= 7.0)\n\n  ?identity pkg:identityName ?packageName .\n  ?package pkg:packageName ?packageName ;\n           pkg:partOfRelease ?release .\n  ?release ^pkg:hasRelease/rdfs:label \"Fedora\" ;\n           pkg:releaseVersion \"43\" .\n\n  # Not patched: no PatchActivity exists for this vulnerability + package\n  FILTER NOT EXISTS {\n    ?patch a sec:PatchActivity ;\n           sec:patchAddresses ?vuln ;\n           sec:patchProducedVersion ?patchedVersion .\n    ?package pkg:hasVersion ?patchedVersion .\n  }\n}\nORDER BY DESC(?cvssScore)"
+  },
+  {
+    "id": "CQ-SEC-03",
+    "title": "Vulnerability Version Range",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?ecosystem ?introducedVersion ?fixedVersion\nWHERE {\n  ?vuln sec:cveId \"CVE-2024-5678\" ;\n        sec:hasAffectedRange ?range .\n  ?range sec:affectsEcosystem/rdfs:label ?ecosystem ;\n         sec:affectsPackageName \"openssl\" ;\n         sec:hasRangeEvent ?event .\n\n  OPTIONAL {\n    ?event sec:eventType sec:event-introduced ;\n           sec:eventVersion ?introducedVersion .\n  }\n  OPTIONAL {\n    ?event sec:eventType sec:event-fixed ;\n           sec:eventVersion ?fixedVersion .\n  }\n}"
+  },
+  {
+    "id": "CQ-SEC-04",
+    "title": "Security Advisory Coverage",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?cveId (COUNT(DISTINCT ?advisory) AS ?advisoryCount) (GROUP_CONCAT(DISTINCT ?advId; separator=\", \") AS ?advisories)\nWHERE {\n  GRAPH ?g {\n    ?vuln sec:cveId ?cveId .\n    ?advisory a sec:SecurityAdvisory ;\n              sec:addressesVulnerability ?vuln ;\n              sec:advisoryId ?advId .\n  }\n}\nGROUP BY ?cveId\nHAVING (COUNT(DISTINCT ?advisory) > 1)\nORDER BY DESC(?advisoryCount)\nLIMIT 20"
+  },
+  {
+    "id": "CQ-SEC-05",
+    "title": "CVSS Version Comparison",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?cveId ?cvss2 ?cvss31 ((?cvss31 - ?cvss2) AS ?diff)\nWHERE {\n  ?vuln sec:cveId ?cveId ;\n        sec:hasCVSSScore ?score2 , ?score31 .\n  ?score2 sec:cvssVersion \"2.0\" ;\n          sec:baseScore ?cvss2 .\n  ?score31 sec:cvssVersion \"3.1\" ;\n           sec:baseScore ?cvss31 .\n}\nORDER BY DESC(?diff)\nLIMIT 50"
+  },
+  {
+    "id": "CQ-SEC-06",
+    "title": "Critical Vulnerabilities Without CVE",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?osvId ?severity ?ecosystem\nWHERE {\n  ?vuln sec:osvId ?osvId ;\n        sec:hasCVSSScore/sec:baseScore ?score ;\n        sec:hasAffectedRange/sec:affectsEcosystem/rdfs:label ?ecosystem .\n  FILTER(?score >= 7.0)\n  FILTER NOT EXISTS { ?vuln sec:cveId ?cveId }\n}\nORDER BY DESC(?score)\nLIMIT 50"
+  },
+  {
+    "id": "CQ-SEC-07",
+    "title": "Patch Provenance Chain",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX prov: <http://www.w3.org/ns/prov#>\n\nSELECT ?unpatchedVersion ?patchActivity ?patchedVersion ?patchDate\nWHERE {\n  ?vuln sec:cveId \"CVE-2024-1234\" .\n  ?patchActivity sec:patchAddresses ?vuln ;\n                 prov:endedAtTime ?patchDate .\n  ?patchedVersion sec:patchProducedVersion ?patchActivity ;\n                  pkg:versionString ?patchedVerStr .\n  ?unpatchedVersion sec:patchedFrom ?patchedVersion ;\n                    pkg:versionString ?unpatchedVerStr .\n}"
+  },
+  {
+    "id": "CQ-SEC-08",
+    "title": "CWE Classification",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\n\nSELECT ?cweId (COUNT(DISTINCT ?vuln) AS ?count)\nWHERE {\n  GRAPH <https://packagegraph.github.io/graph/security/osv> {\n    ?vuln sec:hasAffectedRange ?range .\n    ?range sec:affectsEcosystem <https://packagegraph.github.io/d/ecosystem/pypi> .\n  }\n  GRAPH <https://packagegraph.github.io/graph/cve/nvd> {\n    ?vuln sec:cweId ?cweId .\n  }\n}\nGROUP BY ?cweId\nORDER BY DESC(?count)\nLIMIT 10"
+  },
+  {
+    "id": "CQ-TEMP-01",
+    "title": "Vulnerability Window Analysis",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\nSELECT ?cveId ((?aDate - ?pubDate) AS ?window)\nWHERE {\n  GRAPH <https://packagegraph.github.io/graph/cve/nvd> {\n    ?vuln sec:cveId ?cveId ;\n          sec:publishedDate ?pubDate .\n  }\n  GRAPH ?g {\n    ?adv sec:addressesVulnerability ?vuln ;\n         sec:advisoryDate ?advisoryDate .\n  }\n  BIND(xsd:dateTime(?advisoryDate) AS ?aDate)\n  FILTER(?aDate > ?pubDate)\n}\nORDER BY DESC(?window)\nLIMIT 50"
+  },
+  {
+    "id": "CQ-TEMP-02",
+    "title": "Package Obsolescence Between Releases",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT DISTINCT ?packageName ?lastSeenVersion\nWHERE {\n  ?pkg42 pkg:packageName ?packageName ;\n         pkg:partOfRelease ?release42 ;\n         pkg:hasVersion/pkg:versionString ?lastSeenVersion .\n  ?release42 ^pkg:hasRelease/rdfs:label \"Fedora\" ;\n             pkg:releaseVersion \"42\" .\n\n  FILTER NOT EXISTS {\n    ?pkg43 pkg:packageName ?packageName ;\n           pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"Fedora\" ;\n           pkg:partOfRelease/pkg:releaseVersion \"43\" .\n  }\n}\nORDER BY ?packageName\nLIMIT 500"
+  },
+  {
+    "id": "CQ-TEMP-03",
+    "title": "Maintainer Tenure Analysis",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT (AVG(?tenureDays) AS ?avgTenure) (MIN(?tenureDays) AS ?minTenure) (MAX(?tenureDays) AS ?maxTenure)\nWHERE {\n  ?package pkg:partOfRelease ?release ;\n           pkg:hasMaintenanceRole ?role .\n  ?release ^pkg:hasRelease/rdfs:label \"Debian\" ;\n           pkg:releaseCodename \"trixie\" .\n  ?role pkg:maintainerSince ?startDate .\n  BIND((xsd:dateTime(\"2026-04-21T00:00:00Z\") - ?startDate) AS ?tenureDays)\n  FILTER(?tenureDays > 0)\n}"
+  },
+  {
+    "id": "CQ-SCR-01",
+    "title": "Bus Factor \u2014 Single-Maintainer Packages",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?packageName (COUNT(DISTINCT ?agent) AS ?maintainerCount)\nWHERE {\n  ?package pkg:packageName ?packageName ;\n           pkg:partOfRelease ?release ;\n           pkg:maintainedBy ?agent .\n  ?release ^pkg:hasRelease/rdfs:label \"Fedora\" ;\n           pkg:releaseVersion \"43\" .\n}\nGROUP BY ?packageName\nHAVING (COUNT(DISTINCT ?agent) = 1)\nORDER BY ?packageName"
+  },
+  {
+    "id": "CQ-SCR-02",
+    "title": "Maintainer Overload \u2014 Most Packages Per Person",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX foaf: <http://xmlns.com/foaf/0.1/>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?person ?name (COUNT(DISTINCT ?package) AS ?packageCount) (GROUP_CONCAT(DISTINCT ?distro; separator=\", \") AS ?distributions)\nWHERE {\n  ?package pkg:maintainedBy ?person .\n  ?person foaf:name ?name .\n  ?package pkg:partOfRelease/^pkg:hasRelease/rdfs:label ?distro .\n}\nGROUP BY ?person ?name\nORDER BY DESC(?packageCount)\nLIMIT 50"
+  },
+  {
+    "id": "CQ-SCR-03",
+    "title": "Orphan Risk \u2014 Stale Maintainership Without Recent Releases",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\nPREFIX foaf: <http://xmlns.com/foaf/0.1/>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?packageName ?maintainerName ?maintainerSince ?lastRelease\nWHERE {\n  ?package pkg:packageName ?packageName ;\n           pkg:hasMaintenanceRole ?role .\n  ?role pkg:heldBy ?person ;\n        pkg:maintainerSince ?maintainerSince .\n  ?person foaf:name ?maintainerName .\n\n  # Maintainer assigned > 5 years ago\n  FILTER(?maintainerSince < \"2021-04-21T00:00:00Z\"^^xsd:dateTime)\n\n  # Find latest release date for this package identity\n  ?package pkg:isVersionOf ?identity .\n  ?identity pkg:lastReleaseDate ?lastRelease .\n\n  # No release in last 2 years\n  FILTER(?lastRelease < \"2024-04-21\"^^xsd:date)\n}\nORDER BY ?lastRelease\nLIMIT 100"
+  },
+  {
+    "id": "CQ-SCR-04",
+    "title": "Maintainer Turnover Between Releases",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX foaf: <http://xmlns.com/foaf/0.1/>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT DISTINCT ?packageName ?agentName ?changeType\nWHERE {\n  ?identity pkg:identityName ?packageName .\n\n  ?pkg42 pkg:isVersionOf ?identity ;\n         pkg:partOfRelease ?rel42 .\n  ?rel42 ^pkg:hasRelease/rdfs:label \"Fedora\" ;\n         pkg:releaseVersion \"42\" .\n\n  ?pkg43 pkg:isVersionOf ?identity ;\n         pkg:partOfRelease ?rel43 .\n  ?rel43 ^pkg:hasRelease/rdfs:label \"Fedora\" ;\n         pkg:releaseVersion \"43\" .\n\n  {\n    # Departed: maintainer in 42 but not in 43\n    ?pkg42 pkg:maintainedBy ?agent .\n    FILTER NOT EXISTS { ?pkg43 pkg:maintainedBy ?agent }\n    BIND(\"departed\" AS ?changeType)\n  }\n  UNION\n  {\n    # Joined: maintainer in 43 but not in 42\n    ?pkg43 pkg:maintainedBy ?agent .\n    FILTER NOT EXISTS { ?pkg42 pkg:maintainedBy ?agent }\n    BIND(\"joined\" AS ?changeType)\n  }\n\n  ?agent foaf:name ?agentName .\n}\nORDER BY ?packageName ?changeType"
+  },
+  {
+    "id": "CQ-SCR-05",
+    "title": "Cross-Distribution Maintainer Overlap",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX foaf: <http://xmlns.com/foaf/0.1/>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?person ?name ?upstreamProject (COUNT(DISTINCT ?distro) AS ?distroCount) (GROUP_CONCAT(DISTINCT ?distro; separator=\", \") AS ?distributions)\nWHERE {\n  ?package pkg:maintainedBy ?person ;\n           pkg:isVersionOf/pkg:upstreamRepository ?repo ;\n           pkg:partOfRelease/^pkg:hasRelease/rdfs:label ?distro .\n  ?person foaf:name ?name .\n  ?repo rdfs:label ?upstreamProject .\n}\nGROUP BY ?person ?name ?upstreamProject\nHAVING (COUNT(DISTINCT ?distro) >= 2)\nORDER BY DESC(?distroCount)\nLIMIT 50"
+  },
+  {
+    "id": "CQ-SCR-06",
+    "title": "Patch Lag by Distribution \u2014 Comparative Time-to-Fix",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?cveId ?distro ?advisoryId ((?advisoryDate - ?pubDate) AS ?patchLagDays)\nWHERE {\n  ?vuln sec:cveId ?cveId ;\n        sec:publishedDate ?pubDate .\n  ?advisory sec:addressesVulnerability ?vuln ;\n            sec:advisoryId ?advisoryId ;\n            sec:advisoryDate ?advisoryDate ;\n            sec:advisoryForPackage ?pkg .\n  ?pkg pkg:partOfRelease/^pkg:hasRelease/rdfs:label ?distro .\n}\nORDER BY ?cveId ?patchLagDays"
+  },
+  {
+    "id": "CQ-SCR-07",
+    "title": "Unpatched Critical Vulnerabilities Beyond Threshold",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?cveId ?cvssScore ?pubDate ?packageName ?ecosystem\nWHERE {\n  ?vuln sec:cveId ?cveId ;\n        sec:publishedDate ?pubDate ;\n        sec:hasCVSSScore/sec:baseScore ?cvssScore ;\n        sec:hasAffectedRange ?range .\n  ?range sec:affectsPackageName ?packageName ;\n         sec:affectsEcosystem ?eco .\n  ?eco rdfs:label ?ecosystem .\n\n  FILTER(?cvssScore >= \"9.0\"^^xsd:decimal)\n  FILTER(?pubDate < \"2026-01-21T00:00:00Z\"^^xsd:dateTime)\n\n  # No advisory exists for this vulnerability in THIS ecosystem\n  FILTER NOT EXISTS {\n    ?advisory sec:addressesVulnerability ?vuln ;\n              sec:advisoryForPackage/pkg:partOfRelease/^pkg:hasRelease/pkg:partOfEcosystem ?eco .\n  }\n}\nORDER BY ?pubDate"
+  },
+  {
+    "id": "CQ-SCR-08",
+    "title": "Vulnerability Density \u2014 Most Affected Packages",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?packageName ?ecosystem (COUNT(DISTINCT ?vuln) AS ?cveCount)\nWHERE {\n  ?vuln sec:hasAffectedRange ?range .\n  ?range sec:affectsPackageName ?packageName ;\n         sec:affectsEcosystem/rdfs:label ?ecosystem .\n}\nGROUP BY ?packageName ?ecosystem\nORDER BY DESC(?cveCount)\nLIMIT 50"
+  },
+  {
+    "id": "CQ-SCR-09",
+    "title": "Mean Time to Remediate (MTTR) by Distribution",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?distro (AVG(?lagDays) AS ?avgMTTR) (MIN(?lagDays) AS ?bestCase) (MAX(?lagDays) AS ?worstCase) (COUNT(?advisory) AS ?advisoryCount)\nWHERE {\n  ?vuln sec:publishedDate ?pubDate .\n  ?advisory sec:addressesVulnerability ?vuln ;\n            sec:advisoryDate ?advisoryDate ;\n            sec:advisoryForPackage ?pkg .\n  ?pkg pkg:partOfRelease/^pkg:hasRelease/rdfs:label ?distro .\n  BIND((?advisoryDate - ?pubDate) AS ?lagDays)\n  FILTER(?lagDays > 0)\n}\nGROUP BY ?distro\nORDER BY ?avgMTTR"
+  },
+  {
+    "id": "CQ-SCR-10",
+    "title": "Forge Version Vulnerability Exposure",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX vcs: <https://purl.org/packagegraph/ontology/vcs#>\nPREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\nSELECT ?packageName ?forgeName ?forgeUrl ?version ?cveId ?observedDate ?cvePublished\nWHERE {\n  ?package a pkg:Package ;\n           pkg:packageName ?packageName ;\n           pkg:isVersionOf/pkg:upstreamRepository ?repo .\n  ?repo vcs:hostedOn ?forge .\n  ?forge vcs:forgeUrl ?forgeUrl ;\n         vcs:hasVersionObservation ?obs ;\n         rdfs:label ?forgeName .\n  ?obs vcs:observedSoftwareVersion ?forgeVersion ;\n       vcs:observedAt ?observedDate .\n  ?forgeVersion vcs:versionString ?version .\n  ?vuln sec:affectsForgeSoftwareVersion ?forgeVersion ;\n        sec:cveId ?cveId ;\n        sec:publishedDate ?cvePublished .\n  FILTER(?observedDate >= xsd:date(?cvePublished))\n}\nORDER BY ?cveId ?forgeName"
+  },
+  {
+    "id": "CQ-XD-01",
+    "title": "Equivalent Packages Across Distributions",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?fedoraName ?debianName ?identity\nWHERE {\n  ?identity a pkg:PackageIdentity .\n  ?fedoraPkg pkg:packageName ?fedoraName ;\n             pkg:isVersionOf ?identity ;\n             pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"Fedora\" .\n  ?debianPkg pkg:packageName ?debianName ;\n             pkg:isVersionOf ?identity ;\n             pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"Debian\" .\n  FILTER(?fedoraName != ?debianName)\n}\nLIMIT 100"
+  },
+  {
+    "id": "CQ-XD-02",
+    "title": "Version Skew Analysis",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?packageName ?fedoraVersion ?debianVersion\nWHERE {\n  ?identity a pkg:PackageIdentity ;\n            pkg:identityName ?packageName .\n\n  ?fedoraPkg pkg:isVersionOf ?identity ;\n             pkg:partOfRelease ?fedoraRelease ;\n             pkg:hasVersion/pkg:versionString ?fedoraVersion .\n  ?fedoraRelease ^pkg:hasRelease/rdfs:label \"Fedora\" ;\n                 pkg:releaseVersion \"43\" .\n\n  ?debianPkg pkg:isVersionOf ?identity ;\n             pkg:partOfRelease ?debianRelease ;\n             pkg:hasVersion/pkg:versionString ?debianVersion .\n  ?debianRelease ^pkg:hasRelease/rdfs:label \"Debian\" ;\n                 pkg:releaseCodename \"trixie\" .\n\n  FILTER(?fedoraVersion != ?debianVersion)\n}\nLIMIT 100"
+  },
+  {
+    "id": "CQ-XD-03",
+    "title": "Distribution-Specific Packages",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT DISTINCT ?packageName\nWHERE {\n  ?fedoraPkg pkg:packageName ?packageName ;\n             pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"Fedora\" .\n  FILTER NOT EXISTS {\n    ?debianPkg pkg:packageName ?packageName ;\n               pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"Debian\" .\n  }\n}\nORDER BY ?packageName\nLIMIT 500"
+  },
+  {
+    "id": "CQ-XD-04",
+    "title": "Shared Upstream Projects",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?projectName (COUNT(DISTINCT ?distro) AS ?distroCount) (GROUP_CONCAT(DISTINCT ?distroName; separator=\", \") AS ?distros)\nWHERE {\n  ?upstream a pkg:UpstreamProject ;\n            pkg:projectName ?projectName .\n  ?package pkg:hasUpstreamProject ?upstream ;\n           pkg:partOfRelease/^pkg:hasRelease ?distro .\n  ?distro rdfs:label ?distroName .\n}\nGROUP BY ?projectName\nHAVING (COUNT(DISTINCT ?distro) >= 3)\nORDER BY DESC(?distroCount)\nLIMIT 50"
+  },
+  {
+    "id": "CQ-XD-05",
+    "title": "Repology Cross-Ecosystem Equivalence",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?identity ?linuxName ?npmName ?pypiName ?brewName\nWHERE {\n  ?identity a pkg:PackageIdentity .\n\n  OPTIONAL {\n    ?linuxPkg pkg:isVersionOf ?identity ;\n              pkg:packageName ?linuxName ;\n              pkg:partOfRelease/^pkg:hasRelease/rdfs:label ?linuxDist .\n    FILTER(?linuxDist IN (\"Fedora\", \"Debian\", \"Arch\"))\n  }\n  OPTIONAL {\n    ?npmPkg pkg:isVersionOf ?identity ;\n            pkg:packageName ?npmName ;\n            pkg:partOfRelease/^pkg:hasRelease/pkg:partOfEcosystem/rdfs:label \"npm\" .\n  }\n  OPTIONAL {\n    ?pypiPkg pkg:isVersionOf ?identity ;\n             pkg:packageName ?pypiName ;\n             pkg:partOfRelease/^pkg:hasRelease/pkg:partOfEcosystem/rdfs:label \"PyPI\" .\n  }\n  OPTIONAL {\n    ?brewPkg pkg:isVersionOf ?identity ;\n             pkg:packageName ?brewName ;\n             pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"Homebrew\" .\n  }\n\n  FILTER(BOUND(?linuxName) && (BOUND(?npmName) || BOUND(?pypiName) || BOUND(?brewName)))\n}\nLIMIT 100"
+  },
+  {
+    "id": "CQ-PROV-01",
+    "title": "Build Activity Chain",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX vcs: <https://purl.org/packagegraph/ontology/vcs#>\nPREFIX prov: <http://www.w3.org/ns/prov#>\n\nSELECT ?commit ?commitHash ?source ?buildActivity ?binary\nWHERE {\n  ?binary a pkg:BinaryPackage ;\n          pkg:packageName \"openssl\" ;\n          pkg:partOfRelease/pkg:releaseVersion \"43\" ;\n          pkg:builtFromSource ?source ;\n          pkg:wasBuiltBy ?buildActivity .\n\n  ?buildActivity a pkg:BuildActivity ;\n                 prov:used ?source .\n\n  OPTIONAL {\n    ?source pkg:derivedFromCommit ?commit .\n    ?commit vcs:commitHash ?commitHash .\n  }\n}\nLIMIT 1"
+  },
+  {
+    "id": "CQ-PROV-02",
+    "title": "SLSA Provenance Level",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX slsa: <https://purl.org/packagegraph/ontology/slsa#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?packageName ?levelLabel ?attestation\nWHERE {\n  ?package a pkg:Package ;\n           pkg:packageName ?packageName ;\n           pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"Fedora\" ;\n           pkg:partOfRelease/pkg:releaseVersion \"43\" ;\n           slsa:hasProvenance ?attestation .\n  ?attestation slsa:attestsBuildLevel ?level .\n  ?level rdfs:label ?levelLabel .\n  VALUES ?level { slsa:L3 }\n}\nORDER BY ?packageName"
+  },
+  {
+    "id": "CQ-PROV-03",
+    "title": "Build Environment",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX prov: <http://www.w3.org/ns/prov#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT DISTINCT ?agent ?agentName (COUNT(?package) AS ?packageCount)\nWHERE {\n  ?package pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"RHEL\" ;\n           pkg:partOfRelease/pkg:releaseVersion \"9\" ;\n           prov:wasGeneratedBy ?buildActivity .\n  ?buildActivity prov:wasAssociatedWith ?agent .\n  ?agent rdfs:label ?agentName .\n}\nGROUP BY ?agent ?agentName\nORDER BY DESC(?packageCount)"
+  },
+  {
+    "id": "CQ-PROV-04",
+    "title": "Contributor Activity",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX foaf: <http://xmlns.com/foaf/0.1/>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT DISTINCT ?person ?name\nWHERE {\n  ?package pkg:packageName \"systemd\" .\n\n  ?contributor a pkg:Contributor ;\n               pkg:heldBy ?person ;\n               pkg:contributesTo ?package .\n  ?person foaf:name ?name .\n\n  FILTER NOT EXISTS {\n    ?maintainer a pkg:Maintainer ;\n                pkg:heldBy ?person .\n  }\n}"
+  },
+  {
+    "id": "CQ-DEP-01",
+    "title": "Direct vs Transitive Dependencies",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT (COUNT(DISTINCT ?direct) AS ?directCount) (COUNT(DISTINCT ?transitive) AS ?transitiveCount)\nWHERE {\n  ?package pkg:packageName \"python3\" ;\n           pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"Debian\" ;\n           pkg:partOfRelease/pkg:releaseCodename \"trixie\" .\n\n  OPTIONAL { ?package pkg:directlyDependsOn ?direct }\n  OPTIONAL { ?package pkg:directlyDependsOn+ ?transitive }\n}"
+  },
+  {
+    "id": "CQ-DEP-02",
+    "title": "Dependency Type Distribution",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?depType (COUNT(?dep) AS ?count)\nWHERE {\n  ?package pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"Fedora\" ;\n           pkg:partOfRelease/pkg:releaseVersion \"43\" ;\n           pkg:hasDependency ?dep .\n  ?dep pkg:dependencyType ?depType .\n}\nGROUP BY ?depType\nORDER BY DESC(?count)"
+  },
+  {
+    "id": "CQ-DEP-03",
+    "title": "Version Constraint Patterns",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?sourcePkg ?targetPkg ?operator ?constraintVersion\nWHERE {\n  ?sourcePkg pkg:hasDependency ?dep .\n  ?dep pkg:dependencyTarget ?targetPkg ;\n       pkg:hasVersionConstraint ?constraint .\n  ?constraint pkg:versionConstraintOperator ?operator ;\n              pkg:versionConstraintValue ?constraintVersion .\n  ?sourcePkg pkg:packageName ?srcName .\n  ?targetPkg pkg:packageName ?tgtName .\n}\nLIMIT 100"
+  },
+  {
+    "id": "CQ-DEP-04",
+    "title": "Circular Dependencies",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT DISTINCT ?pkg1Name ?pkg2Name\nWHERE {\n  ?pkg1 pkg:packageName ?pkg1Name ;\n        pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"Arch Linux\" ;\n        pkg:directlyDependsOn ?pkg2 .\n  ?pkg2 pkg:packageName ?pkg2Name ;\n        pkg:directlyDependsOn ?pkg1 .\n  FILTER(?pkg1Name < ?pkg2Name)\n}"
+  },
+  {
+    "id": "CQ-DEP-05",
+    "title": "Dependency Consistency Check",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?package ?packageName ?target\nWHERE {\n  ?package pkg:packageName ?packageName ;\n           pkg:directlyDependsOn ?target .\n\n  FILTER NOT EXISTS {\n    ?package pkg:hasDependency ?dep .\n    ?dep pkg:dependencyTarget ?target .\n  }\n}\nLIMIT 50"
+  },
+  {
+    "id": "CQ-VCS-01",
+    "title": "Repository Language Distribution",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX vcs: <https://purl.org/packagegraph/ontology/vcs#>\nPREFIX met: <https://purl.org/packagegraph/ontology/metrics#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?language (COUNT(DISTINCT ?repo) AS ?repoCount)\nWHERE {\n  ?package pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"Fedora\" ;\n           pkg:isVersionOf/pkg:upstreamRepository ?repo .\n  ?repo met:primaryLanguage ?language .\n}\nGROUP BY ?language\nORDER BY DESC(?repoCount)\nLIMIT 10"
+  },
+  {
+    "id": "CQ-VCS-02",
+    "title": "Commit-to-Release Tracing",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX vcs: <https://purl.org/packagegraph/ontology/vcs#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?packageName ?commitHash ?branchName\nWHERE {\n  ?package a pkg:SourcePackage ;\n           pkg:packageName ?packageName ;\n           pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"Debian\" ;\n           pkg:partOfRelease/pkg:releaseCodename \"trixie\" ;\n           pkg:derivedFromCommit ?commit .\n  ?commit vcs:commitHash ?commitHash ;\n          vcs:onBranch/vcs:branchName ?branchName .\n  FILTER(?branchName = \"main\")\n}\nLIMIT 100"
+  },
+  {
+    "id": "CQ-SET-01",
+    "title": "Package Set Membership",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?packageName\nWHERE {\n  ?set a pkg:PackageSet ;\n       rdfs:label \"BaseOS\" .\n  ?package pkg:memberOfPackageSet ?set ;\n           pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"RHEL\" ;\n           pkg:partOfRelease/pkg:releaseVersion \"9\" ;\n           pkg:packageName ?packageName .\n}\nORDER BY ?packageName"
+  },
+  {
+    "id": "CQ-ECO-01",
+    "title": "RPM Spec File Sources",
+    "query": "PREFIX rpm: <https://purl.org/packagegraph/ontology/rpm#>\nPREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\n\nSELECT ?packageName (COUNT(?source) AS ?sourceCount)\nWHERE {\n  ?package a rpm:SourceRPM ;\n           pkg:packageName ?packageName ;\n           rpm:hasSpecSource ?source .\n}\nGROUP BY ?packageName\nHAVING (COUNT(?source) > 5)\nORDER BY DESC(?sourceCount)"
+  },
+  {
+    "id": "CQ-ECO-02",
+    "title": "Debian Section Distribution",
+    "query": "PREFIX deb: <https://purl.org/packagegraph/ontology/deb#>\nPREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?section (COUNT(?package) AS ?count)\nWHERE {\n  ?package a deb:BinaryDeb ;\n           deb:section ?section ;\n           pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"Debian\" ;\n           pkg:partOfRelease/pkg:releaseCodename \"trixie\" .\n}\nGROUP BY ?section\nORDER BY DESC(?count)\nLIMIT 20"
+  },
+  {
+    "id": "CQ-ECO-03",
+    "title": "npm Dependency Depth",
+    "query": "PREFIX npm: <https://purl.org/packagegraph/ontology/npm#>\nPREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\n\nSELECT (AVG(?depth) AS ?avgDepth)\nWHERE {\n  ?package a npm:NpmPackage .\n  {\n    SELECT ?package (COUNT(?dep) AS ?depth)\n    WHERE {\n      ?package pkg:directlyDependsOn+ ?dep .\n    }\n    GROUP BY ?package\n  }\n}"
+  },
+  {
+    "id": "CQ-MVN-01",
+    "title": "CVEs for a Maven Artifact",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT DISTINCT ?cveId ?osvId ?severity\nWHERE {\n  ?vuln sec:hasAffectedRange ?range .\n  ?range sec:affectsPackageName \"org.springframework:spring-beans\" ;\n         sec:affectsEcosystem/rdfs:label \"Maven\" .\n  ?vuln sec:cveId ?cveId .\n  OPTIONAL { ?vuln sec:osvId ?osvId }\n  OPTIONAL { ?vuln sec:hasCVSSScore/sec:baseScore ?severity }\n}\nORDER BY DESC(?severity)"
+  },
+  {
+    "id": "CQ-MVN-02",
+    "title": "Vulnerable Versions for a CVE",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?introducedVersion ?fixedVersion\nWHERE {\n  ?vuln sec:cveId \"CVE-2022-22965\" ;\n        sec:hasAffectedRange ?range .\n  ?range sec:affectsPackageName \"org.springframework:spring-beans\" ;\n         sec:affectsEcosystem/rdfs:label \"Maven\" ;\n         sec:rangeType ?rangeTypeUri ;\n         sec:hasRangeEvent ?event .\n  FILTER(?rangeTypeUri IN (sec:range-ecosystem, sec:range-semver))\n  OPTIONAL {\n    ?event sec:eventType sec:event-introduced ;\n           sec:eventVersion ?introducedVersion .\n  }\n  OPTIONAL {\n    ?event sec:eventType sec:event-fixed ;\n           sec:eventVersion ?fixedVersion .\n  }\n}"
+  },
+  {
+    "id": "CQ-MVN-03",
+    "title": "Fix Commit for a CVE",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX vcs: <https://purl.org/packagegraph/ontology/vcs#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?fixedVersion ?commitHash ?commitUrl\nWHERE {\n  ?vuln sec:cveId \"CVE-2022-22965\" ;\n        sec:hasAffectedRange ?range .\n  ?range sec:affectsPackageName \"org.springframework:spring-beans\" ;\n         sec:affectsEcosystem/rdfs:label \"Maven\" ;\n         sec:hasRangeEvent ?event .\n  ?event sec:eventType sec:event-fixed .\n\n  OPTIONAL { ?event sec:eventVersion ?fixedVersion }\n  OPTIONAL {\n    ?event sec:eventCommit ?commit .\n    ?commit vcs:commitHash ?commitHash .\n    OPTIONAL {\n      ?commit ^vcs:hasCommit ?repo .\n      ?repo vcs:cloneUrl ?commitUrl .\n    }\n  }\n}"
+  },
+  {
+    "id": "CQ-MVN-04",
+    "title": "Source Location for an Artifact Version",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX vcs: <https://purl.org/packagegraph/ontology/vcs#>\nPREFIX maven: <https://purl.org/packagegraph/ontology/maven#>\n\nSELECT ?cloneUrl ?tag\nWHERE {\n  ?artifact maven:groupId \"org.springframework\" ;\n            maven:artifactId \"spring-core\" ;\n            pkg:hasVersion/pkg:versionString \"6.2.0\" ;\n            pkg:isVersionOf ?identity .\n\n  OPTIONAL { ?identity pkg:upstreamRepository ?repo .\n             ?repo vcs:cloneUrl ?cloneUrl }\n  OPTIONAL { ?artifact vcs:packagedFromTag/vcs:tagName ?tag }\n}"
+  },
+  {
+    "id": "CQ-MVN-05",
+    "title": "Source Diff to Previous Version",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX vcs: <https://purl.org/packagegraph/ontology/vcs#>\nPREFIX maven: <https://purl.org/packagegraph/ontology/maven#>\n\nSELECT ?currentVersion ?previousVersion ?diffUrl\n       ?linesAdded ?linesDeleted ?filesChanged\nWHERE {\n  ?artifact maven:groupId \"org.springframework\" ;\n            maven:artifactId \"spring-core\" ;\n            pkg:hasVersion/pkg:versionString ?currentVersion ;\n            pkg:isVersionOf ?identity .\n  ?identity pkg:upstreamRepository ?repo .\n\n  ?release vcs:correspondingPackageVersion/pkg:versionString ?currentVersion ;\n           vcs:hasDiff ?diff ;\n           vcs:previousRelease ?prevRelease .\n  ?prevRelease vcs:correspondingPackageVersion/pkg:versionString ?previousVersion .\n\n  ?diff vcs:diffUrl ?diffUrl .\n  OPTIONAL { ?diff vcs:linesAdded ?linesAdded }\n  OPTIONAL { ?diff vcs:linesDeleted ?linesDeleted }\n  OPTIONAL { ?diff vcs:filesChanged ?filesChanged }\n}"
+  },
+  {
+    "id": "CQ-PID-01",
+    "title": "High-Confidence Cross-Ecosystem Matches",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX skos: <http://www.w3.org/2004/02/skos/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\nSELECT ?fedoraName ?pypiName ?confidence ?method\nWHERE {\n  ?fedoraId a pkg:PackageIdentity ;\n            pkg:identityName ?fedoraName ;\n            pkg:hasPackageRelationship ?rel .\n  ?rel pkg:relationshipTarget ?pypiId ;\n       pkg:matchMethod ?methodConcept ;\n       pkg:matchConfidence ?confidence .\n  ?methodConcept skos:prefLabel ?method .\n  ?pypiId pkg:identityName ?pypiName .\n\n  ?fedoraPkg pkg:isVersionOf ?fedoraId ;\n             pkg:partOfRelease/^pkg:hasRelease/rdfs:label \"Fedora\" .\n\n  FILTER(?confidence > \"0.9\"^^xsd:decimal)\n}\nORDER BY DESC(?confidence)"
+  },
+  {
+    "id": "CQ-CLASS-01",
+    "title": "Web Frameworks with Unpatched CVEs",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX tax: <https://purl.org/packagegraph/ontology/taxonomy#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\nSELECT ?projectName ?cveId ?cvssScore\nWHERE {\n  ?upstream a pkg:UpstreamProject ;\n            pkg:projectName ?projectName ;\n            pkg:hasClassification tax:role-framework ;\n            pkg:hasClassification tax:domain-web-development .\n  ?identity pkg:hasUpstreamProject ?upstream .\n  ?vuln sec:affectsPackage ?identity ;\n        sec:cveId ?cveId .\n  OPTIONAL { ?vuln sec:hasCVSSScore/sec:baseScore ?cvssScore }\n  FILTER NOT EXISTS {\n    ?advisory sec:addressesVulnerability ?vuln .\n  }\n}\nORDER BY DESC(?cvssScore)"
+  },
+  {
+    "id": "CQ-CLASS-02",
+    "title": "Taxonomy Facet Distribution",
+    "query": "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX skos: <http://www.w3.org/2004/02/skos/core#>\nPREFIX tax: <https://purl.org/packagegraph/ontology/taxonomy#>\n\nSELECT ?facetLabel ?termLabel (COUNT(DISTINCT ?subject) AS ?count)\nWHERE {\n  ?subject pkg:hasClassification ?term .\n  ?term skos:inScheme tax:TaxonomyScheme ;\n        skos:prefLabel ?termLabel .\n  ?facet skos:member ?term ;\n         skos:prefLabel ?facetLabel .\n}\nGROUP BY ?facetLabel ?termLabel\nORDER BY ?facetLabel DESC(?count)"
+  },
+  {
+    "id": "CQ-ERA-01",
+    "title": "EPSS-Ranked Unpatched Vulnerabilities",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\nSELECT ?cveId ?packageName ?epssScore ?cvssScore\nWHERE {\n  ?vuln sec:cveId ?cveId ;\n        sec:affectsPackage ?identity ;\n        sec:hasEPSSAssessment ?epss ;\n        sec:hasCVSSScore ?cvss .\n  ?epss sec:epssScore ?epssScore ;\n        sec:epssAssessmentDate ?epssDate .\n  ?cvss sec:baseScore ?cvssScore .\n  ?identity pkg:identityName ?packageName .\n\n  ?package pkg:isVersionOf ?identity ;\n           pkg:partOfRelease ?release .\n  ?release ^pkg:hasRelease/rdfs:label \"Fedora\" ;\n           pkg:releaseVersion \"43\" .\n\n  FILTER(?epssScore > \"0.5\"^^xsd:decimal)\n\n  # Most recent EPSS assessment\n  FILTER NOT EXISTS {\n    ?vuln sec:hasEPSSAssessment ?newerEpss .\n    ?newerEpss sec:epssAssessmentDate ?newerDate .\n    FILTER(?newerDate > ?epssDate)\n  }\n\n  # Not patched\n  FILTER NOT EXISTS {\n    ?advisory sec:addressesVulnerability ?vuln ;\n              sec:advisoryForPackage ?package .\n  }\n}\nORDER BY DESC(?epssScore)"
+  },
+  {
+    "id": "CQ-ERA-02",
+    "title": "EPSS vs CVSS Disagreement",
+    "query": "PREFIX sec: <https://purl.org/packagegraph/ontology/security#>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\nSELECT ?cveId ?epssScore ?cvssScore\nWHERE {\n  ?vuln sec:cveId ?cveId ;\n        sec:hasEPSSAssessment ?epss ;\n        sec:hasCVSSScore ?cvss .\n  ?epss sec:epssScore ?epssScore .\n  ?cvss sec:cvssVersion \"3.1\" ;\n        sec:baseScore ?cvssScore .\n  FILTER(\n    (?epssScore > \"0.7\"^^xsd:decimal && ?cvssScore < \"4.0\"^^xsd:decimal) ||\n    (?epssScore < \"0.1\"^^xsd:decimal && ?cvssScore > \"9.0\"^^xsd:decimal)\n  )\n}\nORDER BY DESC(?epssScore)"
+  }
+]

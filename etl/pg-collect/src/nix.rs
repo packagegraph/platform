@@ -15,6 +15,7 @@ pub struct NixCollector {
     client: Client,
     channel_url: String,
     source_cache: Option<SourceCache>,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,7 +47,20 @@ impl NixCollector {
             .build()
             .expect("Failed to create HTTP client");
 
-        Self { distro_name, release_name, client, channel_url, source_cache: None }
+        Self {
+            distro_name,
+            release_name,
+            client,
+            channel_url,
+            source_cache: None,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
@@ -55,7 +69,10 @@ impl NixCollector {
     }
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
-        let url = format!("{}/packages.json.br", self.channel_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/packages.json.br",
+            self.channel_url.trim_end_matches('/')
+        );
         eprintln!("Fetching packages.json.br from: {}", url);
 
         let response = self
@@ -86,7 +103,7 @@ impl NixCollector {
         eprintln!("Parsed {} Nix packages", root.packages.len());
 
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         self.emit_distribution_metadata(&mut writer)?;
 
@@ -99,7 +116,8 @@ impl NixCollector {
             }
 
             if let (Some(pname), Some(version)) = (&pkg.pname, &pkg.version) {
-                total_triples += self.emit_package_triples(&mut writer, pname, version, attr_path, pkg)?;
+                total_triples +=
+                    self.emit_package_triples(&mut writer, pname, version, attr_path, pkg)?;
                 count += 1;
             }
         }
@@ -135,7 +153,8 @@ impl NixCollector {
         pkg: &NixPackage,
     ) -> Result<usize> {
         let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", pname, version);
-        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", pname);
+        let identity_uri =
+            package_identity_uri(&self.distro_name, &self.release_name, "any", pname);
         let mut triples = 0;
 
         // Dual typing
@@ -179,10 +198,9 @@ impl NixCollector {
             if let Some(homepage_val) = &meta.homepage {
                 let homepage_str = match homepage_val {
                     serde_json::Value::String(s) => Some(s.clone()),
-                    serde_json::Value::Array(arr) => arr
-                        .first()
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
+                    serde_json::Value::Array(arr) => {
+                        arr.first().and_then(|v| v.as_str()).map(|s| s.to_string())
+                    }
                     _ => None,
                 };
                 if let Some(homepage) = homepage_str {
@@ -242,7 +260,11 @@ mod tests {
         use std::io::{Read, Write};
         use tempfile::NamedTempFile;
 
-        let collector = NixCollector::new("nix".into(), "nixpkgs".into(), "https://channels.nixos.org/nixos-24.05".into());
+        let collector = NixCollector::new(
+            "nix".into(),
+            "nixpkgs".into(),
+            "https://channels.nixos.org/nixos-24.05".into(),
+        );
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 
@@ -251,7 +273,9 @@ mod tests {
             version: Some("2.12.1".to_string()),
             metadata: Some(NixMeta {
                 description: Some("GNU Hello".to_string()),
-                homepage: Some(serde_json::Value::String("https://www.gnu.org/software/hello/".to_string())),
+                homepage: Some(serde_json::Value::String(
+                    "https://www.gnu.org/software/hello/".to_string(),
+                )),
                 license: None,
                 platforms: None,
                 broken: Some(false),
@@ -264,7 +288,11 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("nix#NixPackage"));

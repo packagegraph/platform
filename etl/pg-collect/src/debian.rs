@@ -1,5 +1,7 @@
-use crate::forge::{extract_forge_url_with_field, emit_upstream_repo, emit_dq_issue, emit_forge_triples};
-use crate::ntriples::{NTriplesWriter, bnode_id};
+use crate::forge::{
+    emit_dq_issue, emit_forge_triples, emit_upstream_repo, extract_forge_url_with_field,
+};
+use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use flate2::read::GzDecoder;
@@ -42,6 +44,7 @@ pub struct DebianCollector {
     component: String,
     repo_type: String,
     source_cache: Option<SourceCache>,
+    pub graph_uri: Option<String>,
 }
 
 fn infer_repo_type_debian(url: &str) -> String {
@@ -64,7 +67,12 @@ pub struct ReleaseInfo {
 }
 
 impl DebianCollector {
-    pub fn new(repo_url: String, distro_name: String, distribution: String, component: String) -> Self {
+    pub fn new(
+        repo_url: String,
+        distro_name: String,
+        distribution: String,
+        component: String,
+    ) -> Self {
         let repo_type = infer_repo_type_debian(&repo_url);
 
         // HTTP client with timeout and retry configuration
@@ -78,7 +86,14 @@ impl DebianCollector {
             component,
             repo_type,
             source_cache: None,
+            graph_uri: None,
         }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
@@ -88,7 +103,7 @@ impl DebianCollector {
 
     pub fn collect(&self, arches: &[String], output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         // Get release info
         let release_info = self.get_release_info()?;
@@ -113,7 +128,10 @@ impl DebianCollector {
         // Process each architecture
         for (i, arch) in arches.iter().enumerate() {
             let (repo_path, rdf_identity) = normalize_arch(arch);
-            eprintln!("\nProcessing architecture: {} (repo path: {})", rdf_identity, repo_path);
+            eprintln!(
+                "\nProcessing architecture: {} (repo path: {})",
+                rdf_identity, repo_path
+            );
 
             let (pkg_count, triple_count) = self.collect_with_writer(
                 &mut writer,
@@ -187,12 +205,21 @@ impl DebianCollector {
         }
     }
 
-    fn fetch_raw_bytes(&self, url: &str, logical_name: &str, arch: Option<&str>) -> Result<Vec<u8>> {
+    fn fetch_raw_bytes(
+        &self,
+        url: &str,
+        logical_name: &str,
+        arch: Option<&str>,
+    ) -> Result<Vec<u8>> {
         if let Some(ref cache) = self.source_cache {
             let scope = self.cache_scope(arch);
             match cache.fetch_or_reuse(url, &scope, logical_name)? {
                 CacheResult::Fresh(bytes) => {
-                    eprintln!("Downloaded {} ({} bytes, cached)", logical_name, bytes.len());
+                    eprintln!(
+                        "Downloaded {} ({} bytes, cached)",
+                        logical_name,
+                        bytes.len()
+                    );
                     Ok(bytes)
                 }
                 CacheResult::Cached(path) | CacheResult::NotModified(path) => {
@@ -250,23 +277,38 @@ impl DebianCollector {
         }
     }
 
-    fn client_get_with_retry(&self, url: &str, max_retries: u32) -> Result<reqwest::blocking::Response> {
+    fn client_get_with_retry(
+        &self,
+        url: &str,
+        max_retries: u32,
+    ) -> Result<reqwest::blocking::Response> {
         let mut retries = 0;
         loop {
             match self.client.get(url).send() {
                 Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response) if response.status().is_server_error() && retries < max_retries => {
-                    eprintln!("Server error {}, retrying... ({}/{})", response.status(), retries + 1, max_retries);
+                    eprintln!(
+                        "Server error {}, retrying... ({}/{})",
+                        response.status(),
+                        retries + 1,
+                        max_retries
+                    );
                     retries += 1;
                     std::thread::sleep(Duration::from_millis(1000 * (1 << retries)));
                 }
                 Ok(response) => {
-                    return Err(std::io::Error::other(
-                        format!("HTTP error: {}", response.status()),
-                    ));
+                    return Err(std::io::Error::other(format!(
+                        "HTTP error: {}",
+                        response.status()
+                    )));
                 }
                 Err(e) if retries < max_retries => {
-                    eprintln!("Network error: {}, retrying... ({}/{})", e, retries + 1, max_retries);
+                    eprintln!(
+                        "Network error: {}, retrying... ({}/{})",
+                        e,
+                        retries + 1,
+                        max_retries
+                    );
                     retries += 1;
                     std::thread::sleep(Duration::from_millis(1000 * (1 << retries)));
                 }
@@ -286,7 +328,11 @@ impl DebianCollector {
         // Distribution
         let dist_uri = distro_uri(&self.distro_name);
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
-        writer.write_literal(&dist_uri, &format!("{PKG}distributionName"), &self.distro_name)?;
+        writer.write_literal(
+            &dist_uri,
+            &format!("{PKG}distributionName"),
+            &self.distro_name,
+        )?;
 
         // Add human-readable label
         let display_name = distro_display_name(&self.distro_name);
@@ -295,9 +341,17 @@ impl DebianCollector {
         // Release
         let rel_uri = release_uri(&self.distro_name, &release_info.codename);
         writer.write_triple(&rel_uri, RDF_TYPE, &format!("{PKG}DistributionRelease"))?;
-        writer.write_literal(&rel_uri, &format!("{PKG}releaseCodename"), &release_info.codename)?;
+        writer.write_literal(
+            &rel_uri,
+            &format!("{PKG}releaseCodename"),
+            &release_info.codename,
+        )?;
         writer.write_literal(&rel_uri, &format!("{PKG}releaseSuite"), &release_info.suite)?;
-        writer.write_literal(&rel_uri, &format!("{PKG}releaseOrigin"), &release_info.origin)?;
+        writer.write_literal(
+            &rel_uri,
+            &format!("{PKG}releaseOrigin"),
+            &release_info.origin,
+        )?;
         writer.write_triple(&rel_uri, &format!("{PKG}partOfDistribution"), &dist_uri)?;
         // Repo metadata
         writer.write_literal(&rel_uri, &format!("{PKG}repoType"), &self.repo_type)?;
@@ -309,7 +363,11 @@ impl DebianCollector {
 
             let arch_uri_val = arch_uri(&rdf_identity);
             writer.write_triple(&arch_uri_val, RDF_TYPE, &format!("{PKG}Architecture"))?;
-            writer.write_literal(&arch_uri_val, &format!("{PKG}architectureName"), &rdf_identity)?;
+            writer.write_literal(
+                &arch_uri_val,
+                &format!("{PKG}architectureName"),
+                &rdf_identity,
+            )?;
         }
 
         Ok(())
@@ -358,10 +416,16 @@ impl DebianCollector {
 
             if line.is_empty() {
                 // End of package entry
-                if !current_pkg.is_empty() && current_pkg.contains_key("Package") && current_pkg.contains_key("Version") {
+                if !current_pkg.is_empty()
+                    && current_pkg.contains_key("Package")
+                    && current_pkg.contains_key("Version")
+                {
                     let pkg_name = current_pkg.get("Package").unwrap();
                     let pkg_version = current_pkg.get("Version").unwrap();
-                    let pkg_arch = current_pkg.get("Architecture").map(|s| s.as_str()).unwrap_or("");
+                    let pkg_arch = current_pkg
+                        .get("Architecture")
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
 
                     // Skip Architecture:all packages if already seen (secondary arch)
                     if pkg_arch == "all" && is_secondary {
@@ -419,10 +483,16 @@ impl DebianCollector {
         }
 
         // Process last package if file doesn't end with blank line
-        if !current_pkg.is_empty() && current_pkg.contains_key("Package") && current_pkg.contains_key("Version") {
+        if !current_pkg.is_empty()
+            && current_pkg.contains_key("Package")
+            && current_pkg.contains_key("Version")
+        {
             let pkg_name = current_pkg.get("Package").unwrap();
             let pkg_version = current_pkg.get("Version").unwrap();
-            let pkg_arch = current_pkg.get("Architecture").map(|s| s.as_str()).unwrap_or("");
+            let pkg_arch = current_pkg
+                .get("Architecture")
+                .map(|s| s.as_str())
+                .unwrap_or("");
 
             // Check arch:all dedup for last package too
             let should_emit = if pkg_arch == "all" && is_secondary {
@@ -477,11 +547,18 @@ impl DebianCollector {
         let pkg_name = pkg_data.get("Package").unwrap();
         let pkg_version = pkg_data.get("Version").unwrap();
 
-        let pkg_uri = package_uri(&self.distro_name, codename, arch_name, pkg_name, pkg_version);
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            codename,
+            arch_name,
+            pkg_name,
+            pkg_version,
+        );
         let identity_uri = package_identity_uri(&self.distro_name, codename, arch_name, pkg_name);
 
         // First emit all the package triples (delegates to existing method)
-        let mut triples = self.emit_package_triples(writer, pkg_data, codename, suite, arch_name)?;
+        let mut triples =
+            self.emit_package_triples(writer, pkg_data, codename, suite, arch_name)?;
 
         // Then populate source tracking sets
         let (source_name, source_version) = if let Some(source_str) = pkg_data.get("Source") {
@@ -539,15 +616,27 @@ impl DebianCollector {
             triples += 3;
 
             if let Some(ref upstream_name) = detection.package_name {
-                writer.write_literal(identity_uri, &format!("{PKG}upstreamPackageName"), upstream_name)?;
+                writer.write_literal(
+                    identity_uri,
+                    &format!("{PKG}upstreamPackageName"),
+                    upstream_name,
+                )?;
                 triples += 1;
             }
 
             // DQ annotation for ecosystem detection
-            let confidence = if detection.detection_method == "homepage-domain" { "high" } else { "medium" };
+            let confidence = if detection.detection_method == "homepage-domain" {
+                "high"
+            } else {
+                "medium"
+            };
             triples += emit_dq_issue(
-                writer, "debian", "ecosystem", pkg_name,
-                &format!("ecosystem-detected-{}", confidence), "info"
+                writer,
+                "debian",
+                "ecosystem",
+                pkg_name,
+                &format!("ecosystem-detected-{}", confidence),
+                "info",
             )?;
         }
 
@@ -569,10 +658,24 @@ impl DebianCollector {
             if let Some(extraction) = extract_forge_url_with_field(homepage, "homepage") {
                 triples += emit_upstream_repo(writer, identity_uri, &extraction, None)?;
             } else {
-                triples += emit_dq_issue(writer, "debian", "homepage", homepage, "homepage-no-forge-match", "info")?;
+                triples += emit_dq_issue(
+                    writer,
+                    "debian",
+                    "homepage",
+                    homepage,
+                    "homepage-no-forge-match",
+                    "info",
+                )?;
             }
         } else {
-            triples += emit_dq_issue(writer, "debian", "homepage", pkg_name, "missing-homepage", "info")?;
+            triples += emit_dq_issue(
+                writer,
+                "debian",
+                "homepage",
+                pkg_name,
+                "missing-homepage",
+                "info",
+            )?;
         }
 
         // Vcs-Git → packagingRepository
@@ -585,7 +688,14 @@ impl DebianCollector {
                 triples += 2;
                 triples += emit_forge_triples(writer, &r_uri, &extraction.repo_url)?;
             } else {
-                triples += emit_dq_issue(writer, "debian", "vcs-git", vcs_url, "vcs-git-no-forge-match", "info")?;
+                triples += emit_dq_issue(
+                    writer,
+                    "debian",
+                    "vcs-git",
+                    vcs_url,
+                    "vcs-git-no-forge-match",
+                    "info",
+                )?;
             }
         }
 
@@ -612,7 +722,13 @@ impl DebianCollector {
         let pkg_name = pkg_data.get("Package").unwrap();
         let pkg_version = pkg_data.get("Version").unwrap();
 
-        let pkg_uri = package_uri(&self.distro_name, codename, arch_name, pkg_name, pkg_version);
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            codename,
+            arch_name,
+            pkg_name,
+            pkg_version,
+        );
         let identity_uri = package_identity_uri(&self.distro_name, codename, arch_name, pkg_name);
         let mut triples = 0;
 
@@ -677,7 +793,11 @@ impl DebianCollector {
         }
         if let Some(install_size_str) = pkg_data.get("Installed-Size") {
             if let Ok(install_size_kb) = install_size_str.parse::<i64>() {
-                writer.write_integer(&pkg_uri, &format!("{PKG}installSize"), install_size_kb * 1024)?;
+                writer.write_integer(
+                    &pkg_uri,
+                    &format!("{PKG}installSize"),
+                    install_size_kb * 1024,
+                )?;
                 triples += 1;
             }
         }
@@ -703,7 +823,14 @@ impl DebianCollector {
         }
 
         // Source package
-        triples += self.emit_source_package_triples(writer, &pkg_uri, pkg_data, codename, pkg_name, pkg_version)?;
+        triples += self.emit_source_package_triples(
+            writer,
+            &pkg_uri,
+            pkg_data,
+            codename,
+            pkg_name,
+            pkg_version,
+        )?;
 
         // Ecosystem detection
         let homepage = pkg_data.get("Homepage").map(|s| s.as_str());
@@ -724,13 +851,16 @@ impl DebianCollector {
         pkg_uri: &str,
         maintainer_str: &str,
     ) -> Result<usize> {
-        use crate::normalize::maintainer::{parse_mailbox_list, is_email_iri_safe};
+        use crate::normalize::maintainer::{is_email_iri_safe, parse_mailbox_list};
 
         let parsed = parse_mailbox_list(maintainer_str);
         let mut triples = 0;
 
         if parsed.malformed_count > 0 {
-            eprintln!("WARNING: {} malformed maintainer entries in: {}", parsed.malformed_count, maintainer_str);
+            eprintln!(
+                "WARNING: {} malformed maintainer entries in: {}",
+                parsed.malformed_count, maintainer_str
+            );
         }
 
         let mut iri_unsafe_count = 0usize;
@@ -754,7 +884,11 @@ impl DebianCollector {
             triples += 3;
 
             if let Some(email) = safe_email {
-                writer.write_triple(&maint_uri, &format!("{FOAF}mbox"), &format!("mailto:{email}"))?;
+                writer.write_triple(
+                    &maint_uri,
+                    &format!("{FOAF}mbox"),
+                    &format!("mailto:{email}"),
+                )?;
                 triples += 1;
             }
 
@@ -763,7 +897,10 @@ impl DebianCollector {
         }
 
         if iri_unsafe_count > 0 {
-            eprintln!("WARNING: {} IRI-unsafe email addresses skipped in: {}", iri_unsafe_count, maintainer_str);
+            eprintln!(
+                "WARNING: {} IRI-unsafe email addresses skipped in: {}",
+                iri_unsafe_count, maintainer_str
+            );
         }
 
         Ok(triples)
@@ -801,7 +938,11 @@ impl DebianCollector {
         // Version resource for source
         let src_ver_uri = version_uri(&self.distro_name, codename, &source_name, &source_version);
         writer.write_triple(&src_ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
-        writer.write_literal(&src_ver_uri, &format!("{PKG}versionString"), &source_version)?;
+        writer.write_literal(
+            &src_ver_uri,
+            &format!("{PKG}versionString"),
+            &source_version,
+        )?;
         writer.write_triple(&src_uri, &format!("{PKG}hasVersion"), &src_ver_uri)?;
 
         // Link binary to source
@@ -821,7 +962,11 @@ impl DebianCollector {
         let dep_mappings = vec![
             ("Depends", "runtime", Some(format!("{DEB}debDepends"))),
             ("Pre-Depends", "runtime", Some(format!("{DEB}debDepends"))),
-            ("Recommends", "recommends", Some(format!("{DEB}debRecommends"))),
+            (
+                "Recommends",
+                "recommends",
+                Some(format!("{DEB}debRecommends")),
+            ),
             ("Suggests", "suggests", Some(format!("{DEB}debSuggests"))),
             ("Conflicts", "conflicts", Some(format!("{DEB}debConflicts"))),
             ("Breaks", "breaks", Some(format!("{DEB}debConflicts"))),
@@ -857,11 +1002,7 @@ impl DebianCollector {
 
                 writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
                 writer.write_literal(&dep_uri, &format!("{PKG}packageName"), name)?;
-                writer.write_triple(
-                    pkg_uri,
-                    &format!("{PKG}directlyProvides"),
-                    &dep_uri,
-                )?;
+                writer.write_triple(pkg_uri, &format!("{PKG}directlyProvides"), &dep_uri)?;
                 writer.write_triple(pkg_uri, &format!("{DEB}debProvides"), &dep_uri)?;
 
                 // Also emit Capability entity for CQ-PM-03
@@ -903,7 +1044,8 @@ impl DebianCollector {
 
                 // Dependency targets point to the canonical identity URI (no version).
                 // This enables direct name-based joins without URI parsing.
-                let dep_uri = package_identity_uri(&self.distro_name, codename, arch_name, dep_name);
+                let dep_uri =
+                    package_identity_uri(&self.distro_name, codename, arch_name, dep_name);
 
                 // Ensure identity has basic properties for graph traversal
                 writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
@@ -912,7 +1054,11 @@ impl DebianCollector {
 
                 // Emit generic property based on dep_type
                 if dep_type == "conflicts" || dep_type == "breaks" {
-                    writer.write_triple(pkg_uri, &format!("{PKG}directlyConflictsWith"), &dep_uri)?;
+                    writer.write_triple(
+                        pkg_uri,
+                        &format!("{PKG}directlyConflictsWith"),
+                        &dep_uri,
+                    )?;
                 } else {
                     writer.write_triple(pkg_uri, &format!("{PKG}directlyDependsOn"), &dep_uri)?;
                 }
@@ -928,8 +1074,16 @@ impl DebianCollector {
                 let dep_bnode = bnode_id("dep", &format!("{pkg_uri}_{dep_name}"));
 
                 writer.write_bnode_subject(&dep_bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
-                writer.write_bnode_subject(&dep_bnode, &format!("{PKG}dependencyTarget"), &dep_uri)?;
-                writer.write_bnode_subject(&dep_bnode, &format!("{PKG}dependencyType"), &dep_type_uri(dep_type))?;
+                writer.write_bnode_subject(
+                    &dep_bnode,
+                    &format!("{PKG}dependencyTarget"),
+                    &dep_uri,
+                )?;
+                writer.write_bnode_subject(
+                    &dep_bnode,
+                    &format!("{PKG}dependencyType"),
+                    &dep_type_uri(dep_type),
+                )?;
                 writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &dep_bnode)?;
                 triples += 4;
 
@@ -937,12 +1091,29 @@ impl DebianCollector {
                 if let Some(constraint_str) = version_constraint {
                     let (operator, value) = self.parse_version_constraint(constraint_str);
                     if let (Some(op), Some(val)) = (operator, value) {
-                        let constraint_bnode = bnode_id("constraint", &format!("{dep_bnode}_{val}"));
+                        let constraint_bnode =
+                            bnode_id("constraint", &format!("{dep_bnode}_{val}"));
 
-                        writer.write_bnode_subject(&constraint_bnode, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
-                        writer.write_bnode_literal(&constraint_bnode, &format!("{PKG}versionConstraintOperator"), &op)?;
-                        writer.write_bnode_literal(&constraint_bnode, &format!("{PKG}versionConstraintValue"), &val)?;
-                        writer.write_bnode_subject(&dep_bnode, &format!("{PKG}hasVersionConstraint"), &format!("_{constraint_bnode}"))?;
+                        writer.write_bnode_subject(
+                            &constraint_bnode,
+                            RDF_TYPE,
+                            &format!("{PKG}VersionConstraint"),
+                        )?;
+                        writer.write_bnode_literal(
+                            &constraint_bnode,
+                            &format!("{PKG}versionConstraintOperator"),
+                            &op,
+                        )?;
+                        writer.write_bnode_literal(
+                            &constraint_bnode,
+                            &format!("{PKG}versionConstraintValue"),
+                            &val,
+                        )?;
+                        writer.write_bnode_subject(
+                            &dep_bnode,
+                            &format!("{PKG}hasVersionConstraint"),
+                            &format!("_{constraint_bnode}"),
+                        )?;
                         triples += 4;
                     }
                 }
@@ -1043,7 +1214,8 @@ Description: example package
 
         // Mock the Release file
         let release_body = "Origin: Debian\nSuite: stable\nCodename: trixie\n";
-        let release_mock = server.mock("GET", "/dists/trixie/Release")
+        let release_mock = server
+            .mock("GET", "/dists/trixie/Release")
             .with_status(200)
             .with_body(release_body)
             .create();
@@ -1051,7 +1223,8 @@ Description: example package
         // Mock the Packages.gz at the CORRECT binary-prefixed path.
         // The collector receives bare "amd64" and must request "binary-amd64".
         let packages_gz = make_test_packages_gz();
-        let packages_mock = server.mock("GET", "/dists/trixie/main/binary-amd64/Packages.gz")
+        let packages_mock = server
+            .mock("GET", "/dists/trixie/main/binary-amd64/Packages.gz")
             .with_status(200)
             .with_header("content-type", "application/gzip")
             .with_body(packages_gz)
@@ -1071,7 +1244,11 @@ Description: example package
         // collect() receives bare arch and must normalize to binary-amd64 for the URL
         let result = collector.collect(&["amd64".to_string()], &output_path);
 
-        assert!(result.is_ok(), "collect() should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "collect() should succeed: {:?}",
+            result.err()
+        );
         let (pkg_count, triple_count) = result.unwrap();
         assert_eq!(pkg_count, 1, "Should collect exactly one package");
         assert!(triple_count > 0, "Should emit triples");
@@ -1082,9 +1259,18 @@ Description: example package
 
         // Verify output contains expected triples
         let mut content = String::new();
-        std::fs::File::open(&output_path).unwrap().read_to_string(&mut content).unwrap();
-        assert!(content.contains("hello"), "Output should mention package name");
-        assert!(content.contains("amd64"), "Output should reference amd64 arch");
+        std::fs::File::open(&output_path)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert!(
+            content.contains("hello"),
+            "Output should mention package name"
+        );
+        assert!(
+            content.contains("amd64"),
+            "Output should reference amd64 arch"
+        );
     }
 
     #[test]
@@ -1115,15 +1301,28 @@ Description: example package
         pkg_data.insert("Architecture".to_string(), "all".to_string());
 
         // --- First arch (primary): emit triples ---
-        let triples1 = collector.emit_package_triples_with_tracking(
-            &mut writer, &pkg_data, "trixie", "stable", "amd64",
-            &mut source_names, &mut source_identity_map, &mut vcs_urls, &mut source_pkg_uris,
-        ).unwrap();
+        let triples1 = collector
+            .emit_package_triples_with_tracking(
+                &mut writer,
+                &pkg_data,
+                "trixie",
+                "stable",
+                "amd64",
+                &mut source_names,
+                &mut source_identity_map,
+                &mut vcs_urls,
+                &mut source_pkg_uris,
+            )
+            .unwrap();
         all_arch_seen.insert(("tzdata".to_string(), "2024a-1".to_string()));
 
         writer.flush().unwrap();
         let mut content1 = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content1).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content1)
+            .unwrap();
         let triple_lines_after_first = content1.lines().count();
 
         assert!(triples1 > 0, "First arch should emit triples");
@@ -1139,24 +1338,43 @@ Description: example package
         let should_skip = is_arch_all && is_secondary && all_arch_seen.contains(&dedup_key);
 
         // This is the actual dedup logic from process_arch_with_writer
-        assert!(should_skip, "arch:all package seen in primary should be skipped in secondary");
+        assert!(
+            should_skip,
+            "arch:all package seen in primary should be skipped in secondary"
+        );
 
         // Verify: if we DON'T skip (primary again), triples grow; if we skip, they don't
         // Emit again as primary (should add more triples)
-        let triples_again = collector.emit_package_triples_with_tracking(
-            &mut writer, &pkg_data, "trixie", "stable", "arm64",
-            &mut source_names, &mut source_identity_map, &mut vcs_urls, &mut source_pkg_uris,
-        ).unwrap();
+        let triples_again = collector
+            .emit_package_triples_with_tracking(
+                &mut writer,
+                &pkg_data,
+                "trixie",
+                "stable",
+                "arm64",
+                &mut source_names,
+                &mut source_identity_map,
+                &mut vcs_urls,
+                &mut source_pkg_uris,
+            )
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content2 = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content2).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content2)
+            .unwrap();
         let triple_lines_after_second = content2.lines().count();
 
         assert!(triples_again > 0, "Non-skipped emit should produce triples");
-        assert!(triple_lines_after_second > triple_lines_after_first,
+        assert!(
+            triple_lines_after_second > triple_lines_after_first,
             "Output should grow when package is NOT skipped (triple_lines: {} > {})",
-            triple_lines_after_second, triple_lines_after_first);
+            triple_lines_after_second,
+            triple_lines_after_first
+        );
     }
 
     #[test]
@@ -1178,19 +1396,33 @@ Description: example package
         let mut pkg_data = HashMap::new();
         pkg_data.insert("Package".to_string(), "openssl".to_string());
         pkg_data.insert("Version".to_string(), "3.2.2-1".to_string());
-        pkg_data.insert("Homepage".to_string(), "https://github.com/openssl/openssl".to_string());
+        pkg_data.insert(
+            "Homepage".to_string(),
+            "https://github.com/openssl/openssl".to_string(),
+        );
         pkg_data.insert("Architecture".to_string(), "amd64".to_string());
 
-        let _ = collector.emit_package_triples(&mut writer, &pkg_data, "trixie", "testing", "amd64");
+        let _ =
+            collector.emit_package_triples(&mut writer, &pkg_data, "trixie", "testing", "amd64");
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Should contain forge triples (hostedOn, Forge type, forgeUrl, forgeSoftware)
-        assert!(content.contains("hostedOn"), "Should emit hostedOn triple for GitHub");
+        assert!(
+            content.contains("hostedOn"),
+            "Should emit hostedOn triple for GitHub"
+        );
         assert!(content.contains("Forge"), "Should emit Forge entity");
-        assert!(content.contains("forgeSoftware"), "Should emit forgeSoftware triple");
+        assert!(
+            content.contains("forgeSoftware"),
+            "Should emit forgeSoftware triple"
+        );
     }
 
     #[test]
@@ -1212,22 +1444,39 @@ Description: example package
         let mut pkg_data = HashMap::new();
         pkg_data.insert("Package".to_string(), "libc6".to_string());
         pkg_data.insert("Version".to_string(), "2.36-9".to_string());
-        pkg_data.insert("Vcs-Git".to_string(), "https://salsa.debian.org/glibc-team/glibc.git -b trixie".to_string());
+        pkg_data.insert(
+            "Vcs-Git".to_string(),
+            "https://salsa.debian.org/glibc-team/glibc.git -b trixie".to_string(),
+        );
         pkg_data.insert("Architecture".to_string(), "amd64".to_string());
 
-        let _ = collector.emit_package_triples(&mut writer, &pkg_data, "trixie", "testing", "amd64");
+        let _ =
+            collector.emit_package_triples(&mut writer, &pkg_data, "trixie", "testing", "amd64");
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Debug output
         eprintln!("=== Vcs-Git Test Output ===\n{}\n===", content);
 
         // Should contain forge triples for salsa packaging repo
-        assert!(content.contains("packagingRepository"), "Should emit packagingRepository");
-        assert!(content.contains("hostedOn"), "Should emit hostedOn triple for salsa");
-        assert!(content.contains("salsa.debian.org"), "Should reference salsa.debian.org forge");
+        assert!(
+            content.contains("packagingRepository"),
+            "Should emit packagingRepository"
+        );
+        assert!(
+            content.contains("hostedOn"),
+            "Should emit hostedOn triple for salsa"
+        );
+        assert!(
+            content.contains("salsa.debian.org"),
+            "Should reference salsa.debian.org forge"
+        );
     }
 
     #[test]
@@ -1248,19 +1497,38 @@ Description: example package
         let mut pkg_data = HashMap::new();
         pkg_data.insert("Package".to_string(), "python3-requests".to_string());
         pkg_data.insert("Version".to_string(), "2.31.0-1".to_string());
-        pkg_data.insert("Homepage".to_string(), "https://pypi.org/project/requests/".to_string());
+        pkg_data.insert(
+            "Homepage".to_string(),
+            "https://pypi.org/project/requests/".to_string(),
+        );
         pkg_data.insert("Architecture".to_string(), "all".to_string());
 
         let _ = collector.emit_package_triples(&mut writer, &pkg_data, "trixie", "testing", "all");
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Should contain ecosystem triples
-        assert!(content.contains("upstreamEcosystem"), "Should detect PyPI ecosystem");
-        assert!(content.contains("ecosystem/pypi"), "Should reference pypi ecosystem");
-        assert!(content.contains("upstreamPackageName"), "Should emit upstream package name");
-        assert!(content.contains("\"requests\""), "Should extract 'requests' from python3-requests");
+        assert!(
+            content.contains("upstreamEcosystem"),
+            "Should detect PyPI ecosystem"
+        );
+        assert!(
+            content.contains("ecosystem/pypi"),
+            "Should reference pypi ecosystem"
+        );
+        assert!(
+            content.contains("upstreamPackageName"),
+            "Should emit upstream package name"
+        );
+        assert!(
+            content.contains("\"requests\""),
+            "Should extract 'requests' from python3-requests"
+        );
     }
 }

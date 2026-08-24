@@ -1,0 +1,316 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: rebuild-tdb2
+  namespace: packagegraph
+spec:
+  schedule: "0 3 * * *"  # 3am daily
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 14400  # 4 hours (tdb2.tdbloader throughput decays with index size)
+      ttlSecondsAfterFinished: 1800
+      template:
+        spec:
+          serviceAccountName: rebuild-tdb2
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: rebuild
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom:
+                - secretRef: {name: minio-credentials}
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: JAVA_OPTIONS, value: "-Xmx5g"}
+                - {name: PYTHONUNBUFFERED, value: "1"}
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  echo "=== Offline TDB2 Rebuild ==="
+                  echo "Started: $(date -Iseconds)"
+
+                  # Configure mc
+                  mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
+
+                  # mc_cat_check: reads an object into MC_RESULT.
+                  # Returns 0 (found), 1 (missing), 2 (fatal error).
+                  MC_RESULT=""
+                  mc_cat_check() {
+                    MC_RESULT=""
+                    local mc_err
+                    mc_err=$(mktemp)
+                    if MC_RESULT=$(mc cat "$1" 2>"$mc_err"); then
+                      rm -f "$mc_err"
+                      return 0
+                    fi
+                    local err_msg
+                    err_msg=$(cat "$mc_err")
+                    rm -f "$mc_err"
+                    if echo "$err_msg" | grep -q "NoSuchKey\|Object does not exist"; then
+                      return 1
+                    fi
+                    echo "ERROR: Minio read failed for $1: $err_msg" >&2
+                    return 2
+                  }
+
+                  # Upload ontology to Minio early — before corpus download so QLever
+                  # rebuilds (which may start independently at 03:30) always have it
+                  /app/scripts/upload-ontology.sh
+
+                  # ETag-based snapshot before download to detect concurrent writes
+                  echo "Taking pre-download ETag snapshot..."
+                  mc ls -r --json "pgraph/${MINIO_BUCKET}/nt-output/" | \
+                    jq -r 'select(.status == "success") | select(.key | test("\\.json$") | not) | "\(.key) \(.etag)"' | \
+                    sort > /tmp/etag-before.txt
+
+                  # Download .nt and .graph sidecar files
+                  echo "Downloading .nt and .graph files..."
+                  mc mirror --exclude '*.json' \
+                    "pgraph/${MINIO_BUCKET}/nt-output/" /tmp/nt-output/ --overwrite
+
+                  # Verify no files changed during download (ETags catch same-size replacements)
+                  mc ls -r --json "pgraph/${MINIO_BUCKET}/nt-output/" | \
+                    jq -r 'select(.status == "success") | select(.key | test("\\.json$") | not) | "\(.key) \(.etag)"' | \
+                    sort > /tmp/etag-after.txt
+                  if ! diff -q /tmp/etag-before.txt /tmp/etag-after.txt >/dev/null 2>&1; then
+                    echo "ERROR: nt-output changed during download — concurrent write detected"
+                    diff /tmp/etag-before.txt /tmp/etag-after.txt || true
+                    exit 1
+                  fi
+                  rm -f /tmp/etag-before.txt /tmp/etag-after.txt
+
+                  GRAPH_FILES=$(find /tmp/nt-output -name '*.graph' | wc -l | tr -d ' ')
+                  echo "$GRAPH_FILES graphs discovered via .graph sidecars"
+
+                  if [ "$GRAPH_FILES" -eq 0 ]; then
+                    echo "ERROR: no .graph sidecar files found"
+                    exit 1
+                  fi
+
+                  # Create TDB2 directory
+                  TDB2_DIR="/tmp/tdb2"
+                  mkdir -p "$TDB2_DIR"
+
+                  # Load each .nt file and build manifest
+                  echo "Running tdb2.tdbloader for each graph..."
+
+                  # Initialize build manifest
+                  BUILT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                  cat > /tmp/build-manifest.json <<JSONEOF
+                  {
+                    "built": "$BUILT",
+                    "etl_image": "ghcr.io/packagegraph/etl:v0.12.0",
+                    "ontology_version": "0.12.0",
+                    "graphs": {},
+                    "triple_count": 0,
+                    "errors": []
+                  }
+                  JSONEOF
+
+                  TOTAL_FILES="$GRAPH_FILES"
+                  TOTAL_TRIPLES=0
+                  IDX=0
+
+                  # Iterate over .graph sidecars
+                  for graph_file in /tmp/nt-output/*.graph; do
+                      nt_file="${graph_file%.graph}"
+                      filename=$(basename "$nt_file")
+                      graph_uri=$(cat "$graph_file" | tr -d '\n')
+                      IDX=$((IDX + 1))
+                      echo "[$IDX/$TOTAL_FILES] Loading $filename into <$graph_uri>..."
+
+                      if [ ! -f "$nt_file" ]; then
+                          echo "  Warning: .graph sidecar exists but $filename not found"
+                          jq --arg msg "Missing .nt file for $filename" '.errors += [$msg]' /tmp/build-manifest.json > /tmp/build-manifest.json.tmp && mv /tmp/build-manifest.json.tmp /tmp/build-manifest.json
+                          continue
+                      fi
+
+                      # Compute sha256 and count lines
+                      FILE_HASH=$(sha256sum "$nt_file" | cut -d' ' -f1 | cut -c1-16)
+                      FILE_SIZE=$(stat -c %s "$nt_file" 2>/dev/null || stat -f %z "$nt_file" 2>/dev/null)
+                      LINE_COUNT=$(wc -l < "$nt_file")
+
+                      # Determine arch from graph URI
+                      ARCH="null"
+                      for a in arm64 aarch64 riscv64 x86_64 amd64; do
+                          if echo "$graph_uri" | grep -q "$a"; then
+                              ARCH="\"$a\""
+                              break
+                          fi
+                      done
+
+                      # Run tdb2.tdbloader
+                      if ! /opt/jena/bin/tdb2.tdbloader --loc /tmp/tdb2 --graph "$graph_uri" "$nt_file" 2>/tmp/load-err.txt; then
+                          ERR=$(tail -c 200 /tmp/load-err.txt)
+                          echo "  ✗ tdb2.tdbloader failed for $filename: $ERR"
+                          jq --arg msg "tdb2.tdbloader failed for $filename: $ERR" '.errors += [$msg]' /tmp/build-manifest.json > /tmp/build-manifest.json.tmp && mv /tmp/build-manifest.json.tmp /tmp/build-manifest.json
+                          rm -f "$nt_file"
+                          continue
+                      fi
+
+                      # Update manifest with graph metadata
+                      jq --arg fname "$filename" \
+                         --arg guri "$graph_uri" \
+                         --arg sha "$FILE_HASH" \
+                         --argjson triples "$LINE_COUNT" \
+                         --argjson size "$FILE_SIZE" \
+                         --argjson arch "$ARCH" \
+                         '.graphs[$fname] = {graph_uri: $guri, sha256: $sha, triples: $triples, size_bytes: $size, arch: $arch} | .triple_count += $triples' \
+                         /tmp/build-manifest.json > /tmp/build-manifest.json.tmp && mv /tmp/build-manifest.json.tmp /tmp/build-manifest.json
+
+                      SIZE_MB=$(awk "BEGIN {printf \"%.1f\", $FILE_SIZE / 1048576}")
+                      echo "  ✓ $filename ($LINE_COUNT triples, ${SIZE_MB} MB)"
+
+                      # Remove processed files to save space
+                      rm -f "$nt_file" "$graph_file"
+                  done
+                  rm -rf /tmp/nt-output
+
+                  # Report totals
+                  TOTAL_TRIPLES=$(jq -r '.triple_count' /tmp/build-manifest.json)
+                  GRAPH_COUNT=$(jq -r '.graphs | length' /tmp/build-manifest.json)
+                  ERROR_COUNT=$(jq -r '.errors | length' /tmp/build-manifest.json)
+                  echo ""
+                  echo "Total: $TOTAL_TRIPLES triples across $GRAPH_COUNT graphs"
+                  if [ "$ERROR_COUNT" -gt 0 ]; then
+                      echo "Errors: $ERROR_COUNT"
+                      jq -r '.errors[]' /tmp/build-manifest.json
+                      echo "ERROR: $ERROR_COUNT graph(s) failed to load — aborting to prevent incomplete database promotion"
+                      exit 1
+                  fi
+
+                  # Completeness gate: compare against last successful build
+                  MC_RC=0; mc_cat_check "pgraph/${MINIO_BUCKET}/tdb2/last-success.json" || MC_RC=$?
+                  if [ "$MC_RC" -eq 2 ]; then
+                    echo "FATAL: Minio error reading completeness baseline — aborting"
+                    exit 1
+                  elif [ "$MC_RC" -eq 0 ]; then
+                    PREV_BUILD="$MC_RESULT"
+                    PREV_GRAPH_COUNT=$(echo "$PREV_BUILD" | jq -r '.graph_count // 0')
+                    PREV_TRIPLE_COUNT=$(echo "$PREV_BUILD" | jq -r '.triple_count // 0')
+                    echo "Previous successful build: $PREV_GRAPH_COUNT graphs, $PREV_TRIPLE_COUNT triples"
+
+                    if [ "$GRAPH_COUNT" -lt "$PREV_GRAPH_COUNT" ]; then
+                      echo "ERROR: graph count dropped ($GRAPH_COUNT < $PREV_GRAPH_COUNT) — aborting"
+                      exit 1
+                    fi
+
+                    if [ "$PREV_TRIPLE_COUNT" -gt 0 ]; then
+                      LOSS_PCT=$(( (PREV_TRIPLE_COUNT - TOTAL_TRIPLES) * 100 / PREV_TRIPLE_COUNT ))
+                      if [ "$LOSS_PCT" -gt 25 ]; then
+                        echo "ERROR: triple count dropped by ${LOSS_PCT}% ($TOTAL_TRIPLES < $PREV_TRIPLE_COUNT) — aborting"
+                        exit 1
+                      fi
+                    fi
+                    echo "Completeness check passed"
+                  else
+                    echo "No previous baseline — first build (completeness checks skipped)"
+                  fi
+
+                  # Load ontology into TDB2 (Minio upload already done at start of job)
+                  echo "Loading ontology..."
+                  ONTOLOGY_GRAPH="https://packagegraph.github.io/ontology"
+                  /opt/jena/bin/riot --output=ntriples /app/ontology/*.ttl > /tmp/ontology.nt
+                  /opt/jena/bin/tdb2.tdbloader --loc "$TDB2_DIR" --graph "$ONTOLOGY_GRAPH" /tmp/ontology.nt
+
+                  # Content-hash the TDB2 directory
+                  echo "Computing content hash..."
+                  CONTENT_HASH=$(find "$TDB2_DIR" -type f | sort | xargs sha256sum | sha256sum | cut -c1-16)
+                  echo "Content hash: ${CONTENT_HASH}"
+
+                  # Add hash to manifest
+                  jq --arg hash "$CONTENT_HASH" '.content_hash = $hash' /tmp/build-manifest.json > /tmp/build-manifest.json.tmp && mv /tmp/build-manifest.json.tmp /tmp/build-manifest.json
+
+                  # Check if already archived
+                  EXISTING=$(mc cat "pgraph/${MINIO_BUCKET}/tdb2/latest" 2>/dev/null || echo "none")
+                  if [ "$EXISTING" = "$CONTENT_HASH" ]; then
+                    echo "TDB2 ${CONTENT_HASH} already archived, no changes"
+                    exit 0
+                  fi
+
+                  # Stream tarball directly to Minio (no intermediate file — saves disk)
+                  echo "Streaming tarball to Minio..."
+                  tar -czf - -C /tmp tdb2/ | mc pipe "pgraph/${MINIO_BUCKET}/tdb2/${CONTENT_HASH}/tdb2.tar.gz"
+                  ARCHIVE_SIZE=$(mc stat "pgraph/${MINIO_BUCKET}/tdb2/${CONTENT_HASH}/tdb2.tar.gz" 2>&1 | grep "Size" | awk '{print $3, $4}')
+                  echo "Archive size: ${ARCHIVE_SIZE}"
+
+                  # Upload manifest
+                  mc cp /tmp/build-manifest.json "pgraph/${MINIO_BUCKET}/tdb2/${CONTENT_HASH}/manifest.json"
+
+                  # Save previous latest for rollback
+                  MC_RC=0; mc_cat_check "pgraph/${MINIO_BUCKET}/tdb2/latest" || MC_RC=$?
+                  if [ "$MC_RC" -eq 2 ]; then
+                    echo "FATAL: Minio error reading latest pointer — aborting"
+                    exit 1
+                  elif [ "$MC_RC" -eq 0 ]; then
+                    PREV_HASH="$MC_RESULT"
+                    echo "Previous latest found: ${PREV_HASH}"
+                  else
+                    PREV_HASH=""
+                    echo "No previous latest pointer — first promotion (rollback will delete pointer)"
+                  fi
+
+                  # Update latest pointer
+                  echo "${CONTENT_HASH}" | mc pipe "pgraph/${MINIO_BUCKET}/tdb2/latest"
+
+                  # Create dated tag
+                  DATE_TAG=$(date +%Y-%m-%d)
+                  echo "${CONTENT_HASH}" | mc pipe "pgraph/${MINIO_BUCKET}/tdb2/tags/${DATE_TAG}"
+
+                  echo "✓ Uploaded TDB2 snapshot (${CONTENT_HASH}, ${ARCHIVE_SIZE})"
+                  echo "  Tagged: latest, ${DATE_TAG}"
+
+                  # Trigger Fuseki rollout restart
+                  echo "Triggering Fuseki restart..."
+                  if ! kubectl rollout restart deployment/fuseki -n packagegraph 2>/dev/null; then
+                    echo "ERROR: rollout restart failed — rolling back"
+                    if [ -n "$PREV_HASH" ]; then
+                      echo "${PREV_HASH}" | mc pipe "pgraph/${MINIO_BUCKET}/tdb2/latest"
+                    else
+                      mc rm "pgraph/${MINIO_BUCKET}/tdb2/latest"
+                      echo "Deleted new pointer (first promotion rollback)"
+                    fi
+                    exit 1
+                  fi
+
+                  echo "Waiting for Fuseki rollout to complete (5m timeout)..."
+                  if ! kubectl rollout status deployment/fuseki -n packagegraph --timeout=300s 2>/dev/null; then
+                    echo "ERROR: Fuseki rollout not ready — rolling back"
+                    if [ -n "$PREV_HASH" ]; then
+                      echo "${PREV_HASH}" | mc pipe "pgraph/${MINIO_BUCKET}/tdb2/latest"
+                      kubectl rollout restart deployment/fuseki -n packagegraph 2>/dev/null || true
+                      echo "Waiting for rollback rollout to complete (5m timeout)..."
+                      kubectl rollout status deployment/fuseki -n packagegraph --timeout=300s 2>/dev/null || \
+                        echo "WARNING: rollback rollout did not complete within timeout"
+                    else
+                      mc rm "pgraph/${MINIO_BUCKET}/tdb2/latest"
+                      echo "Deleted new pointer (first promotion rollback — no previous state to restore)"
+                    fi
+                    exit 1
+                  fi
+
+                  # Persist success baseline for future completeness gate
+                  if ! echo "{\"status\":\"success\",\"timestamp\":\"$(date -Iseconds)\",\"content_hash\":\"$CONTENT_HASH\",\"graph_count\":$GRAPH_COUNT,\"triple_count\":$TOTAL_TRIPLES}" | \
+                    mc pipe "pgraph/${MINIO_BUCKET}/tdb2/last-success.json"; then
+                    echo "ERROR: failed to persist last-success.json — next rebuild may use stale baseline"
+                    exit 1
+                  fi
+
+                  echo "=== Rebuild complete: $(date -Iseconds) ==="
+              resources:
+                requests: {cpu: 500m, memory: 4Gi, ephemeral-storage: 30Gi}
+                limits: {cpu: "2", memory: 8Gi, ephemeral-storage: 100Gi}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}

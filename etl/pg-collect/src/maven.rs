@@ -23,6 +23,7 @@ pub struct MavenCollector {
     pub max_roots: usize,
     pub max_packages: usize,
     pub delay_ms: u64,
+    pub graph_uri: Option<String>,
 }
 
 /// Check whether a URL points to Maven Central over HTTPS.
@@ -129,7 +130,13 @@ impl MavenCollector {
             max_roots: 10_000,
             max_packages: 5_000,
             delay_ms: 500,
+            graph_uri: None,
         }
+    }
+
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     /// Enable HTTP caching for search and POM requests.
@@ -149,8 +156,14 @@ impl MavenCollector {
         self
     }
 
-    pub fn collect_discover(&self, endpoint: &str, output_path: &str) -> Result<(usize, usize)> {
-        let raw_names = crate::seed::discover_by_ecosystem(endpoint, "maven")?;
+    pub fn collect_discover(
+        &self,
+        endpoint: &str,
+        auth: &crate::sparql::SparqlAuth,
+        backend: crate::sparql::SparqlBackend,
+        output_path: &str,
+    ) -> Result<(usize, usize)> {
+        let raw_names = crate::seed::discover_by_ecosystem(endpoint, "maven", auth, backend)?;
         let raw_count = raw_names.len();
         let mut seen = HashSet::new();
         let seeds: Vec<(String, String)> = raw_names
@@ -263,7 +276,10 @@ impl MavenCollector {
                         e
                     );
                     return self.get_latest_version_direct(
-                        group_id, artifact_id, &url, base_delay_ms,
+                        group_id,
+                        artifact_id,
+                        &url,
+                        base_delay_ms,
                     );
                 }
             };
@@ -287,9 +303,7 @@ impl MavenCollector {
 
         // Semantic check: empty docs → negative-cache as 404 with 6h TTL.
         // Empty latestVersion → InvalidResponse, NOT cached.
-        self.parse_search_version_with_cache(
-            group_id, artifact_id, &url, &bytes, was_hit,
-        )
+        self.parse_search_version_with_cache(group_id, artifact_id, &url, &bytes, was_hit)
     }
 
     /// Direct search fetch without cache (shared by no-cache path and cache-init fallback).
@@ -395,9 +409,7 @@ impl MavenCollector {
                             }
                         }
                         Err(e) => {
-                            eprintln!(
-                                "  WARNING: negative cache init failed: {}", e
-                            );
+                            eprintln!("  WARNING: negative cache init failed: {}", e);
                         }
                     }
                 }
@@ -418,15 +430,14 @@ impl MavenCollector {
     ) -> std::result::Result<(PomMetadata, bool), (FetchError, bool)> {
         let pom_url = self.build_pom_url(group_id, artifact_id, version);
 
-        let pom_validator = |body: &[u8]| -> std::result::Result<(), String> {
-            validate_pom_xml(body)
-        };
+        let pom_validator =
+            |body: &[u8]| -> std::result::Result<(), String> { validate_pom_xml(body) };
 
         // TTL based on version classification
         let pom_ttl = match classify_version(Some(version)) {
-            VersionClass::ConcreteVersion(_) => None,             // indefinite
+            VersionClass::ConcreteVersion(_) => None, // indefinite
             VersionClass::Snapshot(_) => Some(Duration::from_secs(3600)), // 1h
-            _ => Some(Duration::from_secs(24 * 3600)),           // 24h default
+            _ => Some(Duration::from_secs(24 * 3600)), // 24h default
         };
 
         let (bytes, was_hit) = if let Some(ref cache) = self.http_cache {
@@ -438,7 +449,11 @@ impl MavenCollector {
                         e
                     );
                     return self.fetch_pom_direct(
-                        group_id, artifact_id, version, &pom_url, base_delay_ms,
+                        group_id,
+                        artifact_id,
+                        version,
+                        &pom_url,
+                        base_delay_ms,
                     );
                 }
             };
@@ -447,12 +462,9 @@ impl MavenCollector {
                 Duration::from_secs(6 * 3600), // negative_ttl: 6h for 404s
                 self.refresh,
             );
-            let outcome = fetcher.fetch(
-                &pom_url,
-                pom_ttl,
-                &pom_validator,
-                |req_url, etag| self.http_get_with_retry(req_url, etag, base_delay_ms, 5),
-            );
+            let outcome = fetcher.fetch(&pom_url, pom_ttl, &pom_validator, |req_url, etag| {
+                self.http_get_with_retry(req_url, etag, base_delay_ms, 5)
+            });
             let hit = outcome.was_network_hit;
             match outcome.result {
                 Ok(b) => (b, hit),
@@ -583,10 +595,7 @@ impl MavenCollector {
                             } else {
                                 2u64.pow(attempt + 1)
                             };
-                            eprintln!(
-                                "  HTTP {}, backing off {}s...",
-                                status, delay_secs
-                            );
+                            eprintln!("  HTTP {}, backing off {}s...", status, delay_secs);
                             std::thread::sleep(Duration::from_secs(delay_secs));
                             *base_delay_ms = (*base_delay_ms * 2).min(5000);
                             continue;
@@ -724,7 +733,11 @@ impl MavenCollector {
 
     /// Emit package metadata triples (everything except dependencies).
     /// Returns (triples_count, pkg_uri) so callers can emit deps separately.
-    fn emit_package_metadata(&self, writer: &mut NTriplesWriter, pom: &PomMetadata) -> Result<(usize, String)> {
+    fn emit_package_metadata(
+        &self,
+        writer: &mut NTriplesWriter,
+        pom: &PomMetadata,
+    ) -> Result<(usize, String)> {
         let name = format!("{}/{}", pom.group_id, pom.artifact_id);
         let identity_name = format!("{}:{}", pom.group_id, pom.artifact_id);
         let pkg_uri = package_uri("maven", "central", "any", &name, &pom.version);
@@ -783,7 +796,11 @@ impl MavenCollector {
 
         if let Some(scm_url) = &pom.scm_url {
             if let Some(repo_uri) = crate::uris::normalize_forge_url(scm_url) {
-                writer.write_triple(&identity_uri, &format!("{PKG}upstreamRepository"), &repo_uri)?;
+                writer.write_triple(
+                    &identity_uri,
+                    &format!("{PKG}upstreamRepository"),
+                    &repo_uri,
+                )?;
                 writer.write_triple(&repo_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
                 triples += 2;
 
@@ -797,7 +814,10 @@ impl MavenCollector {
 
         if let Some(tag) = &pom.scm_tag {
             if tag != "HEAD" && !tag.is_empty() {
-                let tag_uri = format!("{DATA}tag/maven/{}/{}/{}", pom.group_id, pom.artifact_id, tag);
+                let tag_uri = format!(
+                    "{DATA}tag/maven/{}/{}/{}",
+                    pom.group_id, pom.artifact_id, tag
+                );
                 writer.write_triple(&pkg_uri, &format!("{VCS}packagedFromTag"), &tag_uri)?;
                 writer.write_triple(&tag_uri, RDF_TYPE, &format!("{VCS}Tag"))?;
                 writer.write_literal(&tag_uri, &format!("{VCS}tagName"), tag)?;
@@ -811,7 +831,11 @@ impl MavenCollector {
     /// Emit all triples for an artifact (package metadata + all dependencies).
     /// Dependencies are resolved through pom.properties before emission.
     #[allow(dead_code)] // used by tests
-    fn emit_artifact_triples(&self, writer: &mut NTriplesWriter, pom: &PomMetadata) -> Result<usize> {
+    fn emit_artifact_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        pom: &PomMetadata,
+    ) -> Result<usize> {
         let (mut triples, pkg_uri) = self.emit_package_metadata(writer, pom)?;
 
         for (ordinal, dep) in pom.dependencies.iter().enumerate() {
@@ -857,7 +881,11 @@ impl MavenCollector {
         writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
         writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
         writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-        writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri(&resolved.scope))?;
+        writer.write_bnode_subject(
+            &bnode,
+            &format!("{PKG}dependencyType"),
+            &dep_type_uri(&resolved.scope),
+        )?;
         writer.write_bnode_literal(&bnode, &format!("{MAVEN}scope"), &resolved.scope)?;
         triples += 5;
 
@@ -867,12 +895,20 @@ impl MavenCollector {
         }
 
         if resolved.dependency_type != "jar" {
-            writer.write_bnode_literal(&bnode, &format!("{MAVEN}type"), &resolved.dependency_type)?;
+            writer.write_bnode_literal(
+                &bnode,
+                &format!("{MAVEN}type"),
+                &resolved.dependency_type,
+            )?;
             triples += 1;
         }
 
         if !resolved.classifier.is_empty() {
-            writer.write_bnode_literal(&bnode, &format!("{MAVEN}classifier"), &resolved.classifier)?;
+            writer.write_bnode_literal(
+                &bnode,
+                &format!("{MAVEN}classifier"),
+                &resolved.classifier,
+            )?;
             triples += 1;
         }
 
@@ -881,7 +917,11 @@ impl MavenCollector {
             writer.write_bnode_to_bnode(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
             writer.write_bnode_subject(&cb, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
             writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintOperator"), "maven")?;
-            writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintValue"), version_constraint)?;
+            writer.write_bnode_literal(
+                &cb,
+                &format!("{PKG}versionConstraintValue"),
+                version_constraint,
+            )?;
             triples += 4;
         }
 
@@ -889,9 +929,17 @@ impl MavenCollector {
             let excl_key = format!("{}#{}", dep_key, excl_idx);
             let excl_bnode = bnode_id("excl", &excl_key);
             writer.write_bnode_to_bnode(&bnode, &format!("{MAVEN}hasExclusion"), &excl_bnode)?;
-            writer.write_bnode_subject(&excl_bnode, RDF_TYPE, &format!("{MAVEN}DependencyExclusion"))?;
+            writer.write_bnode_subject(
+                &excl_bnode,
+                RDF_TYPE,
+                &format!("{MAVEN}DependencyExclusion"),
+            )?;
             writer.write_bnode_literal(&excl_bnode, &format!("{MAVEN}excludedGroupId"), excl_g)?;
-            writer.write_bnode_literal(&excl_bnode, &format!("{MAVEN}excludedArtifactId"), excl_a)?;
+            writer.write_bnode_literal(
+                &excl_bnode,
+                &format!("{MAVEN}excludedArtifactId"),
+                excl_a,
+            )?;
             triples += 4;
         }
 
@@ -912,13 +960,13 @@ impl MavenCollector {
         if seeds.is_empty() {
             eprintln!("WARNING: no seed coordinates provided, nothing to collect");
             let file = File::create(output_path)?;
-            let mut writer = NTriplesWriter::new(file);
+            let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
             writer.flush()?;
             return Ok((0, 0));
         }
 
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         self.emit_distribution_metadata(&mut writer)?;
 
@@ -1015,8 +1063,7 @@ impl MavenCollector {
                     state.fetched_ok += 1;
 
                     // Emit package metadata (without deps)
-                    let (pkg_triples, pkg_uri) =
-                        self.emit_package_metadata(&mut writer, &pom)?;
+                    let (pkg_triples, pkg_uri) = self.emit_package_metadata(&mut writer, &pom)?;
                     total_triples += pkg_triples;
                     total_packages += 1;
 
@@ -1030,13 +1077,8 @@ impl MavenCollector {
                         }
 
                         // Emit dependency triples
-                        total_triples += self.emit_resolved_dep(
-                            &mut writer,
-                            &pkg_uri,
-                            ordinal,
-                            dep,
-                            &resolved,
-                        )?;
+                        total_triples +=
+                            self.emit_resolved_dep(&mut writer, &pkg_uri, ordinal, dep, &resolved)?;
 
                         // Traverse only compile/runtime, non-optional
                         if !should_traverse_resolved(&resolved) {
@@ -1119,9 +1161,15 @@ impl MavenCollector {
         eprintln!("Root failures:        {}", state.root_resolution_failures);
         eprintln!("Scheduled:            {}", state.scheduled.len());
         eprintln!("Fetched OK:           {}", state.fetched_ok);
-        eprintln!("Fetch errors:         {} ({})", total_fetch_errors, error_breakdown);
+        eprintln!(
+            "Fetch errors:         {} ({})",
+            total_fetch_errors, error_breakdown
+        );
         eprintln!("Non-emittable:        {}", state.non_emittable_unresolved);
-        eprintln!("Non-traversable:      {} ({})", non_traversable_sum, non_traversable_breakdown);
+        eprintln!(
+            "Non-traversable:      {} ({})",
+            non_traversable_sum, non_traversable_breakdown
+        );
         eprintln!("Skipped (depth):      {}", state.skipped_depth);
         eprintln!("Skipped (limit):      {}", state.skipped_limit);
         eprintln!("Skipped (roots):      {}", state.skipped_roots);
@@ -1237,7 +1285,11 @@ fn resolve_dependency(pom: &PomMetadata, dep: &PomDependency) -> ResolvedDepende
         group_id: group_id.clone(),
         artifact_id: artifact_id.clone(),
         dependency_type: Some(dependency_type.clone()),
-        classifier: if classifier.is_empty() { None } else { Some(classifier.clone()) },
+        classifier: if classifier.is_empty() {
+            None
+        } else {
+            Some(classifier.clone())
+        },
         ..dep.clone()
     };
     let mgmt_version = lookup_in_dependency_management(pom, &resolved_dep_for_lookup);
@@ -1357,7 +1409,8 @@ fn parse_pom(
                 // Reset exclusion fields when entering an exclusion element
                 if name == "exclusion" && path.ends_with("/exclusions/exclusion") {
                     let dep_path_prefix_a = "project/dependencies/dependency/exclusions/exclusion";
-                    let dep_path_prefix_b = "project/dependencyManagement/dependencies/dependency/exclusions/exclusion";
+                    let dep_path_prefix_b =
+                        "project/dependencyManagement/dependencies/dependency/exclusions/exclusion";
                     if path == dep_path_prefix_a || path == dep_path_prefix_b {
                         current_exclusion_group_id.clear();
                         current_exclusion_artifact_id.clear();
@@ -1383,17 +1436,14 @@ fn parse_pom(
                 {
                     if path == "project/dependencies/dependency" {
                         pom.dependencies.push(current_dep.clone());
-                    } else if path
-                        == "project/dependencyManagement/dependencies/dependency"
-                    {
+                    } else if path == "project/dependencyManagement/dependencies/dependency" {
                         pom.dependency_management.push(current_dep.clone());
                     }
                 }
 
                 // Finalize exclusion
                 if name == "exclusion" {
-                    let dep_path_prefix_a =
-                        "project/dependencies/dependency/exclusions/exclusion";
+                    let dep_path_prefix_a = "project/dependencies/dependency/exclusions/exclusion";
                     let dep_path_prefix_b =
                         "project/dependencyManagement/dependencies/dependency/exclusions/exclusion";
                     if (path == dep_path_prefix_a || path == dep_path_prefix_b)
@@ -1477,56 +1527,37 @@ fn parse_pom(
                         && path_stack[1] == "properties"
                         && !current_property_name.is_empty() =>
                     {
-                        pom.properties
-                            .insert(current_property_name.clone(), text);
+                        pom.properties.insert(current_property_name.clone(), text);
                     }
 
                     // Dependency fields — only for recognized dependency paths
-                    "groupId"
-                        if is_dep_child_path(&path, "groupId") =>
-                    {
+                    "groupId" if is_dep_child_path(&path, "groupId") => {
                         current_dep.group_id = text;
                     }
-                    "artifactId"
-                        if is_dep_child_path(&path, "artifactId") =>
-                    {
+                    "artifactId" if is_dep_child_path(&path, "artifactId") => {
                         current_dep.artifact_id = text;
                     }
-                    "version"
-                        if is_dep_child_path(&path, "version") =>
-                    {
+                    "version" if is_dep_child_path(&path, "version") => {
                         current_dep.version = Some(text);
                     }
-                    "scope"
-                        if is_dep_child_path(&path, "scope") =>
-                    {
+                    "scope" if is_dep_child_path(&path, "scope") => {
                         current_dep.scope = Some(text);
                     }
-                    "optional"
-                        if is_dep_child_path(&path, "optional") =>
-                    {
+                    "optional" if is_dep_child_path(&path, "optional") => {
                         current_dep.optional = text == "true";
                     }
-                    "type"
-                        if is_dep_child_path(&path, "type") =>
-                    {
+                    "type" if is_dep_child_path(&path, "type") => {
                         current_dep.dependency_type = Some(text);
                     }
-                    "classifier"
-                        if is_dep_child_path(&path, "classifier") =>
-                    {
+                    "classifier" if is_dep_child_path(&path, "classifier") => {
                         current_dep.classifier = Some(text);
                     }
 
                     // Exclusion fields
-                    "groupId"
-                        if is_exclusion_child_path(&path, "groupId") =>
-                    {
+                    "groupId" if is_exclusion_child_path(&path, "groupId") => {
                         current_exclusion_group_id = text;
                     }
-                    "artifactId"
-                        if is_exclusion_child_path(&path, "artifactId") =>
-                    {
+                    "artifactId" if is_exclusion_child_path(&path, "artifactId") => {
                         current_exclusion_artifact_id = text;
                     }
 
@@ -1640,9 +1671,7 @@ fn interpolate_recursive(
         let resolved = match key.as_str() {
             "project.version" | "pom.version" => Some(pom_version.to_string()),
             "project.groupId" | "pom.groupId" => Some(pom_group_id.to_string()),
-            "project.artifactId" | "pom.artifactId" => {
-                Some(pom_artifact_id.to_string())
-            }
+            "project.artifactId" | "pom.artifactId" => Some(pom_artifact_id.to_string()),
             other => properties.get(other).cloned(),
         }?;
 
@@ -1691,10 +1720,7 @@ pub(crate) fn lookup_in_dependency_management(
     pom: &PomMetadata,
     dep: &PomDependency,
 ) -> Option<String> {
-    let dep_type = dep
-        .dependency_type
-        .as_deref()
-        .unwrap_or("jar");
+    let dep_type = dep.dependency_type.as_deref().unwrap_or("jar");
     let dep_classifier = dep.classifier.as_deref().unwrap_or("");
 
     for mgmt in &pom.dependency_management {
@@ -1712,10 +1738,7 @@ pub(crate) fn lookup_in_dependency_management(
             &pom.artifact_id,
             &pom.version,
         );
-        let mgmt_type_raw = mgmt
-            .dependency_type
-            .as_deref()
-            .unwrap_or("jar");
+        let mgmt_type_raw = mgmt.dependency_type.as_deref().unwrap_or("jar");
         let mgmt_type = interpolate_or_raw(
             mgmt_type_raw,
             &pom.properties,
@@ -1753,8 +1776,14 @@ fn interpolate_or_raw(
     pom_version: &str,
 ) -> String {
     if field.contains("${") {
-        interpolate_property(field, properties, pom_group_id, pom_artifact_id, pom_version)
-            .unwrap_or_else(|| field.to_string())
+        interpolate_property(
+            field,
+            properties,
+            pom_group_id,
+            pom_artifact_id,
+            pom_version,
+        )
+        .unwrap_or_else(|| field.to_string())
     } else {
         field.to_string()
     }
@@ -1766,8 +1795,7 @@ fn interpolate_or_raw(
 /// error pages, `<projects>` wrappers, comments, and truncated documents are
 /// all rejected.
 fn validate_pom_xml(body: &[u8]) -> std::result::Result<(), String> {
-    let text =
-        std::str::from_utf8(body).map_err(|e| format!("invalid UTF-8: {}", e))?;
+    let text = std::str::from_utf8(body).map_err(|e| format!("invalid UTF-8: {}", e))?;
     let mut reader = quick_xml::Reader::from_str(text);
     let mut buf = Vec::new();
     let mut depth: usize = 0;
@@ -1818,9 +1846,7 @@ fn validate_pom_xml(body: &[u8]) -> std::result::Result<(), String> {
                 if !found_project_root {
                     let text_val = t.unescape().unwrap_or_default();
                     if !text_val.trim().is_empty() {
-                        return Err(
-                            "non-whitespace text before <project>".into(),
-                        );
+                        return Err("non-whitespace text before <project>".into());
                     }
                     seen_non_decl = true;
                 }
@@ -1840,9 +1866,7 @@ fn validate_pom_xml(body: &[u8]) -> std::result::Result<(), String> {
                 }
                 seen_decl = true;
             }
-            Ok(Event::Comment(_)) | Ok(Event::PI(_))
-                if !found_project_root =>
-            {
+            Ok(Event::Comment(_)) | Ok(Event::PI(_)) if !found_project_root => {
                 seen_non_decl = true;
             }
             Ok(Event::DocType(_)) if !found_project_root => {
@@ -1874,9 +1898,7 @@ fn validate_pom_xml(body: &[u8]) -> std::result::Result<(), String> {
 /// After root `</project>` (or `<project/>`), verify only whitespace,
 /// comments, and PI remain before EOF. Reject trailing elements or
 /// non-whitespace text.
-fn validate_pom_trailing(
-    reader: &mut quick_xml::Reader<&[u8]>,
-) -> std::result::Result<(), String> {
+fn validate_pom_trailing(reader: &mut quick_xml::Reader<&[u8]>) -> std::result::Result<(), String> {
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
@@ -1884,26 +1906,17 @@ fn validate_pom_trailing(
             Ok(Event::Start(ref e)) => {
                 let name = e.name();
                 let n = String::from_utf8_lossy(name.as_ref());
-                return Err(format!(
-                    "trailing element <{}> after </project>",
-                    n
-                ));
+                return Err(format!("trailing element <{}> after </project>", n));
             }
             Ok(Event::Empty(ref e)) => {
                 let name = e.name();
                 let n = String::from_utf8_lossy(name.as_ref());
-                return Err(format!(
-                    "trailing element <{}> after </project>",
-                    n
-                ));
+                return Err(format!("trailing element <{}> after </project>", n));
             }
             Ok(Event::Text(ref t)) => {
                 let text_val = t.unescape().unwrap_or_default();
                 if !text_val.trim().is_empty() {
-                    return Err(
-                        "trailing non-whitespace text after </project>"
-                            .into(),
-                    );
+                    return Err("trailing non-whitespace text after </project>".into());
                 }
             }
             Ok(Event::Comment(_)) | Ok(Event::PI(_)) => {}
@@ -1919,9 +1932,7 @@ fn validate_pom_trailing(
             Ok(Event::End(_)) => {
                 return Err("unmatched end tag after document root".into());
             }
-            Err(e) => {
-                return Err(format!("XML parse error after root: {}", e))
-            }
+            Err(e) => return Err(format!("XML parse error after root: {}", e)),
         }
         buf.clear();
     }
@@ -1935,8 +1946,7 @@ fn validate_pom_trailing(
 ///   CachedFetcher does not cache malformed responses for 24h.
 /// - Unparseable JSON / non-JSON (proxy errors, Cloudflare) is rejected.
 fn validate_search_json(body: &[u8]) -> std::result::Result<(), String> {
-    let text =
-        std::str::from_utf8(body).map_err(|e| format!("non-UTF8: {}", e))?;
+    let text = std::str::from_utf8(body).map_err(|e| format!("non-UTF8: {}", e))?;
     let resp: SearchResponse =
         serde_json::from_str(text).map_err(|e| format!("JSON parse: {}", e))?;
     // Empty docs is valid (not-found) — accepted for caching
@@ -1992,8 +2002,17 @@ mod tests {
 
         let coords = read_maven_seed_file(temp.path().to_str().unwrap()).unwrap();
         assert_eq!(coords.len(), 2);
-        assert_eq!(coords[0], ("com.google.guava".to_string(), "guava".to_string()));
-        assert_eq!(coords[1], ("org.apache.commons".to_string(), "commons-lang3".to_string()));
+        assert_eq!(
+            coords[0],
+            ("com.google.guava".to_string(), "guava".to_string())
+        );
+        assert_eq!(
+            coords[1],
+            (
+                "org.apache.commons".to_string(),
+                "commons-lang3".to_string()
+            )
+        );
     }
 
     #[test]
@@ -2030,7 +2049,9 @@ mod tests {
             "https://search.maven.org".into(),
             "https://repo1.maven.org/maven2".into(),
         );
-        let pom = collector.parse_pom(pom_xml, "org.example", "my-lib", "1.0.0").unwrap();
+        let pom = collector
+            .parse_pom(pom_xml, "org.example", "my-lib", "1.0.0")
+            .unwrap();
 
         assert_eq!(pom.group_id, "org.example");
         assert_eq!(pom.artifact_id, "my-lib");
@@ -2074,7 +2095,11 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("maven#MavenArtifact"));
@@ -2112,12 +2137,23 @@ mod tests {
   </scm>
 </project>"#;
 
-        let pom = collector.parse_pom(pom_xml, "org.springframework", "spring-core", "6.2.0").unwrap();
-        assert_eq!(pom.scm_url.as_deref(), Some("https://github.com/spring-projects/spring-framework"));
-        assert_eq!(pom.scm_connection.as_deref(), Some("scm:git:git://github.com/spring-projects/spring-framework.git"));
+        let pom = collector
+            .parse_pom(pom_xml, "org.springframework", "spring-core", "6.2.0")
+            .unwrap();
+        assert_eq!(
+            pom.scm_url.as_deref(),
+            Some("https://github.com/spring-projects/spring-framework")
+        );
+        assert_eq!(
+            pom.scm_connection.as_deref(),
+            Some("scm:git:git://github.com/spring-projects/spring-framework.git")
+        );
         assert_eq!(pom.scm_tag.as_deref(), Some("v6.2.0"));
         // Verify project URL is NOT overwritten by SCM URL
-        assert_eq!(pom.url.as_deref(), Some("https://spring.io/projects/spring-framework"));
+        assert_eq!(
+            pom.url.as_deref(),
+            Some("https://spring.io/projects/spring-framework")
+        );
     }
 
     // ── is_maven_central tests ──────────────────────────────────────────
@@ -2144,7 +2180,9 @@ mod tests {
 
     #[test]
     fn test_not_maven_central_nexus() {
-        assert!(!is_maven_central("https://nexus.internal.org/repository/maven-public"));
+        assert!(!is_maven_central(
+            "https://nexus.internal.org/repository/maven-public"
+        ));
     }
 
     #[test]
@@ -2202,14 +2240,13 @@ mod tests {
             client: crate::enricher::default_http_client(),
             search_base: server.url(),
             repo_base: format!("{}/maven2", server.url()),
-            http_cache: Some(
-                HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap(),
-            ),
+            http_cache: Some(HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap()),
             refresh: false,
             max_depth: 3,
             max_roots: 10_000,
             max_packages: 5_000,
             delay_ms: 0,
+            graph_uri: None,
         };
 
         let mut delay = 1u64;
@@ -2248,14 +2285,13 @@ mod tests {
             client: crate::enricher::default_http_client(),
             search_base: server.url(),
             repo_base: format!("{}/maven2", server.url()),
-            http_cache: Some(
-                HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap(),
-            ),
+            http_cache: Some(HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap()),
             refresh: false,
             max_depth: 3,
             max_roots: 10_000,
             max_packages: 5_000,
             delay_ms: 0,
+            graph_uri: None,
         };
 
         let mut delay = 1u64;
@@ -2267,7 +2303,10 @@ mod tests {
 
         let r2 = collector.fetch_pom("org.ex", "lib", "1.0-SNAPSHOT", &mut delay);
         assert!(r2.is_ok());
-        assert!(r2.unwrap().1, "second call should hit network after TTL expiry");
+        assert!(
+            r2.unwrap().1,
+            "second call should hit network after TTL expiry"
+        );
     }
 
     #[test]
@@ -2282,7 +2321,10 @@ mod tests {
 
         // Search should be hit twice (once fresh, once after 24h expiry)
         let _search = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch/select.*".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch/select.*".into()),
+            )
             .with_status(200)
             .with_body(r#"{"response":{"docs":[{"latestVersion":"1.0"}]}}"#)
             .expect(2)
@@ -2292,14 +2334,13 @@ mod tests {
             client: crate::enricher::default_http_client(),
             search_base: server.url(),
             repo_base: format!("{}/maven2", server.url()),
-            http_cache: Some(
-                HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap(),
-            ),
+            http_cache: Some(HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap()),
             refresh: false,
             max_depth: 3,
             max_roots: 10_000,
             max_packages: 5_000,
             delay_ms: 0,
+            graph_uri: None,
         };
 
         let mut delay = 1u64;
@@ -2329,7 +2370,10 @@ mod tests {
 
         // Set up search and POM mocks (each hit exactly once)
         let search = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch/select.*".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch/select.*".into()),
+            )
             .with_status(200)
             .with_body(r#"{"response":{"docs":[{"latestVersion":"1.0"}]}}"#)
             .expect(1)
@@ -2341,12 +2385,9 @@ mod tests {
             .expect(1)
             .create();
 
-        let collector = MavenCollector::new(
-            server.url(),
-            format!("{}/maven2", server.url()),
-        )
-        .with_cache(tmp.path().to_str().unwrap())
-        .unwrap();
+        let collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()))
+            .with_cache(tmp.path().to_str().unwrap())
+            .unwrap();
 
         let mut delay = 1u64;
 
@@ -2372,8 +2413,7 @@ mod tests {
         let cache_dir = tmp.path().to_str().unwrap();
         let clock = Arc::new(MockClock::new(1_000_000));
 
-        let cache =
-            HttpCache::with_clock(cache_dir, "maven-refresh-test", clock.clone()).unwrap();
+        let cache = HttpCache::with_clock(cache_dir, "maven-refresh-test", clock.clone()).unwrap();
 
         // Put a fresh entry
         cache
@@ -2564,7 +2604,9 @@ mod tests {
         let xml = b"<project></project><?xml version=\"1.0\"?>";
         let result = validate_pom_xml(xml);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("XML declaration after document root"));
+        assert!(result
+            .unwrap_err()
+            .contains("XML declaration after document root"));
     }
 
     #[test]
@@ -2572,7 +2614,9 @@ mod tests {
         let xml = b"<!-- comment --><?xml version=\"1.0\"?><project/>";
         let result = validate_pom_xml(xml);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("XML declaration must be first"));
+        assert!(result
+            .unwrap_err()
+            .contains("XML declaration must be first"));
     }
 
     #[test]
@@ -2594,7 +2638,9 @@ mod tests {
         let xml = b"<project><?xml version=\"1.0\"?></project>";
         let result = validate_pom_xml(xml);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("XML declaration inside document root"));
+        assert!(result
+            .unwrap_err()
+            .contains("XML declaration inside document root"));
     }
 
     #[test]
@@ -2665,10 +2711,7 @@ mod tests {
             .create();
 
         // No cache — exercises the direct path
-        let collector = MavenCollector::new(
-            server.url(),
-            format!("{}/maven2", server.url()),
-        );
+        let collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
 
         let mut delay = 1u64;
         let result = collector.fetch_pom("org.proxy", "lib", "1.0", &mut delay);
@@ -2691,10 +2734,7 @@ mod tests {
             .with_body("<project><groupId>org.trunc2</groupId>")
             .create();
 
-        let collector = MavenCollector::new(
-            server.url(),
-            format!("{}/maven2", server.url()),
-        );
+        let collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
 
         let mut delay = 1u64;
         let result = collector.fetch_pom("org.trunc2", "lib", "1.0", &mut delay);
@@ -2715,18 +2755,18 @@ mod tests {
         // Returns a doc with empty latestVersion — should NOT be negative-cached.
         // Validator rejects → CachedFetcher does NOT cache the 200 body.
         let mock = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch/select.*".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch/select.*".into()),
+            )
             .with_status(200)
             .with_body(r#"{"response":{"docs":[{"latestVersion":""}]}}"#)
             .expect(2) // both calls hit network (not cached)
             .create();
 
-        let collector = MavenCollector::new(
-            server.url(),
-            format!("{}/maven2", server.url()),
-        )
-        .with_cache(tmp.path().to_str().unwrap())
-        .unwrap();
+        let collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()))
+            .with_cache(tmp.path().to_str().unwrap())
+            .unwrap();
 
         let mut delay = 1u64;
 
@@ -2754,7 +2794,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         let search_mock = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch/select.*".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch/select.*".into()),
+            )
             .with_status(200)
             .with_body(r#"{"response":{"docs":[{"latestVersion":"1.0.0"}]}}"#)
             .expect(1)
@@ -2774,12 +2817,9 @@ mod tests {
             .expect(1)
             .create();
 
-        let collector = MavenCollector::new(
-            server.url(),
-            format!("{}/maven2", server.url()),
-        )
-        .with_cache(tmp.path().to_str().unwrap())
-        .unwrap();
+        let collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()))
+            .with_cache(tmp.path().to_str().unwrap())
+            .unwrap();
 
         let mut delay = 1u64;
 
@@ -2808,8 +2848,7 @@ mod tests {
         let clock = Arc::new(MockClock::new(1_000_000));
 
         // Pre-seed POM cache with expired entry containing ETag
-        let pom_cache =
-            HttpCache::with_clock(cache_dir, "maven-pom", clock.clone()).unwrap();
+        let pom_cache = HttpCache::with_clock(cache_dir, "maven-pom", clock.clone()).unwrap();
         pom_cache
             .put(
                 &format!(
@@ -2825,7 +2864,10 @@ mod tests {
         clock.advance(60);
 
         let _search = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch/select.*".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch/select.*".into()),
+            )
             .with_status(200)
             .with_body(r#"{"response":{"docs":[{"latestVersion":"2.0.0"}]}}"#)
             .create();
@@ -2841,14 +2883,13 @@ mod tests {
             client: crate::enricher::default_http_client(),
             search_base: server.url(),
             repo_base: format!("{}/maven2", server.url()),
-            http_cache: Some(
-                HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap(),
-            ),
+            http_cache: Some(HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap()),
             refresh: false,
             max_depth: 3,
             max_roots: 10_000,
             max_packages: 5_000,
             delay_ms: 0,
+            graph_uri: None,
         };
 
         let mut delay = 1u64;
@@ -2871,8 +2912,7 @@ mod tests {
         let pom_body = br#"<?xml version="1.0"?><project><groupId>org.stale</groupId><artifactId>lib</artifactId><version>1.0</version></project>"#;
 
         // Pre-seed stale POM entry
-        let pom_cache =
-            HttpCache::with_clock(cache_dir, "maven-pom", clock.clone()).unwrap();
+        let pom_cache = HttpCache::with_clock(cache_dir, "maven-pom", clock.clone()).unwrap();
         pom_cache
             .put(test_url, pom_body, None, 200, Some(Duration::from_secs(1)))
             .unwrap();
@@ -2935,18 +2975,18 @@ mod tests {
         // Validator rejects → CachedFetcher doesn't cache as 200.
         // Collector manually caches 404 with 6h negative TTL.
         let empty_mock = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch/select.*".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch/select.*".into()),
+            )
             .with_status(200)
             .with_body(r#"{"response":{"docs":[]}}"#)
             .expect(1) // only one network call
             .create();
 
-        let collector = MavenCollector::new(
-            server.url(),
-            format!("{}/maven2", server.url()),
-        )
-        .with_cache(tmp.path().to_str().unwrap())
-        .unwrap();
+        let collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()))
+            .with_cache(tmp.path().to_str().unwrap())
+            .unwrap();
 
         let mut delay = 1u64;
 
@@ -2983,7 +3023,10 @@ mod tests {
 
         // First call returns empty docs, second (after 6h+) also returns empty docs
         let _empty = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch/select.*".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch/select.*".into()),
+            )
             .with_status(200)
             .with_body(r#"{"response":{"docs":[]}}"#)
             .expect(2) // hit twice: initial + after negative TTL expires
@@ -2993,14 +3036,13 @@ mod tests {
             client: crate::enricher::default_http_client(),
             search_base: server.url(),
             repo_base: format!("{}/maven2", server.url()),
-            http_cache: Some(
-                HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap(),
-            ),
+            http_cache: Some(HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap()),
             refresh: false,
             max_depth: 3,
             max_roots: 10_000,
             max_packages: 5_000,
             delay_ms: 0,
+            graph_uri: None,
         };
 
         let mut delay = 1u64;
@@ -3035,12 +3077,9 @@ mod tests {
             .expect(2)
             .create();
 
-        let collector = MavenCollector::new(
-            server.url(),
-            format!("{}/maven2", server.url()),
-        )
-        .with_cache(tmp.path().to_str().unwrap())
-        .unwrap();
+        let collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()))
+            .with_cache(tmp.path().to_str().unwrap())
+            .unwrap();
 
         let mut delay = 1u64;
         let r1 = collector.fetch_pom("org.bad", "lib", "1.0", &mut delay);
@@ -3063,12 +3102,9 @@ mod tests {
             .expect(2) // not cached, so hit twice
             .create();
 
-        let collector = MavenCollector::new(
-            server.url(),
-            format!("{}/maven2", server.url()),
-        )
-        .with_cache(tmp.path().to_str().unwrap())
-        .unwrap();
+        let collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()))
+            .with_cache(tmp.path().to_str().unwrap())
+            .unwrap();
 
         let mut delay = 1u64;
         let r1 = collector.fetch_pom("org.trunc", "lib", "1.0", &mut delay);
@@ -3097,16 +3133,17 @@ mod tests {
             .expect(1)
             .create();
 
-        let collector = MavenCollector::new(
-            server.url(),
-            format!("{}/maven2", server.url()),
-        )
-        .with_cache(tmp.path().to_str().unwrap())
-        .unwrap();
+        let collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()))
+            .with_cache(tmp.path().to_str().unwrap())
+            .unwrap();
 
         let mut delay = 1u64;
         let result = collector.fetch_pom("org.retry", "lib", "1.0", &mut delay);
-        assert!(result.is_ok(), "Expected retry to succeed, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Expected retry to succeed, got: {:?}",
+            result.err()
+        );
         let (pom, was_hit) = result.unwrap();
         assert_eq!(pom.group_id, "org.retry");
         assert!(was_hit);
@@ -3120,7 +3157,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         let _search = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch/select.*".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch/select.*".into()),
+            )
             .with_status(200)
             .with_body(r#"{"response":{"docs":[{"latestVersion":"1.0"}]}}"#)
             .create();
@@ -3133,12 +3173,9 @@ mod tests {
             .expect(1)
             .create();
 
-        let collector = MavenCollector::new(
-            server.url(),
-            format!("{}/maven2", server.url()),
-        )
-        .with_cache(tmp.path().to_str().unwrap())
-        .unwrap();
+        let collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()))
+            .with_cache(tmp.path().to_str().unwrap())
+            .unwrap();
 
         let mut delay = 1u64;
         let result = collector.fetch_artifact_with_retry("org.fail", "lib", &mut delay);
@@ -3296,29 +3333,21 @@ mod tests {
     #[test]
     fn test_interpolate_project_version() {
         let props = HashMap::new();
-        let result =
-            interpolate_property("${project.version}", &props, "g", "a", "1.2.3");
+        let result = interpolate_property("${project.version}", &props, "g", "a", "1.2.3");
         assert_eq!(result, Some("1.2.3".to_string()));
     }
 
     #[test]
     fn test_interpolate_project_group_id() {
         let props = HashMap::new();
-        let result =
-            interpolate_property("${project.groupId}", &props, "org.example", "a", "1.0");
+        let result = interpolate_property("${project.groupId}", &props, "org.example", "a", "1.0");
         assert_eq!(result, Some("org.example".to_string()));
     }
 
     #[test]
     fn test_interpolate_project_artifact_id() {
         let props = HashMap::new();
-        let result = interpolate_property(
-            "${project.artifactId}",
-            &props,
-            "g",
-            "my-lib",
-            "1.0",
-        );
+        let result = interpolate_property("${project.artifactId}", &props, "g", "my-lib", "1.0");
         assert_eq!(result, Some("my-lib".to_string()));
     }
 
@@ -3326,24 +3355,21 @@ mod tests {
     fn test_interpolate_custom_property() {
         let mut props = HashMap::new();
         props.insert("spring.version".to_string(), "6.0.0".to_string());
-        let result =
-            interpolate_property("${spring.version}", &props, "g", "a", "1.0");
+        let result = interpolate_property("${spring.version}", &props, "g", "a", "1.0");
         assert_eq!(result, Some("6.0.0".to_string()));
     }
 
     #[test]
     fn test_interpolate_unresolvable_returns_none() {
         let props = HashMap::new();
-        let result =
-            interpolate_property("${parent.version}", &props, "g", "a", "1.0");
+        let result = interpolate_property("${parent.version}", &props, "g", "a", "1.0");
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_interpolate_no_placeholder() {
         let props = HashMap::new();
-        let result =
-            interpolate_property("1.2.3", &props, "g", "a", "1.0");
+        let result = interpolate_property("1.2.3", &props, "g", "a", "1.0");
         assert_eq!(result, Some("1.2.3".to_string()));
     }
 
@@ -3379,8 +3405,7 @@ mod tests {
     #[test]
     fn test_interpolate_pom_version_alias() {
         let props = HashMap::new();
-        let result =
-            interpolate_property("${pom.version}", &props, "g", "a", "3.0.0");
+        let result = interpolate_property("${pom.version}", &props, "g", "a", "3.0.0");
         assert_eq!(result, Some("3.0.0".to_string()));
     }
 
@@ -3628,10 +3653,7 @@ mod tests {
             pom.dependencies[0].dependency_type.as_deref(),
             Some("test-jar")
         );
-        assert_eq!(
-            pom.dependencies[0].classifier.as_deref(),
-            Some("sources")
-        );
+        assert_eq!(pom.dependencies[0].classifier.as_deref(), Some("sources"));
 
         // Second dep: no type or classifier -> None (caller defaults)
         assert!(pom.dependencies[1].dependency_type.is_none());
@@ -3660,9 +3682,7 @@ mod tests {
         assert_eq!(pom.properties.get("spring.version").unwrap(), "6.0.0");
         assert_eq!(pom.properties.get("java.version").unwrap(), "17");
         assert_eq!(
-            pom.properties
-                .get("project.build.sourceEncoding")
-                .unwrap(),
+            pom.properties.get("project.build.sourceEncoding").unwrap(),
             "UTF-8"
         );
     }
@@ -3838,15 +3858,29 @@ mod tests {
 
         // Step 1: Interpolate all coordinate fields
         let resolved_group = interpolate_property(
-            &dep.group_id, &pom.properties, &pom.group_id, &pom.artifact_id, &pom.version,
-        ).unwrap();
+            &dep.group_id,
+            &pom.properties,
+            &pom.group_id,
+            &pom.artifact_id,
+            &pom.version,
+        )
+        .unwrap();
         let resolved_artifact = interpolate_property(
-            &dep.artifact_id, &pom.properties, &pom.group_id, &pom.artifact_id, &pom.version,
-        ).unwrap();
+            &dep.artifact_id,
+            &pom.properties,
+            &pom.group_id,
+            &pom.artifact_id,
+            &pom.version,
+        )
+        .unwrap();
         let resolved_type = interpolate_property(
             dep.dependency_type.as_deref().unwrap(),
-            &pom.properties, &pom.group_id, &pom.artifact_id, &pom.version,
-        ).unwrap();
+            &pom.properties,
+            &pom.group_id,
+            &pom.artifact_id,
+            &pom.version,
+        )
+        .unwrap();
 
         assert_eq!(resolved_group, "org.example");
         assert_eq!(resolved_artifact, "my-lib");
@@ -3871,8 +3905,12 @@ mod tests {
         // Step 4: Interpolate the management version
         let resolved_version = interpolate_property(
             mgmt_version.as_deref().unwrap(),
-            &pom.properties, &pom.group_id, &pom.artifact_id, &pom.version,
-        ).unwrap();
+            &pom.properties,
+            &pom.group_id,
+            &pom.artifact_id,
+            &pom.version,
+        )
+        .unwrap();
 
         // Final result: fully resolved, no ${...} values remain
         assert_eq!(resolved_group, "org.example");
@@ -4057,7 +4095,10 @@ mod tests {
         let pkg = "https://example.org/pkg/1";
         let id_jar = dep_identity(pkg, 0, &dep_jar);
         let id_test_jar = dep_identity(pkg, 1, &dep_test_jar);
-        assert_ne!(id_jar, id_test_jar, "jar vs test-jar must produce distinct identities");
+        assert_ne!(
+            id_jar, id_test_jar,
+            "jar vs test-jar must produce distinct identities"
+        );
 
         let bnode_jar = bnode_id("dep", &id_jar);
         let bnode_test_jar = bnode_id("dep", &id_test_jar);
@@ -4107,7 +4148,10 @@ mod tests {
         let pkg = "https://example.org/pkg/1";
         let id_0 = dep_identity(pkg, 0, &dep);
         let id_1 = dep_identity(pkg, 1, &dep);
-        assert_ne!(id_0, id_1, "different ordinals must produce distinct identities");
+        assert_ne!(
+            id_0, id_1,
+            "different ordinals must produce distinct identities"
+        );
     }
 
     #[test]
@@ -4184,21 +4228,55 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("maven#hasExclusion"), "missing hasExclusion predicate");
-        assert!(content.contains("maven#DependencyExclusion"), "missing DependencyExclusion type");
-        assert!(content.contains("maven#excludedGroupId"), "missing excludedGroupId");
-        assert!(content.contains("maven#excludedArtifactId"), "missing excludedArtifactId");
-        assert!(content.contains("\"com.excluded\""), "missing excluded groupId value");
-        assert!(content.contains("\"bad-lib\""), "missing excluded artifactId value");
-        assert!(content.contains("\"*\""), "wildcard exclusion must be emitted as literal '*'");
+        assert!(
+            content.contains("maven#hasExclusion"),
+            "missing hasExclusion predicate"
+        );
+        assert!(
+            content.contains("maven#DependencyExclusion"),
+            "missing DependencyExclusion type"
+        );
+        assert!(
+            content.contains("maven#excludedGroupId"),
+            "missing excludedGroupId"
+        );
+        assert!(
+            content.contains("maven#excludedArtifactId"),
+            "missing excludedArtifactId"
+        );
+        assert!(
+            content.contains("\"com.excluded\""),
+            "missing excluded groupId value"
+        );
+        assert!(
+            content.contains("\"bad-lib\""),
+            "missing excluded artifactId value"
+        );
+        assert!(
+            content.contains("\"*\""),
+            "wildcard exclusion must be emitted as literal '*'"
+        );
 
-        let excl_count = content.lines()
+        let excl_count = content
+            .lines()
             .filter(|l| l.contains("maven#hasExclusion"))
             .count();
-        assert_eq!(excl_count, 2, "expected 2 hasExclusion triples, got {}", excl_count);
-        assert!(triples > 10, "expected at least base + exclusion triples, got {}", triples);
+        assert_eq!(
+            excl_count, 2,
+            "expected 2 hasExclusion triples, got {}",
+            excl_count
+        );
+        assert!(
+            triples > 10,
+            "expected at least base + exclusion triples, got {}",
+            triples
+        );
     }
 
     #[test]
@@ -4243,17 +4321,32 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("maven#type"), "missing type predicate for test-jar");
+        assert!(
+            content.contains("maven#type"),
+            "missing type predicate for test-jar"
+        );
         assert!(content.contains("\"test-jar\""), "missing test-jar literal");
-        assert!(content.contains("maven#classifier"), "missing classifier predicate");
-        assert!(content.contains("\"sources\""), "missing sources classifier literal");
+        assert!(
+            content.contains("maven#classifier"),
+            "missing classifier predicate"
+        );
+        assert!(
+            content.contains("\"sources\""),
+            "missing sources classifier literal"
+        );
 
-        let type_count = content.lines()
-            .filter(|l| l.contains("maven#type"))
-            .count();
-        assert_eq!(type_count, 1, "jar type should not be emitted, got {} type triples", type_count);
+        let type_count = content.lines().filter(|l| l.contains("maven#type")).count();
+        assert_eq!(
+            type_count, 1,
+            "jar type should not be emitted, got {} type triples",
+            type_count
+        );
     }
 
     #[test]
@@ -4298,15 +4391,29 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        let dep_triples: Vec<&str> = content.lines()
+        let dep_triples: Vec<&str> = content
+            .lines()
             .filter(|l| l.contains("core#hasDependency"))
             .collect();
         assert_eq!(dep_triples.len(), 2, "expected 2 hasDependency triples");
-        assert_ne!(dep_triples[0], dep_triples[1], "dependency blank nodes must be distinct");
-        assert!(content.contains("\"com.x\""), "missing first dep's exclusion groupId");
-        assert!(content.contains("\"com.z\""), "missing second dep's exclusion groupId");
+        assert_ne!(
+            dep_triples[0], dep_triples[1],
+            "dependency blank nodes must be distinct"
+        );
+        assert!(
+            content.contains("\"com.x\""),
+            "missing first dep's exclusion groupId"
+        );
+        assert!(
+            content.contains("\"com.z\""),
+            "missing second dep's exclusion groupId"
+        );
     }
 
     #[test]
@@ -4349,7 +4456,10 @@ mod tests {
         assert_eq!(dep.dependency_type.as_deref(), Some("test-jar"));
         assert_eq!(dep.classifier.as_deref(), Some("sources"));
         assert_eq!(dep.exclusions.len(), 2);
-        assert_eq!(dep.exclusions[0], ("com.unwanted".to_string(), "bad".to_string()));
+        assert_eq!(
+            dep.exclusions[0],
+            ("com.unwanted".to_string(), "bad".to_string())
+        );
         assert_eq!(dep.exclusions[1], ("*".to_string(), "*".to_string()));
     }
 
@@ -4386,14 +4496,23 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        let excl_count = content.lines()
+        let excl_count = content
+            .lines()
             .filter(|l| l.contains("maven#hasExclusion"))
             .count();
-        assert_eq!(excl_count, 2, "identical exclusions must produce 2 distinct nodes");
+        assert_eq!(
+            excl_count, 2,
+            "identical exclusions must produce 2 distinct nodes"
+        );
 
-        let type_count = content.lines()
+        let type_count = content
+            .lines()
             .filter(|l| l.contains("maven#DependencyExclusion"))
             .count();
         assert_eq!(type_count, 2, "expected 2 DependencyExclusion type triples");
@@ -4481,7 +4600,10 @@ mod tests {
         };
         let resolved = resolve_dependency(&pom, &dep);
         assert_eq!(resolved.version.as_deref(), Some("2.5.0"));
-        assert!(matches!(resolved.version_class, VersionClass::ConcreteVersion(_)));
+        assert!(matches!(
+            resolved.version_class,
+            VersionClass::ConcreteVersion(_)
+        ));
     }
 
     #[test]
@@ -4557,7 +4679,10 @@ mod tests {
         };
         let resolved = resolve_dependency(&pom, &dep);
         assert_eq!(resolved.version.as_deref(), Some("3.2.1"));
-        assert!(matches!(resolved.version_class, VersionClass::ConcreteVersion(_)));
+        assert!(matches!(
+            resolved.version_class,
+            VersionClass::ConcreteVersion(_)
+        ));
     }
 
     #[test]
@@ -4607,18 +4732,32 @@ mod tests {
         assert!(should_traverse_resolved(&base));
 
         let test_scope = ResolvedDependency {
-            group_id: "g".into(), artifact_id: "a".into(), version: Some("1.0".into()),
-            dependency_type: "jar".into(), classifier: String::new(), scope: "test".into(),
-            optional: false, exclusions: vec![], raw_version_expr: None,
-            version_class: VersionClass::ConcreteVersion("1.0".into()), is_emittable: true,
+            group_id: "g".into(),
+            artifact_id: "a".into(),
+            version: Some("1.0".into()),
+            dependency_type: "jar".into(),
+            classifier: String::new(),
+            scope: "test".into(),
+            optional: false,
+            exclusions: vec![],
+            raw_version_expr: None,
+            version_class: VersionClass::ConcreteVersion("1.0".into()),
+            is_emittable: true,
         };
         assert!(!should_traverse_resolved(&test_scope));
 
         let optional = ResolvedDependency {
-            group_id: "g".into(), artifact_id: "a".into(), version: Some("1.0".into()),
-            dependency_type: "jar".into(), classifier: String::new(), scope: "compile".into(),
-            optional: true, exclusions: vec![], raw_version_expr: None,
-            version_class: VersionClass::ConcreteVersion("1.0".into()), is_emittable: true,
+            group_id: "g".into(),
+            artifact_id: "a".into(),
+            version: Some("1.0".into()),
+            dependency_type: "jar".into(),
+            classifier: String::new(),
+            scope: "compile".into(),
+            optional: true,
+            exclusions: vec![],
+            raw_version_expr: None,
+            version_class: VersionClass::ConcreteVersion("1.0".into()),
+            is_emittable: true,
         };
         assert!(!should_traverse_resolved(&optional));
     }
@@ -4636,13 +4775,22 @@ mod tests {
     #[test]
     fn test_try_enqueue_respects_depth_limit() {
         let mut state = TraversalState {
-            queue: VecDeque::new(), scheduled: HashSet::new(),
-            roots_provided: 0, roots_unique: 0, roots_resolved: 0,
-            root_resolution_failures: 0, fetched_ok: 0,
-            fetch_errors: HashMap::new(), non_emittable_unresolved: 0,
-            non_traversable_snapshot: 0, non_traversable_range: 0,
-            non_traversable_unresolved: 0, non_traversable_special: 0,
-            skipped_depth: 0, skipped_limit: 0, skipped_roots: 0,
+            queue: VecDeque::new(),
+            scheduled: HashSet::new(),
+            roots_provided: 0,
+            roots_unique: 0,
+            roots_resolved: 0,
+            root_resolution_failures: 0,
+            fetched_ok: 0,
+            fetch_errors: HashMap::new(),
+            non_emittable_unresolved: 0,
+            non_traversable_snapshot: 0,
+            non_traversable_range: 0,
+            non_traversable_unresolved: 0,
+            non_traversable_special: 0,
+            skipped_depth: 0,
+            skipped_limit: 0,
+            skipped_roots: 0,
         };
         try_enqueue(&mut state, "g", "a", "1.0", 1, 1, 100);
         assert_eq!(state.queue.len(), 1);
@@ -4654,13 +4802,22 @@ mod tests {
     #[test]
     fn test_try_enqueue_deduplicates() {
         let mut state = TraversalState {
-            queue: VecDeque::new(), scheduled: HashSet::new(),
-            roots_provided: 0, roots_unique: 0, roots_resolved: 0,
-            root_resolution_failures: 0, fetched_ok: 0,
-            fetch_errors: HashMap::new(), non_emittable_unresolved: 0,
-            non_traversable_snapshot: 0, non_traversable_range: 0,
-            non_traversable_unresolved: 0, non_traversable_special: 0,
-            skipped_depth: 0, skipped_limit: 0, skipped_roots: 0,
+            queue: VecDeque::new(),
+            scheduled: HashSet::new(),
+            roots_provided: 0,
+            roots_unique: 0,
+            roots_resolved: 0,
+            root_resolution_failures: 0,
+            fetched_ok: 0,
+            fetch_errors: HashMap::new(),
+            non_emittable_unresolved: 0,
+            non_traversable_snapshot: 0,
+            non_traversable_range: 0,
+            non_traversable_unresolved: 0,
+            non_traversable_special: 0,
+            skipped_depth: 0,
+            skipped_limit: 0,
+            skipped_roots: 0,
         };
         try_enqueue(&mut state, "g", "a", "1.0", 0, 3, 100);
         try_enqueue(&mut state, "g", "a", "1.0", 0, 3, 100);
@@ -4671,13 +4828,22 @@ mod tests {
     #[test]
     fn test_try_enqueue_respects_max_packages() {
         let mut state = TraversalState {
-            queue: VecDeque::new(), scheduled: HashSet::new(),
-            roots_provided: 0, roots_unique: 0, roots_resolved: 0,
-            root_resolution_failures: 0, fetched_ok: 0,
-            fetch_errors: HashMap::new(), non_emittable_unresolved: 0,
-            non_traversable_snapshot: 0, non_traversable_range: 0,
-            non_traversable_unresolved: 0, non_traversable_special: 0,
-            skipped_depth: 0, skipped_limit: 0, skipped_roots: 0,
+            queue: VecDeque::new(),
+            scheduled: HashSet::new(),
+            roots_provided: 0,
+            roots_unique: 0,
+            roots_resolved: 0,
+            root_resolution_failures: 0,
+            fetched_ok: 0,
+            fetch_errors: HashMap::new(),
+            non_emittable_unresolved: 0,
+            non_traversable_snapshot: 0,
+            non_traversable_range: 0,
+            non_traversable_unresolved: 0,
+            non_traversable_special: 0,
+            skipped_depth: 0,
+            skipped_limit: 0,
+            skipped_roots: 0,
         };
         try_enqueue(&mut state, "g", "a", "1.0", 0, 3, 2);
         try_enqueue(&mut state, "g", "b", "1.0", 0, 3, 2);
@@ -4690,13 +4856,22 @@ mod tests {
     #[test]
     fn test_max_depth_zero_is_seed_only() {
         let mut state = TraversalState {
-            queue: VecDeque::new(), scheduled: HashSet::new(),
-            roots_provided: 0, roots_unique: 0, roots_resolved: 0,
-            root_resolution_failures: 0, fetched_ok: 0,
-            fetch_errors: HashMap::new(), non_emittable_unresolved: 0,
-            non_traversable_snapshot: 0, non_traversable_range: 0,
-            non_traversable_unresolved: 0, non_traversable_special: 0,
-            skipped_depth: 0, skipped_limit: 0, skipped_roots: 0,
+            queue: VecDeque::new(),
+            scheduled: HashSet::new(),
+            roots_provided: 0,
+            roots_unique: 0,
+            roots_resolved: 0,
+            root_resolution_failures: 0,
+            fetched_ok: 0,
+            fetch_errors: HashMap::new(),
+            non_emittable_unresolved: 0,
+            non_traversable_snapshot: 0,
+            non_traversable_range: 0,
+            non_traversable_unresolved: 0,
+            non_traversable_special: 0,
+            skipped_depth: 0,
+            skipped_limit: 0,
+            skipped_roots: 0,
         };
         try_enqueue(&mut state, "g", "a", "1.0", 0, 0, 100);
         assert_eq!(state.queue.len(), 1);
@@ -4708,13 +4883,22 @@ mod tests {
     #[test]
     fn test_cycle_detection_via_scheduled_set() {
         let mut state = TraversalState {
-            queue: VecDeque::new(), scheduled: HashSet::new(),
-            roots_provided: 0, roots_unique: 0, roots_resolved: 0,
-            root_resolution_failures: 0, fetched_ok: 0,
-            fetch_errors: HashMap::new(), non_emittable_unresolved: 0,
-            non_traversable_snapshot: 0, non_traversable_range: 0,
-            non_traversable_unresolved: 0, non_traversable_special: 0,
-            skipped_depth: 0, skipped_limit: 0, skipped_roots: 0,
+            queue: VecDeque::new(),
+            scheduled: HashSet::new(),
+            roots_provided: 0,
+            roots_unique: 0,
+            roots_resolved: 0,
+            root_resolution_failures: 0,
+            fetched_ok: 0,
+            fetch_errors: HashMap::new(),
+            non_emittable_unresolved: 0,
+            non_traversable_snapshot: 0,
+            non_traversable_range: 0,
+            non_traversable_unresolved: 0,
+            non_traversable_special: 0,
+            skipped_depth: 0,
+            skipped_limit: 0,
+            skipped_roots: 0,
         };
         try_enqueue(&mut state, "g", "A", "1.0", 0, 3, 100);
         try_enqueue(&mut state, "g", "B", "1.0", 1, 3, 100);
@@ -4726,13 +4910,22 @@ mod tests {
     #[test]
     fn test_dense_fan_out_bounded() {
         let mut state = TraversalState {
-            queue: VecDeque::new(), scheduled: HashSet::new(),
-            roots_provided: 0, roots_unique: 0, roots_resolved: 0,
-            root_resolution_failures: 0, fetched_ok: 0,
-            fetch_errors: HashMap::new(), non_emittable_unresolved: 0,
-            non_traversable_snapshot: 0, non_traversable_range: 0,
-            non_traversable_unresolved: 0, non_traversable_special: 0,
-            skipped_depth: 0, skipped_limit: 0, skipped_roots: 0,
+            queue: VecDeque::new(),
+            scheduled: HashSet::new(),
+            roots_provided: 0,
+            roots_unique: 0,
+            roots_resolved: 0,
+            root_resolution_failures: 0,
+            fetched_ok: 0,
+            fetch_errors: HashMap::new(),
+            non_emittable_unresolved: 0,
+            non_traversable_snapshot: 0,
+            non_traversable_range: 0,
+            non_traversable_unresolved: 0,
+            non_traversable_special: 0,
+            skipped_depth: 0,
+            skipped_limit: 0,
+            skipped_roots: 0,
         };
         for i in 0..100 {
             try_enqueue(&mut state, "g", &format!("dep-{}", i), "1.0", 1, 3, 5);
@@ -4743,7 +4936,12 @@ mod tests {
 
     // ── Traversal integration tests (mockito) ─────────────────────────
 
-    fn make_pom_xml(group: &str, artifact: &str, version: &str, deps: &[(&str, &str, &str, &str, bool)]) -> String {
+    fn make_pom_xml(
+        group: &str,
+        artifact: &str,
+        version: &str,
+        deps: &[(&str, &str, &str, &str, bool)],
+    ) -> String {
         let dep_xml: String = deps.iter().map(|(dg, da, dv, scope, optional)| {
             let opt = if *optional { "<optional>true</optional>" } else { "" };
             format!(
@@ -4758,7 +4956,10 @@ mod tests {
     }
 
     fn make_search_json(version: &str) -> String {
-        format!(r#"{{"response":{{"docs":[{{"latestVersion":"{}"}}]}}}}"#, version)
+        format!(
+            r#"{{"response":{{"docs":[{{"latestVersion":"{}"}}]}}}}"#,
+            version
+        )
     }
 
     #[test]
@@ -4766,19 +4967,32 @@ mod tests {
         let mut server = mockito::Server::new();
 
         let _sa = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()),
+            )
             .with_status(200)
             .with_body(make_search_json("1.0"))
             .create();
         let _pa = server
             .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
             .with_status(200)
-            .with_body(make_pom_xml("org.a", "art-a", "1.0", &[("org.b", "art-b", "1.0", "compile", false)]))
+            .with_body(make_pom_xml(
+                "org.a",
+                "art-a",
+                "1.0",
+                &[("org.b", "art-b", "1.0", "compile", false)],
+            ))
             .create();
         let _pb = server
             .mock("GET", "/maven2/org/b/art-b/1.0/art-b-1.0.pom")
             .with_status(200)
-            .with_body(make_pom_xml("org.b", "art-b", "1.0", &[("org.c", "art-c", "1.0", "compile", false)]))
+            .with_body(make_pom_xml(
+                "org.b",
+                "art-b",
+                "1.0",
+                &[("org.c", "art-c", "1.0", "compile", false)],
+            ))
             .create();
         let pc = server
             .mock("GET", "/maven2/org/c/art-c/1.0/art-c-1.0.pom")
@@ -4794,7 +5008,11 @@ mod tests {
         let seeds = vec![("org.a".into(), "art-a".into())];
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
-        assert!(result.is_ok(), "collect_recursive failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "collect_recursive failed: {:?}",
+            result.err()
+        );
         let (packages, _) = result.unwrap();
         assert_eq!(packages, 2, "should fetch A and B (depth=0 and 1)");
         pc.assert();
@@ -4804,20 +5022,33 @@ mod tests {
     fn test_recursive_cycle_detection() {
         let mut server = mockito::Server::new();
         let _sa = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()),
+            )
             .with_status(200)
             .with_body(make_search_json("1.0"))
             .create();
         let pa = server
             .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
             .with_status(200)
-            .with_body(make_pom_xml("org.a", "art-a", "1.0", &[("org.b", "art-b", "1.0", "compile", false)]))
+            .with_body(make_pom_xml(
+                "org.a",
+                "art-a",
+                "1.0",
+                &[("org.b", "art-b", "1.0", "compile", false)],
+            ))
             .expect(1)
             .create();
         let pb = server
             .mock("GET", "/maven2/org/b/art-b/1.0/art-b-1.0.pom")
             .with_status(200)
-            .with_body(make_pom_xml("org.b", "art-b", "1.0", &[("org.a", "art-a", "1.0", "compile", false)]))
+            .with_body(make_pom_xml(
+                "org.b",
+                "art-b",
+                "1.0",
+                &[("org.a", "art-a", "1.0", "compile", false)],
+            ))
             .expect(1)
             .create();
 
@@ -4839,17 +5070,25 @@ mod tests {
     fn test_recursive_test_scope_emitted_not_traversed() {
         let mut server = mockito::Server::new();
         let _sa = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()),
+            )
             .with_status(200)
             .with_body(make_search_json("1.0"))
             .create();
         let _pa = server
             .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
             .with_status(200)
-            .with_body(make_pom_xml("org.a", "art-a", "1.0", &[
-                ("org.b", "art-b", "1.0", "compile", false),
-                ("org.c", "art-c", "1.0", "test", false),
-            ]))
+            .with_body(make_pom_xml(
+                "org.a",
+                "art-a",
+                "1.0",
+                &[
+                    ("org.b", "art-b", "1.0", "compile", false),
+                    ("org.c", "art-c", "1.0", "test", false),
+                ],
+            ))
             .create();
         let _pb = server
             .mock("GET", "/maven2/org/b/art-b/1.0/art-b-1.0.pom")
@@ -4881,16 +5120,22 @@ mod tests {
     fn test_recursive_optional_emitted_not_traversed() {
         let mut server = mockito::Server::new();
         let _sa = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()),
+            )
             .with_status(200)
             .with_body(make_search_json("1.0"))
             .create();
         let _pa = server
             .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
             .with_status(200)
-            .with_body(make_pom_xml("org.a", "art-a", "1.0", &[
-                ("org.opt", "opt-lib", "1.0", "compile", true),
-            ]))
+            .with_body(make_pom_xml(
+                "org.a",
+                "art-a",
+                "1.0",
+                &[("org.opt", "opt-lib", "1.0", "compile", true)],
+            ))
             .create();
         let popt = server
             .mock("GET", "/maven2/org/opt/opt-lib/1.0/opt-lib-1.0.pom")
@@ -4916,16 +5161,22 @@ mod tests {
     fn test_recursive_snapshot_not_traversed() {
         let mut server = mockito::Server::new();
         let _sa = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()),
+            )
             .with_status(200)
             .with_body(make_search_json("1.0"))
             .create();
         let _pa = server
             .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
             .with_status(200)
-            .with_body(make_pom_xml("org.a", "art-a", "1.0", &[
-                ("org.snap", "snap-lib", "2.0-SNAPSHOT", "compile", false),
-            ]))
+            .with_body(make_pom_xml(
+                "org.a",
+                "art-a",
+                "1.0",
+                &[("org.snap", "snap-lib", "2.0-SNAPSHOT", "compile", false)],
+            ))
             .create();
 
         let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
@@ -4948,7 +5199,10 @@ mod tests {
     fn test_recursive_duplicate_roots_deduplicated() {
         let mut server = mockito::Server::new();
         let sa = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()),
+            )
             .with_status(200)
             .with_body(make_search_json("1.0"))
             .expect(1)
@@ -4997,7 +5251,11 @@ mod tests {
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
         assert!(result.is_err(), "100% root failure should return error");
-        assert!(result.err().unwrap().to_string().contains("error rate exceeded threshold"));
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("error rate exceeded threshold"));
     }
 
     #[test]
@@ -5018,7 +5276,11 @@ mod tests {
         // Output file should be empty (no distribution metadata)
         let mut content = String::new();
         out.reopen().unwrap().read_to_string(&mut content).unwrap();
-        assert!(content.is_empty(), "empty seed should produce empty output, got: {}", content);
+        assert!(
+            content.is_empty(),
+            "empty seed should produce empty output, got: {}",
+            content
+        );
     }
 
     #[test]
@@ -5075,7 +5337,10 @@ mod tests {
         for i in 0..2 {
             let art = format!("a{}", i);
             server
-                .mock("GET", format!("/maven2/org/a/{}/1.0/{}-1.0.pom", art, art).as_str())
+                .mock(
+                    "GET",
+                    format!("/maven2/org/a/{}/1.0/{}-1.0.pom", art, art).as_str(),
+                )
                 .with_status(200)
                 .with_body(make_pom_xml("org.a", &art, "1.0", &[]))
                 .create();
@@ -5086,7 +5351,9 @@ mod tests {
         collector.max_packages = 2;
         collector.delay_ms = 0;
 
-        let seeds: Vec<_> = (0..10).map(|i| ("org.a".into(), format!("a{}", i))).collect();
+        let seeds: Vec<_> = (0..10)
+            .map(|i| ("org.a".into(), format!("a{}", i)))
+            .collect();
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
         assert!(result.is_ok());
@@ -5110,7 +5377,10 @@ mod tests {
         </project>"#;
 
         let _sa = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()),
+            )
             .with_status(200)
             .with_body(make_search_json("1.0"))
             .create();
@@ -5131,7 +5401,10 @@ mod tests {
 
         let mut content = String::new();
         out.reopen().unwrap().read_to_string(&mut content).unwrap();
-        assert!(!content.contains("${unresolvable.group}"), "unresolved groupId dep should not be emitted");
+        assert!(
+            !content.contains("${unresolvable.group}"),
+            "unresolved groupId dep should not be emitted"
+        );
     }
 
     #[test]
@@ -5151,7 +5424,10 @@ mod tests {
         </project>"#;
 
         let _sa = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()),
+            )
             .with_status(200)
             .with_body(make_search_json("1.0"))
             .create();
@@ -5199,7 +5475,10 @@ mod tests {
         </project>"#;
 
         let _sa = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()),
+            )
             .with_status(200)
             .with_body(make_search_json("1.0"))
             .create();
@@ -5220,7 +5499,10 @@ mod tests {
 
         let mut content = String::new();
         out.reopen().unwrap().read_to_string(&mut content).unwrap();
-        assert!(content.contains("\"4.2.0\""), "managed version 4.2.0 should appear in emitted triples");
+        assert!(
+            content.contains("\"4.2.0\""),
+            "managed version 4.2.0 should appear in emitted triples"
+        );
     }
 
     #[test]
@@ -5239,7 +5521,10 @@ mod tests {
         </project>"#;
 
         let _sa = server
-            .mock("GET", mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"solrsearch.*g:org\.a".into()),
+            )
             .with_status(200)
             .with_body(make_search_json("1.0"))
             .create();
@@ -5260,8 +5545,14 @@ mod tests {
 
         let mut content = String::new();
         out.reopen().unwrap().read_to_string(&mut content).unwrap();
-        assert!(content.contains("\"5.3.1\""), "interpolated version should appear in emitted triples");
-        assert!(!content.contains("${foo.version}"), "raw property ref should not appear");
+        assert!(
+            content.contains("\"5.3.1\""),
+            "interpolated version should appear in emitted triples"
+        );
+        assert!(
+            !content.contains("${foo.version}"),
+            "raw property ref should not appear"
+        );
     }
 
     #[test]
@@ -5276,7 +5567,12 @@ mod tests {
         let _p = server
             .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
             .with_status(200)
-            .with_body(make_pom_xml("org.a", "art-a", "1.0", &[("org.b", "art-b", "1.0", "compile", false)]))
+            .with_body(make_pom_xml(
+                "org.a",
+                "art-a",
+                "1.0",
+                &[("org.b", "art-b", "1.0", "compile", false)],
+            ))
             .create();
         let pb = server
             .mock("GET", "/maven2/org/b/art-b/1.0/art-b-1.0.pom")

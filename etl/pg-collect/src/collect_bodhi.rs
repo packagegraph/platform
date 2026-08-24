@@ -7,7 +7,7 @@ use crate::cache::FileCache;
 use crate::enricher::rate_limit;
 use crate::forge::emit_dq_issue;
 use crate::ntriples::NTriplesWriter;
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use once_cell::sync::Lazy;
 use quick_xml::events::Event;
@@ -20,9 +20,7 @@ use std::io::Result;
 use std::time::Duration;
 
 /// CVE identifier regex: CVE-YYYY-NNNNN
-static CVE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"CVE-\d{4}-\d{4,}").unwrap()
-});
+static CVE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"CVE-\d{4}-\d{4,}").unwrap());
 
 /// Bodhi advisory collector with SPARQL-based package resolution.
 pub struct BodhiCollector {
@@ -34,6 +32,7 @@ pub struct BodhiCollector {
     graph_release: String,
     since: Option<String>,
     cache: Option<FileCache>,
+    pub graph_uri: Option<String>,
 }
 
 impl BodhiCollector {
@@ -43,7 +42,14 @@ impl BodhiCollector {
     /// - `release`: Fedora release tag (e.g., "F43")
     /// - `since`: Optional date filter (ISO format YYYY-MM-DD) — only advisories after this date
     /// - `cache_dir`: Optional cache directory for RSS feeds
-    pub fn new(endpoint: &str, release: String, since: Option<String>, cache_dir: Option<&str>) -> Result<Self> {
+    pub fn new(
+        endpoint: &str,
+        release: String,
+        since: Option<String>,
+        cache_dir: Option<&str>,
+        auth: SparqlAuth,
+        backend: SparqlBackend,
+    ) -> Result<Self> {
         let client = crate::enricher::default_http_client();
 
         let cache = cache_dir
@@ -60,12 +66,19 @@ impl BodhiCollector {
 
         Ok(Self {
             client,
-            sparql: SparqlClient::new(endpoint),
+            sparql: make_sparql_client(endpoint, &auth, backend),
             release,
             graph_release,
             since,
             cache,
+            graph_uri: None,
         })
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     /// Collect Bodhi advisories and emit N-Triples.
@@ -73,7 +86,7 @@ impl BodhiCollector {
     /// Returns (advisories_count, triples_count).
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         let mut total_advisories = 0;
         let mut total_triples = 0;
@@ -93,9 +106,9 @@ impl BodhiCollector {
             let xml = match self.cached_get(&cache_key) {
                 Some(data) => data,
                 None => {
-                    let resp = self.client.get(&url)
-                        .send()
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    let resp = self.client.get(&url).send().map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    })?;
 
                     if !resp.status().is_success() {
                         return Err(std::io::Error::new(
@@ -104,8 +117,9 @@ impl BodhiCollector {
                         ));
                     }
 
-                    let xml = resp.text()
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    let xml = resp.text().map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    })?;
 
                     self.cache_put(&cache_key, &xml);
                     xml
@@ -140,7 +154,11 @@ impl BodhiCollector {
                 // Advisory entity
                 writer.write_triple(&advisory_uri, RDF_TYPE, &format!("{SEC}SecurityAdvisory"))?;
                 writer.write_literal(&advisory_uri, &format!("{SEC}advisoryId"), &advisory.id)?;
-                writer.write_triple(&advisory_uri, &format!("{SEC}advisoryType"), &advisory_category_uri("security"))?;
+                writer.write_triple(
+                    &advisory_uri,
+                    &format!("{SEC}advisoryType"),
+                    &advisory_category_uri("security"),
+                )?;
                 advisory_triples += 3;
 
                 // Publication date as xsd:dateTime (convert RFC 2822 → ISO 8601)
@@ -155,25 +173,53 @@ impl BodhiCollector {
                         match self.resolve_nvr_to_binaries(&name, &version_release) {
                             Ok(binaries) if !binaries.is_empty() => {
                                 for pkg_uri in binaries {
-                                    writer.write_triple(&advisory_uri, &format!("{SEC}advisoryForPackage"), &pkg_uri)?;
+                                    writer.write_triple(
+                                        &advisory_uri,
+                                        &format!("{SEC}advisoryForPackage"),
+                                        &pkg_uri,
+                                    )?;
                                     advisory_triples += 1;
                                     total_resolved_packages += 1;
                                 }
                             }
                             Ok(_) => {
-                                eprintln!("  Warning: NVR {} has no matching binaries in graph", nvr);
-                                advisory_triples += emit_dq_issue(&mut writer, "bodhi-collector", "nvr", nvr, "nvr-unresolved", "info")?;
+                                eprintln!(
+                                    "  Warning: NVR {} has no matching binaries in graph",
+                                    nvr
+                                );
+                                advisory_triples += emit_dq_issue(
+                                    &mut writer,
+                                    "bodhi-collector",
+                                    "nvr",
+                                    nvr,
+                                    "nvr-unresolved",
+                                    "info",
+                                )?;
                                 unresolved_nvrs += 1;
                             }
                             Err(e) => {
                                 eprintln!("  Warning: SPARQL query failed for NVR {}: {}", nvr, e);
-                                advisory_triples += emit_dq_issue(&mut writer, "bodhi-collector", "nvr", nvr, "nvr-query-failed", "warning")?;
+                                advisory_triples += emit_dq_issue(
+                                    &mut writer,
+                                    "bodhi-collector",
+                                    "nvr",
+                                    nvr,
+                                    "nvr-query-failed",
+                                    "warning",
+                                )?;
                                 unresolved_nvrs += 1;
                             }
                         }
                     } else {
                         eprintln!("  Warning: Could not parse NVR: {}", nvr);
-                        advisory_triples += emit_dq_issue(&mut writer, "bodhi-collector", "nvr", nvr, "nvr-parse-failed", "warning")?;
+                        advisory_triples += emit_dq_issue(
+                            &mut writer,
+                            "bodhi-collector",
+                            "nvr",
+                            nvr,
+                            "nvr-parse-failed",
+                            "warning",
+                        )?;
                         unresolved_nvrs += 1;
                     }
                 }
@@ -181,7 +227,11 @@ impl BodhiCollector {
                 // CVE cross-references
                 for cve_id in &advisory.cves {
                     let cve_uri = cve_entity_uri(cve_id);
-                    writer.write_triple(&advisory_uri, &format!("{SEC}addressesVulnerability"), &cve_uri)?;
+                    writer.write_triple(
+                        &advisory_uri,
+                        &format!("{SEC}addressesVulnerability"),
+                        &cve_uri,
+                    )?;
                     advisory_triples += 1;
                 }
 
@@ -224,12 +274,16 @@ impl BodhiCollector {
                         item_buf.push_str("<item>");
                     } else if in_item {
                         depth += 1;
-                        item_buf.push_str(&format!("<{}>", String::from_utf8_lossy(e.name().as_ref())));
+                        item_buf
+                            .push_str(&format!("<{}>", String::from_utf8_lossy(e.name().as_ref())));
                     }
                 }
                 Ok(Event::End(e)) => {
                     if in_item {
-                        item_buf.push_str(&format!("</{}>", String::from_utf8_lossy(e.name().as_ref())));
+                        item_buf.push_str(&format!(
+                            "</{}>",
+                            String::from_utf8_lossy(e.name().as_ref())
+                        ));
                         depth -= 1;
                         if depth == 0 {
                             // Item complete
@@ -259,7 +313,10 @@ impl BodhiCollector {
     }
 
     fn cached_get(&self, key: &str) -> Option<String> {
-        self.cache.as_ref()?.get(key).and_then(|v| v.as_str().map(|s| s.to_string()))
+        self.cache
+            .as_ref()?
+            .get(key)
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
     }
 
     fn cache_put(&self, key: &str, data: &str) {
@@ -299,7 +356,10 @@ impl BodhiCollector {
     /// Queries the Fedora graph for binary RPM packages whose rpm:sourceRPM
     /// starts with the given name-version-release pattern.
     fn resolve_nvr_to_binaries(&self, name: &str, version_release: &str) -> Result<Vec<String>> {
-        let graph_uri = format!("https://packagegraph.github.io/graph/fedora/{}", self.graph_release);
+        let graph_uri = format!(
+            "https://packagegraph.github.io/graph/fedora/{}",
+            self.graph_release
+        );
         let nvr_prefix = format!("{}-{}", name, version_release);
 
         let sparql = format!(
@@ -314,7 +374,8 @@ SELECT ?pkg WHERE {{
         );
 
         let bindings = self.sparql.query(&sparql)?;
-        Ok(bindings.into_iter()
+        Ok(bindings
+            .into_iter()
             .filter_map(|b| b.get("pkg").cloned())
             .collect())
     }
@@ -337,13 +398,24 @@ fn parse_rfc2822_to_iso8601(rfc2822: &str) -> Result<String> {
 
     let day = parts[1];
     let month = match parts[2] {
-        "Jan" => "01", "Feb" => "02", "Mar" => "03", "Apr" => "04",
-        "May" => "05", "Jun" => "06", "Jul" => "07", "Aug" => "08",
-        "Sep" => "09", "Oct" => "10", "Nov" => "11", "Dec" => "12",
-        _ => return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("Unknown month: {}", parts[2]),
-        )),
+        "Jan" => "01",
+        "Feb" => "02",
+        "Mar" => "03",
+        "Apr" => "04",
+        "May" => "05",
+        "Jun" => "06",
+        "Jul" => "07",
+        "Aug" => "08",
+        "Sep" => "09",
+        "Oct" => "10",
+        "Nov" => "11",
+        "Dec" => "12",
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Unknown month: {}", parts[2]),
+            ))
+        }
     };
     let year = parts[3];
     let time = parts[4];
@@ -416,16 +488,14 @@ impl BodhiAdvisory {
         }
 
         // Extract NVRs from title (space-separated)
-        let nvrs: Vec<String> = title?
-            .split_whitespace()
-            .map(|s| s.to_string())
-            .collect();
+        let nvrs: Vec<String> = title?.split_whitespace().map(|s| s.to_string()).collect();
 
         // Extract CVEs from description using regex
         let cves: Vec<String> = description
             .as_deref()
             .map(|desc| {
-                CVE_RE.find_iter(desc)
+                CVE_RE
+                    .find_iter(desc)
                     .map(|m| m.as_str().to_string())
                     .collect()
             })
@@ -463,14 +533,17 @@ mod tests {
 
     #[test]
     fn test_parse_rss_item() {
-        let advisory = BodhiAdvisory::from_rss_item(SAMPLE_RSS_ITEM)
-            .expect("Should parse valid RSS item");
+        let advisory =
+            BodhiAdvisory::from_rss_item(SAMPLE_RSS_ITEM).expect("Should parse valid RSS item");
 
         assert_eq!(advisory.id, "FEDORA-2026-16a3cea414");
-        assert_eq!(advisory.nvrs, vec![
-            "rust-openssl-0.10.78-1.fc43",
-            "rust-openssl-sys-0.9.114-1.fc43"
-        ]);
+        assert_eq!(
+            advisory.nvrs,
+            vec![
+                "rust-openssl-0.10.78-1.fc43",
+                "rust-openssl-sys-0.9.114-1.fc43"
+            ]
+        );
         assert_eq!(advisory.cves, vec!["CVE-2026-41564", "CVE-2026-41676"]);
         assert_eq!(advisory.date, "Tue, 15 Apr 2026 14:23:01 +0000");
     }
@@ -478,11 +551,15 @@ mod tests {
     #[test]
     fn test_cve_extraction_from_html() {
         let html = "This update fixes CVE-2025-1234, CVE-2025-5678, and CVE-2026-99999.";
-        let cves: Vec<String> = CVE_RE.find_iter(html)
+        let cves: Vec<String> = CVE_RE
+            .find_iter(html)
             .map(|m| m.as_str().to_string())
             .collect();
 
-        assert_eq!(cves, vec!["CVE-2025-1234", "CVE-2025-5678", "CVE-2026-99999"]);
+        assert_eq!(
+            cves,
+            vec!["CVE-2025-1234", "CVE-2025-5678", "CVE-2026-99999"]
+        );
     }
 
     #[test]
@@ -496,8 +573,7 @@ mod tests {
             </item>
         "#;
 
-        let advisory = BodhiAdvisory::from_rss_item(xml)
-            .expect("Should parse item without CVEs");
+        let advisory = BodhiAdvisory::from_rss_item(xml).expect("Should parse item without CVEs");
 
         assert_eq!(advisory.id, "FEDORA-2026-xyz789");
         assert_eq!(advisory.nvrs, vec!["bash-5.2.26-6.fc43"]);
@@ -506,8 +582,8 @@ mod tests {
 
     #[test]
     fn test_parse_nvr() {
-        let (name, vr) = BodhiCollector::parse_nvr("openssl-3.0.9-1.fc43")
-            .expect("Should parse valid NVR");
+        let (name, vr) =
+            BodhiCollector::parse_nvr("openssl-3.0.9-1.fc43").expect("Should parse valid NVR");
         assert_eq!(name, "openssl");
         assert_eq!(vr, "3.0.9-1.fc43");
 
@@ -522,23 +598,52 @@ mod tests {
 
     #[test]
     fn test_advisory_triple_emission() {
-        use tempfile::NamedTempFile;
         use std::io::Read;
+        use tempfile::NamedTempFile;
 
         let tmp = NamedTempFile::new().unwrap();
         let file = tmp.reopen().unwrap();
         let mut writer = NTriplesWriter::new(file);
 
         let advisory_uri = "https://packagegraph.github.io/d/advisory/fedora/43/FEDORA-2026-test";
-        let pkg_uri = "https://packagegraph.github.io/d/pkg/fedora/43/x86_64/openssl/3.0.9-1.fc43.x86_64";
+        let pkg_uri =
+            "https://packagegraph.github.io/d/pkg/fedora/43/x86_64/openssl/3.0.9-1.fc43.x86_64";
         let cve_uri = "https://packagegraph.github.io/d/cve/CVE-2026-1234";
 
-        writer.write_triple(advisory_uri, RDF_TYPE, &format!("{SEC}SecurityAdvisory")).unwrap();
-        writer.write_literal(advisory_uri, &format!("{SEC}advisoryId"), "FEDORA-2026-test").unwrap();
-        writer.write_triple(advisory_uri, &format!("{SEC}advisoryType"), &advisory_category_uri("security")).unwrap();
-        writer.write_datetime(advisory_uri, &format!("{SEC}advisoryDate"), "2026-04-15T00:00:00Z").unwrap();
-        writer.write_triple(advisory_uri, &format!("{SEC}advisoryForPackage"), pkg_uri).unwrap();
-        writer.write_triple(advisory_uri, &format!("{SEC}addressesVulnerability"), cve_uri).unwrap();
+        writer
+            .write_triple(advisory_uri, RDF_TYPE, &format!("{SEC}SecurityAdvisory"))
+            .unwrap();
+        writer
+            .write_literal(
+                advisory_uri,
+                &format!("{SEC}advisoryId"),
+                "FEDORA-2026-test",
+            )
+            .unwrap();
+        writer
+            .write_triple(
+                advisory_uri,
+                &format!("{SEC}advisoryType"),
+                &advisory_category_uri("security"),
+            )
+            .unwrap();
+        writer
+            .write_datetime(
+                advisory_uri,
+                &format!("{SEC}advisoryDate"),
+                "2026-04-15T00:00:00Z",
+            )
+            .unwrap();
+        writer
+            .write_triple(advisory_uri, &format!("{SEC}advisoryForPackage"), pkg_uri)
+            .unwrap();
+        writer
+            .write_triple(
+                advisory_uri,
+                &format!("{SEC}addressesVulnerability"),
+                cve_uri,
+            )
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();

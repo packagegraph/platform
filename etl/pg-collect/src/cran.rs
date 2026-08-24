@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Result};
 pub struct CranCollector {
     client: Client,
     mirror_url: String,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -34,11 +35,24 @@ impl CranCollector {
     pub fn new(mirror_url: String) -> Self {
         let client = crate::enricher::default_http_client();
 
-        Self { client, mirror_url }
+        Self {
+            client,
+            mirror_url,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
-        let packages_url = format!("{}/src/contrib/PACKAGES.gz", self.mirror_url.trim_end_matches('/'));
+        let packages_url = format!(
+            "{}/src/contrib/PACKAGES.gz",
+            self.mirror_url.trim_end_matches('/')
+        );
         eprintln!("Fetching PACKAGES from: {}", packages_url);
 
         let response = self
@@ -62,7 +76,7 @@ impl CranCollector {
         let reader = BufReader::new(decoder);
 
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         self.emit_distribution_metadata(&mut writer)?;
 
@@ -186,7 +200,11 @@ impl CranCollector {
             .collect()
     }
 
-    fn emit_package_triples(&self, writer: &mut NTriplesWriter, pkg: &CranPackage) -> Result<usize> {
+    fn emit_package_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        pkg: &CranPackage,
+    ) -> Result<usize> {
         let pkg_uri = package_uri("cran", "cran", "any", &pkg.package, &pkg.version);
         let identity_uri = package_identity_uri("cran", "cran", "any", &pkg.package);
         let mut triples = 0;
@@ -300,7 +318,9 @@ mod tests {
         let data = "Package: ggplot2\nVersion: 3.4.4\nDepends: R (>= 3.3)\nImports: cli, glue\nLicense: MIT\nNeedsCompilation: no\nTitle: Create Elegant Data Visualisations\n\nPackage: dplyr\nVersion: 1.1.4\nImports: rlang, tibble\nLicense: MIT\nNeedsCompilation: yes\n\n";
 
         let collector = CranCollector::new("https://cran.r-project.org".into());
-        let packages = collector.parse_packages_file(BufReader::new(data.as_bytes())).unwrap();
+        let packages = collector
+            .parse_packages_file(BufReader::new(data.as_bytes()))
+            .unwrap();
 
         assert_eq!(packages.len(), 2);
         assert_eq!(packages[0].package, "ggplot2");
@@ -335,7 +355,11 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("cran#CranPackage"));

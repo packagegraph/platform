@@ -15,11 +15,24 @@ pub struct VoidCollector {
     release_name: String,
     repo_path: String,
     source_cache: Option<SourceCache>,
+    pub graph_uri: Option<String>,
 }
 
 impl VoidCollector {
     pub fn new(distro_name: String, release_name: String, repo_path: String) -> Self {
-        Self { distro_name, release_name, repo_path, source_cache: None }
+        Self {
+            distro_name,
+            release_name,
+            repo_path,
+            source_cache: None,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
@@ -29,7 +42,7 @@ impl VoidCollector {
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
         self.emit_distribution_metadata(&mut writer)?;
 
         let srcpkgs_path = Path::new(&self.repo_path).join("srcpkgs");
@@ -153,8 +166,15 @@ impl VoidCollector {
         pkg: &VoidPackage,
     ) -> Result<usize> {
         let version = pkg.version.as_ref().unwrap();
-        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", &pkg.pkgname, version);
-        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", &pkg.pkgname);
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            &self.release_name,
+            "any",
+            &pkg.pkgname,
+            version,
+        );
+        let identity_uri =
+            package_identity_uri(&self.distro_name, &self.release_name, "any", &pkg.pkgname);
         let mut triples = 0;
 
         // Dual typing
@@ -212,17 +232,20 @@ impl VoidCollector {
 
         // Dependencies
         for dep in &pkg.depends {
-            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
+            let target_uri =
+                package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
             writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
         }
         for dep in &pkg.makedepends {
-            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
+            let target_uri =
+                package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
             writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
         }
         for dep in &pkg.hostmakedepends {
-            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
+            let target_uri =
+                package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
             writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
         }
@@ -272,9 +295,7 @@ hostmakedepends="python3 nodejs"
         let mut file = File::create(&template_path).unwrap();
         file.write_all(template_content.as_bytes()).unwrap();
 
-        let pkg = collector
-            .parse_template("firefox", &template_path)
-            .unwrap();
+        let pkg = collector.parse_template("firefox", &template_path).unwrap();
 
         assert_eq!(pkg.pkgname, "firefox");
         assert_eq!(pkg.version, Some("125.0".to_string()));
@@ -307,7 +328,11 @@ hostmakedepends="python3 nodejs"
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("xbps#XbpsPackage"));

@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sparql-proxy
+  namespace: packagegraph
+  labels:
+    app: sparql-proxy
+    app.kubernetes.io/name: sparql-proxy
+    app.kubernetes.io/part-of: packagegraph
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sparql-proxy
+  template:
+    metadata:
+      labels:
+        app: sparql-proxy
+    spec:
+      containers:
+        - name: nginx
+          image: docker.io/nginxinc/nginx-unprivileged:1.27.5-alpine
+          ports:
+            - containerPort: 8443
+              name: https
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+            - name: tls
+              mountPath: /etc/nginx/tls
+              readOnly: true
+            - name: auth
+              mountPath: /etc/nginx/auth
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {cpu: 200m, memory: 64Mi}
+          livenessProbe:
+            tcpSocket: {port: 8443}
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket: {port: 8443}
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: sparql-proxy-config
+        - name: tls
+          secret:
+            secretName: sparql-proxy-tls
+        - name: auth
+          secret:
+            secretName: sparql-proxy-auth
+        - name: tmp
+          emptyDir: {}

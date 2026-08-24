@@ -7,7 +7,7 @@ use crate::cache::FileCache;
 use crate::enricher::rate_limit;
 use crate::forge::emit_dq_issue;
 use crate::ntriples::NTriplesWriter;
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -25,6 +25,7 @@ pub struct KojiEnricher {
     pub distro: String,
     pub release: String,
     graph: Option<String>,
+    pub graph_uri: Option<String>,
 }
 
 impl KojiEnricher {
@@ -34,8 +35,10 @@ impl KojiEnricher {
         distro: &str,
         release: &str,
         cache_dir: Option<&str>,
+        auth: SparqlAuth,
+        backend: SparqlBackend,
     ) -> Self {
-        let sparql = Some(SparqlClient::new(endpoint));
+        let sparql = Some(make_sparql_client(endpoint, &auth, backend));
         let client = crate::enricher::default_http_client();
 
         let cache = cache_dir.map(|dir| {
@@ -45,18 +48,30 @@ impl KojiEnricher {
 
         // Auto-derive graph URI from distro/release if both are non-empty
         let graph = if !distro.is_empty() && !release.is_empty() {
-            Some(format!("https://packagegraph.github.io/graph/{}/{}", distro, release))
+            Some(format!(
+                "https://packagegraph.github.io/graph/{}/{}",
+                distro, release
+            ))
         } else {
             None
         };
 
         Self {
-            sparql, client, cache,
+            sparql,
+            client,
+            cache,
             koji_hub: koji_hub.to_string(),
             distro: distro.to_string(),
             release: release.to_string(),
             graph,
+            graph_uri: None,
         }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph_uri(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     /// Create a standalone enricher without a SPARQL endpoint.
@@ -81,23 +96,27 @@ impl KojiEnricher {
     ) -> Self {
         let client = crate::enricher::default_http_client();
 
-        let cache = cache_dir.map(|dir| {
-            FileCache::new(dir, "koji", 720, minio)
-                .expect("Failed to create cache")
-        });
+        let cache = cache_dir
+            .map(|dir| FileCache::new(dir, "koji", 720, minio).expect("Failed to create cache"));
 
         let graph = if !distro.is_empty() && !release.is_empty() {
-            Some(format!("https://packagegraph.github.io/graph/{}/{}", distro, release))
+            Some(format!(
+                "https://packagegraph.github.io/graph/{}/{}",
+                distro, release
+            ))
         } else {
             None
         };
 
         Self {
-            sparql: None, client, cache,
+            sparql: None,
+            client,
+            cache,
             koji_hub: koji_hub.to_string(),
             distro: distro.to_string(),
             release: release.to_string(),
             graph,
+            graph_uri: None,
         }
     }
 
@@ -105,26 +124,25 @@ impl KojiEnricher {
         self.enrich_with_limit(output_path, None)
     }
 
-    pub fn enrich_with_limit(&self, output_path: &str, limit: Option<usize>) -> Result<(usize, usize)> {
+    pub fn enrich_with_limit(
+        &self,
+        output_path: &str,
+        limit: Option<usize>,
+    ) -> Result<(usize, usize)> {
         let sparql = self.sparql.as_ref().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput,
                 "enrich_with_limit requires a SPARQL endpoint. Use enrich_from_nvrs() with --srpm-list instead.")
         })?;
 
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         let packages = match &self.graph {
             Some(graph_uri) => {
                 eprintln!("Querying graph: {}", graph_uri);
-                sparql.query_packages_by_type_in_graph(
-                    &format!("{RPM}BinaryRPM"),
-                    graph_uri,
-                )?
+                sparql.query_packages_by_type_in_graph(&format!("{RPM}BinaryRPM"), graph_uri)?
             }
-            None => {
-                sparql.query_packages_by_type(&format!("{RPM}BinaryRPM"))?
-            }
+            None => sparql.query_packages_by_type(&format!("{RPM}BinaryRPM"))?,
         };
         eprintln!("Found {} RPM packages to query Koji for", packages.len());
 
@@ -171,11 +189,19 @@ impl KojiEnricher {
 
     /// Enrich from a pre-built list of SRPM NVRs, bypassing the Fuseki discovery query.
     /// This is the entry point for --srpm-list mode and for colocated enrichment via rpm-full.
-    pub fn enrich_from_nvrs(&self, nvrs: &[String], output_path: &str, limit: Option<usize>) -> Result<(usize, usize)> {
+    pub fn enrich_from_nvrs(
+        &self,
+        nvrs: &[String],
+        output_path: &str,
+        limit: Option<usize>,
+    ) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
-        eprintln!("Processing {} NVRs from pre-built list (no SPARQL query)", nvrs.len());
+        eprintln!(
+            "Processing {} NVRs from pre-built list (no SPARQL query)",
+            nvrs.len()
+        );
 
         let mut total_builds = 0;
         let mut total_triples = 0;
@@ -229,7 +255,8 @@ impl KojiEnricher {
                     nvr
                 );
 
-                let resp = self.client
+                let resp = self
+                    .client
                     .post(&self.koji_hub)
                     .header("Content-Type", "text/xml")
                     .body(xml_body)
@@ -237,16 +264,31 @@ impl KojiEnricher {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
                 if !resp.status().is_success() {
-                    emit_dq_issue(writer, "koji-enricher", "getBuild", nvr, "koji-api-error", "warning")?;
+                    emit_dq_issue(
+                        writer,
+                        "koji-enricher",
+                        "getBuild",
+                        nvr,
+                        "koji-api-error",
+                        "warning",
+                    )?;
                     return Ok(0);
                 }
 
-                let body = resp.text()
+                let body = resp
+                    .text()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
                 let data = parse_xmlrpc_struct(&body);
                 if data.is_empty() {
-                    emit_dq_issue(writer, "koji-enricher", "getBuild", nvr, "koji-build-not-found", "info")?;
+                    emit_dq_issue(
+                        writer,
+                        "koji-enricher",
+                        "getBuild",
+                        nvr,
+                        "koji-build-not-found",
+                        "info",
+                    )?;
                     return Ok(0);
                 }
 
@@ -261,9 +303,11 @@ impl KojiEnricher {
         let mut triples = self.emit_build_triples(writer, nvr, &data)?;
 
         // Query RPM signatures: listBuildRPMs(build_id) → queryRPMSigs(rpm_id)
-        let build_id = data.get("build_id")
-            .and_then(|v| v.as_str().map(|s| s.to_string())
-                .or_else(|| v.as_i64().map(|n| n.to_string())));
+        let build_id = data.get("build_id").and_then(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+        });
         if let Some(bid) = build_id {
             triples += self.query_rpm_signatures(writer, nvr, &bid)?;
         }
@@ -276,7 +320,12 @@ impl KojiEnricher {
     /// Two-step API chain:
     ///   1. listBuildRPMs(build_id) → get rpm_ids for this build
     ///   2. queryRPMSigs(rpm_id)    → get sigkeys for the first binary RPM
-    fn query_rpm_signatures(&self, writer: &mut NTriplesWriter, nvr: &str, build_id: &str) -> Result<usize> {
+    fn query_rpm_signatures(
+        &self,
+        writer: &mut NTriplesWriter,
+        nvr: &str,
+        build_id: &str,
+    ) -> Result<usize> {
         let cache_key = format!("koji-sigs-{}", build_id);
 
         if let Some(cached) = self.cached_get(&cache_key) {
@@ -295,7 +344,8 @@ impl KojiEnricher {
             build_id
         );
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(&self.koji_hub)
             .header("Content-Type", "text/xml")
             .body(list_rpms_xml)
@@ -303,16 +353,25 @@ impl KojiEnricher {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         if !resp.status().is_success() {
-            emit_dq_issue(writer, "koji-enricher", "listBuildRPMs", build_id, "koji-api-error", "warning")?;
+            emit_dq_issue(
+                writer,
+                "koji-enricher",
+                "listBuildRPMs",
+                build_id,
+                "koji-api-error",
+                "warning",
+            )?;
             return Ok(0);
         }
 
-        let body = resp.text()
+        let body = resp
+            .text()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         let rpms = parse_xmlrpc_array(&body);
         // Find first non-src RPM with an id
-        let rpm_id = rpms.iter()
+        let rpm_id = rpms
+            .iter()
             .find(|r| r.get("arch").map_or(true, |a| a != "src"))
             .and_then(|r| r.get("id"))
             .cloned();
@@ -336,7 +395,8 @@ impl KojiEnricher {
             rpm_id
         );
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(&self.koji_hub)
             .header("Content-Type", "text/xml")
             .body(query_sigs_xml)
@@ -344,16 +404,25 @@ impl KojiEnricher {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         if !resp.status().is_success() {
-            emit_dq_issue(writer, "koji-enricher", "queryRPMSigs", &rpm_id, "koji-api-error", "warning")?;
+            emit_dq_issue(
+                writer,
+                "koji-enricher",
+                "queryRPMSigs",
+                &rpm_id,
+                "koji-api-error",
+                "warning",
+            )?;
             return Ok(0);
         }
 
-        let body = resp.text()
+        let body = resp
+            .text()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         let sigs = parse_xmlrpc_array(&body);
         // Find first entry with a non-empty sigkey
-        let sigkey = sigs.iter()
+        let sigkey = sigs
+            .iter()
             .filter_map(|s| s.get("sigkey"))
             .find(|k| !k.is_empty())
             .cloned();
@@ -368,7 +437,12 @@ impl KojiEnricher {
     }
 
     /// Emit att:DigitalSignature triples for a signed RPM build.
-    fn emit_signature_triples(&self, writer: &mut NTriplesWriter, nvr: &str, data: &serde_json::Value) -> Result<usize> {
+    fn emit_signature_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        nvr: &str,
+        data: &serde_json::Value,
+    ) -> Result<usize> {
         let sigkey = match data.get("sigkey").and_then(|v| v.as_str()) {
             Some(k) if !k.is_empty() => k,
             _ => return Ok(0),
@@ -381,12 +455,19 @@ impl KojiEnricher {
             (nvr, "unknown".to_string())
         };
 
-        let build_uri = format!("{DATA}build/{}/{}/{}/{}", self.distro, self.release, name, version);
+        let build_uri = format!(
+            "{DATA}build/{}/{}/{}/{}",
+            self.distro, self.release, name, version
+        );
         let sig_uri = format!("{build_uri}/sig");
 
         writer.write_triple(&build_uri, &format!("{ATT}hasSignature"), &sig_uri)?;
         writer.write_triple(&sig_uri, RDF_TYPE, &format!("{ATT}DigitalSignature"))?;
-        writer.write_triple(&sig_uri, &format!("{ATT}signatureMethod"), &format!("{ATT}GPG"))?;
+        writer.write_triple(
+            &sig_uri,
+            &format!("{ATT}signatureMethod"),
+            &format!("{ATT}GPG"),
+        )?;
         writer.write_literal(&sig_uri, &format!("{ATT}signingKeyFingerprint"), sigkey)?;
         // Koji only stores verified signatures
         writer.write_literal(&sig_uri, &format!("{ATT}signatureStatus"), "verified")?;
@@ -394,11 +475,19 @@ impl KojiEnricher {
         Ok(5)
     }
 
-    fn emit_build_triples(&self, writer: &mut NTriplesWriter, nvr: &str, data: &serde_json::Value) -> Result<usize> {
+    fn emit_build_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        nvr: &str,
+        data: &serde_json::Value,
+    ) -> Result<usize> {
         let mut triples = 0;
 
         // Extract fields from Koji build data
-        let owner = data.get("owner_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let owner = data
+            .get("owner_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         let start_time = data.get("start_time").and_then(|v| v.as_str());
         let end_time = data.get("completion_time").and_then(|v| v.as_str());
 
@@ -410,7 +499,10 @@ impl KojiEnricher {
             (nvr, "unknown".to_string())
         };
 
-        let build_uri = format!("{DATA}build/{}/{}/{}/{}", self.distro, self.release, name, version);
+        let build_uri = format!(
+            "{DATA}build/{}/{}/{}/{}",
+            self.distro, self.release, name, version
+        );
 
         // BuildActivity with pkg: namespace properties (per core.ttl)
         writer.write_triple(&build_uri, RDF_TYPE, &format!("{PKG}BuildActivity"))?;
@@ -420,8 +512,11 @@ impl KojiEnricher {
         // Builder node (slsa:Builder → prov:Agent) linked via slsa:builtBy
         let koji_builder_uri = builder_uri("https://koji.fedoraproject.org");
         writer.write_triple(&koji_builder_uri, RDF_TYPE, &format!("{SLSA}Builder"))?;
-        writer.write_literal(&koji_builder_uri, &format!("{SLSA}builderId"),
-            "https://koji.fedoraproject.org")?;
+        writer.write_literal(
+            &koji_builder_uri,
+            &format!("{SLSA}builderId"),
+            "https://koji.fedoraproject.org",
+        )?;
         writer.write_triple(&build_uri, &format!("{SLSA}builtBy"), &koji_builder_uri)?;
         triples += 3;
 
@@ -476,33 +571,29 @@ fn parse_xmlrpc_struct(xml: &str) -> HashMap<String, String> {
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                match e.name().as_ref() {
-                    b"struct" => {
-                        struct_depth += 1;
-                    }
-                    b"member" if struct_depth == 1 => in_member = true,
-                    b"name" if in_member && struct_depth == 1 => in_name = true,
-                    b"string" | b"int" | b"i4" | b"double" if in_member && struct_depth == 1 => {
-                        in_value_child = true;
-                    }
-                    _ => {}
+            Ok(Event::Start(e)) => match e.name().as_ref() {
+                b"struct" => {
+                    struct_depth += 1;
                 }
-            }
-            Ok(Event::End(e)) => {
-                match e.name().as_ref() {
-                    b"struct" => {
-                        struct_depth -= 1;
-                    }
-                    b"member" if struct_depth == 1 => {
-                        in_member = false;
-                        current_name.clear();
-                    }
-                    b"name" => in_name = false,
-                    b"string" | b"int" | b"i4" | b"double" => in_value_child = false,
-                    _ => {}
+                b"member" if struct_depth == 1 => in_member = true,
+                b"name" if in_member && struct_depth == 1 => in_name = true,
+                b"string" | b"int" | b"i4" | b"double" if in_member && struct_depth == 1 => {
+                    in_value_child = true;
                 }
-            }
+                _ => {}
+            },
+            Ok(Event::End(e)) => match e.name().as_ref() {
+                b"struct" => {
+                    struct_depth -= 1;
+                }
+                b"member" if struct_depth == 1 => {
+                    in_member = false;
+                    current_name.clear();
+                }
+                b"name" => in_name = false,
+                b"string" | b"int" | b"i4" | b"double" => in_value_child = false,
+                _ => {}
+            },
             Ok(Event::Text(e)) => {
                 if in_name && struct_depth == 1 {
                     current_name = e.unescape().unwrap_or_default().to_string();
@@ -542,23 +633,21 @@ fn parse_xmlrpc_array(xml: &str) -> Vec<HashMap<String, String>> {
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                match e.name().as_ref() {
-                    b"array" => in_array = true,
-                    b"struct" if in_array => {
-                        struct_depth += 1;
-                        if struct_depth == 1 {
-                            current_struct.clear();
-                        }
+            Ok(Event::Start(e)) => match e.name().as_ref() {
+                b"array" => in_array = true,
+                b"struct" if in_array => {
+                    struct_depth += 1;
+                    if struct_depth == 1 {
+                        current_struct.clear();
                     }
-                    b"member" if struct_depth == 1 => in_member = true,
-                    b"name" if in_member && struct_depth == 1 => in_name = true,
-                    b"string" | b"int" | b"i4" | b"double" if in_member && struct_depth == 1 => {
-                        in_value_child = true;
-                    }
-                    _ => {}
                 }
-            }
+                b"member" if struct_depth == 1 => in_member = true,
+                b"name" if in_member && struct_depth == 1 => in_name = true,
+                b"string" | b"int" | b"i4" | b"double" if in_member && struct_depth == 1 => {
+                    in_value_child = true;
+                }
+                _ => {}
+            },
             Ok(Event::End(e)) => {
                 match e.name().as_ref() {
                     b"array" => in_array = false,
@@ -573,10 +662,14 @@ fn parse_xmlrpc_array(xml: &str) -> Vec<HashMap<String, String>> {
                         current_name.clear();
                     }
                     b"name" => in_name = false,
-                    b"string" | b"int" | b"i4" | b"double" if in_value_child && struct_depth == 1 => {
+                    b"string" | b"int" | b"i4" | b"double"
+                        if in_value_child && struct_depth == 1 =>
+                    {
                         // Empty element (e.g. <string></string>) — store empty string
                         if !current_name.is_empty() {
-                            current_struct.entry(current_name.clone()).or_insert_with(String::new);
+                            current_struct
+                                .entry(current_name.clone())
+                                .or_insert_with(String::new);
                         }
                         in_value_child = false;
                     }
@@ -636,7 +729,10 @@ mod tests {
         let result = parse_xmlrpc_struct(xml);
         assert_eq!(result.get("owner_name"), Some(&"releng".to_string()));
         assert_eq!(result.get("build_id"), Some(&"12345".to_string()));
-        assert_eq!(result.get("start_time"), Some(&"2024-01-15 10:30:00".to_string()));
+        assert_eq!(
+            result.get("start_time"),
+            Some(&"2024-01-15 10:30:00".to_string())
+        );
     }
 
     #[test]
@@ -721,14 +817,20 @@ mod tests {
     #[test]
     fn test_emit_build_triples() {
         let mut server = mockito::Server::new();
-        let _mock = server.mock("POST", "/sparql")
+        let _mock = server
+            .mock("POST", "/sparql")
             .with_status(200)
             .with_body(r#"{"results": {"bindings": []}}"#)
             .create();
 
         let enricher = KojiEnricher::new(
-            &server.url(), "https://koji.fedoraproject.org/kojihub",
-            "fedora", "41", None,
+            &server.url(),
+            "https://koji.fedoraproject.org/kojihub",
+            "fedora",
+            "41",
+            None,
+            None,
+            SparqlBackend::Fuseki,
         );
 
         let temp_file = NamedTempFile::new().unwrap();
@@ -741,36 +843,72 @@ mod tests {
             "build_id": 12345
         });
 
-        let triples = enricher.emit_build_triples(&mut writer, "gcc-14.0.1-1.fc41", &data).unwrap();
+        let triples = enricher
+            .emit_build_triples(&mut writer, "gcc-14.0.1-1.fc41", &data)
+            .unwrap();
         writer.flush().unwrap();
 
-        assert!(triples >= 8, "Should emit at least 8 triples (build + builder + owner + timestamps)");
+        assert!(
+            triples >= 8,
+            "Should emit at least 8 triples (build + builder + owner + timestamps)"
+        );
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("core#BuildActivity"), "Should have BuildActivity type");
+        assert!(
+            content.contains("core#BuildActivity"),
+            "Should have BuildActivity type"
+        );
         assert!(content.contains("slsa#Builder"), "Should have Builder type");
         assert!(content.contains("slsa#builderId"), "Should have builder ID");
-        assert!(content.contains("slsa#builtBy"), "Should link build to builder");
-        assert!(content.contains("prov#Agent"), "Should have owner as prov:Agent");
-        assert!(content.contains("prov#wasAttributedTo"), "Should attribute build to owner");
-        assert!(content.contains("\"releng\""), "Should have releng owner label");
-        assert!(content.contains("core#activityStartTime"), "Should use pkg:activityStartTime");
-        assert!(content.contains("core#activityEndTime"), "Should use pkg:activityEndTime");
+        assert!(
+            content.contains("slsa#builtBy"),
+            "Should link build to builder"
+        );
+        assert!(
+            content.contains("prov#Agent"),
+            "Should have owner as prov:Agent"
+        );
+        assert!(
+            content.contains("prov#wasAttributedTo"),
+            "Should attribute build to owner"
+        );
+        assert!(
+            content.contains("\"releng\""),
+            "Should have releng owner label"
+        );
+        assert!(
+            content.contains("core#activityStartTime"),
+            "Should use pkg:activityStartTime"
+        );
+        assert!(
+            content.contains("core#activityEndTime"),
+            "Should use pkg:activityEndTime"
+        );
     }
 
     #[test]
     fn test_emit_signature_triples() {
         let mut server = mockito::Server::new();
-        let _mock = server.mock("POST", "/sparql")
+        let _mock = server
+            .mock("POST", "/sparql")
             .with_status(200)
             .with_body(r#"{"results": {"bindings": []}}"#)
             .create();
 
         let enricher = KojiEnricher::new(
-            &server.url(), "https://koji.fedoraproject.org/kojihub",
-            "fedora", "41", None,
+            &server.url(),
+            "https://koji.fedoraproject.org/kojihub",
+            "fedora",
+            "41",
+            None,
+            None,
+            SparqlBackend::Fuseki,
         );
 
         let temp_file = NamedTempFile::new().unwrap();
@@ -778,20 +916,44 @@ mod tests {
 
         let data = serde_json::json!({"sigkey": "e99d6ad1"});
 
-        let triples = enricher.emit_signature_triples(&mut writer, "openssl-3.2.4-1.fc41", &data).unwrap();
+        let triples = enricher
+            .emit_signature_triples(&mut writer, "openssl-3.2.4-1.fc41", &data)
+            .unwrap();
         writer.flush().unwrap();
 
         assert_eq!(triples, 5, "Should emit 5 signature triples");
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("attestation#hasSignature"), "Should link build to signature");
-        assert!(content.contains("attestation#DigitalSignature"), "Should type as DigitalSignature");
-        assert!(content.contains("attestation#GPG"), "Should reference att:GPG named individual");
-        assert!(content.contains("attestation#signingKeyFingerprint"), "Should emit key fingerprint");
-        assert!(content.contains("\"e99d6ad1\""), "Should have the sigkey value");
-        assert!(content.contains("attestation#signatureStatus"), "Should emit signature status");
+        assert!(
+            content.contains("attestation#hasSignature"),
+            "Should link build to signature"
+        );
+        assert!(
+            content.contains("attestation#DigitalSignature"),
+            "Should type as DigitalSignature"
+        );
+        assert!(
+            content.contains("attestation#GPG"),
+            "Should reference att:GPG named individual"
+        );
+        assert!(
+            content.contains("attestation#signingKeyFingerprint"),
+            "Should emit key fingerprint"
+        );
+        assert!(
+            content.contains("\"e99d6ad1\""),
+            "Should have the sigkey value"
+        );
+        assert!(
+            content.contains("attestation#signatureStatus"),
+            "Should emit signature status"
+        );
         assert!(content.contains("\"verified\""), "Should be verified");
     }
 
@@ -800,13 +962,18 @@ mod tests {
         // new_standalone should create a KojiEnricher without requiring a SPARQL endpoint
         let enricher = KojiEnricher::new_standalone(
             "https://koji.fedoraproject.org/kojihub",
-            "fedora", "43", None,
+            "fedora",
+            "43",
+            None,
         );
 
         assert_eq!(enricher.koji_hub, "https://koji.fedoraproject.org/kojihub");
         assert_eq!(enricher.distro, "fedora");
         assert_eq!(enricher.release, "43");
-        assert!(enricher.sparql.is_none(), "Standalone enricher should not have SPARQL client");
+        assert!(
+            enricher.sparql.is_none(),
+            "Standalone enricher should not have SPARQL client"
+        );
     }
 
     #[test]
@@ -815,9 +982,11 @@ mod tests {
         let mut server = mockito::Server::new();
 
         // Mock Koji getBuild — return a valid build response
-        let _koji_mock = server.mock("POST", "/")
+        let _koji_mock = server
+            .mock("POST", "/")
             .with_status(200)
-            .with_body(r#"<?xml version="1.0"?>
+            .with_body(
+                r#"<?xml version="1.0"?>
 <methodResponse>
   <params><param><value><struct>
     <member><name>owner_name</name><value><string>testuser</string></value></member>
@@ -825,20 +994,23 @@ mod tests {
     <member><name>start_time</name><value><string>2026-04-01 10:00:00</string></value></member>
     <member><name>completion_time</name><value><string>2026-04-01 10:15:00</string></value></member>
   </struct></value></param></params>
-</methodResponse>"#)
+</methodResponse>"#,
+            )
             .expect_at_least(1)
             .create();
 
-        let enricher = KojiEnricher::new_standalone(
-            &server.url(), "fedora", "43", None,
-        );
+        let enricher = KojiEnricher::new_standalone(&server.url(), "fedora", "43", None);
 
         let nvrs = vec!["openssl-3.2.1-1.fc43".to_string()];
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_str().unwrap().to_string();
 
         let result = enricher.enrich_from_nvrs(&nvrs, &path, None);
-        assert!(result.is_ok(), "enrich_from_nvrs should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "enrich_from_nvrs should succeed: {:?}",
+            result
+        );
 
         let (builds, triples) = result.unwrap();
         assert_eq!(builds, 1, "Should process exactly 1 build");

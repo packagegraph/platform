@@ -9,10 +9,7 @@ use crate::uris::*;
 use std::io::Result;
 
 /// Emit Debian-specific triples from the collector_specific field.
-pub fn emit_debian_extras(
-    ir: &PackageIr,
-    writer: &mut NTriplesWriter,
-) -> Result<usize> {
+pub fn emit_debian_extras(ir: &PackageIr, writer: &mut NTriplesWriter) -> Result<usize> {
     let cs = match &ir.collector_specific {
         Some(v) => v,
         None => return Ok(0),
@@ -20,7 +17,13 @@ pub fn emit_debian_extras(
 
     let scope = &ir.scope;
     let pkg = &ir.package;
-    let pkg_uri = package_uri(&scope.distro, &scope.release, &pkg.arch, &pkg.name, &pkg.full_version);
+    let pkg_uri = package_uri(
+        &scope.distro,
+        &scope.release,
+        &pkg.arch,
+        &pkg.name,
+        &pkg.full_version,
+    );
     let identity_uri = package_identity_uri(&scope.distro, &scope.release, &pkg.arch, &pkg.name);
     let mut triples = 0;
 
@@ -52,7 +55,11 @@ pub fn emit_debian_extras(
     if let Some(vcs_git) = cs.get("vcs_git").and_then(|v| v.as_str()) {
         let vcs_url = vcs_git.split_whitespace().next().unwrap_or(vcs_git);
         if let Some(pkg_repo_uri) = normalize_forge_url(vcs_url) {
-            writer.write_triple(&identity_uri, &format!("{PKG}packagingRepository"), &pkg_repo_uri)?;
+            writer.write_triple(
+                &identity_uri,
+                &format!("{PKG}packagingRepository"),
+                &pkg_repo_uri,
+            )?;
             writer.write_triple(&pkg_repo_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
             triples += 2;
         }
@@ -111,12 +118,25 @@ mod tests {
         assert!(count >= 4, "Should emit at least 4 Debian-specific triples");
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("deb#BinaryPackage"), "Should type as BinaryPackage");
+        assert!(
+            content.contains("deb#BinaryPackage"),
+            "Should type as BinaryPackage"
+        );
         assert!(content.contains("deb#inSuite"), "Should emit suite");
         assert!(content.contains("deb#inComponent"), "Should emit component");
-        assert!(content.contains("deb#installedSize"), "Should emit installed size");
-        assert!(content.contains("packagingRepository"), "Should emit VCS repo");
+        assert!(
+            content.contains("deb#installedSize"),
+            "Should emit installed size"
+        );
+        assert!(
+            content.contains("packagingRepository"),
+            "Should emit VCS repo"
+        );
     }
 }

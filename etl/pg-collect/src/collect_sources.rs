@@ -20,6 +20,7 @@ pub struct SourcesCollector {
     distribution: String,
     component: String,
     source_cache: Option<SourceCache>,
+    pub graph_uri: Option<String>,
 }
 
 impl SourcesCollector {
@@ -33,7 +34,14 @@ impl SourcesCollector {
             distribution,
             component,
             source_cache: None,
+            graph_uri: None,
         }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
@@ -70,8 +78,12 @@ impl SourcesCollector {
                 eprintln!("Sources.gz unavailable: {}", e);
                 // DQ: Sources.gz not found
                 let triples = crate::forge::emit_dq_issue(
-                    writer, "debian-sources", "sources-gz", &self.distribution,
-                    "sources-gz-unavailable", "warning"
+                    writer,
+                    "debian-sources",
+                    "sources-gz",
+                    &self.distribution,
+                    "sources-gz-unavailable",
+                    "warning",
                 )?;
                 return Ok((0, triples));
             }
@@ -149,7 +161,10 @@ impl SourcesCollector {
             }
         }
 
-        eprintln!("Sources.gz: processed {} source packages, {} triples", src_count, triple_count);
+        eprintln!(
+            "Sources.gz: processed {} source packages, {} triples",
+            src_count, triple_count
+        );
         Ok((src_count, triple_count))
     }
 
@@ -164,7 +179,11 @@ impl SourcesCollector {
             };
             match cache.fetch_or_reuse(url, &scope, logical_name)? {
                 CacheResult::Fresh(bytes) => {
-                    eprintln!("Downloaded {} ({} bytes, cached)", logical_name, bytes.len());
+                    eprintln!(
+                        "Downloaded {} ({} bytes, cached)",
+                        logical_name,
+                        bytes.len()
+                    );
                     Ok(bytes)
                 }
                 CacheResult::Cached(path) | CacheResult::NotModified(path) => {
@@ -173,12 +192,16 @@ impl SourcesCollector {
                 }
             }
         } else {
-            let response = self.client.get(url).send()
+            let response = self
+                .client
+                .get(url)
+                .send()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             if !response.status().is_success() {
                 return Err(std::io::Error::other(format!("HTTP {}", response.status())));
             }
-            let bytes = response.bytes()
+            let bytes = response
+                .bytes()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             Ok(bytes.to_vec())
         }
@@ -216,15 +239,27 @@ impl SourcesCollector {
                 if let Some(binary_uris) = source_identity_map.get(src_name) {
                     for identity_uri in binary_uris {
                         let eco_uri = ecosystem_uri("gomod");
-                        writer.write_triple(identity_uri, &format!("{PKG}upstreamEcosystem"), &eco_uri)?;
+                        writer.write_triple(
+                            identity_uri,
+                            &format!("{PKG}upstreamEcosystem"),
+                            &eco_uri,
+                        )?;
                         writer.write_triple(&eco_uri, RDF_TYPE, &format!("{PKG}Ecosystem"))?;
                         writer.write_literal(&eco_uri, RDFS_LABEL, "gomod")?;
-                        writer.write_literal(identity_uri, &format!("{PKG}upstreamPackageName"), import_path)?;
+                        writer.write_literal(
+                            identity_uri,
+                            &format!("{PKG}upstreamPackageName"),
+                            import_path,
+                        )?;
                         triples += 4;
                     }
                 }
                 // Also on the source package itself
-                writer.write_literal(src_pkg_uri, &format!("{PKG}upstreamPackageName"), import_path)?;
+                writer.write_literal(
+                    src_pkg_uri,
+                    &format!("{PKG}upstreamPackageName"),
+                    import_path,
+                )?;
                 triples += 1;
             }
         }
@@ -232,14 +267,32 @@ impl SourcesCollector {
         // Build-Depends emission (on SourcePackage URI per deb.ttl:40)
         if emit_builddeps {
             if let Some(build_deps) = src_data.get("Build-Depends") {
-                triples += self.emit_build_deps(writer, src_pkg_uri, build_deps, codename, "deb:buildDepends")?;
+                triples += self.emit_build_deps(
+                    writer,
+                    src_pkg_uri,
+                    build_deps,
+                    codename,
+                    "deb:buildDepends",
+                )?;
             }
             if let Some(build_deps_indep) = src_data.get("Build-Depends-Indep") {
-                triples += self.emit_build_deps(writer, src_pkg_uri, build_deps_indep, codename, "deb:buildDependsIndep")?;
+                triples += self.emit_build_deps(
+                    writer,
+                    src_pkg_uri,
+                    build_deps_indep,
+                    codename,
+                    "deb:buildDependsIndep",
+                )?;
             }
             if let Some(build_deps_arch) = src_data.get("Build-Depends-Arch") {
                 // Fallback to deb:buildDepends if buildDependsArch not in ontology
-                triples += self.emit_build_deps(writer, src_pkg_uri, build_deps_arch, codename, "deb:buildDepends")?;
+                triples += self.emit_build_deps(
+                    writer,
+                    src_pkg_uri,
+                    build_deps_arch,
+                    codename,
+                    "deb:buildDepends",
+                )?;
             }
         }
 
@@ -305,7 +358,7 @@ impl SourcesCollector {
         uploaders_str: &str,
         vcs_urls: &HashMap<String, String>,
     ) -> Result<usize> {
-        use crate::normalize::maintainer::{parse_mailbox_list, is_email_iri_safe};
+        use crate::normalize::maintainer::{is_email_iri_safe, parse_mailbox_list};
 
         let mut triples = 0;
 
@@ -319,7 +372,10 @@ impl SourcesCollector {
         let parsed = parse_mailbox_list(uploaders_str);
 
         if parsed.malformed_count > 0 {
-            eprintln!("WARNING: {} malformed maintainer entries in: {}", parsed.malformed_count, uploaders_str);
+            eprintln!(
+                "WARNING: {} malformed maintainer entries in: {}",
+                parsed.malformed_count, uploaders_str
+            );
         }
 
         let mut iri_unsafe_count = 0usize;
@@ -343,7 +399,11 @@ impl SourcesCollector {
             triples += 3;
 
             if let Some(email) = safe_email {
-                writer.write_triple(&maint_uri, &format!("{FOAF}mbox"), &format!("mailto:{email}"))?;
+                writer.write_triple(
+                    &maint_uri,
+                    &format!("{FOAF}mbox"),
+                    &format!("mailto:{email}"),
+                )?;
                 triples += 1;
             }
 
@@ -356,7 +416,10 @@ impl SourcesCollector {
         }
 
         if iri_unsafe_count > 0 {
-            eprintln!("WARNING: {} IRI-unsafe email addresses skipped in: {}", iri_unsafe_count, uploaders_str);
+            eprintln!(
+                "WARNING: {} IRI-unsafe email addresses skipped in: {}",
+                iri_unsafe_count, uploaders_str
+            );
         }
 
         Ok(triples)
@@ -395,22 +458,45 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 
-        let src_pkg_uri = "https://packagegraph.github.io/d/src/debian/trixie/openssl/3.2.2-1".to_string();
+        let src_pkg_uri =
+            "https://packagegraph.github.io/d/src/debian/trixie/openssl/3.2.2-1".to_string();
 
         // Test Build-Depends with version constraints and alternatives
-        let build_deps = "debhelper-compat (= 13), dpkg-dev (>= 1.22.5), gcc | clang, perl:any [arch]";
-        let triples = collector.emit_build_deps(&mut writer, &src_pkg_uri, build_deps, "trixie", "deb:buildDepends").unwrap();
+        let build_deps =
+            "debhelper-compat (= 13), dpkg-dev (>= 1.22.5), gcc | clang, perl:any [arch]";
+        let triples = collector
+            .emit_build_deps(
+                &mut writer,
+                &src_pkg_uri,
+                build_deps,
+                "trixie",
+                "deb:buildDepends",
+            )
+            .unwrap();
 
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Should emit Build-Depends triples for first alternatives (debhelper-compat, dpkg-dev, gcc, perl)
-        assert!(content.contains("buildDepends"), "Should emit buildDepends predicate");
-        assert!(content.contains("debhelper-compat"), "Should extract debhelper-compat");
+        assert!(
+            content.contains("buildDepends"),
+            "Should emit buildDepends predicate"
+        );
+        assert!(
+            content.contains("debhelper-compat"),
+            "Should extract debhelper-compat"
+        );
         assert!(content.contains("dpkg-dev"), "Should extract dpkg-dev");
-        assert!(content.contains("\"gcc\""), "Should extract gcc (first alternative)");
+        assert!(
+            content.contains("\"gcc\""),
+            "Should extract gcc (first alternative)"
+        );
         assert!(triples > 0, "Should emit triples");
     }
 
@@ -429,28 +515,55 @@ mod tests {
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 
         let mut vcs_urls = HashMap::new();
-        vcs_urls.insert("openssl".to_string(), "https://salsa.debian.org/debian/openssl.git".to_string());
+        vcs_urls.insert(
+            "openssl".to_string(),
+            "https://salsa.debian.org/debian/openssl.git".to_string(),
+        );
 
         let uploaders = "Alice Developer <alice@debian.org>, Bob Maintainer <bob@example.com>";
-        let triples = collector.emit_uploaders_triples(&mut writer, "openssl", uploaders, &vcs_urls).unwrap();
+        let triples = collector
+            .emit_uploaders_triples(&mut writer, "openssl", uploaders, &vcs_urls)
+            .unwrap();
 
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Should emit Person entities for both uploaders
         assert!(content.contains("Person"), "Should type as Person");
-        assert!(content.contains("Alice Developer"), "Should emit Alice's name");
+        assert!(
+            content.contains("Alice Developer"),
+            "Should emit Alice's name"
+        );
         assert!(content.contains("Bob Maintainer"), "Should emit Bob's name");
-        assert!(content.contains("mailto:alice@debian.org"), "Should emit Alice's email");
-        assert!(content.contains("mailto:bob@example.com"), "Should emit Bob's email");
+        assert!(
+            content.contains("mailto:alice@debian.org"),
+            "Should emit Alice's email"
+        );
+        assert!(
+            content.contains("mailto:bob@example.com"),
+            "Should emit Bob's email"
+        );
 
         // Should link to packaging repository
-        assert!(content.contains("hasContributor"), "Should emit hasContributor on repo");
-        assert!(content.contains("contributesTo"), "Should emit contributesTo on person");
+        assert!(
+            content.contains("hasContributor"),
+            "Should emit hasContributor on repo"
+        );
+        assert!(
+            content.contains("contributesTo"),
+            "Should emit contributesTo on person"
+        );
 
-        assert!(triples >= 12, "Should emit at least 12 triples (6 per person: 4 Person + 2 links)");
+        assert!(
+            triples >= 12,
+            "Should emit at least 12 triples (6 per person: 4 Person + 2 links)"
+        );
     }
 
     #[test]
@@ -506,11 +619,20 @@ Homepage: https://curl.se
         source_names.insert("curl".to_string());
 
         let mut source_pkg_uris = HashMap::new();
-        source_pkg_uris.insert("openssl".to_string(), "https://packagegraph.github.io/d/src/debian/trixie/openssl/3.2.2-1".to_string());
-        source_pkg_uris.insert("curl".to_string(), "https://packagegraph.github.io/d/src/debian/trixie/curl/8.5.0-2".to_string());
+        source_pkg_uris.insert(
+            "openssl".to_string(),
+            "https://packagegraph.github.io/d/src/debian/trixie/openssl/3.2.2-1".to_string(),
+        );
+        source_pkg_uris.insert(
+            "curl".to_string(),
+            "https://packagegraph.github.io/d/src/debian/trixie/curl/8.5.0-2".to_string(),
+        );
 
         let mut vcs_urls = HashMap::new();
-        vcs_urls.insert("openssl".to_string(), "https://salsa.debian.org/debian/openssl.git".to_string());
+        vcs_urls.insert(
+            "openssl".to_string(),
+            "https://salsa.debian.org/debian/openssl.git".to_string(),
+        );
 
         let source_identity_map: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -528,10 +650,19 @@ Homepage: https://curl.se
                 if !current_src.is_empty() && current_src.contains_key("Package") {
                     let src_name = current_src.get("Package").unwrap().clone();
                     if source_names.contains(&src_name) {
-                        total_triples += collector.emit_source_triples(
-                            &mut writer, &current_src, &src_name,
-                            &source_pkg_uris, &source_identity_map, &vcs_urls, "trixie", true, true,
-                        ).unwrap();
+                        total_triples += collector
+                            .emit_source_triples(
+                                &mut writer,
+                                &current_src,
+                                &src_name,
+                                &source_pkg_uris,
+                                &source_identity_map,
+                                &vcs_urls,
+                                "trixie",
+                                true,
+                                true,
+                            )
+                            .unwrap();
                         parsed_count += 1;
                     }
                 }
@@ -554,24 +685,49 @@ Homepage: https://curl.se
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Verify both source packages were parsed
         assert_eq!(parsed_count, 2, "Should parse both openssl and curl");
 
         // Verify Build-Depends emitted on SourcePackage URI
-        assert!(content.contains("d/src/debian/trixie/openssl"), "Should emit on openssl SourcePackage");
+        assert!(
+            content.contains("d/src/debian/trixie/openssl"),
+            "Should emit on openssl SourcePackage"
+        );
         assert!(content.contains("buildDepends"), "Should emit buildDepends");
-        assert!(content.contains("debhelper-compat"), "Should parse debhelper-compat");
+        assert!(
+            content.contains("debhelper-compat"),
+            "Should parse debhelper-compat"
+        );
 
         // Verify Build-Depends-Indep emitted with correct predicate
-        assert!(content.contains("buildDependsIndep"), "Should emit buildDependsIndep for openssl");
+        assert!(
+            content.contains("buildDependsIndep"),
+            "Should emit buildDependsIndep for openssl"
+        );
 
         // Verify Uploaders parsed (openssl has Uploaders, curl does not)
-        assert!(content.contains("Christoph Martin"), "Should parse Christoph from Uploaders");
-        assert!(content.contains("Kurt Roeckx"), "Should parse Kurt from multi-line Uploaders");
-        assert!(content.contains("hasContributor"), "Should link Uploaders to packaging repo");
+        assert!(
+            content.contains("Christoph Martin"),
+            "Should parse Christoph from Uploaders"
+        );
+        assert!(
+            content.contains("Kurt Roeckx"),
+            "Should parse Kurt from multi-line Uploaders"
+        );
+        assert!(
+            content.contains("hasContributor"),
+            "Should link Uploaders to packaging repo"
+        );
 
-        assert!(total_triples > 20, "Should emit significant number of triples");
+        assert!(
+            total_triples > 20,
+            "Should emit significant number of triples"
+        );
     }
 }

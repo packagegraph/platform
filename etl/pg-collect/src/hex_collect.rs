@@ -1,4 +1,5 @@
 use crate::ntriples::NTriplesWriter;
+use crate::sparql::{SparqlAuth, SparqlBackend};
 use crate::uris::*;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -11,6 +12,7 @@ use std::time::Duration;
 pub struct HexCollector {
     client: Client,
     api_base: String,
+    pub graph_uri: Option<String>,
 }
 
 /// Package listing from /api/packages/{name}
@@ -62,11 +64,27 @@ impl HexCollector {
     pub fn new(api_base: String) -> Self {
         let client = crate::enricher::default_http_client();
 
-        Self { client, api_base }
+        Self {
+            client,
+            api_base,
+            graph_uri: None,
+        }
     }
 
-    pub fn collect_discover(&self, endpoint: &str, output_path: &str) -> Result<(usize, usize)> {
-        let names = crate::seed::discover_by_ecosystem(endpoint, "hex")?;
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
+    }
+
+    pub fn collect_discover(
+        &self,
+        endpoint: &str,
+        auth: &SparqlAuth,
+        backend: SparqlBackend,
+        output_path: &str,
+    ) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "hex", auth, backend.clone())?;
         let seed_path = "/tmp/seed-hex-discover.txt";
         std::fs::write(seed_path, names.join("\n"))?;
         self.collect(seed_path, output_path)
@@ -74,12 +92,15 @@ impl HexCollector {
 
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         self.emit_distribution_metadata(&mut writer)?;
 
         let package_names = read_hex_seed_file(packages_file)?;
-        eprintln!("Loaded {} Hex package names from seed file", package_names.len());
+        eprintln!(
+            "Loaded {} Hex package names from seed file",
+            package_names.len()
+        );
 
         let mut total_packages = 0;
         let mut total_triples = 0;
@@ -198,7 +219,10 @@ impl HexCollector {
         version: &str,
         base_delay_ms: &mut u64,
     ) -> std::result::Result<HexReleaseDetail, String> {
-        let url = format!("{}/api/packages/{}/releases/{}", self.api_base, name, version);
+        let url = format!(
+            "{}/api/packages/{}/releases/{}",
+            self.api_base, name, version
+        );
         let max_attempts = 5;
 
         for attempt in 0..max_attempts {
@@ -206,7 +230,10 @@ impl HexCollector {
                 Ok(response) => {
                     if response.status() == StatusCode::TOO_MANY_REQUESTS {
                         let retry_secs = 2u64.pow(attempt as u32);
-                        eprintln!("  Rate limited on {}/{}, waiting {}s...", name, version, retry_secs);
+                        eprintln!(
+                            "  Rate limited on {}/{}, waiting {}s...",
+                            name, version, retry_secs
+                        );
                         std::thread::sleep(Duration::from_secs(retry_secs));
                         *base_delay_ms = (*base_delay_ms * 2).min(5000);
                         continue;
@@ -427,26 +454,41 @@ mod tests {
             version: "3.11.1".to_string(),
             requirements: {
                 let mut m = HashMap::new();
-                m.insert("decimal".to_string(), HexRequirement {
-                    requirement: Some("~> 2.0".to_string()),
-                });
+                m.insert(
+                    "decimal".to_string(),
+                    HexRequirement {
+                        requirement: Some("~> 2.0".to_string()),
+                    },
+                );
                 m
             },
             checksum: Some("abc123".to_string()),
         };
 
-        let triples = collector.emit_package_triples(&mut writer, &pkg, &release).unwrap();
+        let triples = collector
+            .emit_package_triples(&mut writer, &pkg, &release)
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("hex#HexPackage"));
         assert!(content.contains("\"ecto\""));
         assert!(content.contains("\"3.11.1\""));
-        assert!(content.contains("directlyDependsOn"), "Should emit dependency from release detail");
-        assert!(content.contains("\"abc123\""), "Should emit checksum from release detail");
+        assert!(
+            content.contains("directlyDependsOn"),
+            "Should emit dependency from release detail"
+        );
+        assert!(
+            content.contains("\"abc123\""),
+            "Should emit checksum from release detail"
+        );
         assert!(triples > 10);
     }
 }

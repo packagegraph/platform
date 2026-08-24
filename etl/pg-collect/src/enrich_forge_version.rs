@@ -6,7 +6,7 @@
 use crate::cache::FileCache;
 use crate::enricher::{rate_limit, SLOW_RATE_LIMIT};
 use crate::ntriples::NTriplesWriter;
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use reqwest::blocking::Client;
 use std::fs::File;
@@ -19,11 +19,18 @@ pub struct ForgeVersionEnricher {
     #[allow(dead_code)]
     cache: Option<FileCache>,
     gitlab_token: Option<String>,
+    pub graph_uri: Option<String>,
 }
 
 impl ForgeVersionEnricher {
-    pub fn new(endpoint: &str, cache_dir: Option<&str>, gitlab_token: Option<String>) -> Self {
-        let sparql = SparqlClient::new(endpoint);
+    pub fn new(
+        endpoint: &str,
+        cache_dir: Option<&str>,
+        gitlab_token: Option<String>,
+        auth: SparqlAuth,
+        backend: SparqlBackend,
+    ) -> Self {
+        let sparql = make_sparql_client(endpoint, &auth, backend);
         let client = crate::enricher::default_http_client();
 
         let cache = cache_dir.map(|dir| {
@@ -31,12 +38,24 @@ impl ForgeVersionEnricher {
                 .expect("Failed to create cache")
         });
 
-        Self { sparql, client, cache, gitlab_token }
+        Self {
+            sparql,
+            client,
+            cache,
+            gitlab_token,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn enrich(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         // Discover forge instances from SPARQL
         let forges = self.sparql.query_forge_instances()?;
@@ -48,9 +67,21 @@ impl ForgeVersionEnricher {
 
         for (forge_uri, forge_url, software_uri) in forges {
             // Extract hostname from forge URL for cache key
-            let host = forge_url.trim_start_matches("https://").trim_start_matches("http://").split('/').next().unwrap_or(&forge_url);
+            let host = forge_url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or(&forge_url);
 
-            match self.probe_forge_version(&mut writer, &forge_uri, &forge_url, &software_uri, host, &today) {
+            match self.probe_forge_version(
+                &mut writer,
+                &forge_uri,
+                &forge_url,
+                &software_uri,
+                host,
+                &today,
+            ) {
                 Ok(triples) if triples > 0 => {
                     probed += 1;
                     total_triples += triples;
@@ -63,7 +94,10 @@ impl ForgeVersionEnricher {
         }
 
         writer.flush()?;
-        eprintln!("Probed {} forges, emitted {} triples", probed, total_triples);
+        eprintln!(
+            "Probed {} forges, emitted {} triples",
+            probed, total_triples
+        );
         Ok((probed, total_triples))
     }
 
@@ -91,14 +125,26 @@ impl ForgeVersionEnricher {
         // Emit ForgeSoftwareVersion (shared entity)
         let software_name = extract_software_name(software_uri);
         let version_uri = forge_software_version_uri(&software_name, &version);
-        writer.write_triple(&version_uri, RDF_TYPE, &format!("{VCS}ForgeSoftwareVersion"))?;
-        writer.write_triple(&version_uri, &format!("{VCS}versionOfSoftware"), software_uri)?;
+        writer.write_triple(
+            &version_uri,
+            RDF_TYPE,
+            &format!("{VCS}ForgeSoftwareVersion"),
+        )?;
+        writer.write_triple(
+            &version_uri,
+            &format!("{VCS}versionOfSoftware"),
+            software_uri,
+        )?;
         writer.write_literal(&version_uri, &format!("{VCS}versionString"), &version)?;
 
         // Emit ForgeVersionObservation
         let obs_uri = forge_version_observation_uri(host, today);
         writer.write_triple(&obs_uri, RDF_TYPE, &format!("{VCS}ForgeVersionObservation"))?;
-        writer.write_triple(&obs_uri, &format!("{VCS}observedSoftwareVersion"), &version_uri)?;
+        writer.write_triple(
+            &obs_uri,
+            &format!("{VCS}observedSoftwareVersion"),
+            &version_uri,
+        )?;
         writer.write_date(&obs_uri, &format!("{VCS}observedAt"), today)?;
 
         // Link forge instance to observation
@@ -118,9 +164,15 @@ impl ForgeVersionEnricher {
 
     fn fetch_version(&self, forge_url: &str, software_uri: &str) -> Result<Option<String>> {
         let api_url = match software_uri {
-            "https://purl.org/packagegraph/ontology/vcs#GitLab" => format!("{}/api/v4/version", forge_url),
-            "https://purl.org/packagegraph/ontology/vcs#Forgejo" => format!("{}/api/v1/version", forge_url),
-            "https://purl.org/packagegraph/ontology/vcs#Gitea" => format!("{}/api/v1/version", forge_url),
+            "https://purl.org/packagegraph/ontology/vcs#GitLab" => {
+                format!("{}/api/v4/version", forge_url)
+            }
+            "https://purl.org/packagegraph/ontology/vcs#Forgejo" => {
+                format!("{}/api/v1/version", forge_url)
+            }
+            "https://purl.org/packagegraph/ontology/vcs#Gitea" => {
+                format!("{}/api/v1/version", forge_url)
+            }
             "https://purl.org/packagegraph/ontology/vcs#GitHub" => {
                 // Check if GHES (non-github.com)
                 if !forge_url.contains("github.com") {
@@ -129,7 +181,9 @@ impl ForgeVersionEnricher {
                     return Ok(None); // SaaS, skip
                 }
             }
-            "https://purl.org/packagegraph/ontology/vcs#BitbucketDataCenter" => format!("{}/rest/api/1.0/application-properties", forge_url),
+            "https://purl.org/packagegraph/ontology/vcs#BitbucketDataCenter" => {
+                format!("{}/rest/api/1.0/application-properties", forge_url)
+            }
             _ => return Ok(None), // Unsupported forge software
         };
 
@@ -170,18 +224,22 @@ impl ForgeVersionEnricher {
 
         // Extract version string from JSON
         let version = match software_uri {
-            "https://purl.org/packagegraph/ontology/vcs#GitLab" |
-            "https://purl.org/packagegraph/ontology/vcs#Forgejo" |
-            "https://purl.org/packagegraph/ontology/vcs#Gitea" => {
-                json.get("version").and_then(|v| v.as_str()).map(|s| s.to_string())
-            }
+            "https://purl.org/packagegraph/ontology/vcs#GitLab"
+            | "https://purl.org/packagegraph/ontology/vcs#Forgejo"
+            | "https://purl.org/packagegraph/ontology/vcs#Gitea" => json
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             "https://purl.org/packagegraph/ontology/vcs#GitHub" => {
                 // GHES meta endpoint
-                json.get("installed_version").and_then(|v| v.as_str()).map(|s| s.to_string())
+                json.get("installed_version")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
             }
-            "https://purl.org/packagegraph/ontology/vcs#BitbucketDataCenter" => {
-                json.get("version").and_then(|v| v.as_str()).map(|s| s.to_string())
-            }
+            "https://purl.org/packagegraph/ontology/vcs#BitbucketDataCenter" => json
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             _ => None,
         };
 
@@ -193,10 +251,7 @@ impl ForgeVersionEnricher {
 ///
 /// Example: "https://purl.org/packagegraph/ontology/vcs#GitLab" → "gitlab"
 fn extract_software_name(uri: &str) -> String {
-    uri.rsplit('#')
-        .next()
-        .unwrap_or("unknown")
-        .to_lowercase()
+    uri.rsplit('#').next().unwrap_or("unknown").to_lowercase()
 }
 
 #[cfg(test)]
@@ -207,9 +262,18 @@ mod tests {
 
     #[test]
     fn test_extract_software_name() {
-        assert_eq!(extract_software_name("https://purl.org/packagegraph/ontology/vcs#GitLab"), "gitlab");
-        assert_eq!(extract_software_name("https://purl.org/packagegraph/ontology/vcs#Forgejo"), "forgejo");
-        assert_eq!(extract_software_name("https://purl.org/packagegraph/ontology/vcs#GitHub"), "github");
+        assert_eq!(
+            extract_software_name("https://purl.org/packagegraph/ontology/vcs#GitLab"),
+            "gitlab"
+        );
+        assert_eq!(
+            extract_software_name("https://purl.org/packagegraph/ontology/vcs#Forgejo"),
+            "forgejo"
+        );
+        assert_eq!(
+            extract_software_name("https://purl.org/packagegraph/ontology/vcs#GitHub"),
+            "github"
+        );
     }
 
     #[test]
@@ -219,14 +283,33 @@ mod tests {
             client: Client::new(),
             cache: None,
             gitlab_token: None,
+            graph_uri: None,
         };
 
-        assert!(enricher.is_saas_forge("https://purl.org/packagegraph/ontology/vcs#GitHub", "github.com"));
-        assert!(!enricher.is_saas_forge("https://purl.org/packagegraph/ontology/vcs#GitHub", "github.example.com"));
-        assert!(enricher.is_saas_forge("https://purl.org/packagegraph/ontology/vcs#GitLab", "gitlab.com"));
-        assert!(!enricher.is_saas_forge("https://purl.org/packagegraph/ontology/vcs#GitLab", "gitlab.gnome.org"));
-        assert!(enricher.is_saas_forge("https://purl.org/packagegraph/ontology/vcs#BitbucketCloud", "bitbucket.org"));
-        assert!(!enricher.is_saas_forge("https://purl.org/packagegraph/ontology/vcs#BitbucketDataCenter", "bitbucket.example.com"));
+        assert!(enricher.is_saas_forge(
+            "https://purl.org/packagegraph/ontology/vcs#GitHub",
+            "github.com"
+        ));
+        assert!(!enricher.is_saas_forge(
+            "https://purl.org/packagegraph/ontology/vcs#GitHub",
+            "github.example.com"
+        ));
+        assert!(enricher.is_saas_forge(
+            "https://purl.org/packagegraph/ontology/vcs#GitLab",
+            "gitlab.com"
+        ));
+        assert!(!enricher.is_saas_forge(
+            "https://purl.org/packagegraph/ontology/vcs#GitLab",
+            "gitlab.gnome.org"
+        ));
+        assert!(enricher.is_saas_forge(
+            "https://purl.org/packagegraph/ontology/vcs#BitbucketCloud",
+            "bitbucket.org"
+        ));
+        assert!(!enricher.is_saas_forge(
+            "https://purl.org/packagegraph/ontology/vcs#BitbucketDataCenter",
+            "bitbucket.example.com"
+        ));
     }
 
     #[test]
@@ -239,6 +322,7 @@ mod tests {
             client: Client::new(),
             cache: None,
             gitlab_token: None,
+            graph_uri: None,
         };
 
         // Simulate successful probe
@@ -259,20 +343,24 @@ mod tests {
             client: Client::new(),
             cache: None,
             gitlab_token: None,
+            graph_uri: None,
         };
 
         // Unsupported software should return None
-        let result = enricher.fetch_version(
-            "https://savannah.gnu.org",
-            "https://purl.org/packagegraph/ontology/vcs#Savannah"
-        ).unwrap();
+        let result = enricher
+            .fetch_version(
+                "https://savannah.gnu.org",
+                "https://purl.org/packagegraph/ontology/vcs#Savannah",
+            )
+            .unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn test_fetch_version_gitlab() {
         let mut server = mockito::Server::new();
-        let mock = server.mock("GET", "/api/v4/version")
+        let mock = server
+            .mock("GET", "/api/v4/version")
             .with_status(200)
             .with_body(r#"{"version": "17.1.0", "revision": "abc123"}"#)
             .create();
@@ -282,12 +370,15 @@ mod tests {
             client: Client::new(),
             cache: None,
             gitlab_token: None,
+            graph_uri: None,
         };
 
-        let version = enricher.fetch_version(
-            &server.url(),
-            "https://purl.org/packagegraph/ontology/vcs#GitLab"
-        ).unwrap();
+        let version = enricher
+            .fetch_version(
+                &server.url(),
+                "https://purl.org/packagegraph/ontology/vcs#GitLab",
+            )
+            .unwrap();
 
         mock.assert();
         assert_eq!(version, Some("17.1.0".to_string()));
@@ -296,7 +387,8 @@ mod tests {
     #[test]
     fn test_fetch_version_forgejo() {
         let mut server = mockito::Server::new();
-        let mock = server.mock("GET", "/api/v1/version")
+        let mock = server
+            .mock("GET", "/api/v1/version")
             .with_status(200)
             .with_body(r#"{"version": "9.0.0"}"#)
             .create();
@@ -306,12 +398,15 @@ mod tests {
             client: Client::new(),
             cache: None,
             gitlab_token: None,
+            graph_uri: None,
         };
 
-        let version = enricher.fetch_version(
-            &server.url(),
-            "https://purl.org/packagegraph/ontology/vcs#Forgejo"
-        ).unwrap();
+        let version = enricher
+            .fetch_version(
+                &server.url(),
+                "https://purl.org/packagegraph/ontology/vcs#Forgejo",
+            )
+            .unwrap();
 
         mock.assert();
         assert_eq!(version, Some("9.0.0".to_string()));
@@ -320,7 +415,8 @@ mod tests {
     #[test]
     fn test_fetch_version_ghes() {
         let mut server = mockito::Server::new();
-        let mock = server.mock("GET", "/api/v3/meta")
+        let mock = server
+            .mock("GET", "/api/v3/meta")
             .with_status(200)
             .with_body(r#"{"installed_version": "3.12.0"}"#)
             .create();
@@ -330,12 +426,15 @@ mod tests {
             client: Client::new(),
             cache: None,
             gitlab_token: None,
+            graph_uri: None,
         };
 
-        let version = enricher.fetch_version(
-            &server.url(),
-            "https://purl.org/packagegraph/ontology/vcs#GitHub"
-        ).unwrap();
+        let version = enricher
+            .fetch_version(
+                &server.url(),
+                "https://purl.org/packagegraph/ontology/vcs#GitHub",
+            )
+            .unwrap();
 
         mock.assert();
         assert_eq!(version, Some("3.12.0".to_string()));
@@ -344,7 +443,8 @@ mod tests {
     #[test]
     fn test_fetch_version_handles_401() {
         let mut server = mockito::Server::new();
-        let mock = server.mock("GET", "/api/v4/version")
+        let mock = server
+            .mock("GET", "/api/v4/version")
             .with_status(401)
             .with_body("Unauthorized")
             .create();
@@ -354,12 +454,15 @@ mod tests {
             client: Client::new(),
             cache: None,
             gitlab_token: None,
+            graph_uri: None,
         };
 
-        let version = enricher.fetch_version(
-            &server.url(),
-            "https://purl.org/packagegraph/ontology/vcs#GitLab"
-        ).unwrap();
+        let version = enricher
+            .fetch_version(
+                &server.url(),
+                "https://purl.org/packagegraph/ontology/vcs#GitLab",
+            )
+            .unwrap();
 
         mock.assert();
         assert!(version.is_none(), "Should return None for 401 responses");
