@@ -9,10 +9,7 @@ use crate::uris::*;
 use std::io::Result;
 
 /// Emit RPM-specific triples from the collector_specific field.
-pub fn emit_rpm_extras(
-    ir: &PackageIr,
-    writer: &mut NTriplesWriter,
-) -> Result<usize> {
+pub fn emit_rpm_extras(ir: &PackageIr, writer: &mut NTriplesWriter) -> Result<usize> {
     let cs = match &ir.collector_specific {
         Some(v) => v,
         None => return Ok(0),
@@ -20,7 +17,13 @@ pub fn emit_rpm_extras(
 
     let scope = &ir.scope;
     let pkg = &ir.package;
-    let pkg_uri = package_uri(&scope.distro, &scope.release, &pkg.arch, &pkg.name, &pkg.full_version);
+    let pkg_uri = package_uri(
+        &scope.distro,
+        &scope.release,
+        &pkg.arch,
+        &pkg.name,
+        &pkg.full_version,
+    );
     let mut triples = 0;
 
     // RPM-specific type
@@ -50,7 +53,11 @@ pub fn emit_rpm_extras(
     // Dist-git packaging repository
     let identity_uri = package_identity_uri(&scope.distro, &scope.release, &pkg.arch, &pkg.name);
     let distgit = fedora_distgit_uri(&scope.distro, &pkg.name);
-    writer.write_triple(&identity_uri, &format!("{PKG}packagingRepository"), &distgit)?;
+    writer.write_triple(
+        &identity_uri,
+        &format!("{PKG}packagingRepository"),
+        &distgit,
+    )?;
     writer.write_triple(&distgit, RDF_TYPE, &format!("{VCS}Repository"))?;
     triples += 2;
 
@@ -106,12 +113,22 @@ mod tests {
         assert!(count >= 3, "Should emit at least 3 RPM-specific triples");
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("rpm#BinaryRPM"), "Should type as BinaryRPM");
+        assert!(
+            content.contains("rpm#BinaryRPM"),
+            "Should type as BinaryRPM"
+        );
         assert!(content.contains("rpm#sourceRPM"), "Should emit sourceRPM");
         assert!(content.contains("rpm#RPMGroup"), "Should emit RPMGroup");
-        assert!(content.contains("packagingRepository"), "Should emit dist-git repo");
+        assert!(
+            content.contains("packagingRepository"),
+            "Should emit dist-git repo"
+        );
     }
 
     #[test]

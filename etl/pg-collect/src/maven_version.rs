@@ -7,9 +7,8 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 /// Timestamped snapshot pattern: `1.0-20260101.120000-1`
-static TIMESTAMPED_SNAPSHOT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"-\d{8}\.\d{6}-\d+$").expect("valid regex")
-});
+static TIMESTAMPED_SNAPSHOT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"-\d{8}\.\d{6}-\d+$").expect("valid regex"));
 
 /// Classification of a Maven version string.
 #[derive(Debug, Clone, PartialEq)]

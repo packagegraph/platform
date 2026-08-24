@@ -32,6 +32,7 @@ RUN curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/
 # Copy pg-collect binary from Rust builder
 COPY --from=rust-builder /app/target/release/pg-collect /usr/local/bin/pg-collect
 
+
 WORKDIR /app
 
 # Copy ontology files (added at build time from ontology repo via sync-ontology.sh)

@@ -4,7 +4,7 @@
 //! and emits sec:publishedDate, sec:hasCVSSScore, and sec:hasCWE triples for matched CVEs.
 
 use crate::ntriples::{escape_literal, NTriplesWriter};
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use flate2::read::GzDecoder;
 use reqwest::blocking::Client;
@@ -22,10 +22,17 @@ pub struct NvdEnricher {
     sparql: SparqlClient,
     api_key: Option<String>,
     cache_dir: Option<PathBuf>,
+    pub graph_uri: Option<String>,
 }
 
 impl NvdEnricher {
-    pub fn new(endpoint: &str, api_key: Option<String>, cache_dir: Option<&str>) -> Result<Self> {
+    pub fn new(
+        endpoint: &str,
+        api_key: Option<String>,
+        cache_dir: Option<&str>,
+        auth: SparqlAuth,
+        backend: SparqlBackend,
+    ) -> Result<Self> {
         let client = crate::enricher::default_http_client();
 
         let cache_path = if let Some(dir) = cache_dir {
@@ -38,10 +45,17 @@ impl NvdEnricher {
 
         Ok(Self {
             client,
-            sparql: SparqlClient::new(endpoint),
+            sparql: make_sparql_client(endpoint, &auth, backend),
             api_key,
             cache_dir: cache_path,
+            graph_uri: None,
         })
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     /// Fetch NVD META file and extract SHA256 hash.
@@ -51,7 +65,9 @@ impl NvdEnricher {
             feed_name
         );
         let resp = self.client.get(&url).send().ok()?;
-        if !resp.status().is_success() { return None; }
+        if !resp.status().is_success() {
+            return None;
+        }
         let text = resp.text().ok()?;
         // META format: key:value lines. Find sha256:XXXX
         for line in text.lines() {
@@ -88,15 +104,18 @@ impl NvdEnricher {
 
                 // Cache miss or SHA mismatch — download
                 eprintln!("  Downloading {} ({})...", feed_name, url);
-                let resp = self.client.get(&url).send()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let resp =
+                    self.client.get(&url).send().map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    })?;
                 if !resp.status().is_success() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         format!("NVD feed {} returned {}", feed_name, resp.status()),
                     ));
                 }
-                let bytes = resp.bytes()
+                let bytes = resp
+                    .bytes()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
                     .to_vec();
 
@@ -126,7 +145,8 @@ impl NvdEnricher {
                 format!("NVD feed {} returned {}", feed_name, resp.status()),
             ));
         }
-        let bytes = resp.bytes()
+        let bytes = resp
+            .bytes()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
             .to_vec();
         Ok(bytes)
@@ -134,12 +154,15 @@ impl NvdEnricher {
 
     pub fn enrich(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         // Discover advisory-linked CVE IDs via SPARQL
         eprintln!("Discovering advisory-linked CVE IDs...");
         let advisory_linked_cves = self.discover_advisory_linked_cves()?;
-        eprintln!("Found {} advisory-linked CVE entities", advisory_linked_cves.len());
+        eprintln!(
+            "Found {} advisory-linked CVE entities",
+            advisory_linked_cves.len()
+        );
 
         // Download NVD JSON 2.0 per-year feeds (no rate limiting, no API key needed)
         let mut total_nvd_cves = 0;
@@ -175,7 +198,10 @@ impl NvdEnricher {
             let mut decoder = GzDecoder::new(&compressed[..]);
             let mut decompressed = Vec::new();
             if let Err(e) = decoder.read_to_end(&mut decompressed) {
-                eprintln!("  Warning: Decompression error for {}: {} — skipping", feed_name, e);
+                eprintln!(
+                    "  Warning: Decompression error for {}: {} — skipping",
+                    feed_name, e
+                );
                 continue;
             }
 
@@ -183,7 +209,10 @@ impl NvdEnricher {
             let nvd_response: NvdResponse = match serde_json::from_slice(&decompressed) {
                 Ok(resp) => resp,
                 Err(e) => {
-                    eprintln!("  Warning: JSON parse error for {}: {} — skipping", feed_name, e);
+                    eprintln!(
+                        "  Warning: JSON parse error for {}: {} — skipping",
+                        feed_name, e
+                    );
                     continue;
                 }
             };
@@ -206,19 +235,32 @@ impl NvdEnricher {
                     matched_cves += 1;
                     feed_matched += 1;
                     total_triples += emitted.triples;
-                    if emitted.has_published_date { with_published_date += 1; }
-                    if emitted.has_cvss { with_cvss += 1; }
-                    if emitted.has_cwe { with_cwe += 1; }
+                    if emitted.has_published_date {
+                        with_published_date += 1;
+                    }
+                    if emitted.has_cvss {
+                        with_cvss += 1;
+                    }
+                    if emitted.has_cwe {
+                        with_cwe += 1;
+                    }
                 }
             }
 
-            eprintln!("  {} CVEs in feed, {} advisory-linked matches", nvd_response.total_results, feed_matched);
+            eprintln!(
+                "  {} CVEs in feed, {} advisory-linked matches",
+                nvd_response.total_results, feed_matched
+            );
         }
 
         writer.flush()?;
 
         eprintln!();
-        eprintln!("Processed {} total NVD CVEs across {} feeds", total_nvd_cves, feed_names.len());
+        eprintln!(
+            "Processed {} total NVD CVEs across {} feeds",
+            total_nvd_cves,
+            feed_names.len()
+        );
         eprintln!("Matched {} advisory-linked CVEs", matched_cves);
         eprintln!("  With publishedDate: {}", with_published_date);
         eprintln!("  With CVSS: {}", with_cvss);
@@ -237,7 +279,11 @@ impl NvdEnricher {
         eprintln!("Discovering missing CVEs from {}...", graph_uri);
         let missing_cve_ids = self.discover_missing_cves(graph_uri)?;
 
-        eprintln!("Found {} CVEs missing from {}", missing_cve_ids.len(), graph_uri);
+        eprintln!(
+            "Found {} CVEs missing from {}",
+            missing_cve_ids.len(),
+            graph_uri
+        );
 
         if missing_cve_ids.is_empty() {
             eprintln!("No gaps found — graph is up to date");
@@ -245,7 +291,10 @@ impl NvdEnricher {
         }
 
         if missing_cve_ids.len() > 5000 {
-            eprintln!("WARNING: Large gap set ({} CVEs) — consider using feed mode for bulk refresh", missing_cve_ids.len());
+            eprintln!(
+                "WARNING: Large gap set ({} CVEs) — consider using feed mode for bulk refresh",
+                missing_cve_ids.len()
+            );
         }
 
         let total_missing = missing_cve_ids.len();
@@ -263,9 +312,15 @@ impl NvdEnricher {
                     batch.extend(lines);
                     matched_cves += 1;
                     total_triples += stats.triples;
-                    if stats.has_published_date { with_published_date += 1; }
-                    if stats.has_cvss { with_cvss += 1; }
-                    if stats.has_cwe { with_cwe += 1; }
+                    if stats.has_published_date {
+                        with_published_date += 1;
+                    }
+                    if stats.has_cvss {
+                        with_cvss += 1;
+                    }
+                    if stats.has_cwe {
+                        with_cwe += 1;
+                    }
 
                     // Flush batch when reaching 500 lines
                     if batch.len() >= 500 {
@@ -276,7 +331,12 @@ impl NvdEnricher {
 
                     // Progress reporting every 50 CVEs
                     if (idx + 1) % 50 == 0 {
-                        eprintln!("  Processed {}/{} CVEs ({} triples inserted)", idx + 1, total_missing, total_triples);
+                        eprintln!(
+                            "  Processed {}/{} CVEs ({} triples inserted)",
+                            idx + 1,
+                            total_missing,
+                            total_triples
+                        );
                     }
                 }
                 Ok(None) => {
@@ -315,12 +375,14 @@ SELECT DISTINCT ?vuln WHERE {{
         );
 
         let bindings = self.sparql.query(&sparql)?;
-        let cve_uris: HashSet<String> = bindings.into_iter()
+        let cve_uris: HashSet<String> = bindings
+            .into_iter()
             .filter_map(|b| b.get("vuln").cloned())
             .collect();
 
         // Extract CVE IDs from URIs (d/cve/CVE-YYYY-NNNNN → CVE-YYYY-NNNNN)
-        let cve_ids: HashSet<String> = cve_uris.iter()
+        let cve_ids: HashSet<String> = cve_uris
+            .iter()
             .filter_map(|uri| uri.rsplit('/').next().map(|s| s.to_string()))
             .collect();
 
@@ -350,12 +412,14 @@ SELECT DISTINCT ?vuln WHERE {{
         );
 
         let bindings = self.sparql.query(&sparql)?;
-        let cve_uris: Vec<String> = bindings.into_iter()
+        let cve_uris: Vec<String> = bindings
+            .into_iter()
             .filter_map(|b| b.get("vuln").cloned())
             .collect();
 
         // Extract CVE IDs from URIs (d/cve/CVE-YYYY-NNNNN → CVE-YYYY-NNNNN)
-        let cve_ids: Vec<String> = cve_uris.iter()
+        let cve_ids: Vec<String> = cve_uris
+            .iter()
             .filter_map(|uri| uri.rsplit('/').next().map(|s| s.to_string()))
             .collect();
 
@@ -376,8 +440,8 @@ SELECT DISTINCT ?vuln WHERE {{
         // Rate limiting: pre-delay to prevent burst at start
         // NVD uses a rolling 30-second window: 5 req/30s = 6s/req, 50 req/30s = 600ms/req
         let delay = match self.api_key {
-            Some(_) => Duration::from_millis(650),  // 50 req/30s with key
-            None => Duration::from_millis(6500),    // 5 req/30s without key
+            Some(_) => Duration::from_millis(650), // 50 req/30s with key
+            None => Duration::from_millis(6500),   // 5 req/30s without key
         };
         std::thread::sleep(delay);
 
@@ -394,8 +458,12 @@ SELECT DISTINCT ?vuln WHERE {{
 
             match request.send() {
                 Ok(response) if response.status().is_success() => {
-                    let nvd_response: NvdResponse = response.json()
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to parse NVD response: {}", e)))?;
+                    let nvd_response: NvdResponse = response.json().map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to parse NVD response: {}", e),
+                        )
+                    })?;
 
                     // If totalResults=0, CVE doesn't exist
                     if nvd_response.total_results == 0 || nvd_response.vulnerabilities.is_empty() {
@@ -404,9 +472,19 @@ SELECT DISTINCT ?vuln WHERE {{
 
                     return Ok(Some(nvd_response.vulnerabilities[0].cve.clone()));
                 }
-                Ok(response) if (response.status() == 429 || response.status() == 403 || response.status() == 503) && attempt < max_retries => {
+                Ok(response)
+                    if (response.status() == 429
+                        || response.status() == 403
+                        || response.status() == 503)
+                        && attempt < max_retries =>
+                {
                     let backoff = Duration::from_secs(2 * (1 << attempt)); // 2s, 4s, 8s
-                    eprintln!("    NVD API {} for {}, retrying in {}s...", response.status(), cve_id, backoff.as_secs());
+                    eprintln!(
+                        "    NVD API {} for {}, retrying in {}s...",
+                        response.status(),
+                        cve_id,
+                        backoff.as_secs()
+                    );
                     std::thread::sleep(backoff);
                 }
                 Ok(response) if response.status() == 404 => {
@@ -416,12 +494,21 @@ SELECT DISTINCT ?vuln WHERE {{
                 Ok(response) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
-                        format!("NVD API request failed for {}: {}", cve_id, response.status()),
+                        format!(
+                            "NVD API request failed for {}: {}",
+                            cve_id,
+                            response.status()
+                        ),
                     ));
                 }
                 Err(e) if attempt < max_retries => {
                     let backoff = Duration::from_secs(2 * (1 << attempt));
-                    eprintln!("    NVD API error for {}: {}, retrying in {}s...", cve_id, e, backoff.as_secs());
+                    eprintln!(
+                        "    NVD API error for {}: {}, retrying in {}s...",
+                        cve_id,
+                        e,
+                        backoff.as_secs()
+                    );
                     std::thread::sleep(backoff);
                 }
                 Err(e) => {
@@ -435,12 +522,19 @@ SELECT DISTINCT ?vuln WHERE {{
 
         Err(std::io::Error::new(
             std::io::ErrorKind::Other,
-            format!("NVD API request failed for {} after {} retries", cve_id, max_retries),
+            format!(
+                "NVD API request failed for {} after {} retries",
+                cve_id, max_retries
+            ),
         ))
     }
 
     /// Emit triples for a single CVE. Returns emission stats.
-    fn emit_cve_triples(&self, writer: &mut NTriplesWriter, cve: &NvdCve) -> Result<CveEmissionStats> {
+    fn emit_cve_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        cve: &NvdCve,
+    ) -> Result<CveEmissionStats> {
         let (lines, stats) = format_cve_ntriples(cve);
 
         for line in lines {
@@ -499,8 +593,12 @@ fn format_cve_ntriples(cve: &NvdCve) -> (Vec<String>, CveEmissionStats) {
                     lines.push(format!("<{score_uri}> <{RDF_TYPE}> <{SEC}CVSSScore> ."));
 
                     let vector_escaped = escape_literal(&cvss_metric.cvss_data.vector_string);
-                    lines.push(format!("<{score_uri}> <{SEC}vectorString> \"{vector_escaped}\" ."));
-                    lines.push(format!("<{score_uri}> <{SEC}cvssVersion> \"{version_label}\" ."));
+                    lines.push(format!(
+                        "<{score_uri}> <{SEC}vectorString> \"{vector_escaped}\" ."
+                    ));
+                    lines.push(format!(
+                        "<{score_uri}> <{SEC}cvssVersion> \"{version_label}\" ."
+                    ));
 
                     // baseScore as decimal
                     let base_score_str = format!("{:.1}", cvss_metric.cvss_data.base_score);
@@ -659,8 +757,8 @@ mod tests {
 
     #[test]
     fn test_parse_nvd_response() {
-        let response: NvdResponse = serde_json::from_str(SAMPLE_NVD_JSON)
-            .expect("Should parse NVD JSON");
+        let response: NvdResponse =
+            serde_json::from_str(SAMPLE_NVD_JSON).expect("Should parse NVD JSON");
 
         assert_eq!(response.total_results, 1);
         assert_eq!(response.vulnerabilities.len(), 1);
@@ -673,7 +771,10 @@ mod tests {
         let cvss_v31 = metrics.cvss_metric_v31.as_ref().unwrap();
         assert_eq!(cvss_v31.len(), 1);
         assert_eq!(cvss_v31[0].cvss_data.version, "3.1");
-        assert_eq!(cvss_v31[0].cvss_data.vector_string, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H");
+        assert_eq!(
+            cvss_v31[0].cvss_data.vector_string,
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+        );
         assert_eq!(cvss_v31[0].cvss_data.base_score, 7.5);
 
         let weaknesses = cve.weaknesses.as_ref().unwrap();
@@ -690,7 +791,8 @@ mod tests {
     #[test]
     fn test_filter_nvd_cwe_placeholders() {
         let cwe_values = vec!["CWE-89", "NVD-CWE-noinfo", "CWE-79", "NVD-CWE-Other"];
-        let filtered: Vec<&str> = cwe_values.iter()
+        let filtered: Vec<&str> = cwe_values
+            .iter()
             .filter(|s| !s.starts_with("NVD-CWE-"))
             .copied()
             .collect();
@@ -699,8 +801,8 @@ mod tests {
 
     #[test]
     fn test_cve_triple_emission() {
-        use tempfile::NamedTempFile;
         use std::io::Read;
+        use tempfile::NamedTempFile;
 
         let tmp = NamedTempFile::new().unwrap();
         let file = tmp.reopen().unwrap();
@@ -731,10 +833,14 @@ mod tests {
         };
 
         let enricher = NvdEnricher {
-            client: Client::builder().timeout(Duration::from_secs(10)).build().unwrap(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
             sparql: SparqlClient::new("http://localhost:3030/packagegraph"),
             api_key: None,
             cache_dir: None,
+            graph_uri: None,
         };
 
         let stats = enricher.emit_cve_triples(&mut writer, &nvd_cve).unwrap();
@@ -751,7 +857,10 @@ mod tests {
         assert!(content.contains("security#Vulnerability"));
         assert!(content.contains("CVE-2025-26794"));
         assert!(content.contains("security#publishedDate"));
-        assert!(content.contains("2025-02-21T13:15:11Z"), "Should truncate milliseconds");
+        assert!(
+            content.contains("2025-02-21T13:15:11Z"),
+            "Should truncate milliseconds"
+        );
         assert!(content.contains("security#hasCVSSScore"));
         assert!(content.contains("security#CVSSScore"));
         assert!(content.contains("CVSS:3.1/AV:N/AC:L"));
@@ -801,7 +910,10 @@ mod tests {
         assert!(content.contains("security#Vulnerability"));
         assert!(content.contains("CVE-2025-26794"));
         assert!(content.contains("security#publishedDate"));
-        assert!(content.contains("2025-02-21T13:15:11Z"), "Should truncate milliseconds");
+        assert!(
+            content.contains("2025-02-21T13:15:11Z"),
+            "Should truncate milliseconds"
+        );
         assert!(content.contains("security#hasCVSSScore"));
         assert!(content.contains("security#CVSSScore"));
         assert!(content.contains("CVSS:3.1/AV:N/AC:L"));
@@ -836,13 +948,19 @@ mod tests {
             .create();
 
         let enricher = NvdEnricher {
-            client: Client::builder().timeout(Duration::from_secs(10)).build().unwrap(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
             sparql: SparqlClient::new(&server.url()),
             api_key: None,
             cache_dir: None,
+            graph_uri: None,
         };
 
-        let missing = enricher.discover_missing_cves("https://packagegraph.github.io/graph/cve/nvd").unwrap();
+        let missing = enricher
+            .discover_missing_cves("https://packagegraph.github.io/graph/cve/nvd")
+            .unwrap();
 
         mock.assert();
         assert_eq!(missing.len(), 3);
@@ -854,19 +972,26 @@ mod tests {
     #[test]
     fn test_discover_missing_cves_empty() {
         let mut server = mockito::Server::new();
-        let mock = server.mock("POST", "/sparql")
+        let mock = server
+            .mock("POST", "/sparql")
             .with_status(200)
             .with_body(r#"{"results": {"bindings": []}}"#)
             .create();
 
         let enricher = NvdEnricher {
-            client: Client::builder().timeout(Duration::from_secs(10)).build().unwrap(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
             sparql: SparqlClient::new(&server.url()),
             api_key: None,
             cache_dir: None,
+            graph_uri: None,
         };
 
-        let missing = enricher.discover_missing_cves("https://packagegraph.github.io/graph/cve/nvd").unwrap();
+        let missing = enricher
+            .discover_missing_cves("https://packagegraph.github.io/graph/cve/nvd")
+            .unwrap();
 
         mock.assert();
         assert_eq!(missing.len(), 0);
@@ -875,11 +1000,16 @@ mod tests {
     #[test]
     fn test_fetch_cve_from_api_success() {
         let mut server = mockito::Server::new();
-        let mock = server.mock("GET", "/")
-            .match_query(mockito::Matcher::UrlEncoded("cveId".into(), "CVE-2025-1234".into()))
+        let mock = server
+            .mock("GET", "/")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "cveId".into(),
+                "CVE-2025-1234".into(),
+            ))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{
+            .with_body(
+                r#"{
                 "totalResults": 1,
                 "vulnerabilities": [{
                     "cve": {
@@ -897,43 +1027,63 @@ mod tests {
                         }
                     }
                 }]
-            }"#)
+            }"#,
+            )
             .create();
 
         let enricher = NvdEnricher {
-            client: Client::builder().timeout(Duration::from_secs(10)).build().unwrap(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
             sparql: SparqlClient::new("http://localhost:3030/test"),
             api_key: None,
             cache_dir: None,
+            graph_uri: None,
         };
 
         // Override NVD API base to point to mock server
-        let cve = enricher.fetch_cve_from_api_with_base(&server.url(), "CVE-2025-1234").unwrap();
+        let cve = enricher
+            .fetch_cve_from_api_with_base(&server.url(), "CVE-2025-1234")
+            .unwrap();
 
         mock.assert();
         assert!(cve.is_some());
         let cve_data = cve.unwrap();
         assert_eq!(cve_data.id, "CVE-2025-1234");
-        assert_eq!(cve_data.published.as_ref().unwrap(), "2025-01-15T10:00:00.000");
+        assert_eq!(
+            cve_data.published.as_ref().unwrap(),
+            "2025-01-15T10:00:00.000"
+        );
     }
 
     #[test]
     fn test_fetch_cve_from_api_not_found() {
         let mut server = mockito::Server::new();
-        let mock = server.mock("GET", "/")
-            .match_query(mockito::Matcher::UrlEncoded("cveId".into(), "CVE-NONEXISTENT".into()))
+        let mock = server
+            .mock("GET", "/")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "cveId".into(),
+                "CVE-NONEXISTENT".into(),
+            ))
             .with_status(200)
             .with_body(r#"{"totalResults": 0, "vulnerabilities": []}"#)
             .create();
 
         let enricher = NvdEnricher {
-            client: Client::builder().timeout(Duration::from_secs(10)).build().unwrap(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
             sparql: SparqlClient::new("http://localhost:3030/test"),
             api_key: None,
             cache_dir: None,
+            graph_uri: None,
         };
 
-        let cve = enricher.fetch_cve_from_api_with_base(&server.url(), "CVE-NONEXISTENT").unwrap();
+        let cve = enricher
+            .fetch_cve_from_api_with_base(&server.url(), "CVE-NONEXISTENT")
+            .unwrap();
 
         mock.assert();
         assert!(cve.is_none());
@@ -943,19 +1093,26 @@ mod tests {
     fn test_enrich_api_zero_gaps() {
         let mut server = mockito::Server::new();
         // Gap discovery returns empty
-        let mock_sparql = server.mock("POST", "/sparql")
+        let mock_sparql = server
+            .mock("POST", "/sparql")
             .with_status(200)
             .with_body(r#"{"results": {"bindings": []}}"#)
             .create();
 
         let enricher = NvdEnricher {
-            client: Client::builder().timeout(Duration::from_secs(10)).build().unwrap(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
             sparql: SparqlClient::new(&server.url()),
             api_key: None,
             cache_dir: None,
+            graph_uri: None,
         };
 
-        let (matched, triples) = enricher.enrich_api("https://packagegraph.github.io/graph/cve/nvd").unwrap();
+        let (matched, triples) = enricher
+            .enrich_api("https://packagegraph.github.io/graph/cve/nvd")
+            .unwrap();
 
         mock_sparql.assert();
         assert_eq!(matched, 0);

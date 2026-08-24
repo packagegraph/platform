@@ -125,10 +125,7 @@ mod tests {
             "%DESC%".to_string(),
             vec!["The GNU Compiler Collection".to_string()],
         );
-        fields.insert(
-            "%URL%".to_string(),
-            vec!["https://gcc.gnu.org".to_string()],
-        );
+        fields.insert("%URL%".to_string(), vec!["https://gcc.gnu.org".to_string()]);
 
         let scope = ScopeIr {
             collector: "arch".to_string(),

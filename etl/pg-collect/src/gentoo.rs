@@ -11,23 +11,38 @@ use walkdir::WalkDir;
 
 /// Matches simple variable assignments: VAR="value" or VAR=value
 static VAR_RE_QUOTED: Lazy<Regex> = Lazy::new(|| Regex::new(r#"^\s*([A-Z_]+)="([^"]*)""#).unwrap());
-static VAR_RE_UNQUOTED: Lazy<Regex> = Lazy::new(|| Regex::new(r#"^\s*([A-Z_]+)=([^\s]+)"#).unwrap());
+static VAR_RE_UNQUOTED: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"^\s*([A-Z_]+)=([^\s]+)"#).unwrap());
 
 /// Matches Gentoo dependency atoms: category/package-name (no version).
 /// Anchored to avoid capturing version suffixes like "glib-2" as part of the name.
-static DEP_ATOM_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?:^|[\s(])(?:[<>=!~]*)?([a-z0-9_-]+/[a-z0-9_.+-]+?)(?:[-:]\d|[\s)\n]|$)").unwrap());
+static DEP_ATOM_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:^|[\s(])(?:[<>=!~]*)?([a-z0-9_-]+/[a-z0-9_.+-]+?)(?:[-:]\d|[\s)\n]|$)").unwrap()
+});
 
 pub struct GentooCollector {
     distro_name: String,
     release_name: String,
     repo_path: String,
     source_cache: Option<SourceCache>,
+    pub graph_uri: Option<String>,
 }
 
 impl GentooCollector {
     pub fn new(distro_name: String, release_name: String, repo_path: String) -> Self {
-        Self { distro_name, release_name, repo_path, source_cache: None }
+        Self {
+            distro_name,
+            release_name,
+            repo_path,
+            source_cache: None,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
@@ -37,7 +52,7 @@ impl GentooCollector {
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
         self.emit_distribution_metadata(&mut writer)?;
 
         let mut total_packages = 0;
@@ -69,9 +84,7 @@ impl GentooCollector {
                     .max_depth(1)
                     .into_iter()
                     .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path().extension().and_then(|s| s.to_str()) == Some("ebuild")
-                    })
+                    .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("ebuild"))
                 {
                     match self.parse_ebuild(category_name, pkg_name, ebuild_file.path()) {
                         Ok(pkg) => {
@@ -169,9 +182,7 @@ impl GentooCollector {
                 "KEYWORDS" => {
                     pkg.keywords = value.split_whitespace().map(|s| s.to_string()).collect()
                 }
-                "IUSE" => {
-                    pkg.iuse = value.split_whitespace().map(|s| s.to_string()).collect()
-                }
+                "IUSE" => pkg.iuse = value.split_whitespace().map(|s| s.to_string()).collect(),
                 "DEPEND" => {
                     pkg.depend = parse_dependencies(value);
                 }
@@ -196,9 +207,19 @@ impl GentooCollector {
         let full_name = format!("{}/{}", pkg.category, pkg.name);
         // Gentoo has no arch in the same sense as RPM/Debian — use category as the
         // organizational axis. URIs: d/pkg/gentoo/gentoo/{category}/{name}/{version}
-        let pkg_uri = package_uri(&self.distro_name, &self.release_name, &pkg.category, &pkg.name, &pkg.version);
-        let identity_uri =
-            package_identity_uri(&self.distro_name, &self.release_name, &pkg.category, &pkg.name);
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            &self.release_name,
+            &pkg.category,
+            &pkg.name,
+            &pkg.version,
+        );
+        let identity_uri = package_identity_uri(
+            &self.distro_name,
+            &self.release_name,
+            &pkg.category,
+            &pkg.name,
+        );
         let mut triples = 0;
 
         // Gentoo ebuilds are source packages — they compile from source
@@ -218,7 +239,12 @@ impl GentooCollector {
         writer.write_literal(&pkg_uri, &format!("{GENTOO}category"), &pkg.category)?;
         triples += 1;
 
-        let ver_uri = version_uri(&self.distro_name, &self.release_name, &full_name, &pkg.version);
+        let ver_uri = version_uri(
+            &self.distro_name,
+            &self.release_name,
+            &full_name,
+            &pkg.version,
+        );
         writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
         writer.write_literal(&ver_uri, &format!("{PKG}versionString"), &pkg.version)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
@@ -240,7 +266,8 @@ impl GentooCollector {
         if let Some(homepage) = &pkg.homepage {
             // Gentoo HOMEPAGE can have multiple space-separated URLs.
             // First URL goes to pkg:homepage; try all URLs for upstream repo.
-            let urls: Vec<&str> = homepage.split_whitespace()
+            let urls: Vec<&str> = homepage
+                .split_whitespace()
                 .filter(|u| !u.contains("${") && !u.is_empty())
                 .collect();
 
@@ -250,11 +277,10 @@ impl GentooCollector {
             }
 
             // Try all HOMEPAGE URLs for upstream repo extraction (best confidence wins)
-            let candidates: Vec<(&str, &str)> = urls.iter()
-                .map(|u| ("homepage", *u))
-                .collect();
+            let candidates: Vec<(&str, &str)> = urls.iter().map(|u| ("homepage", *u)).collect();
             if let Some(extraction) = crate::forge::extract_best_repo(&candidates) {
-                triples += crate::forge::emit_upstream_repo(writer, &identity_uri, &extraction, None)?;
+                triples +=
+                    crate::forge::emit_upstream_repo(writer, &identity_uri, &extraction, None)?;
             }
         }
 
@@ -294,11 +320,20 @@ impl GentooCollector {
 
         // Dependencies — deduplicate across DEPEND/RDEPEND/BDEPEND
         let mut seen_deps: HashSet<String> = HashSet::new();
-        for dep in pkg.depend.iter().chain(pkg.rdepend.iter()).chain(pkg.bdepend.iter()) {
+        for dep in pkg
+            .depend
+            .iter()
+            .chain(pkg.rdepend.iter())
+            .chain(pkg.bdepend.iter())
+        {
             if seen_deps.insert(dep.clone()) {
                 if let Some((dep_cat, dep_name)) = dep.split_once('/') {
-                    let target_uri =
-                        package_identity_uri(&self.distro_name, &self.release_name, dep_cat, dep_name);
+                    let target_uri = package_identity_uri(
+                        &self.distro_name,
+                        &self.release_name,
+                        dep_cat,
+                        dep_name,
+                    );
                     writer.write_triple(&target_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
                     writer.write_literal(&target_uri, &format!("{PKG}packageName"), dep)?;
                     writer.write_triple(
@@ -408,14 +443,20 @@ mod tests {
             version: "3.2.1".to_string(),
             eapi: Some("8".to_string()),
             description: Some("TLS/SSL toolkit".to_string()),
-            homepage: Some("https://www.openssl.org/ https://github.com/openssl/openssl".to_string()),
+            homepage: Some(
+                "https://www.openssl.org/ https://github.com/openssl/openssl".to_string(),
+            ),
             license: Some("Apache-2.0".to_string()),
             slot: Some("0".to_string()),
             subslot: Some("3".to_string()),
             keywords: vec!["amd64".to_string(), "~arm64".to_string()],
-            iuse: vec!["+asm".to_string(), "cpu_flags_x86_sse2".to_string(), "doc".to_string()],
+            iuse: vec![
+                "+asm".to_string(),
+                "cpu_flags_x86_sse2".to_string(),
+                "doc".to_string(),
+            ],
             depend: vec!["sys-libs/zlib".to_string(), "dev-lang/perl".to_string()],
-            rdepend: vec!["sys-libs/zlib".to_string()],  // duplicate with DEPEND
+            rdepend: vec!["sys-libs/zlib".to_string()], // duplicate with DEPEND
             bdepend: vec!["dev-build/make".to_string()],
         }
     }
@@ -443,7 +484,9 @@ BDEPEND="sys-devel/gettext"
             .write_all(content.as_bytes())
             .unwrap();
 
-        let pkg = collector.parse_ebuild("app-editors", "gedit", &ebuild_path).unwrap();
+        let pkg = collector
+            .parse_ebuild("app-editors", "gedit", &ebuild_path)
+            .unwrap();
 
         assert_eq!(pkg.category, "app-editors");
         assert_eq!(pkg.name, "gedit");
@@ -467,7 +510,11 @@ BDEPEND="sys-devel/gettext"
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Package URI should use category as path segment, name without category prefix
         // e.g., d/pkg/gentoo/gentoo/dev-libs/openssl/3.2.1
@@ -476,12 +523,14 @@ BDEPEND="sys-devel/gettext"
         // should appear unencoded. But the full_name "dev-libs/openssl" would
         // have the slash encoded. Check that we're passing name (not full_name)
         // to the URI builder.
-        let pkg_line = content.lines()
+        let pkg_line = content
+            .lines()
             .find(|l| l.contains("3.2.1") && l.contains("rdf-syntax"))
             .unwrap_or("NOT FOUND");
         assert!(
             !pkg_line.contains("dev-libs%2F"),
-            "Category should not be encoded in package name. Got: {}", pkg_line
+            "Category should not be encoded in package name. Got: {}",
+            pkg_line
         );
     }
 
@@ -495,29 +544,46 @@ BDEPEND="sys-devel/gettext"
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Dependency URI should be d/pkg/gentoo/gentoo/sys-libs/zlib (no double slash)
-        assert!(content.contains("d/pkg/gentoo/gentoo/sys-libs/zlib"), "Dependency URI should use category as arch segment");
-        assert!(!content.contains("gentoo//"), "No double slash in dependency URIs");
+        assert!(
+            content.contains("d/pkg/gentoo/gentoo/sys-libs/zlib"),
+            "Dependency URI should use category as arch segment"
+        );
+        assert!(
+            !content.contains("gentoo//"),
+            "No double slash in dependency URIs"
+        );
     }
 
     #[test]
     fn test_dependency_dedup_across_dep_types() {
         let collector = GentooCollector::new("gentoo".into(), "gentoo".into(), "/tmp".to_string());
-        let pkg = make_test_package();  // sys-libs/zlib appears in both DEPEND and RDEPEND
+        let pkg = make_test_package(); // sys-libs/zlib appears in both DEPEND and RDEPEND
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
         collector.emit_package_triples(&mut writer, &pkg).unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // sys-libs/zlib should appear as directlyDependsOn exactly once (deduped)
         let dep_count = content.matches("directlyDependsOn").count();
         // Should be 3: zlib (deduped), perl, make
-        assert_eq!(dep_count, 3, "Dependencies should be deduplicated across DEPEND/RDEPEND/BDEPEND");
+        assert_eq!(
+            dep_count, 3,
+            "Dependencies should be deduplicated across DEPEND/RDEPEND/BDEPEND"
+        );
         // Each dep target should have PackageIdentity type and packageName
         assert!(content.contains("d/pkg/gentoo/gentoo/sys-libs/zlib> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>"), "Dep target should have type");
     }
@@ -532,11 +598,24 @@ BDEPEND="sys-devel/gettext"
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("core#SourcePackage"), "Gentoo packages should be typed as SourcePackage");
-        assert!(!content.contains("core#Package>"), "Should not use generic Package type");
-        assert!(content.contains("portage#PortagePackage"), "Should have Gentoo-specific type");
+        assert!(
+            content.contains("core#SourcePackage"),
+            "Gentoo packages should be typed as SourcePackage"
+        );
+        assert!(
+            !content.contains("core#Package>"),
+            "Should not use generic Package type"
+        );
+        assert!(
+            content.contains("portage#PortagePackage"),
+            "Should have Gentoo-specific type"
+        );
     }
 
     #[test]
@@ -549,13 +628,29 @@ BDEPEND="sys-devel/gettext"
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // USE flags should have actual names, not empty strings
-        assert!(content.contains("\"asm\""), "USE flag 'asm' should be present (+ prefix stripped)");
-        assert!(content.contains("\"cpu_flags_x86_sse2\""), "USE flag should be present");
-        assert!(content.contains("\"doc\""), "USE flag 'doc' should be present");
-        assert!(!content.contains("hasUseFlag> \"\""), "No empty USE flag values");
+        assert!(
+            content.contains("\"asm\""),
+            "USE flag 'asm' should be present (+ prefix stripped)"
+        );
+        assert!(
+            content.contains("\"cpu_flags_x86_sse2\""),
+            "USE flag should be present"
+        );
+        assert!(
+            content.contains("\"doc\""),
+            "USE flag 'doc' should be present"
+        );
+        assert!(
+            !content.contains("hasUseFlag> \"\""),
+            "No empty USE flag values"
+        );
     }
 
     #[test]
@@ -568,68 +663,122 @@ BDEPEND="sys-devel/gettext"
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("portage#category"), "Category should be a separate property");
-        assert!(content.contains("\"dev-libs\""), "Category value should be just the category");
+        assert!(
+            content.contains("portage#category"),
+            "Category should be a separate property"
+        );
+        assert!(
+            content.contains("\"dev-libs\""),
+            "Category value should be just the category"
+        );
     }
 
     #[test]
     fn test_homepage_takes_first_url() {
         let collector = GentooCollector::new("gentoo".into(), "gentoo".into(), "/tmp".to_string());
-        let pkg = make_test_package();  // homepage has two URLs
+        let pkg = make_test_package(); // homepage has two URLs
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
         collector.emit_package_triples(&mut writer, &pkg).unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("\"https://www.openssl.org/\""), "Should take first homepage URL");
+        assert!(
+            content.contains("\"https://www.openssl.org/\""),
+            "Should take first homepage URL"
+        );
         // Second HOMEPAGE URL should appear as upstreamRepository, not in homepage literal
-        assert!(content.contains("core#upstreamRepository"), "Should emit upstreamRepository from second HOMEPAGE URL");
-        assert!(content.contains("vcs#repositoryURL"), "Should emit repositoryURL for upstream repo");
+        assert!(
+            content.contains("core#upstreamRepository"),
+            "Should emit upstreamRepository from second HOMEPAGE URL"
+        );
+        assert!(
+            content.contains("vcs#repositoryURL"),
+            "Should emit repositoryURL for upstream repo"
+        );
     }
 
     #[test]
     fn test_parse_dependencies_strips_versions() {
         let deps = parse_dependencies(">=dev-libs/glib-2.78:2 sys-libs/zlib x11-libs/gtk+-3.24");
-        assert!(deps.contains(&"dev-libs/glib".to_string()), "Should strip version from glib-2.78");
+        assert!(
+            deps.contains(&"dev-libs/glib".to_string()),
+            "Should strip version from glib-2.78"
+        );
         assert!(deps.contains(&"sys-libs/zlib".to_string()));
-        assert!(deps.contains(&"x11-libs/gtk+".to_string()), "Should strip version from gtk+-3.24");
+        assert!(
+            deps.contains(&"x11-libs/gtk+".to_string()),
+            "Should strip version from gtk+-3.24"
+        );
     }
 
     #[test]
     fn test_parse_dependencies_strips_slot_operators() {
         let deps = parse_dependencies("dev-libs/openssl:0= sys-libs/glibc:2.2+");
-        assert!(deps.contains(&"dev-libs/openssl".to_string()), "Should strip slot operator :0=");
-        assert!(deps.contains(&"sys-libs/glibc".to_string()), "Should strip slot operator :2.2+");
+        assert!(
+            deps.contains(&"dev-libs/openssl".to_string()),
+            "Should strip slot operator :0="
+        );
+        assert!(
+            deps.contains(&"sys-libs/glibc".to_string()),
+            "Should strip slot operator :2.2+"
+        );
     }
 
     #[test]
     fn test_parse_dependencies_skips_virtuals_and_bash() {
-        let deps = parse_dependencies("use? ( dev-libs/foo ) || ( dev-libs/bar dev-libs/baz ) ${DEPEND}");
+        let deps =
+            parse_dependencies("use? ( dev-libs/foo ) || ( dev-libs/bar dev-libs/baz ) ${DEPEND}");
         assert!(deps.contains(&"dev-libs/foo".to_string()));
         assert!(deps.contains(&"dev-libs/bar".to_string()));
         assert!(deps.contains(&"dev-libs/baz".to_string()));
         // Should not contain bash variables
-        assert!(!deps.iter().any(|d| d.contains('$')), "Should skip bash variables");
+        assert!(
+            !deps.iter().any(|d| d.contains('$')),
+            "Should skip bash variables"
+        );
     }
 
     #[test]
     fn test_parse_dependencies_strips_leading_quotes() {
         let deps = parse_dependencies(r#"">=dev-libs/apr-1.5:= ">=dev-libs/apr-util-1.5:=""#);
-        assert!(deps.contains(&"dev-libs/apr".to_string()), "Should strip leading quote and version");
-        assert!(deps.contains(&"dev-libs/apr-util".to_string()), "Should strip leading quote and version");
-        assert!(!deps.iter().any(|d| d.contains('"')), "No quotes in dependency atoms");
+        assert!(
+            deps.contains(&"dev-libs/apr".to_string()),
+            "Should strip leading quote and version"
+        );
+        assert!(
+            deps.contains(&"dev-libs/apr-util".to_string()),
+            "Should strip leading quote and version"
+        );
+        assert!(
+            !deps.iter().any(|d| d.contains('"')),
+            "No quotes in dependency atoms"
+        );
     }
 
     #[test]
     fn test_parse_dependencies_handles_use_flags() {
         let deps = parse_dependencies("dev-libs/libxml2[python] >=dev-libs/json-c-0.13:=[threads]");
-        assert!(deps.contains(&"dev-libs/libxml2".to_string()), "Should strip [python] USE flag");
-        assert!(deps.contains(&"dev-libs/json-c".to_string()), "Should strip version and [threads]");
+        assert!(
+            deps.contains(&"dev-libs/libxml2".to_string()),
+            "Should strip [python] USE flag"
+        );
+        assert!(
+            deps.contains(&"dev-libs/json-c".to_string()),
+            "Should strip version and [threads]"
+        );
     }
 
     #[test]
@@ -666,7 +815,9 @@ BDEPEND="dev-build/make"
             .write_all(content.as_bytes())
             .unwrap();
 
-        let pkg = collector.parse_ebuild("dev-libs", "openssl", &ebuild_path).unwrap();
+        let pkg = collector
+            .parse_ebuild("dev-libs", "openssl", &ebuild_path)
+            .unwrap();
 
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
@@ -674,20 +825,28 @@ BDEPEND="dev-build/make"
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Structural checks
-        assert!(triple_count >= 15, "Should produce at least 15 triples, got {}", triple_count);
+        assert!(
+            triple_count >= 15,
+            "Should produce at least 15 triples, got {}",
+            triple_count
+        );
         assert!(content.contains("core#SourcePackage"));
         assert!(content.contains("portage#PortagePackage"));
         assert!(content.contains("d/pkg/gentoo/gentoo/dev-libs/openssl/3.2.1"));
-        assert!(content.contains("d/pkg/gentoo/gentoo/dev-libs/openssl>"));  // identity URI
-        assert!(content.contains("\"dev-libs/openssl\""));  // packageName
-        assert!(content.contains("\"dev-libs\""));  // category
-        assert!(content.contains("\"3.2.1\""));  // version
-        assert!(content.contains("\"0\""));  // slot
-        assert!(content.contains("\"3\""));  // subslot
-        assert!(content.contains("\"asm\""));  // USE flag (+ stripped)
+        assert!(content.contains("d/pkg/gentoo/gentoo/dev-libs/openssl>")); // identity URI
+        assert!(content.contains("\"dev-libs/openssl\"")); // packageName
+        assert!(content.contains("\"dev-libs\"")); // category
+        assert!(content.contains("\"3.2.1\"")); // version
+        assert!(content.contains("\"0\"")); // slot
+        assert!(content.contains("\"3\"")); // subslot
+        assert!(content.contains("\"asm\"")); // USE flag (+ stripped)
         assert!(content.contains("\"doc\""));
         assert!(content.contains("\"test\""));
         // Dependencies

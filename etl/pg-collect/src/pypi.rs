@@ -1,8 +1,8 @@
 use crate::cached_fetch::{CachedFetcher, HttpResponse};
 use crate::fetch_error::FetchError;
 use crate::http_cache::HttpCache;
-use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::npm::read_seed_file;
+use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::uris::*;
 use regex::Regex;
 use reqwest::blocking::Client;
@@ -55,6 +55,7 @@ pub struct PypiCollector {
     http_cache: Option<HttpCache>,
     cache_ttl_hours: u64,
     base_url: String,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,7 +100,13 @@ impl PypiCollector {
             http_cache: None,
             cache_ttl_hours: 24,
             base_url: "https://pypi.org".to_string(),
+            graph_uri: None,
         }
+    }
+
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     /// Override the PyPI API base URL (for testing).
@@ -121,8 +128,16 @@ impl PypiCollector {
         self
     }
 
-    pub fn collect_discover(&self, endpoint: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
-        let names = crate::seed::discover_by_ecosystem(endpoint, "pypi")?;
+    pub fn collect_discover(
+        &self,
+        endpoint: &str,
+        auth: &crate::sparql::SparqlAuth,
+        backend: crate::sparql::SparqlBackend,
+        max_depth: u32,
+        max_packages: usize,
+        output_path: &str,
+    ) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "pypi", auth, backend)?;
         let seed_path = "/tmp/seed-pypi-discover.txt";
         std::fs::write(seed_path, names.join("\n"))?;
         self.collect(seed_path, max_depth, max_packages, output_path)
@@ -130,7 +145,7 @@ impl PypiCollector {
 
     pub fn collect(&self, packages_file: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         self.emit_distribution_metadata(&mut writer)?;
 
@@ -146,7 +161,10 @@ impl PypiCollector {
         let raw_seeds = read_seed_file(packages_file)?;
         let seeds: Vec<String> = raw_seeds.iter().map(|s| normalize_pypi_name(s)).collect();
         eprintln!("Loaded {} seed packages", seeds.len());
-        eprintln!("Spider config: max_depth={}, max_packages={}", max_depth, max_packages);
+        eprintln!(
+            "Spider config: max_depth={}, max_packages={}",
+            max_depth, max_packages
+        );
 
         // BFS state, all guarded by a single mutex. Seeds start at depth 0.
         let queue: VecDeque<String> = seeds.into_iter().collect();
@@ -328,7 +346,11 @@ impl PypiCollector {
         let mut triples = 0;
 
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
-        writer.write_literal(&dist_uri, &format!("{PKG}projectName"), "Python Package Index")?;
+        writer.write_literal(
+            &dist_uri,
+            &format!("{PKG}projectName"),
+            "Python Package Index",
+        )?;
         triples += 2;
 
         writer.write_triple(&rel_uri, RDF_TYPE, &format!("{PKG}DistributionRelease"))?;
@@ -357,21 +379,19 @@ impl PypiCollector {
         };
 
         if let Some(fetcher) = cached_fetcher {
-            let outcome = fetcher.fetch(
-                &url,
-                Some(ttl),
-                &pypi_validator,
-                |req_url, etag| self.http_get_with_retry(req_url, etag, base_delay_ms),
-            );
+            let outcome = fetcher.fetch(&url, Some(ttl), &pypi_validator, |req_url, etag| {
+                self.http_get_with_retry(req_url, etag, base_delay_ms)
+            });
 
             PypiOutcome {
                 was_network_hit: outcome.was_network_hit,
                 result: outcome.result.and_then(|bytes| {
-                    serde_json::from_slice::<PypiProjectResponse>(&bytes)
-                        .map_err(|e| FetchError::Parse {
+                    serde_json::from_slice::<PypiProjectResponse>(&bytes).map_err(|e| {
+                        FetchError::Parse {
                             url: url.clone(),
                             detail: e.to_string(),
-                        })
+                        }
+                    })
                 }),
             }
         } else {
@@ -433,7 +453,10 @@ impl PypiCollector {
                             .unwrap_or_else(|| 2u64.pow(attempt as u32));
 
                         let delay_ms = retry_after_secs * 1000;
-                        eprintln!("  Rate limited on {}, waiting {}s...", url, retry_after_secs);
+                        eprintln!(
+                            "  Rate limited on {}, waiting {}s...",
+                            url, retry_after_secs
+                        );
                         std::thread::sleep(Duration::from_millis(delay_ms));
                         *base_delay_ms = (*base_delay_ms * 2).min(5000);
                         continue;
@@ -594,16 +617,40 @@ impl PypiCollector {
                 let bnode = bnode_id("depends", &format!("{}-{}", pkg_uri, &dep_name));
                 writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
                 writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
-                writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-                writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri("depends"))?;
+                writer.write_bnode_subject(
+                    &bnode,
+                    &format!("{PKG}dependencyTarget"),
+                    &target_uri,
+                )?;
+                writer.write_bnode_subject(
+                    &bnode,
+                    &format!("{PKG}dependencyType"),
+                    &dep_type_uri("depends"),
+                )?;
                 triples += 4;
 
                 if let Some(spec) = version_spec {
                     let cb = bnode_id("constraint", &format!("{}-{}", pkg_uri, &dep_name));
-                    writer.write_bnode_to_bnode(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
-                    writer.write_bnode_subject(&cb, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
-                    writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintOperator"), "pep440")?;
-                    writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintValue"), spec)?;
+                    writer.write_bnode_to_bnode(
+                        &bnode,
+                        &format!("{PKG}hasVersionConstraint"),
+                        &cb,
+                    )?;
+                    writer.write_bnode_subject(
+                        &cb,
+                        RDF_TYPE,
+                        &format!("{PKG}VersionConstraint"),
+                    )?;
+                    writer.write_bnode_literal(
+                        &cb,
+                        &format!("{PKG}versionConstraintOperator"),
+                        "pep440",
+                    )?;
+                    writer.write_bnode_literal(
+                        &cb,
+                        &format!("{PKG}versionConstraintValue"),
+                        spec,
+                    )?;
                     triples += 4;
                 }
 
@@ -661,11 +708,17 @@ mod tests {
             },
         };
 
-        let (triples, dep_names) = collector.emit_package_triples(&mut writer, &response).unwrap();
+        let (triples, dep_names) = collector
+            .emit_package_triples(&mut writer, &response)
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("pypi#PythonPackage"));
@@ -675,7 +728,11 @@ mod tests {
         assert!(content.contains("classifierString"));
         assert!(content.contains("directlyDependsOn"));
         assert!(triples > 15);
-        assert_eq!(dep_names, vec!["charset-normalizer"], "Should extract dep name");
+        assert_eq!(
+            dep_names,
+            vec!["charset-normalizer"],
+            "Should extract dep name"
+        );
     }
 
     #[test]
@@ -691,11 +748,17 @@ mod tests {
             "urllib3 (<3,>=1.21.1)".into(),
         ];
 
-        let (triples, dep_names) = collector.parse_requires_dist(&mut writer, &pkg_uri, &requires).unwrap();
+        let (triples, dep_names) = collector
+            .parse_requires_dist(&mut writer, &pkg_uri, &requires)
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("charset-normalizer"));
         assert!(content.contains("idna"));
@@ -746,13 +809,27 @@ mod tests {
             "Normal.Dep".into(),
         ];
 
-        let (_triples, dep_names) = collector.parse_requires_dist(&mut writer, &pkg_uri, &requires).unwrap();
+        let (_triples, dep_names) = collector
+            .parse_requires_dist(&mut writer, &pkg_uri, &requires)
+            .unwrap();
 
         assert_eq!(dep_names.len(), 4);
-        assert!(dep_names.contains(&"aiohttp".to_string()), "Should strip extras from aiohttp[speedups]");
-        assert!(dep_names.contains(&"azure-core".to_string()), "Should strip extras from azure-core[aio]");
-        assert!(dep_names.contains(&"my-package".to_string()), "Should normalize My_Package");
-        assert!(dep_names.contains(&"normal-dep".to_string()), "Should normalize Normal.Dep");
+        assert!(
+            dep_names.contains(&"aiohttp".to_string()),
+            "Should strip extras from aiohttp[speedups]"
+        );
+        assert!(
+            dep_names.contains(&"azure-core".to_string()),
+            "Should strip extras from azure-core[aio]"
+        );
+        assert!(
+            dep_names.contains(&"my-package".to_string()),
+            "Should normalize My_Package"
+        );
+        assert!(
+            dep_names.contains(&"normal-dep".to_string()),
+            "Should normalize Normal.Dep"
+        );
     }
 
     #[test]
@@ -763,7 +840,10 @@ mod tests {
             .with_cache(cache_path.to_str().unwrap())
             .unwrap();
         assert!(collector.http_cache.is_some());
-        assert!(cache_path.join("pypi").exists(), "HttpCache should create the collector subdirectory");
+        assert!(
+            cache_path.join("pypi").exists(),
+            "HttpCache should create the collector subdirectory"
+        );
     }
 
     #[test]
@@ -802,7 +882,10 @@ mod tests {
                 },
             }),
         };
-        assert!(!outcome.was_network_hit, "cache hit should not be a network hit");
+        assert!(
+            !outcome.was_network_hit,
+            "cache hit should not be a network hit"
+        );
         assert!(outcome.result.is_ok());
     }
 
@@ -837,9 +920,14 @@ mod tests {
             was_network_hit: false,
             result: Ok(PypiProjectResponse {
                 info: PypiInfo {
-                    name: "cached".into(), version: "1.0".into(),
-                    summary: None, license: None, home_page: None,
-                    requires_python: None, requires_dist: None, classifiers: None,
+                    name: "cached".into(),
+                    version: "1.0".into(),
+                    summary: None,
+                    license: None,
+                    home_page: None,
+                    requires_python: None,
+                    requires_dist: None,
+                    classifiers: None,
                 },
             }),
         };
@@ -852,9 +940,14 @@ mod tests {
             was_network_hit: true,
             result: Ok(PypiProjectResponse {
                 info: PypiInfo {
-                    name: "fetched".into(), version: "1.0".into(),
-                    summary: None, license: None, home_page: None,
-                    requires_python: None, requires_dist: None, classifiers: None,
+                    name: "fetched".into(),
+                    version: "1.0".into(),
+                    summary: None,
+                    license: None,
+                    home_page: None,
+                    requires_python: None,
+                    requires_dist: None,
+                    classifiers: None,
                 },
             }),
         };
@@ -883,13 +976,10 @@ mod tests {
 
     /// Build a CachedFetcher from a collector's stored HttpCache (mirrors collect()).
     fn make_cached_fetcher(collector: &PypiCollector) -> Option<CachedFetcher> {
-        collector.http_cache.as_ref().map(|cache| {
-            CachedFetcher::new(
-                cache.clone(),
-                Duration::from_secs(3600),
-                false,
-            )
-        })
+        collector
+            .http_cache
+            .as_ref()
+            .map(|cache| CachedFetcher::new(cache.clone(), Duration::from_secs(3600), false))
     }
 
     #[test]
@@ -906,8 +996,18 @@ mod tests {
         // Pre-populate cache with valid response for the URL the collector will construct
         let url = format!("{}/pypi/requests/json", server.url());
         let body = valid_pypi_json("requests", "2.31.0");
-        collector.http_cache.as_ref().unwrap()
-            .put(&url, body.as_bytes(), Some("\"etag-1\""), 200, Some(Duration::from_secs(86400))).unwrap();
+        collector
+            .http_cache
+            .as_ref()
+            .unwrap()
+            .put(
+                &url,
+                body.as_bytes(),
+                Some("\"etag-1\""),
+                200,
+                Some(Duration::from_secs(86400)),
+            )
+            .unwrap();
 
         // No mock registered -- any HTTP request will fail, proving cache hit
         let cached_fetcher = make_cached_fetcher(&collector);
@@ -915,7 +1015,10 @@ mod tests {
         let mut base_delay = 200u64;
         let outcome = collector.fetch_package("requests", &mut base_delay, &cached_fetcher);
 
-        assert!(!outcome.was_network_hit, "cache hit should not touch network");
+        assert!(
+            !outcome.was_network_hit,
+            "cache hit should not touch network"
+        );
         let pkg = outcome.result.expect("cache hit should return Ok");
         assert_eq!(pkg.info.name, "requests");
     }
@@ -927,7 +1030,8 @@ mod tests {
         let cache_dir = tmp.path().join("cache");
 
         let body = valid_pypi_json("flask", "3.0.0");
-        let mock = server.mock("GET", "/pypi/flask/json")
+        let mock = server
+            .mock("GET", "/pypi/flask/json")
             .with_status(200)
             .with_header("etag", "\"flask-etag\"")
             .with_body(&body)
@@ -952,7 +1056,10 @@ mod tests {
         // Verify response was cached -- second fetch should NOT hit network
         let cached_fetcher2 = make_cached_fetcher(&collector);
         let outcome2 = collector.fetch_package("flask", &mut base_delay, &cached_fetcher2);
-        assert!(!outcome2.was_network_hit, "second fetch should be cache hit");
+        assert!(
+            !outcome2.was_network_hit,
+            "second fetch should be cache hit"
+        );
         assert!(outcome2.result.is_ok());
     }
 
@@ -965,14 +1072,16 @@ mod tests {
         let body = valid_pypi_json("retry-pkg", "1.0.0");
 
         // First request returns 429 with retry-after
-        let mock_429 = server.mock("GET", "/pypi/retry-pkg/json")
+        let mock_429 = server
+            .mock("GET", "/pypi/retry-pkg/json")
             .with_status(429)
             .with_header("retry-after", "1")
             .expect(1)
             .create();
 
         // Second request succeeds
-        let mock_200 = server.mock("GET", "/pypi/retry-pkg/json")
+        let mock_200 = server
+            .mock("GET", "/pypi/retry-pkg/json")
             .with_status(200)
             .with_body(&body)
             .expect(1)
@@ -1003,7 +1112,8 @@ mod tests {
         let cache_dir = tmp.path().join("cache");
 
         // Server returns HTML with 200 (not valid PyPI JSON)
-        let mock = server.mock("GET", "/pypi/broken/json")
+        let mock = server
+            .mock("GET", "/pypi/broken/json")
             .with_status(200)
             .with_body("<html>Not Found</html>")
             .expect_at_least(2)
@@ -1026,7 +1136,10 @@ mod tests {
         // Second fetch -- should hit network again (not cached)
         let cached_fetcher2 = make_cached_fetcher(&collector);
         let outcome2 = collector.fetch_package("broken", &mut base_delay, &cached_fetcher2);
-        assert!(outcome2.was_network_hit, "malformed response should not be cached -- second fetch must hit network");
+        assert!(
+            outcome2.was_network_hit,
+            "malformed response should not be cached -- second fetch must hit network"
+        );
 
         mock.assert();
     }
@@ -1045,21 +1158,30 @@ mod tests {
         let clock = Arc::new(MockClock::new(1_000_000));
 
         // Pre-populate cache with an entry that will expire, WITH an ETag
-        let cache = HttpCache::with_clock(cache_dir.to_str().unwrap(), "pypi", clock.clone()).unwrap();
-        cache.put(&url, body.as_bytes(), Some("\"v2-etag\""), 200, Some(Duration::from_secs(60))).unwrap();
+        let cache =
+            HttpCache::with_clock(cache_dir.to_str().unwrap(), "pypi", clock.clone()).unwrap();
+        cache
+            .put(
+                &url,
+                body.as_bytes(),
+                Some("\"v2-etag\""),
+                200,
+                Some(Duration::from_secs(60)),
+            )
+            .unwrap();
 
         // Expire the cache entry
         clock.advance(120);
 
         // Mock expects If-None-Match header and returns 304
-        let mock = server.mock("GET", "/pypi/etag-pkg/json")
+        let mock = server
+            .mock("GET", "/pypi/etag-pkg/json")
             .match_header("If-None-Match", "\"v2-etag\"")
             .with_status(304)
             .expect(1)
             .create();
 
-        let collector = PypiCollector::new()
-            .with_base_url(&server.url());
+        let collector = PypiCollector::new().with_base_url(&server.url());
 
         let cached_fetcher = Some(CachedFetcher::new(
             HttpCache::with_clock(cache_dir.to_str().unwrap(), "pypi", clock.clone()).unwrap(),
@@ -1081,15 +1203,15 @@ mod tests {
         let mut server = mockito::Server::new();
         let body = valid_pypi_json("direct-pkg", "1.0.0");
 
-        let mock = server.mock("GET", "/pypi/direct-pkg/json")
+        let mock = server
+            .mock("GET", "/pypi/direct-pkg/json")
             .with_status(200)
             .with_body(&body)
             .expect(1)
             .create();
 
         // No cache configured
-        let collector = PypiCollector::new()
-            .with_base_url(&server.url());
+        let collector = PypiCollector::new().with_base_url(&server.url());
 
         let mut base_delay = 200u64;
         let outcome = collector.fetch_package("direct-pkg", &mut base_delay, &None);

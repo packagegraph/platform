@@ -4,6 +4,6 @@
 //! the current ontology contract. This is where ALL ontology-specific decisions
 //! are made: URI construction, type assignments, property choices, inverse edges.
 
+pub mod debian_ext;
 pub mod rdf;
 pub mod rpm_ext;
-pub mod debian_ext;

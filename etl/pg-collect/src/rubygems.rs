@@ -1,4 +1,5 @@
 use crate::ntriples::NTriplesWriter;
+use crate::sparql::{SparqlAuth, SparqlBackend};
 use crate::uris::*;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -10,6 +11,7 @@ use std::time::Duration;
 pub struct RubyGemsCollector {
     client: Client,
     api_base: String,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,7 +69,17 @@ impl RubyGemsCollector {
             .build()
             .expect("Failed to create HTTP client");
 
-        Self { client, api_base }
+        Self {
+            client,
+            api_base,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     /// Collect from a seed file of gem names.
@@ -78,14 +90,21 @@ impl RubyGemsCollector {
     }
 
     /// Discover gem names from Fuseki (rubygem() provides in RPM repos) and collect them.
-    pub fn collect_discover(&self, endpoint: &str, output_path: &str) -> Result<(usize, usize)> {
-        let names = crate::seed::discover_by_ecosystem(endpoint, "rubygems")?;
+    pub fn collect_discover(
+        &self,
+        endpoint: &str,
+        auth: &SparqlAuth,
+        backend: SparqlBackend,
+        output_path: &str,
+    ) -> Result<(usize, usize)> {
+        let names =
+            crate::seed::discover_by_ecosystem(endpoint, "rubygems", auth, backend.clone())?;
         self.collect_names(&names, output_path)
     }
 
     fn collect_names(&self, package_names: &[String], output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         self.emit_distribution_metadata(&mut writer)?;
 
@@ -150,7 +169,10 @@ impl RubyGemsCollector {
                             .unwrap_or_else(|| 2u64.pow(attempt as u32));
 
                         let delay_ms = retry_after_secs * 1000;
-                        eprintln!("  Rate limited on {}, waiting {}s...", name, retry_after_secs);
+                        eprintln!(
+                            "  Rate limited on {}, waiting {}s...",
+                            name, retry_after_secs
+                        );
                         std::thread::sleep(Duration::from_millis(delay_ms));
                         *base_delay_ms = (*base_delay_ms * 2).min(5000);
                         continue;
@@ -355,7 +377,11 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("rubygems#Gem"));

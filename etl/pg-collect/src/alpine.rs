@@ -19,6 +19,7 @@ pub struct AlpineCollector {
     repos: Vec<String>,
     arch: String,
     source_cache: Option<SourceCache>,
+    pub graph_uri: Option<String>,
 }
 
 impl AlpineCollector {
@@ -39,7 +40,14 @@ impl AlpineCollector {
             repos,
             arch,
             source_cache: None,
+            graph_uri: None,
         }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
@@ -49,7 +57,7 @@ impl AlpineCollector {
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         // Emit distribution metadata
         self.emit_distribution_metadata(&mut writer)?;
@@ -132,11 +140,7 @@ impl AlpineCollector {
         Ok(triples)
     }
 
-    fn process_repo(
-        &self,
-        writer: &mut NTriplesWriter,
-        repo: &str,
-    ) -> Result<(usize, usize)> {
+    fn process_repo(&self, writer: &mut NTriplesWriter, repo: &str) -> Result<(usize, usize)> {
         let url = format!(
             "{}/{}/{}/{}/APKINDEX.tar.gz",
             self.mirror_url.trim_end_matches('/'),
@@ -217,7 +221,10 @@ impl AlpineCollector {
         let version = match pkg.get("V") {
             Some(v) => v,
             None => {
-                eprintln!("  Warning: package {} missing V (version) field, skipping", name);
+                eprintln!(
+                    "  Warning: package {} missing V (version) field, skipping",
+                    name
+                );
                 return emit_dq_issue(
                     writer,
                     "alpine-collector",
@@ -337,7 +344,8 @@ impl AlpineCollector {
 
         // Dependencies
         if let Some(deps_str) = pkg.get("D") {
-            triples += self.emit_dependencies(writer, &pkg_uri, &identity_uri, deps_str, "depends")?;
+            triples +=
+                self.emit_dependencies(writer, &pkg_uri, &identity_uri, deps_str, "depends")?;
         }
 
         // Provides
@@ -414,15 +422,35 @@ impl AlpineCollector {
             triples += 3;
 
             // Dependency type as property URI (v0.6.0 properties-as-taxonomy)
-            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri(dep_type))?;
+            writer.write_bnode_subject(
+                &bnode,
+                &format!("{PKG}dependencyType"),
+                &dep_type_uri(dep_type),
+            )?;
             triples += 1;
 
             if let (Some(op), Some(val)) = (&constraint_op, &constraint_val) {
                 let constraint_bnode = bnode_id("constraint", &format!("{}-{}", pkg_uri, dep_name));
-                writer.write_bnode_to_bnode(&bnode, &format!("{PKG}hasVersionConstraint"), &constraint_bnode)?;
-                writer.write_bnode_subject(&constraint_bnode, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
-                writer.write_bnode_literal(&constraint_bnode, &format!("{PKG}versionConstraintOperator"), op)?;
-                writer.write_bnode_literal(&constraint_bnode, &format!("{PKG}versionConstraintValue"), val)?;
+                writer.write_bnode_to_bnode(
+                    &bnode,
+                    &format!("{PKG}hasVersionConstraint"),
+                    &constraint_bnode,
+                )?;
+                writer.write_bnode_subject(
+                    &constraint_bnode,
+                    RDF_TYPE,
+                    &format!("{PKG}VersionConstraint"),
+                )?;
+                writer.write_bnode_literal(
+                    &constraint_bnode,
+                    &format!("{PKG}versionConstraintOperator"),
+                    op,
+                )?;
+                writer.write_bnode_literal(
+                    &constraint_bnode,
+                    &format!("{PKG}versionConstraintValue"),
+                    val,
+                )?;
                 triples += 4;
             }
         }
@@ -470,10 +498,7 @@ struct SecdbPkg {
 
 impl AlpineCollector {
     /// Fetch and emit vulnerability triples from Alpine's secdb.
-    pub fn collect_secdb(
-        &self,
-        writer: &mut NTriplesWriter,
-    ) -> Result<usize> {
+    pub fn collect_secdb(&self, writer: &mut NTriplesWriter) -> Result<usize> {
         let mut total_triples = 0;
 
         for repo in &self.repos {
@@ -507,11 +532,7 @@ impl AlpineCollector {
     }
 
     fn fetch_secdb(&self, url: &str) -> std::result::Result<SecdbDistro, String> {
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .map_err(|e| e.to_string())?;
+        let response = self.client.get(url).send().map_err(|e| e.to_string())?;
 
         let text = response.text().map_err(|e| e.to_string())?;
         serde_json::from_str(&text).map_err(|e| e.to_string())
@@ -543,13 +564,27 @@ impl AlpineCollector {
                         triples += 2;
 
                         // Fixed version link
-                        let fixed_ver_uri = version_uri(&self.distro_name, &self.branch, pkg_name, fixed_version);
-                        writer.write_triple(&cve_uri, &format!("{SEC}fixedInVersion"), &fixed_ver_uri)?;
+                        let fixed_ver_uri =
+                            version_uri(&self.distro_name, &self.branch, pkg_name, fixed_version);
+                        writer.write_triple(
+                            &cve_uri,
+                            &format!("{SEC}fixedInVersion"),
+                            &fixed_ver_uri,
+                        )?;
                         triples += 1;
 
                         // Affected package link (the package identity)
-                        let identity = package_identity_uri(&self.distro_name, &self.branch, &self.arch, pkg_name);
-                        writer.write_triple(&cve_uri, &format!("{SEC}affectsPackage"), &identity)?;
+                        let identity = package_identity_uri(
+                            &self.distro_name,
+                            &self.branch,
+                            &self.arch,
+                            pkg_name,
+                        );
+                        writer.write_triple(
+                            &cve_uri,
+                            &format!("{SEC}affectsPackage"),
+                            &identity,
+                        )?;
                         triples += 1;
                     }
                 }
@@ -667,11 +702,17 @@ D:readline ncurses-libs
         pkg.insert("V".into(), "8.7.1-r0".into());
         pkg.insert("T".into(), "URL retrieval utility".into());
 
-        let triples = collector.emit_package_triples(&mut writer, &pkg, "main").unwrap();
+        let triples = collector
+            .emit_package_triples(&mut writer, &pkg, "main")
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Verify dual typing
         assert!(content.contains("core#BinaryPackage"));
@@ -696,17 +737,23 @@ D:readline ncurses-libs
         let pkg_uri = package_uri("alpine", "v3.20", "x86_64", "curl", "8.7.1-r0");
         let identity_uri = package_identity_uri("alpine", "v3.20", "x86_64", "curl");
 
-        let triples = collector.emit_dependencies(
-            &mut writer,
-            &pkg_uri,
-            &identity_uri,
-            "libcurl>=8.7.1-r0 ca-certificates",
-            "depends",
-        ).unwrap();
+        let triples = collector
+            .emit_dependencies(
+                &mut writer,
+                &pkg_uri,
+                &identity_uri,
+                "libcurl>=8.7.1-r0 ca-certificates",
+                "depends",
+            )
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("directlyDependsOn"));
         assert!(content.contains("hasDependency"));
@@ -748,7 +795,11 @@ D:readline ncurses-libs
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Should have CVE triples
         assert!(content.contains("CVE-2024-2398"));
@@ -779,11 +830,17 @@ D:readline ncurses-libs
         pkg.insert("V".into(), "1.0-r0".into());
         pkg.insert("m".into(), "Natanael Copa <ncopa@alpinelinux.org>".into());
 
-        collector.emit_package_triples(&mut writer, &pkg, "main").unwrap();
+        collector
+            .emit_package_triples(&mut writer, &pkg, "main")
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("maintainedBy"));
         assert!(content.contains("Natanael Copa"));

@@ -79,9 +79,12 @@ fn test_pypi_invalid_cache_dir_degrades_gracefully() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_pg-collect"))
         .args([
             "pypi",
-            "--packages-file", seed.path().to_str().unwrap(),
-            "--cache-dir", "/dev/null/nonexistent",
-            "-o", out.path().to_str().unwrap(),
+            "--packages-file",
+            seed.path().to_str().unwrap(),
+            "--cache-dir",
+            "/dev/null/nonexistent",
+            "-o",
+            out.path().to_str().unwrap(),
         ])
         .output()
         .expect("Failed to run pg-collect");

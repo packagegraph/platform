@@ -13,24 +13,33 @@
 //! - Layer: inferred from name patterns and description keywords
 
 use crate::ntriples::NTriplesWriter;
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use std::fs::File;
 use std::io::Result;
 
 pub struct TaxonomyEnricher {
     sparql: SparqlClient,
+    pub graph_uri: Option<String>,
 }
 
 impl TaxonomyEnricher {
-    pub fn new(endpoint: &str) -> Self {
-        let sparql = SparqlClient::new(endpoint);
-        Self { sparql }
+    pub fn new(endpoint: &str, auth: SparqlAuth, backend: SparqlBackend) -> Self {
+        let sparql = make_sparql_client(endpoint, &auth, backend);
+        Self {
+            sparql,
+            graph_uri: None,
+        }
+    }
+
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn enrich(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         let packages = self.query_package_identities()?;
         eprintln!("Found {} package identities to classify", packages.len());
@@ -39,7 +48,11 @@ impl TaxonomyEnricher {
         let mut total_triples = 0usize;
 
         for pkg in &packages {
-            let classifications = classify_package(&pkg.name, pkg.description.as_deref(), pkg.ecosystem.as_deref());
+            let classifications = classify_package(
+                &pkg.name,
+                pkg.description.as_deref(),
+                pkg.ecosystem.as_deref(),
+            );
             if !classifications.is_empty() {
                 classified += 1;
                 for concept_uri in &classifications {
@@ -165,10 +178,29 @@ fn ecosystem_to_technology(ecosystem: &str) -> Option<&'static str> {
 }
 
 const KNOWN_FRAMEWORKS: &[&str] = &[
-    "django", "flask", "fastapi", "rails", "sinatra", "spring",
-    "express", "nextjs", "nuxt", "svelte", "ember", "laravel",
-    "symfony", "rocket", "actix-web", "axum", "gin", "echo",
-    "phoenix", "qt5", "qt6", "gtk3", "gtk4",
+    "django",
+    "flask",
+    "fastapi",
+    "rails",
+    "sinatra",
+    "spring",
+    "express",
+    "nextjs",
+    "nuxt",
+    "svelte",
+    "ember",
+    "laravel",
+    "symfony",
+    "rocket",
+    "actix-web",
+    "axum",
+    "gin",
+    "echo",
+    "phoenix",
+    "qt5",
+    "qt6",
+    "gtk3",
+    "gtk4",
 ];
 
 fn infer_role(name: &str) -> Option<&'static str> {
@@ -216,28 +248,110 @@ fn infer_domains(name: &str, desc: &str) -> Vec<&'static str> {
     let mut domains = Vec::new();
     let text = format!("{name} {desc}");
 
-    if contains_any(&text, &["security", "cryptograph", "cipher", "tls ", "ssl ", "firewall", "selinux", "apparmor", "vulnerability", "cve "]) {
+    if contains_any(
+        &text,
+        &[
+            "security",
+            "cryptograph",
+            "cipher",
+            "tls ",
+            "ssl ",
+            "firewall",
+            "selinux",
+            "apparmor",
+            "vulnerability",
+            "cve ",
+        ],
+    ) {
         domains.push("security");
     }
-    if contains_any(&text, &["web server", "http server", "web application", "web framework", "html ", "cgi ", "wsgi", "asgi"]) {
+    if contains_any(
+        &text,
+        &[
+            "web server",
+            "http server",
+            "web application",
+            "web framework",
+            "html ",
+            "cgi ",
+            "wsgi",
+            "asgi",
+        ],
+    ) {
         domains.push("web-development");
     }
-    if contains_any(&text, &["kernel", "systemd", "init system", "bootloader", "grub", "filesystem", "mount ", "partition"]) {
+    if contains_any(
+        &text,
+        &[
+            "kernel",
+            "systemd",
+            "init system",
+            "bootloader",
+            "grub",
+            "filesystem",
+            "mount ",
+            "partition",
+        ],
+    ) {
         domains.push("operating-systems");
     }
-    if contains_any(&text, &["database", "sql ", "nosql", "postgresql", "mysql", "mariadb", "sqlite", "mongodb"]) {
+    if contains_any(
+        &text,
+        &[
+            "database",
+            "sql ",
+            "nosql",
+            "postgresql",
+            "mysql",
+            "mariadb",
+            "sqlite",
+            "mongodb",
+        ],
+    ) {
         domains.push("database");
     }
-    if contains_any(&text, &["machine learning", "neural network", "deep learning", "tensorflow", "pytorch", "scikit"]) {
+    if contains_any(
+        &text,
+        &[
+            "machine learning",
+            "neural network",
+            "deep learning",
+            "tensorflow",
+            "pytorch",
+            "scikit",
+        ],
+    ) {
         domains.push("machine-learning");
     }
-    if contains_any(&text, &["container", "docker", "podman", "kubernetes", "k8s ", "orchestrat"]) {
+    if contains_any(
+        &text,
+        &[
+            "container",
+            "docker",
+            "podman",
+            "kubernetes",
+            "k8s ",
+            "orchestrat",
+        ],
+    ) {
         domains.push("devops");
     }
-    if contains_any(&text, &["game ", "gaming", "opengl", "vulkan", "sdl ", "game engine"]) {
+    if contains_any(
+        &text,
+        &["game ", "gaming", "opengl", "vulkan", "sdl ", "game engine"],
+    ) {
         domains.push("game-development");
     }
-    if contains_any(&text, &["embedded", "microcontroller", "firmware", "rtos", "arm cortex"]) {
+    if contains_any(
+        &text,
+        &[
+            "embedded",
+            "microcontroller",
+            "firmware",
+            "rtos",
+            "arm cortex",
+        ],
+    ) {
         domains.push("embedded-systems");
     }
 
@@ -248,34 +362,127 @@ fn infer_functions(name: &str, desc: &str) -> Vec<&'static str> {
     let mut funcs = Vec::new();
     let text = format!("{name} {desc}");
 
-    if contains_any(&text, &["encrypt", "decrypt", "cipher", "cryptograph", "aes ", "rsa ", "gpg", "pgp", "x509", "certificate"]) {
+    if contains_any(
+        &text,
+        &[
+            "encrypt",
+            "decrypt",
+            "cipher",
+            "cryptograph",
+            "aes ",
+            "rsa ",
+            "gpg",
+            "pgp",
+            "x509",
+            "certificate",
+        ],
+    ) {
         funcs.push("encryption");
     }
-    if contains_any(&text, &["authenticat", "login", "oauth", "saml", "kerberos", "pam ", "ldap auth"]) {
+    if contains_any(
+        &text,
+        &[
+            "authenticat",
+            "login",
+            "oauth",
+            "saml",
+            "kerberos",
+            "pam ",
+            "ldap auth",
+        ],
+    ) {
         funcs.push("authentication");
     }
-    if contains_any(&text, &["rest api", "grpc", "graphql", "api gateway", "api server", "openapi", "web application", "web framework"]) {
+    if contains_any(
+        &text,
+        &[
+            "rest api",
+            "grpc",
+            "graphql",
+            "api gateway",
+            "api server",
+            "openapi",
+            "web application",
+            "web framework",
+        ],
+    ) {
         funcs.push("api-development");
     }
-    if contains_any(&text, &["logging", "log file", "syslog", "journald", "log rotation", "log collector"]) {
+    if contains_any(
+        &text,
+        &[
+            "logging",
+            "log file",
+            "syslog",
+            "journald",
+            "log rotation",
+            "log collector",
+        ],
+    ) {
         funcs.push("logging");
     }
     if contains_any(&text, &["cache", "caching", "memcache", "redis", "varnish"]) {
         funcs.push("caching");
     }
-    if contains_any(&text, &["ci/cd", "continuous integration", "continuous delivery", "jenkins", "gitlab-ci"]) {
+    if contains_any(
+        &text,
+        &[
+            "ci/cd",
+            "continuous integration",
+            "continuous delivery",
+            "jenkins",
+            "gitlab-ci",
+        ],
+    ) {
         funcs.push("ci-cd");
     }
-    if contains_any(&text, &["process manage", "init system", "supervisor", "systemd", "service manager", "daemon manage"]) {
+    if contains_any(
+        &text,
+        &[
+            "process manage",
+            "init system",
+            "supervisor",
+            "systemd",
+            "service manager",
+            "daemon manage",
+        ],
+    ) {
         funcs.push("process-management");
     }
-    if contains_any(&text, &["compress", "decompress", "gzip", "bzip2", "zstd", "lz4 ", "xz ", "zip ", "archive"]) {
+    if contains_any(
+        &text,
+        &[
+            "compress",
+            "decompress",
+            "gzip",
+            "bzip2",
+            "zstd",
+            "lz4 ",
+            "xz ",
+            "zip ",
+            "archive",
+        ],
+    ) {
         funcs.push("compression");
     }
-    if contains_any(&text, &["automat", "workflow", "task runner", "cron", "scheduler"]) && !contains_any(&text, &["test automat"]) {
+    if contains_any(
+        &text,
+        &["automat", "workflow", "task runner", "cron", "scheduler"],
+    ) && !contains_any(&text, &["test automat"])
+    {
         funcs.push("automation");
     }
-    if contains_any(&text, &["deploy", "provisioning", "ansible", "puppet", "chef ", "terraform"]) {
+    if contains_any(
+        &text,
+        &[
+            "deploy",
+            "provisioning",
+            "ansible",
+            "puppet",
+            "chef ",
+            "terraform",
+        ],
+    ) {
         funcs.push("deployment");
     }
 
@@ -285,10 +492,30 @@ fn infer_functions(name: &str, desc: &str) -> Vec<&'static str> {
 fn infer_audience(name: &str, desc: &str) -> Option<&'static str> {
     let text = format!("{name} {desc}");
 
-    if contains_any(&text, &["system admin", "sysadmin", "server manage", "infrastructure manage"]) {
+    if contains_any(
+        &text,
+        &[
+            "system admin",
+            "sysadmin",
+            "server manage",
+            "infrastructure manage",
+        ],
+    ) {
         return Some("system-administrator");
     }
-    if contains_any(&text, &["developer tool", "development tool", "sdk ", "development kit", "debugger", "for developer", "by developer", "development"]) {
+    if contains_any(
+        &text,
+        &[
+            "developer tool",
+            "development tool",
+            "sdk ",
+            "development kit",
+            "debugger",
+            "for developer",
+            "by developer",
+            "development",
+        ],
+    ) {
         return Some("developer");
     }
     if contains_any(&text, &["enterprise", "business", "corporate"]) {
@@ -301,22 +528,81 @@ fn infer_audience(name: &str, desc: &str) -> Option<&'static str> {
 fn infer_layer(name: &str, desc: &str) -> Option<&'static str> {
     let text = format!("{name} {desc}");
 
-    if contains_any(&text, &["kernel", "driver", "firmware", "bootloader", "grub", "uefi", "bios"]) {
+    if contains_any(
+        &text,
+        &[
+            "kernel",
+            "driver",
+            "firmware",
+            "bootloader",
+            "grub",
+            "uefi",
+            "bios",
+        ],
+    ) {
         return Some("operating-system");
     }
-    if contains_any(&text, &["infrastructure", "cloud", "provisioning", "terraform", "ansible"]) {
+    if contains_any(
+        &text,
+        &[
+            "infrastructure",
+            "cloud",
+            "provisioning",
+            "terraform",
+            "ansible",
+        ],
+    ) {
         return Some("infrastructure");
     }
-    if contains_any(&text, &["frontend", "ui ", "user interface", "widget", "gtk", "qt ", "react", "angular", "css "]) {
+    if contains_any(
+        &text,
+        &[
+            "frontend",
+            "ui ",
+            "user interface",
+            "widget",
+            "gtk",
+            "qt ",
+            "react",
+            "angular",
+            "css ",
+        ],
+    ) {
         return Some("frontend");
     }
-    if contains_any(&text, &["backend", "server-side", "api server", "database server", "web server", "daemon", " server"]) {
+    if contains_any(
+        &text,
+        &[
+            "backend",
+            "server-side",
+            "api server",
+            "database server",
+            "web server",
+            "daemon",
+            " server",
+        ],
+    ) {
         return Some("backend");
     }
-    if contains_any(&text, &["middleware", "message queue", "message broker", "rabbitmq", "kafka"]) {
+    if contains_any(
+        &text,
+        &[
+            "middleware",
+            "message queue",
+            "message broker",
+            "rabbitmq",
+            "kafka",
+        ],
+    ) {
         return Some("middleware");
     }
-    if contains_any(&text, &["network", "tcp ", "udp ", "dns ", "dhcp", "routing", "firewall", "iptables", "nftables"]) {
+    if contains_any(
+        &text,
+        &[
+            "network", "tcp ", "udp ", "dns ", "dhcp", "routing", "firewall", "iptables",
+            "nftables",
+        ],
+    ) {
         return Some("network-layer");
     }
 
@@ -374,33 +660,23 @@ mod tests {
 
     #[test]
     fn test_classify_security_package() {
-        let classes = classify_package(
-            "openssl",
-            Some("TLS/SSL cryptography library"),
-            None,
-        );
+        let classes = classify_package("openssl", Some("TLS/SSL cryptography library"), None);
         assert!(classes.iter().any(|c| c.contains("domain-security")));
         assert!(classes.iter().any(|c| c.contains("function-encryption")));
     }
 
     #[test]
     fn test_classify_kernel_package() {
-        let classes = classify_package(
-            "kernel",
-            Some("The Linux kernel"),
-            None,
-        );
-        assert!(classes.iter().any(|c| c.contains("domain-operating-systems")));
+        let classes = classify_package("kernel", Some("The Linux kernel"), None);
+        assert!(classes
+            .iter()
+            .any(|c| c.contains("domain-operating-systems")));
         assert!(classes.iter().any(|c| c.contains("layer-operating-system")));
     }
 
     #[test]
     fn test_classify_database_package() {
-        let classes = classify_package(
-            "postgresql",
-            Some("PostgreSQL database server"),
-            None,
-        );
+        let classes = classify_package("postgresql", Some("PostgreSQL database server"), None);
         assert!(classes.iter().any(|c| c.contains("domain-database")));
         assert!(classes.iter().any(|c| c.contains("layer-backend")));
     }
@@ -412,18 +688,16 @@ mod tests {
             Some("Infrastructure provisioning and configuration management tool for system administrators"),
             None,
         );
-        assert!(classes.iter().any(|c| c.contains("audience-system-administrator")));
+        assert!(classes
+            .iter()
+            .any(|c| c.contains("audience-system-administrator")));
         assert!(classes.iter().any(|c| c.contains("layer-infrastructure")));
         assert!(classes.iter().any(|c| c.contains("function-deployment")));
     }
 
     #[test]
     fn test_classify_compression() {
-        let classes = classify_package(
-            "gzip",
-            Some("GNU compression utility"),
-            None,
-        );
+        let classes = classify_package("gzip", Some("GNU compression utility"), None);
         assert!(classes.iter().any(|c| c.contains("function-compression")));
     }
 
@@ -461,7 +735,10 @@ mod tests {
         assert!(has("technology-"), "Should have technology");
         assert!(has("role-"), "Should have role");
         assert!(has("domain-"), "Should have domain");
-        assert!(has("function-"), "Should have function (api-development from 'web application')");
+        assert!(
+            has("function-"),
+            "Should have function (api-development from 'web application')"
+        );
         assert!(has("audience-"), "Should have audience");
         // layer may or may not match — backend from "web framework"
     }

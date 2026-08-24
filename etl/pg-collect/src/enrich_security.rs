@@ -8,7 +8,7 @@ use crate::cache::FileCache;
 use crate::enricher::rate_limit;
 use crate::ntriples::NTriplesWriter;
 use crate::osv::{emit_vulnerability_triples, OsvVulnerability};
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use reqwest::blocking::Client;
 use std::fs::File;
 use std::io::Result;
@@ -19,6 +19,7 @@ pub struct SecurityEnricher {
     client: Client,
     cache: Option<FileCache>,
     ecosystem: String,
+    pub graph_uri: Option<String>,
 }
 
 impl SecurityEnricher {
@@ -26,8 +27,10 @@ impl SecurityEnricher {
         endpoint: &str,
         ecosystem: &str,
         cache_dir: Option<&str>,
+        auth: SparqlAuth,
+        backend: SparqlBackend,
     ) -> Self {
-        let sparql = SparqlClient::new(endpoint);
+        let sparql = make_sparql_client(endpoint, &auth, backend);
         let client = crate::enricher::default_http_client();
 
         let cache = cache_dir.map(|dir| {
@@ -35,12 +38,24 @@ impl SecurityEnricher {
                 .expect("Failed to create cache")
         });
 
-        Self { sparql, client, cache, ecosystem: ecosystem.to_string() }
+        Self {
+            sparql,
+            client,
+            cache,
+            ecosystem: ecosystem.to_string(),
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn enrich(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         // Map ecosystem name to RDF type — accepts both packaging system names (preferred)
         // and legacy distro names for backward compatibility
@@ -65,7 +80,11 @@ impl SecurityEnricher {
         };
 
         let packages = self.sparql.query_packages_by_type(rdf_type)?;
-        eprintln!("Found {} {} packages to check for vulnerabilities", packages.len(), self.ecosystem);
+        eprintln!(
+            "Found {} {} packages to check for vulnerabilities",
+            packages.len(),
+            self.ecosystem
+        );
 
         let mut total_checked = 0;
         let mut total_triples = 0;
@@ -99,23 +118,28 @@ impl SecurityEnricher {
                     "package": {"name": name, "ecosystem": self.osv_ecosystem_name()},
                 });
 
-                let resp = self.client.post(url)
-                    .json(&payload)
-                    .send()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let resp =
+                    self.client.post(url).json(&payload).send().map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    })?;
 
                 if !resp.status().is_success() {
                     return Ok(0);
                 }
 
-                let data: serde_json::Value = resp.json()
+                let data: serde_json::Value = resp
+                    .json()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-                let vulns_data = data.get("vulns").and_then(|v| v.as_array()).map(|arr| {
-                    arr.iter().filter_map(|v| {
-                        serde_json::from_value(v.clone()).ok()
-                    }).collect::<Vec<OsvVulnerability>>()
-                }).unwrap_or_default();
+                let vulns_data = data
+                    .get("vulns")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                            .collect::<Vec<OsvVulnerability>>()
+                    })
+                    .unwrap_or_default();
 
                 self.cache_put(&cache_key, &serde_json::to_value(&vulns_data).unwrap());
                 vulns_data
@@ -163,26 +187,53 @@ mod tests {
 
     #[test]
     fn test_osv_ecosystem_mapping() {
-        let enricher = SecurityEnricher::new("http://localhost:3030/test", "debian", None);
+        let enricher = SecurityEnricher::new(
+            "http://localhost:3030/test",
+            "debian",
+            None,
+            None,
+            SparqlBackend::Fuseki,
+        );
         assert_eq!(enricher.osv_ecosystem_name(), "Debian");
 
-        let enricher2 = SecurityEnricher::new("http://localhost:3030/test", "pypi", None);
+        let enricher2 = SecurityEnricher::new(
+            "http://localhost:3030/test",
+            "pypi",
+            None,
+            None,
+            SparqlBackend::Fuseki,
+        );
         assert_eq!(enricher2.osv_ecosystem_name(), "PyPI");
     }
 
     #[test]
     fn test_maven_ecosystem_mapping() {
-        let enricher = SecurityEnricher::new("http://localhost:3030/test", "maven", None);
+        let enricher = SecurityEnricher::new(
+            "http://localhost:3030/test",
+            "maven",
+            None,
+            None,
+            SparqlBackend::Fuseki,
+        );
         assert_eq!(enricher.osv_ecosystem_name(), "Maven");
     }
 
     #[test]
     fn test_unsupported_ecosystem() {
-        let enricher = SecurityEnricher::new("http://localhost:3030/test", "unsupported", None);
+        let enricher = SecurityEnricher::new(
+            "http://localhost:3030/test",
+            "unsupported",
+            None,
+            None,
+            SparqlBackend::Fuseki,
+        );
         let temp_file = NamedTempFile::new().unwrap();
         let result = enricher.enrich(temp_file.path().to_str().unwrap());
 
         assert!(result.is_err(), "Should reject unsupported ecosystem");
-        assert!(result.unwrap_err().to_string().contains("Unsupported ecosystem"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported ecosystem"));
     }
 }

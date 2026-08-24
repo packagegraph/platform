@@ -5,7 +5,7 @@
 //! Queries for all distinct core:packageName values in the specified graph,
 //! writes them to a text file (one per line, sorted, deduplicated).
 
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend};
 use std::fs::File;
 use std::io::{Result, Write};
 
@@ -13,8 +13,13 @@ use std::io::{Result, Write};
 ///
 /// Queries for `upstreamPackageName` where `upstreamEcosystem` matches the given
 /// ecosystem name (handles both old string literals and new v0.6.0 Ecosystem URIs).
-pub fn discover_by_ecosystem(endpoint: &str, ecosystem: &str) -> Result<Vec<String>> {
-    let client = SparqlClient::new(endpoint);
+pub fn discover_by_ecosystem(
+    endpoint: &str,
+    ecosystem: &str,
+    auth: &SparqlAuth,
+    backend: SparqlBackend,
+) -> Result<Vec<String>> {
+    let client = make_sparql_client(endpoint, auth, backend);
     let sparql = format!(
         "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\n\
          SELECT DISTINCT ?name WHERE {{\n\
@@ -26,7 +31,10 @@ pub fn discover_by_ecosystem(endpoint: &str, ecosystem: &str) -> Result<Vec<Stri
          }} ORDER BY ?name"
     );
 
-    eprintln!("Querying Fuseki for {} upstream package names...", ecosystem);
+    eprintln!(
+        "Querying Fuseki for {} upstream package names...",
+        ecosystem
+    );
     let bindings = client.query(&sparql)?;
 
     let names: Vec<String> = bindings
@@ -42,8 +50,10 @@ pub fn generate_seed(
     endpoint: &str,
     graph_uri: &str,
     output_path: &str,
+    auth: SparqlAuth,
+    backend: SparqlBackend,
 ) -> Result<()> {
-    let client = SparqlClient::new(endpoint);
+    let client = make_sparql_client(endpoint, &auth, backend);
 
     // Query for distinct package names in the specified graph
     let sparql = format!(
@@ -85,11 +95,13 @@ mod tests {
     #[test]
     fn test_generate_seed_with_mockito() {
         let mut server = mockito::Server::new();
-        let mock = server.mock("POST", "/sparql")
+        let mock = server
+            .mock("POST", "/sparql")
             .match_header("accept", "application/sparql-results+json")
             .with_status(200)
             .with_header("content-type", "application/sparql-results+json")
-            .with_body(r#"{
+            .with_body(
+                r#"{
                 "results": {
                     "bindings": [
                         {"name": {"type": "literal", "value": "bash"}},
@@ -97,15 +109,19 @@ mod tests {
                         {"name": {"type": "literal", "value": "git"}}
                     ]
                 }
-            }"#)
+            }"#,
+            )
             .create();
 
         let output_path = "/tmp/test-seed-output.txt";
         generate_seed(
             &server.url(),
             "https://packagegraph.github.io/graph/test",
-            output_path
-        ).unwrap();
+            output_path,
+            None,
+            SparqlBackend::Fuseki,
+        )
+        .unwrap();
 
         mock.assert();
 
@@ -124,7 +140,8 @@ mod tests {
     #[test]
     fn test_generate_seed_empty_result() {
         let mut server = mockito::Server::new();
-        let mock = server.mock("POST", "/sparql")
+        let mock = server
+            .mock("POST", "/sparql")
             .match_header("accept", "application/sparql-results+json")
             .with_status(200)
             .with_body(r#"{"results": {"bindings": []}}"#)
@@ -134,8 +151,11 @@ mod tests {
         generate_seed(
             &server.url(),
             "https://packagegraph.github.io/graph/empty",
-            output_path
-        ).unwrap();
+            output_path,
+            None,
+            SparqlBackend::Fuseki,
+        )
+        .unwrap();
 
         mock.assert();
 

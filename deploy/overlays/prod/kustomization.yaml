@@ -4,6 +4,27 @@ kind: Kustomization
 resources:
   - ../../base
   - cronjob.yaml
+  - jobs/rebuild-tdb2.yaml
+  - jobs/rebuild-qlever-index.yaml
+  - jobs/enrich-github.yaml
+  - rbac/rebuild-tdb2-rbac.yaml
+  - rbac/rebuild-qlever-rbac.yaml
+
+images:
+  - name: ghcr.io/packagegraph/etl
+    newTag: v0.12.0
+  - name: ghcr.io/packagegraph/qlever-rebuild
+    newTag: v0.12.0
 
 patches:
   - path: patches/fuseki-resources.yaml
+  - path: patches/fuseki-no-init.yaml
+  - target:
+      kind: Deployment
+      name: fuseki
+    patch: |
+      - op: add
+        path: /spec/template/spec/volumes/-
+        value:
+          name: fuseki-run
+          emptyDir: {}

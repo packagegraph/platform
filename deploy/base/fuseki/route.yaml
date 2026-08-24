@@ -8,8 +8,8 @@ metadata:
 spec:
   to:
     kind: Service
-    name: fuseki
+    name: sparql-proxy
   port:
-    targetPort: http
+    targetPort: https
   tls:
-    termination: edge
+    termination: passthrough

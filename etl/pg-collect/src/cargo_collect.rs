@@ -1,5 +1,6 @@
-use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::npm::read_seed_file;
+use crate::ntriples::{bnode_id, NTriplesWriter};
+use crate::sparql::{SparqlAuth, SparqlBackend};
 use crate::uris::*;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -10,6 +11,7 @@ use std::time::Duration;
 
 pub struct CargoCollector {
     client: Client,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,28 +59,54 @@ impl CargoCollector {
     pub fn new() -> Self {
         let client = crate::enricher::default_http_client();
 
-        Self { client }
+        Self {
+            client,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     /// Discover crate names from Fuseki and collect them.
-    pub fn collect_discover(&self, endpoint: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
-        let names = crate::seed::discover_by_ecosystem(endpoint, "cargo")?;
+    pub fn collect_discover(
+        &self,
+        endpoint: &str,
+        auth: &SparqlAuth,
+        backend: SparqlBackend,
+        max_depth: u32,
+        max_packages: usize,
+        output_path: &str,
+    ) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "cargo", auth, backend.clone())?;
         let seed_path = "/tmp/seed-cargo-discover.txt";
         std::fs::write(seed_path, names.join("\n"))?;
         self.collect(seed_path, max_depth, max_packages, output_path)
     }
 
-    pub fn collect(&self, packages_file: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
-        use std::collections::{HashSet, HashMap, VecDeque};
+    pub fn collect(
+        &self,
+        packages_file: &str,
+        max_depth: u32,
+        max_packages: usize,
+        output_path: &str,
+    ) -> Result<(usize, usize)> {
+        use std::collections::{HashMap, HashSet, VecDeque};
 
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         self.emit_distribution_metadata(&mut writer)?;
 
         let seeds = read_seed_file(packages_file)?;
         eprintln!("Loaded {} seed crates", seeds.len());
-        eprintln!("Spider config: max_depth={}, max_packages={}", max_depth, max_packages);
+        eprintln!(
+            "Spider config: max_depth={}, max_packages={}",
+            max_depth, max_packages
+        );
 
         // BFS state
         let mut queue: VecDeque<String> = seeds.into_iter().collect();
@@ -120,7 +148,10 @@ impl CargoCollector {
                     // Enqueue runtime + build deps (skip dev)
                     if depth < max_depth {
                         for dep in deps {
-                            if dep.kind != "dev" && !visited.contains(&dep.crate_id) && !depth_map.contains_key(&dep.crate_id) {
+                            if dep.kind != "dev"
+                                && !visited.contains(&dep.crate_id)
+                                && !depth_map.contains_key(&dep.crate_id)
+                            {
                                 depth_map.insert(dep.crate_id.clone(), depth + 1);
                                 queue.push_back(dep.crate_id);
                             }
@@ -133,7 +164,11 @@ impl CargoCollector {
             std::thread::sleep(Duration::from_millis(base_delay_ms));
         }
 
-        eprintln!("Collected {} crates ({} total in graph)", total_packages, visited.len());
+        eprintln!(
+            "Collected {} crates ({} total in graph)",
+            total_packages,
+            visited.len()
+        );
         writer.flush()?;
         Ok((total_packages, total_triples))
     }
@@ -169,10 +204,19 @@ impl CargoCollector {
             .crate_data
             .max_stable_version
             .as_deref()
-            .or_else(|| crate_resp.versions.as_ref()?.first().map(|v| v.num.as_str()))
+            .or_else(|| {
+                crate_resp
+                    .versions
+                    .as_ref()?
+                    .first()
+                    .map(|v| v.num.as_str())
+            })
             .unwrap_or("0.0.0");
 
-        let deps_url = format!("https://crates.io/api/v1/crates/{}/{}/dependencies", name, version);
+        let deps_url = format!(
+            "https://crates.io/api/v1/crates/{}/{}/dependencies",
+            name, version
+        );
         let deps = match self.fetch_json_with_retry::<DepsResponse>(&deps_url, base_delay_ms) {
             Ok(r) => r.dependencies,
             Err(_) => vec![],
@@ -244,7 +288,11 @@ impl CargoCollector {
 
         // Identity
         writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &crate_data.name)?;
+        writer.write_literal(
+            &identity_uri,
+            &format!("{PKG}packageName"),
+            &crate_data.name,
+        )?;
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 
@@ -277,7 +325,8 @@ impl CargoCollector {
             triples += 1;
             // Upstream repository via forge library
             if let Some(extraction) = crate::forge::extract_forge_url(repo) {
-                triples += crate::forge::emit_upstream_repo(writer, &identity_uri, &extraction, None)?;
+                triples +=
+                    crate::forge::emit_upstream_repo(writer, &identity_uri, &extraction, None)?;
             }
         }
         if let Some(license) = &crate_data.license {
@@ -310,7 +359,11 @@ impl CargoCollector {
                 if let Some(features) = &ver_data.features {
                     if let Some(features_map) = features.as_object() {
                         for feature_name in features_map.keys() {
-                            writer.write_literal(&pkg_uri, &format!("{CARGO}featureName"), feature_name)?;
+                            writer.write_literal(
+                                &pkg_uri,
+                                &format!("{CARGO}featureName"),
+                                feature_name,
+                            )?;
                             triples += 1;
                         }
                     }
@@ -334,15 +387,27 @@ impl CargoCollector {
             writer.write_bnode_object(&pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri(dep_type))?;
+            writer.write_bnode_subject(
+                &bnode,
+                &format!("{PKG}dependencyType"),
+                &dep_type_uri(dep_type),
+            )?;
             triples += 4;
 
             if !dep.req.is_empty() {
                 let cb = bnode_id("constraint", &format!("{}-{}", pkg_uri, dep.crate_id));
                 writer.write_bnode_to_bnode(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
                 writer.write_bnode_subject(&cb, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
-                writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintOperator"), "semver")?;
-                writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintValue"), &dep.req)?;
+                writer.write_bnode_literal(
+                    &cb,
+                    &format!("{PKG}versionConstraintOperator"),
+                    "semver",
+                )?;
+                writer.write_bnode_literal(
+                    &cb,
+                    &format!("{PKG}versionConstraintValue"),
+                    &dep.req,
+                )?;
                 triples += 4;
             }
         }
@@ -376,7 +441,10 @@ mod tests {
 
         let resp: CratesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.crate_data.name, "serde");
-        assert_eq!(resp.crate_data.max_stable_version.as_deref(), Some("1.0.200"));
+        assert_eq!(
+            resp.crate_data.max_stable_version.as_deref(),
+            Some("1.0.200")
+        );
         assert_eq!(resp.versions.unwrap()[0].edition.as_deref(), Some("2021"));
     }
 
@@ -413,11 +481,17 @@ mod tests {
             optional: true,
         }];
 
-        let triples = collector.emit_crate_triples(&mut writer, &resp, &deps).unwrap();
+        let triples = collector
+            .emit_crate_triples(&mut writer, &resp, &deps)
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("cargo#Crate"));

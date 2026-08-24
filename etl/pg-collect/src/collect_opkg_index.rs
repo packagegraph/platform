@@ -14,8 +14,18 @@ pub struct OpkgIndexCollector {
 }
 
 impl OpkgIndexCollector {
-    pub fn new(distro_name: String, release_name: String, release_url: String, arch: String) -> Self {
-        Self { distro_name, release_name, release_url, arch }
+    pub fn new(
+        distro_name: String,
+        release_name: String,
+        release_url: String,
+        arch: String,
+    ) -> Self {
+        Self {
+            distro_name,
+            release_name,
+            release_url,
+            arch,
+        }
     }
 
     pub fn collect(
@@ -32,9 +42,19 @@ impl OpkgIndexCollector {
         let feeds = vec!["packages", "luci", "routing", "telephony", "base"];
 
         for feed in feeds {
-            let url = format!("{}/packages/{}/{}/Packages.gz", self.release_url, self.arch, feed);
+            let url = format!(
+                "{}/packages/{}/{}/Packages.gz",
+                self.release_url, self.arch, feed
+            );
 
-            match self.fetch_and_parse_packages_gz(&url, feed, writer, identity_map, &mut digest_map, cache) {
+            match self.fetch_and_parse_packages_gz(
+                &url,
+                feed,
+                writer,
+                identity_map,
+                &mut digest_map,
+                cache,
+            ) {
                 Ok(count) => {
                     total_packages += count;
                     eprintln!("  {} feed: {} packages", feed, count);
@@ -166,7 +186,10 @@ impl OpkgIndexCollector {
             triples += 1;
         } else {
             // Standalone binary (base/ or other unmatched)
-            eprintln!("  Creating standalone binary node for {} (not in feed identity map)", name);
+            eprintln!(
+                "  Creating standalone binary node for {} (not in feed identity map)",
+                name
+            );
         }
 
         // Binary metadata - targetArchitecture
@@ -195,7 +218,12 @@ impl OpkgIndexCollector {
         // installedSize
         if let Some(size_str) = pkg.get("Installed-Size") {
             if let Ok(size) = size_str.parse::<i64>() {
-                writer.write_typed_literal(&pkg_uri, &format!("{OPENWRT}installedSize"), &size.to_string(), &format!("{XSD}integer"))?;
+                writer.write_typed_literal(
+                    &pkg_uri,
+                    &format!("{OPENWRT}installedSize"),
+                    &size.to_string(),
+                    &format!("{XSD}integer"),
+                )?;
                 triples += 1;
             }
         }
@@ -203,7 +231,12 @@ impl OpkgIndexCollector {
         // packageSize (download size)
         if let Some(size_str) = pkg.get("Size") {
             if let Ok(size) = size_str.parse::<i64>() {
-                writer.write_typed_literal(&pkg_uri, &format!("{PKG}packageSize"), &size.to_string(), &format!("{XSD}long"))?;
+                writer.write_typed_literal(
+                    &pkg_uri,
+                    &format!("{PKG}packageSize"),
+                    &size.to_string(),
+                    &format!("{XSD}long"),
+                )?;
                 triples += 1;
             }
         }
@@ -229,7 +262,8 @@ impl OpkgIndexCollector {
                     dep
                 };
 
-                let target_uri = package_identity_uri(&self.distro_name, &self.release_name, arch, dep_name);
+                let target_uri =
+                    package_identity_uri(&self.distro_name, &self.release_name, arch, dep_name);
                 writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
                 triples += 1;
             }
@@ -286,29 +320,50 @@ Description: Another test
 
         let mut digest_map = HashMap::new();
         let reader = BufReader::new(packages_data.as_bytes());
-        let count = collector.parse_packages_from_reader(reader, &mut writer, &identity_map, &mut digest_map).unwrap();
+        let count = collector
+            .parse_packages_from_reader(reader, &mut writer, &identity_map, &mut digest_map)
+            .unwrap();
 
         assert_eq!(count, 2, "Should parse 2 packages");
 
         // Verify digest_map built
-        assert!(digest_map.contains_key("sha256:abc123"), "Should have testpkg digest");
-        assert!(digest_map.contains_key("sha256:def456"), "Should have anotherpkg digest");
+        assert!(
+            digest_map.contains_key("sha256:abc123"),
+            "Should have testpkg digest"
+        );
+        assert!(
+            digest_map.contains_key("sha256:def456"),
+            "Should have anotherpkg digest"
+        );
 
         writer.flush().unwrap();
 
         // Verify output
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Should have BinaryIPK types
-        assert!(content.contains("opkg#BinaryIPK"), "Should emit BinaryIPK nodes");
+        assert!(
+            content.contains("opkg#BinaryIPK"),
+            "Should emit BinaryIPK nodes"
+        );
 
         // testpkg should have builtFromSource link
         assert!(content.contains("builtFromSource"), "Should link to source");
-        assert!(content.contains(source_uri), "Should link testpkg to its source URI");
+        assert!(
+            content.contains(source_uri),
+            "Should link testpkg to its source URI"
+        );
 
         // Both should have binary metadata
-        assert!(content.contains("installedSize"), "Should have installed size");
+        assert!(
+            content.contains("installedSize"),
+            "Should have installed size"
+        );
         assert!(content.contains("opkgFilename"), "Should have filename");
         assert!(content.contains("hasChecksum"), "Should have checksum");
     }

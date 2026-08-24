@@ -5,7 +5,7 @@
 //! percentile, and assessment date.
 
 use crate::ntriples::NTriplesWriter;
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use reqwest::blocking::Client;
 use std::collections::HashMap;
@@ -18,22 +18,34 @@ pub struct EpssEnricher {
     sparql: SparqlClient,
     client: Client,
     min_score: f64,
+    pub graph_uri: Option<String>,
 }
 
 impl EpssEnricher {
-    pub fn new(endpoint: &str, min_score: f64) -> Self {
-        let sparql = SparqlClient::new(endpoint);
+    pub fn new(endpoint: &str, min_score: f64, auth: SparqlAuth, backend: SparqlBackend) -> Self {
+        let sparql = make_sparql_client(endpoint, &auth, backend);
         let client = Client::builder()
             .user_agent("pg-collect/1.0 (packagegraph.github.io)")
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .expect("Failed to build HTTP client");
-        Self { sparql, client, min_score }
+        Self {
+            sparql,
+            client,
+            min_score,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn enrich(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         let cve_map = self.query_cve_entities()?;
         eprintln!("Found {} CVE entities in graph", cve_map.len());
@@ -53,7 +65,11 @@ impl EpssEnricher {
 
                 let assessment_uri = epss_assessment_uri(cve_id, &today);
 
-                writer.write_triple(vuln_uri, &format!("{SEC}hasEPSSAssessment"), &assessment_uri)?;
+                writer.write_triple(
+                    vuln_uri,
+                    &format!("{SEC}hasEPSSAssessment"),
+                    &assessment_uri,
+                )?;
                 writer.write_triple(&assessment_uri, RDF_TYPE, &format!("{SEC}EPSSAssessment"))?;
                 writer.write_typed_literal(
                     &assessment_uri,
@@ -75,7 +91,10 @@ impl EpssEnricher {
         }
 
         writer.flush()?;
-        eprintln!("Matched {} CVEs with EPSS scores ({} triples)", matched, total_triples);
+        eprintln!(
+            "Matched {} CVEs with EPSS scores ({} triples)",
+            matched, total_triples
+        );
         Ok((matched, total_triples))
     }
 
@@ -159,7 +178,10 @@ impl EpssEnricher {
                 map.insert(cve.to_string(), (epss, percentile));
             }
 
-            eprintln!("  Fetched EPSS page at offset {} ({} records)", offset, page_count);
+            eprintln!(
+                "  Fetched EPSS page at offset {} ({} records)",
+                offset, page_count
+            );
 
             if page_count < PAGE_SIZE {
                 break;
@@ -193,7 +215,7 @@ mod tests {
             )
             .create();
 
-        let enricher = EpssEnricher::new(&server.url(), 0.0);
+        let enricher = EpssEnricher::new(&server.url(), 0.0, None, SparqlBackend::Fuseki);
 
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
@@ -201,9 +223,12 @@ mod tests {
         let mut epss_data = HashMap::new();
         epss_data.insert("CVE-2024-6119".to_string(), (0.00532, 0.721));
 
-        let cve_map: HashMap<String, String> = [("CVE-2024-6119".to_string(), "https://packagegraph.github.io/d/cve/CVE-2024-6119".to_string())]
-            .into_iter()
-            .collect();
+        let cve_map: HashMap<String, String> = [(
+            "CVE-2024-6119".to_string(),
+            "https://packagegraph.github.io/d/cve/CVE-2024-6119".to_string(),
+        )]
+        .into_iter()
+        .collect();
 
         let today = "2026-06-04";
         let assessment_uri = epss_assessment_uri("CVE-2024-6119", today);
@@ -240,7 +265,11 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("EPSSAssessment"));
         assert!(content.contains("epssScore"));
@@ -254,6 +283,9 @@ mod tests {
     fn test_epss_min_score_filter() {
         let filtered = 0.001_f64;
         let threshold = 0.01_f64;
-        assert!(filtered < threshold, "Score below threshold should be filtered");
+        assert!(
+            filtered < threshold,
+            "Score below threshold should be filtered"
+        );
     }
 }

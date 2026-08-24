@@ -14,6 +14,7 @@ pub struct HomebrewCollector {
     distro_name: String,
     release_name: String,
     source_cache: Option<SourceCache>,
+    pub graph_uri: Option<String>,
 }
 
 /// Minimal serde model for Homebrew formula JSON.
@@ -62,7 +63,20 @@ impl HomebrewCollector {
             .build()
             .expect("Failed to create HTTP client");
 
-        Self { client, api_base, distro_name, release_name, source_cache: None }
+        Self {
+            client,
+            api_base,
+            distro_name,
+            release_name,
+            source_cache: None,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
@@ -72,7 +86,7 @@ impl HomebrewCollector {
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         // Emit distribution metadata
         self.emit_distribution_metadata(&mut writer)?;
@@ -162,15 +176,26 @@ impl HomebrewCollector {
         serde_json::from_str(&text).map_err(|e| e.to_string())
     }
 
-    fn emit_formula_triples(&self, writer: &mut NTriplesWriter, formula: &Formula) -> Result<usize> {
+    fn emit_formula_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        formula: &Formula,
+    ) -> Result<usize> {
         let version = formula
             .versions
             .as_ref()
             .and_then(|v| v.stable.as_deref())
             .unwrap_or("unknown");
 
-        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", &formula.name, version);
-        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", &formula.name);
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            &self.release_name,
+            "any",
+            &formula.name,
+            version,
+        );
+        let identity_uri =
+            package_identity_uri(&self.distro_name, &self.release_name, "any", &formula.name);
         let mut triples = 0;
 
         // Dual typing
@@ -194,7 +219,12 @@ impl HomebrewCollector {
         }
 
         // Version
-        let ver_uri = version_uri(&self.distro_name, &self.release_name, &formula.name, version);
+        let ver_uri = version_uri(
+            &self.distro_name,
+            &self.release_name,
+            &formula.name,
+            version,
+        );
         writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
         writer.write_literal(&ver_uri, &format!("{PKG}versionString"), version)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
@@ -256,8 +286,15 @@ impl HomebrewCollector {
 
     fn emit_cask_triples(&self, writer: &mut NTriplesWriter, cask: &Cask) -> Result<usize> {
         let version = cask.version.as_deref().unwrap_or("latest");
-        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", &cask.token, version);
-        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", &cask.token);
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            &self.release_name,
+            "any",
+            &cask.token,
+            version,
+        );
+        let identity_uri =
+            package_identity_uri(&self.distro_name, &self.release_name, "any", &cask.token);
         let mut triples = 0;
 
         // Dual typing
@@ -312,7 +349,8 @@ impl HomebrewCollector {
     ) -> Result<usize> {
         let mut triples = 0;
         for dep_name in deps {
-            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", dep_name);
+            let target_uri =
+                package_identity_uri(&self.distro_name, &self.release_name, "any", dep_name);
 
             writer.write_triple(pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
@@ -321,7 +359,11 @@ impl HomebrewCollector {
             writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri(dep_type))?;
+            writer.write_bnode_subject(
+                &bnode,
+                &format!("{PKG}dependencyType"),
+                &dep_type_uri(dep_type),
+            )?;
             triples += 4;
         }
         Ok(triples)
@@ -382,7 +424,11 @@ mod tests {
 
     #[test]
     fn test_emit_formula_triples_produces_dual_typing() {
-        let collector = HomebrewCollector::new("https://formulae.brew.sh/api".into(), "homebrew".into(), "homebrew".into());
+        let collector = HomebrewCollector::new(
+            "https://formulae.brew.sh/api".into(),
+            "homebrew".into(),
+            "homebrew".into(),
+        );
 
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
@@ -406,11 +452,17 @@ mod tests {
             disable_reason: None,
         };
 
-        let triples = collector.emit_formula_triples(&mut writer, &formula).unwrap();
+        let triples = collector
+            .emit_formula_triples(&mut writer, &formula)
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Verify dual typing
         assert!(content.contains("core#Package"));
@@ -423,7 +475,11 @@ mod tests {
 
     #[test]
     fn test_emit_cask_triples() {
-        let collector = HomebrewCollector::new("https://formulae.brew.sh/api".into(), "homebrew".into(), "homebrew".into());
+        let collector = HomebrewCollector::new(
+            "https://formulae.brew.sh/api".into(),
+            "homebrew".into(),
+            "homebrew".into(),
+        );
 
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
@@ -444,7 +500,11 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("homebrew#Cask"));
         assert!(content.contains("\"firefox\""));

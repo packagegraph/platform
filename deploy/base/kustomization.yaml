@@ -3,6 +3,14 @@ kind: Kustomization
 
 namespace: packagegraph
 
+images:
+  - name: ghcr.io/packagegraph/etl
+    newTag: v0.12.0
+  - name: ghcr.io/packagegraph/qlever-rebuild
+    newTag: v0.12.0
+  - name: docker.io/nginxinc/nginx-unprivileged
+    newTag: 1.27.5-alpine
+
 resources:
   - namespace.yaml
   # minio/secret.yaml — managed out-of-band via `oc create secret`
@@ -15,3 +23,13 @@ resources:
   - fuseki/service.yaml
   - fuseki/route.yaml
   - fuseki/read-replica.yaml
+  # sparql-proxy: TLS + basic auth reverse proxy
+  # Requires out-of-band secrets: sparql-proxy-tls, sparql-proxy-auth
+  - sparql-proxy/deployment.yaml
+  - sparql-proxy/service.yaml
+  - sparql-proxy/configmap.yaml
+  # qlever: SPARQL engine (parallel with Fuseki during migration)
+  # Requires out-of-band secret: qlever-credentials (see qlever/secret.yaml)
+  - qlever/pvc.yaml
+  - qlever/deployment.yaml
+  - qlever/service.yaml

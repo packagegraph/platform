@@ -16,6 +16,7 @@ pub struct FreebsdCollector {
     release: String,
     arch: String,
     source_cache: Option<SourceCache>,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,7 +55,14 @@ impl FreebsdCollector {
             release,
             arch,
             source_cache: None,
+            graph_uri: None,
         }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
@@ -79,7 +87,10 @@ impl FreebsdCollector {
 
         let (url, use_zstd) = {
             eprintln!("Fetching packagesite.pkg from: {}", pkg_url);
-            let resp = self.client.get(&pkg_url).send()
+            let resp = self
+                .client
+                .get(&pkg_url)
+                .send()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
             if resp.status().is_success() {
                 (pkg_url, true)
@@ -91,10 +102,15 @@ impl FreebsdCollector {
 
         let response = if use_zstd {
             // Re-fetch since we consumed the first response checking status
-            self.client.get(&url).send()
+            self.client
+                .get(&url)
+                .send()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
         } else {
-            let resp = self.client.get(&url).send()
+            let resp = self
+                .client
+                .get(&url)
+                .send()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
             if !resp.status().is_success() {
                 return Err(std::io::Error::new(
@@ -123,7 +139,7 @@ impl FreebsdCollector {
         let mut archive = Archive::new(std::io::Cursor::new(&tar_bytes));
 
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         self.emit_distribution_metadata(&mut writer)?;
 
@@ -186,9 +202,20 @@ impl FreebsdCollector {
         Ok(triples)
     }
 
-    fn emit_package_triples(&self, writer: &mut NTriplesWriter, pkg: &PackageSiteEntry) -> Result<usize> {
-        let pkg_uri = package_uri(&self.distro_name, &self.release, &self.arch, &pkg.name, &pkg.version);
-        let identity_uri = package_identity_uri(&self.distro_name, &self.release, &self.arch, &pkg.name);
+    fn emit_package_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        pkg: &PackageSiteEntry,
+    ) -> Result<usize> {
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            &self.release,
+            &self.arch,
+            &pkg.name,
+            &pkg.version,
+        );
+        let identity_uri =
+            package_identity_uri(&self.distro_name, &self.release, &self.arch, &pkg.name);
         let mut triples = 0;
 
         // Dual typing
@@ -252,7 +279,8 @@ impl FreebsdCollector {
 
         // Dependencies
         for (dep_name, _info) in &pkg.deps {
-            let target = package_identity_uri(&self.distro_name, &self.release, &self.arch, dep_name);
+            let target =
+                package_identity_uri(&self.distro_name, &self.release, &self.arch, dep_name);
             writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target)?;
             triples += 1;
         }
@@ -306,7 +334,11 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("bsdpkg#BinaryPackage"));

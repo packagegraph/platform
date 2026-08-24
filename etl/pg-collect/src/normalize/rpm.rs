@@ -66,7 +66,10 @@ pub fn normalize_rpm_package(
         summary: fields.get("summary").cloned(),
         description: fields.get("description").cloned(),
         homepage: fields.get("url").cloned(),
-        license: fields.get("rpm:license").or_else(|| fields.get("license")).cloned(),
+        license: fields
+            .get("rpm:license")
+            .or_else(|| fields.get("license"))
+            .cloned(),
         checksum: fields.get("checksum").cloned(),
         size_bytes: fields
             .get("size")
@@ -76,14 +79,26 @@ pub fn normalize_rpm_package(
 
     // Collector-specific fields
     let mut collector_specific = serde_json::Map::new();
-    if let Some(srpm) = fields.get("rpm:sourcerpm").or_else(|| fields.get("sourcerpm")) {
-        collector_specific.insert("source_rpm".to_string(), serde_json::Value::String(srpm.clone()));
+    if let Some(srpm) = fields
+        .get("rpm:sourcerpm")
+        .or_else(|| fields.get("sourcerpm"))
+    {
+        collector_specific.insert(
+            "source_rpm".to_string(),
+            serde_json::Value::String(srpm.clone()),
+        );
     }
     if let Some(group) = fields.get("rpm:group").or_else(|| fields.get("group")) {
-        collector_specific.insert("rpm_group".to_string(), serde_json::Value::String(group.clone()));
+        collector_specific.insert(
+            "rpm_group".to_string(),
+            serde_json::Value::String(group.clone()),
+        );
     }
     if epoch != 0 {
-        collector_specific.insert("rpm_epoch".to_string(), serde_json::Value::Number(epoch.into()));
+        collector_specific.insert(
+            "rpm_epoch".to_string(),
+            serde_json::Value::Number(epoch.into()),
+        );
     }
 
     let mut source_artifacts = BTreeMap::new();
@@ -157,9 +172,7 @@ fn parse_maintainer(packager: &str) -> Vec<MaintainerIr> {
 }
 
 fn parse_source_rpm(srpm: &str) -> Option<SourcePackageRef> {
-    let name = srpm
-        .trim_end_matches(".src.rpm")
-        .trim_end_matches(".rpm");
+    let name = srpm.trim_end_matches(".src.rpm").trim_end_matches(".rpm");
     // Parse NVR: name-version-release
     let mut parts = name.rsplitn(3, '-');
     let release = parts.next()?;
@@ -187,23 +200,30 @@ mod tests {
         fields.insert("ver".to_string(), "2.39".to_string());
         fields.insert("rel".to_string(), "17.fc43".to_string());
         fields.insert("epoch".to_string(), "0".to_string());
-        fields.insert("packager".to_string(), "Fedora Project <admin@fedoraproject.org>".to_string());
+        fields.insert(
+            "packager".to_string(),
+            "Fedora Project <admin@fedoraproject.org>".to_string(),
+        );
         fields.insert("summary".to_string(), "GNU C Library".to_string());
-        fields.insert("url".to_string(), "https://www.gnu.org/software/libc/".to_string());
-        fields.insert("rpm:sourcerpm".to_string(), "glibc-2.39-17.fc43.src.rpm".to_string());
+        fields.insert(
+            "url".to_string(),
+            "https://www.gnu.org/software/libc/".to_string(),
+        );
+        fields.insert(
+            "rpm:sourcerpm".to_string(),
+            "glibc-2.39-17.fc43.src.rpm".to_string(),
+        );
 
         RpmPackageData {
             fields,
-            deps: vec![
-                RpmDep {
-                    name: "glibc-common".to_string(),
-                    flags: Some("EQ".to_string()),
-                    epoch: None,
-                    ver: Some("2.39".to_string()),
-                    rel: Some("17.fc43".to_string()),
-                    dep_type: "requires".to_string(),
-                },
-            ],
+            deps: vec![RpmDep {
+                name: "glibc-common".to_string(),
+                flags: Some("EQ".to_string()),
+                epoch: None,
+                ver: Some("2.39".to_string()),
+                rel: Some("17.fc43".to_string()),
+                dep_type: "requires".to_string(),
+            }],
         }
     }
 
@@ -230,7 +250,10 @@ mod tests {
         assert_eq!(ir.package.kind, "binary");
         assert_eq!(ir.maintainers.len(), 1);
         assert_eq!(ir.maintainers[0].name, "Fedora Project");
-        assert_eq!(ir.maintainers[0].email.as_deref(), Some("admin@fedoraproject.org"));
+        assert_eq!(
+            ir.maintainers[0].email.as_deref(),
+            Some("admin@fedoraproject.org")
+        );
         assert_eq!(ir.dependencies.len(), 1);
         assert_eq!(ir.dependencies[0].name, "glibc-common");
         assert!(ir.source_package.is_some());

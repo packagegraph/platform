@@ -1,4 +1,4 @@
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind, Result};
@@ -36,10 +36,18 @@ pub struct LinuxDistroSeeds {
 impl ExtractConfig {
     /// Load config from a TOML file.
     pub fn load(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to read config {}: {}", path.display(), e)))?;
-        toml::from_str(&content)
-            .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to parse config {}: {}", path.display(), e)))
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            Error::new(
+                ErrorKind::Other,
+                format!("Failed to read config {}: {}", path.display(), e),
+            )
+        })?;
+        toml::from_str(&content).map_err(|e| {
+            Error::new(
+                ErrorKind::Other,
+                format!("Failed to parse config {}: {}", path.display(), e),
+            )
+        })
     }
 
     /// Collect all seed package names into a flat deduplicated list.
@@ -111,8 +119,12 @@ pub fn resolve_seeds(
         }
     }
 
-    eprintln!("Phase 1: Resolved {}/{} seed packages across {} graphs",
-        resolved_count, seed_names.len(), graph_uris.len());
+    eprintln!(
+        "Phase 1: Resolved {}/{} seed packages across {} graphs",
+        resolved_count,
+        seed_names.len(),
+        graph_uris.len()
+    );
 
     Ok(graph_uris)
 }
@@ -151,7 +163,8 @@ pub fn bfs_expand(
     let mut visited = seeds.clone();
     let mut frontier: Vec<String> = seeds.iter().cloned().collect();
 
-    let predicates_values: String = BFS_PREDICATES.iter()
+    let predicates_values: String = BFS_PREDICATES
+        .iter()
         .map(|p| format!("<{}>", p))
         .collect::<Vec<_>>()
         .join(" ");
@@ -164,7 +177,8 @@ pub fn bfs_expand(
         let mut next_frontier = Vec::new();
 
         for batch in frontier.chunks(50) {
-            let uri_values: String = batch.iter()
+            let uri_values: String = batch
+                .iter()
                 .map(|u| format!("<{}>", u))
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -192,7 +206,8 @@ pub fn bfs_expand(
                     binding.get("predicate"),
                     binding.get("neighbor"),
                 ) {
-                    groups.entry((seed.clone(), pred.clone()))
+                    groups
+                        .entry((seed.clone(), pred.clone()))
                         .or_default()
                         .push(neighbor.clone());
                 }
@@ -207,7 +222,12 @@ pub fn bfs_expand(
             }
         }
 
-        eprintln!("  Hop {}: +{} URIs (total {})", hop + 1, next_frontier.len(), visited.len());
+        eprintln!(
+            "  Hop {}: +{} URIs (total {})",
+            hop + 1,
+            next_frontier.len(),
+            visited.len()
+        );
         frontier = next_frontier;
     }
 
@@ -229,7 +249,8 @@ pub fn extract_triples(
 
     // Extract triples where subject is in our set
     for batch in uri_list.chunks(50) {
-        let values: String = batch.iter()
+        let values: String = batch
+            .iter()
             .map(|u| format!("<{}>", u))
             .collect::<Vec<_>>()
             .join(" ");
@@ -253,22 +274,25 @@ pub fn extract_triples(
 
     // Filter: keep only triples where object URIs are also in our set
     // (literal objects are always kept)
-    let filtered: Vec<String> = all_triples.into_iter().filter(|triple| {
-        // If the object is a URI (starts with <, ends with > before the dot),
-        // check it's in our extraction set
-        if let Some(obj_start) = triple.rfind("> <") {
-            // Object is a URI — extract it
-            if let Some(obj) = triple.get(obj_start + 2..) {
-                let obj = obj.trim_end_matches(" .").trim();
-                if obj.starts_with('<') && obj.ends_with('>') {
-                    let uri = &obj[1..obj.len()-1];
-                    return uris.contains(uri);
+    let filtered: Vec<String> = all_triples
+        .into_iter()
+        .filter(|triple| {
+            // If the object is a URI (starts with <, ends with > before the dot),
+            // check it's in our extraction set
+            if let Some(obj_start) = triple.rfind("> <") {
+                // Object is a URI — extract it
+                if let Some(obj) = triple.get(obj_start + 2..) {
+                    let obj = obj.trim_end_matches(" .").trim();
+                    if obj.starts_with('<') && obj.ends_with('>') {
+                        let uri = &obj[1..obj.len() - 1];
+                        return uris.contains(uri);
+                    }
                 }
             }
-        }
-        // Literal objects or unparseable lines: keep them
-        true
-    }).collect();
+            // Literal objects or unparseable lines: keep them
+            true
+        })
+        .collect();
 
     Ok(filtered)
 }
@@ -324,7 +348,11 @@ pub fn parse_ontology_reference(ontology_dir: &Path) -> Result<OntologyReference
         .map_err(|e| Error::new(ErrorKind::Other, format!("Glob error: {}", e)))?
         .filter_map(|r| r.ok())
         .filter(|p| {
-            let name = p.file_name().unwrap_or_default().to_str().unwrap_or_default();
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_str()
+                .unwrap_or_default();
             !name.contains("examples") && !name.contains("test")
         })
         .collect();
@@ -367,23 +395,34 @@ pub fn parse_ontology_reference(ontology_dir: &Path) -> Result<OntologyReference
         }
     }
 
-    eprintln!("Ontology: {} files, {} classes, {} predicates, {} SHACL targets",
-        files.len(), classes.len(), predicates.len(), shacl_targets.len());
+    eprintln!(
+        "Ontology: {} files, {} classes, {} predicates, {} SHACL targets",
+        files.len(),
+        classes.len(),
+        predicates.len(),
+        shacl_targets.len()
+    );
 
-    Ok(OntologyReferenceSet { classes, predicates, shacl_targets })
+    Ok(OntologyReferenceSet {
+        classes,
+        predicates,
+        shacl_targets,
+    })
 }
 
 /// Expand a prefixed name (e.g., "pkg:Package") to its full URI.
 fn expand_prefixed(name: &str, prefixes: &HashMap<String, String>) -> Option<String> {
     if name.starts_with('<') && name.ends_with('>') {
         // Already a full URI
-        Some(name[1..name.len()-1].to_string())
+        Some(name[1..name.len() - 1].to_string())
     } else if let Some(colon_pos) = name.find(':') {
         let prefix = &name[..colon_pos];
-        let local = &name[colon_pos+1..];
+        let local = &name[colon_pos + 1..];
         // Strip trailing semicolons/commas/periods from local name
         let local = local.trim_end_matches(|c| c == ';' || c == ',' || c == '.');
-        prefixes.get(prefix).map(|base| format!("{}{}", base, local))
+        prefixes
+            .get(prefix)
+            .map(|base| format!("{}{}", base, local))
     } else {
         None
     }
@@ -412,12 +451,21 @@ pub fn compute_coverage(triples: &[String], ref_set: &OntologyReferenceSet) -> C
         }
     }
 
-    let classes_missing: Vec<String> = ref_set.classes.difference(&found_classes)
-        .cloned().collect();
-    let predicates_missing: Vec<String> = ref_set.predicates.difference(&found_predicates)
-        .cloned().collect();
-    let shacl_missing: Vec<String> = ref_set.shacl_targets.difference(&found_classes)
-        .cloned().collect();
+    let classes_missing: Vec<String> = ref_set
+        .classes
+        .difference(&found_classes)
+        .cloned()
+        .collect();
+    let predicates_missing: Vec<String> = ref_set
+        .predicates
+        .difference(&found_predicates)
+        .cloned()
+        .collect();
+    let shacl_missing: Vec<String> = ref_set
+        .shacl_targets
+        .difference(&found_classes)
+        .cloned()
+        .collect();
 
     CoverageReport {
         generated_at: String::new(),
@@ -470,6 +518,8 @@ pub fn run(
     max_triples_override: Option<usize>,
     depth_override: Option<usize>,
     fan_out_override: Option<usize>,
+    auth: SparqlAuth,
+    backend: SparqlBackend,
 ) -> Result<()> {
     eprintln!("=== PackageGraph Test Corpus Extraction ===");
 
@@ -483,7 +533,7 @@ pub fn run(
     eprintln!("Endpoint: {}", endpoint);
     eprintln!("Max triples: {}", max_triples);
 
-    let client = SparqlClient::new(endpoint);
+    let client = make_sparql_client(endpoint, &auth, backend);
 
     // Parse ontology reference set
     let ref_set = parse_ontology_reference(ontology_dir)?;
@@ -507,12 +557,18 @@ pub fn run(
         // Size check
         let estimated = total_uri_count * 50;
         if estimated > max_triples {
-            eprintln!("  Size estimate ({}) exceeds max_triples ({}), stopping expansion",
-                estimated, max_triples);
+            eprintln!(
+                "  Size estimate ({}) exceeds max_triples ({}), stopping expansion",
+                estimated, max_triples
+            );
             break;
         }
     }
-    eprintln!("Phase 2: {} total URIs across {} graphs", total_uri_count, graph_uris.len());
+    eprintln!(
+        "Phase 2: {} total URIs across {} graphs",
+        total_uri_count,
+        graph_uris.len()
+    );
 
     // Phase 3: Triple extraction
     eprintln!("\n--- Phase 3: Triple Extraction ---");
@@ -528,7 +584,11 @@ pub fn run(
 
         // Determine output file path from graph URI
         let file_name = graph_uri_to_filename(graph);
-        let subdir = if graph.contains("/enrichment/") { "enrichment" } else { "collector" };
+        let subdir = if graph.contains("/enrichment/") {
+            "enrichment"
+        } else {
+            "collector"
+        };
         let rel_path = format!("{}/{}", subdir, file_name);
         let full_path = output_dir.join(&rel_path);
 
@@ -555,22 +615,37 @@ pub fn run(
     let mut report = compute_coverage(&all_triples, &ref_set);
 
     // Gap fill for missing classes
-    let gap_fill_count = gap_fill(&client, &ref_set, &report, &mut all_triples, output_dir, &mut manifest_entries)?;
+    let gap_fill_count = gap_fill(
+        &client,
+        &ref_set,
+        &report,
+        &mut all_triples,
+        output_dir,
+        &mut manifest_entries,
+    )?;
     if gap_fill_count > 0 {
         // Recompute coverage after gap fill
         report = compute_coverage(&all_triples, &ref_set);
     }
 
     let total_triples = all_triples.len();
-    eprintln!("Coverage: {}/{} classes, {}/{} predicates, {}/{} SHACL shapes",
-        report.classes_covered, report.classes_total,
-        report.predicates_covered, report.predicates_total,
-        report.shacl_covered, report.shacl_total);
+    eprintln!(
+        "Coverage: {}/{} classes, {}/{} predicates, {}/{} SHACL shapes",
+        report.classes_covered,
+        report.classes_total,
+        report.predicates_covered,
+        report.predicates_total,
+        report.shacl_covered,
+        report.shacl_total
+    );
     if !report.classes_missing.is_empty() {
         eprintln!("  Missing classes: {:?}", report.classes_missing);
     }
     if !report.predicates_missing.is_empty() {
-        eprintln!("  Predicates with no instances: {:?}", report.predicates_missing);
+        eprintln!(
+            "  Predicates with no instances: {:?}",
+            report.predicates_missing
+        );
     }
 
     // Write coverage report
@@ -629,7 +704,10 @@ fn gap_fill(
         return Ok(0);
     }
 
-    eprintln!("  Gap fill: {} missing classes", report.classes_missing.len());
+    eprintln!(
+        "  Gap fill: {} missing classes",
+        report.classes_missing.len()
+    );
     let mut gap_triples = 0;
 
     for missing_class in &report.classes_missing {
@@ -653,7 +731,9 @@ fn gap_fill(
                     // Append to gap-fill file
                     let gap_path = output_dir.join("collector/gap-fill.nt");
                     let mut file = std::fs::OpenOptions::new()
-                        .create(true).append(true).open(&gap_path)?;
+                        .create(true)
+                        .append(true)
+                        .open(&gap_path)?;
                     use std::io::Write;
                     for triple in &triples {
                         writeln!(file, "{}", triple)?;
@@ -661,11 +741,17 @@ fn gap_fill(
 
                     all_triples.extend(triples);
                     gap_triples += count;
-                    eprintln!("    {} — found in <{}>, +{} triples", missing_class, g, count);
+                    eprintln!(
+                        "    {} — found in <{}>, +{} triples",
+                        missing_class, g, count
+                    );
                 }
             }
             _ => {
-                eprintln!("    {} — not found in any graph (no instances exist)", missing_class);
+                eprintln!(
+                    "    {} — not found in any graph (no instances exist)",
+                    missing_class
+                );
             }
         }
     }
@@ -776,7 +862,8 @@ alpine = ["openssl", "busybox"]
         assert_eq!(resolved.len(), 2); // two graphs
         assert!(resolved.contains_key("http://example.org/graph/fedora"));
         assert!(resolved.contains_key("http://example.org/graph/debian"));
-        assert!(resolved["http://example.org/graph/fedora"].contains("http://example.org/pkg/fedora/openssl"));
+        assert!(resolved["http://example.org/graph/fedora"]
+            .contains("http://example.org/pkg/fedora/openssl"));
     }
 
     #[test]
@@ -822,7 +909,8 @@ alpine = ["openssl", "busybox"]
         )).collect();
         let body = format!(r#"{{"results": {{"bindings": [{}]}}}}"#, bindings.join(","));
 
-        let _mock = server.mock("POST", "/sparql")
+        let _mock = server
+            .mock("POST", "/sparql")
             .with_status(200)
             .with_header("content-type", "application/sparql-results+json")
             .with_body(&body)
@@ -882,22 +970,38 @@ pkg:hasVersion a owl:ObjectProperty .
 
         let ref_set = parse_ontology_reference(dir.path()).unwrap();
 
-        assert!(ref_set.classes.contains("https://purl.org/packagegraph/ontology/core#Package"));
-        assert!(ref_set.classes.contains("https://purl.org/packagegraph/ontology/core#Version"));
-        assert!(ref_set.predicates.contains("https://purl.org/packagegraph/ontology/core#packageName"));
-        assert!(ref_set.predicates.contains("https://purl.org/packagegraph/ontology/core#hasVersion"));
+        assert!(ref_set
+            .classes
+            .contains("https://purl.org/packagegraph/ontology/core#Package"));
+        assert!(ref_set
+            .classes
+            .contains("https://purl.org/packagegraph/ontology/core#Version"));
+        assert!(ref_set
+            .predicates
+            .contains("https://purl.org/packagegraph/ontology/core#packageName"));
+        assert!(ref_set
+            .predicates
+            .contains("https://purl.org/packagegraph/ontology/core#hasVersion"));
     }
 
     #[test]
     fn test_coverage_audit() {
         let triples = vec![
-            "<http://ex/p1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex/ClassA> .".to_string(),
+            "<http://ex/p1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex/ClassA> ."
+                .to_string(),
             "<http://ex/p1> <http://ex/pred1> \"value\" .".to_string(),
         ];
 
         let ref_set = OntologyReferenceSet {
-            classes: vec!["http://ex/ClassA".to_string(), "http://ex/ClassB".to_string()].into_iter().collect(),
-            predicates: vec!["http://ex/pred1".to_string(), "http://ex/pred2".to_string()].into_iter().collect(),
+            classes: vec![
+                "http://ex/ClassA".to_string(),
+                "http://ex/ClassB".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+            predicates: vec!["http://ex/pred1".to_string(), "http://ex/pred2".to_string()]
+                .into_iter()
+                .collect(),
             shacl_targets: HashSet::new(),
         };
 
@@ -905,10 +1009,14 @@ pkg:hasVersion a owl:ObjectProperty .
 
         assert_eq!(report.classes_covered, 1);
         assert_eq!(report.classes_total, 2);
-        assert!(report.classes_missing.contains(&"http://ex/ClassB".to_string()));
+        assert!(report
+            .classes_missing
+            .contains(&"http://ex/ClassB".to_string()));
         assert_eq!(report.predicates_covered, 1);
         assert_eq!(report.predicates_total, 2);
-        assert!(report.predicates_missing.contains(&"http://ex/pred2".to_string()));
+        assert!(report
+            .predicates_missing
+            .contains(&"http://ex/pred2".to_string()));
     }
 
     #[test]
@@ -930,7 +1038,10 @@ pkg:hasVersion a owl:ObjectProperty .
     #[test]
     fn test_expand_prefixed() {
         let mut prefixes = HashMap::new();
-        prefixes.insert("pkg".to_string(), "https://purl.org/packagegraph/ontology/core#".to_string());
+        prefixes.insert(
+            "pkg".to_string(),
+            "https://purl.org/packagegraph/ontology/core#".to_string(),
+        );
 
         assert_eq!(
             expand_prefixed("pkg:Package", &prefixes),

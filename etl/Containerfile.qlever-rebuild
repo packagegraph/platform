@@ -1,0 +1,33 @@
+# QLever index rebuild image — based on QLever with mc, kubectl, and jq added.
+# Used by the rebuild-qlever-index CronJob.
+FROM docker.io/adfreiburg/qlever:commit-1075455fae
+
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install mc (Minio client) — pinned version with sha256 verification
+ARG MC_VERSION=RELEASE.2025-04-08T15-39-49Z
+RUN curl -fsSL "https://dl.min.io/client/mc/release/linux-amd64/archive/mc.${MC_VERSION}" -o /tmp/mc.${MC_VERSION} \
+    && curl -fsSL "https://dl.min.io/client/mc/release/linux-amd64/archive/mc.${MC_VERSION}.sha256sum" -o /tmp/mc.sha256sum \
+    && cd /tmp && sha256sum -c mc.sha256sum \
+    && mv /tmp/mc.${MC_VERSION} /usr/local/bin/mc \
+    && chmod +x /usr/local/bin/mc \
+    && rm /tmp/mc.sha256sum
+
+# Install kubectl — pinned version with sha256 verification
+ARG KUBECTL_VERSION=v1.31.4
+RUN curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl \
+    && curl -fsSL "https://dl.k8s.io/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256" -o /tmp/kubectl.sha256 \
+    && echo "$(cat /tmp/kubectl.sha256)  /usr/local/bin/kubectl" | sha256sum -c - \
+    && chmod +x /usr/local/bin/kubectl \
+    && rm /tmp/kubectl.sha256
+
+# Run as non-root (UID 1000 already exists in the QLever base image)
+USER 1000
+
+ENV PATH="/qlever:${PATH}"
+
+ENTRYPOINT ["/bin/bash"]

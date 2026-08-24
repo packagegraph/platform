@@ -171,8 +171,8 @@ impl IrReader<Decoder<'static, BufReader<File>>> {
     /// Open an IR shard file for streaming reads.
     pub fn new(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
-        let decoder = Decoder::new(file)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let decoder =
+            Decoder::new(file).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let buf_reader = BufReader::new(decoder);
 
         Ok(Self { buf_reader })
@@ -180,7 +180,6 @@ impl IrReader<Decoder<'static, BufReader<File>>> {
 }
 
 impl<R: std::io::Read> IrReader<R> {
-
     /// Read the next IR record. Returns None at EOF.
     pub fn read_next(&mut self) -> io::Result<Option<PackageIr>> {
         let mut line = String::new();
@@ -344,7 +343,10 @@ mod tests {
         let json1 = serde_json::to_string(&record).unwrap();
         let json2 = serde_json::to_string(&record).unwrap();
 
-        assert_eq!(json1, json2, "Identical records must produce identical JSON");
+        assert_eq!(
+            json1, json2,
+            "Identical records must produce identical JSON"
+        );
 
         // Verify BTreeMap serialization is ordered
         assert!(json1.contains("\"source_artifacts\":{\"primary\":\"sha256:abc123\"}"));

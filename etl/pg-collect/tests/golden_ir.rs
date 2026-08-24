@@ -4,7 +4,7 @@
 //! This test creates IR fixtures in memory, emits N-Triples via the shared
 //! emitter, and verifies the output contains expected triples.
 
-use pg_collect::emit::rdf::{emit_rdf, emit_distribution_metadata, EmitPolicy};
+use pg_collect::emit::rdf::{emit_distribution_metadata, emit_rdf, EmitPolicy};
 use pg_collect::ir::*;
 use pg_collect::ntriples::NTriplesWriter;
 use std::collections::BTreeMap;
@@ -139,42 +139,86 @@ fn test_golden_fedora_package_emission() {
     let triples = emit_rdf(&ir, &mut writer, &policy).unwrap();
     writer.flush().unwrap();
 
-    assert!(triples > 15, "Fedora package should emit at least 15 triples, got {}", triples);
+    assert!(
+        triples > 15,
+        "Fedora package should emit at least 15 triples, got {}",
+        triples
+    );
 
     let mut content = String::new();
-    temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+    temp_file
+        .reopen()
+        .unwrap()
+        .read_to_string(&mut content)
+        .unwrap();
 
     // Distribution metadata
-    assert!(content.contains("core#Distribution"), "Missing Distribution type");
+    assert!(
+        content.contains("core#Distribution"),
+        "Missing Distribution type"
+    );
     assert!(content.contains("\"Fedora\""), "Missing Fedora label");
-    assert!(content.contains("core#releaseVersion"), "43 is numeric → releaseVersion");
-    assert!(content.contains("core#hasRelease"), "Missing hasRelease inverse");
+    assert!(
+        content.contains("core#releaseVersion"),
+        "43 is numeric → releaseVersion"
+    );
+    assert!(
+        content.contains("core#hasRelease"),
+        "Missing hasRelease inverse"
+    );
 
     // Package identity
-    assert!(content.contains("core#BinaryPackage"), "Missing BinaryPackage type");
-    assert!(content.contains("core#PackageIdentity"), "Missing PackageIdentity");
+    assert!(
+        content.contains("core#BinaryPackage"),
+        "Missing BinaryPackage type"
+    );
+    assert!(
+        content.contains("core#PackageIdentity"),
+        "Missing PackageIdentity"
+    );
     assert!(content.contains("core#isVersionOf"), "Missing isVersionOf");
     assert!(content.contains("\"openssl\""), "Missing package name");
 
     // Maintainer (SD-3: Person, not Maintainer)
-    assert!(content.contains("core#Person"), "Maintainer must be typed as Person");
-    assert!(!content.contains("core#Maintainer"), "Must NOT type as Maintainer");
+    assert!(
+        content.contains("core#Person"),
+        "Maintainer must be typed as Person"
+    );
+    assert!(
+        !content.contains("core#Maintainer"),
+        "Must NOT type as Maintainer"
+    );
     assert!(content.contains("foaf/0.1/name"), "Missing foaf:name");
 
     // Dependencies
-    assert!(content.contains("core#hasDependency"), "Missing dependency reification");
-    assert!(content.contains("core#directlyDependsOn"), "Missing direct dependency");
+    assert!(
+        content.contains("core#hasDependency"),
+        "Missing dependency reification"
+    );
+    assert!(
+        content.contains("core#directlyDependsOn"),
+        "Missing direct dependency"
+    );
 
     // Source package
-    assert!(content.contains("core#SourcePackage"), "Missing SourcePackage");
-    assert!(content.contains("core#builtFromSource"), "Missing builtFromSource");
+    assert!(
+        content.contains("core#SourcePackage"),
+        "Missing SourcePackage"
+    );
+    assert!(
+        content.contains("core#builtFromSource"),
+        "Missing builtFromSource"
+    );
 
     // Version
     assert!(content.contains("core#hasVersion"), "Missing hasVersion");
     assert!(content.contains("core#epoch"), "Missing epoch on version");
 
     // Upstream repo from homepage
-    assert!(content.contains("core#upstreamRepository"), "Missing upstream repo from GitHub homepage");
+    assert!(
+        content.contains("core#upstreamRepository"),
+        "Missing upstream repo from GitHub homepage"
+    );
 }
 
 #[test]
@@ -192,16 +236,26 @@ fn test_golden_debian_package_emission() {
     assert!(triples > 10);
 
     let mut content = String::new();
-    temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+    temp_file
+        .reopen()
+        .unwrap()
+        .read_to_string(&mut content)
+        .unwrap();
 
     // Debian uses codename, not version
-    assert!(content.contains("core#releaseCodename"), "trixie is a codename");
+    assert!(
+        content.contains("core#releaseCodename"),
+        "trixie is a codename"
+    );
     assert!(content.contains("\"trixie\""), "Missing codename value");
 
     // Package basics
     assert!(content.contains("\"libc6\""), "Missing package name");
     assert!(content.contains("core#Person"), "Maintainer must be Person");
-    assert!(content.contains("\"GNU Libc Maintainers\""), "Missing maintainer name");
+    assert!(
+        content.contains("\"GNU Libc Maintainers\""),
+        "Missing maintainer name"
+    );
 }
 
 #[test]
@@ -233,10 +287,18 @@ fn test_ir_round_trip_then_emit() {
     }
     nt_writer.flush().unwrap();
 
-    assert!(total_triples > 25, "Two packages should emit at least 25 triples, got {}", total_triples);
+    assert!(
+        total_triples > 25,
+        "Two packages should emit at least 25 triples, got {}",
+        total_triples
+    );
 
     let mut content = String::new();
-    temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+    temp_file
+        .reopen()
+        .unwrap()
+        .read_to_string(&mut content)
+        .unwrap();
 
     // Both packages should be present
     assert!(content.contains("\"openssl\""), "Missing Fedora package");

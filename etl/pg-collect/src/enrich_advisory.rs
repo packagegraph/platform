@@ -17,6 +17,7 @@ pub struct AdvisoryEnricher {
     cache: Option<FileCache>,
     advisory_type: AdvisoryType,
     days_back: u32,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -26,11 +27,7 @@ pub enum AdvisoryType {
 }
 
 impl AdvisoryEnricher {
-    pub fn new(
-        advisory_type: AdvisoryType,
-        days_back: u32,
-        cache_dir: Option<&str>,
-    ) -> Self {
+    pub fn new(advisory_type: AdvisoryType, days_back: u32, cache_dir: Option<&str>) -> Self {
         let client = crate::enricher::default_http_client();
 
         let cache = cache_dir.map(|dir| {
@@ -38,12 +35,24 @@ impl AdvisoryEnricher {
                 .expect("Failed to create cache")
         });
 
-        Self { client, cache, advisory_type, days_back }
+        Self {
+            client,
+            cache,
+            advisory_type,
+            days_back,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn enrich(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         let (advisories, triples) = match self.advisory_type {
             AdvisoryType::Rhsa => self.enrich_rhsa(&mut writer)?,
@@ -70,18 +79,23 @@ impl AdvisoryEnricher {
             let data = match self.cached_get(&cache_key) {
                 Some(d) => d,
                 None => {
-                    let resp = self.client.get(&url)
+                    let resp = self
+                        .client
+                        .get(&url)
                         .header("Accept", "application/json")
                         .send()
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                        .map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                        })?;
 
                     if !resp.status().is_success() {
                         eprintln!("RHSA API returned {}", resp.status());
                         break;
                     }
 
-                    let data: serde_json::Value = resp.json()
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    let data: serde_json::Value = resp.json().map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    })?;
 
                     self.cache_put(&cache_key, &data);
                     data
@@ -107,7 +121,11 @@ impl AdvisoryEnricher {
         Ok((total_advisories, total_triples))
     }
 
-    fn emit_rhsa_advisory(&self, writer: &mut NTriplesWriter, entry: &serde_json::Value) -> Result<Option<usize>> {
+    fn emit_rhsa_advisory(
+        &self,
+        writer: &mut NTriplesWriter,
+        entry: &serde_json::Value,
+    ) -> Result<Option<usize>> {
         let cve_id = match entry.get("CVE").and_then(|v| v.as_str()) {
             Some(id) => id,
             None => return Ok(None),
@@ -118,7 +136,11 @@ impl AdvisoryEnricher {
 
         writer.write_triple(&advisory_uri, RDF_TYPE, &format!("{SEC}SecurityAdvisory"))?;
         writer.write_literal(&advisory_uri, &format!("{SEC}advisoryId"), cve_id)?;
-        writer.write_triple(&advisory_uri, &format!("{SEC}advisoryType"), &advisory_category_uri("security"))?;
+        writer.write_triple(
+            &advisory_uri,
+            &format!("{SEC}advisoryType"),
+            &advisory_category_uri("security"),
+        )?;
         triples += 3;
 
         if let Some(severity) = entry.get("severity").and_then(|v| v.as_str()) {
@@ -135,7 +157,11 @@ impl AdvisoryEnricher {
 
         // Link to CVE entity (shared with OSV collector)
         let cve_entity = cve_entity_uri(cve_id);
-        writer.write_triple(&advisory_uri, &format!("{SEC}addressesVulnerability"), &cve_entity)?;
+        writer.write_triple(
+            &advisory_uri,
+            &format!("{SEC}addressesVulnerability"),
+            &cve_entity,
+        )?;
         triples += 1;
 
         Ok(Some(triples))
@@ -148,9 +174,10 @@ impl AdvisoryEnricher {
         let data = match self.cached_get(cache_key) {
             Some(d) => d,
             None => {
-                let resp = self.client.get(url)
-                    .send()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let resp =
+                    self.client.get(url).send().map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    })?;
 
                 if !resp.status().is_success() {
                     return Err(std::io::Error::new(
@@ -159,7 +186,8 @@ impl AdvisoryEnricher {
                     ));
                 }
 
-                let data: serde_json::Value = resp.json()
+                let data: serde_json::Value = resp
+                    .json()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
                 self.cache_put(cache_key, &data);
@@ -182,21 +210,37 @@ impl AdvisoryEnricher {
                         let advisory_uri = format!("{DATA}advisory/dsa/{}", cve_id);
                         let mut triples = 0;
 
-                        writer.write_triple(&advisory_uri, RDF_TYPE, &format!("{SEC}SecurityAdvisory"))?;
+                        writer.write_triple(
+                            &advisory_uri,
+                            RDF_TYPE,
+                            &format!("{SEC}SecurityAdvisory"),
+                        )?;
                         writer.write_literal(&advisory_uri, &format!("{SEC}advisoryId"), cve_id)?;
-                        writer.write_triple(&advisory_uri, &format!("{SEC}advisoryType"), &advisory_category_uri("security"))?;
+                        writer.write_triple(
+                            &advisory_uri,
+                            &format!("{SEC}advisoryType"),
+                            &advisory_category_uri("security"),
+                        )?;
                         triples += 3;
 
                         if let Some(severity) = cve_data.get("urgency").and_then(|v| v.as_str()) {
                             if let Some(sev_uri) = severity_concept_uri(severity) {
-                                writer.write_triple(&advisory_uri, &format!("{SEC}advisorySeverity"), &sev_uri)?;
+                                writer.write_triple(
+                                    &advisory_uri,
+                                    &format!("{SEC}advisorySeverity"),
+                                    &sev_uri,
+                                )?;
                                 triples += 1;
                             }
                         }
 
                         // Link to CVE entity (shared with OSV collector)
                         let cve_entity = cve_entity_uri(cve_id);
-                        writer.write_triple(&advisory_uri, &format!("{SEC}addressesVulnerability"), &cve_entity)?;
+                        writer.write_triple(
+                            &advisory_uri,
+                            &format!("{SEC}addressesVulnerability"),
+                            &cve_entity,
+                        )?;
                         triples += 1;
 
                         // NOTE: advisoryForPackage intentionally NOT emitted here.
@@ -264,14 +308,36 @@ mod tests {
         assert!(result.unwrap() >= 5, "Should emit at least 5 triples");
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("security#SecurityAdvisory"), "Should have SecurityAdvisory type");
-        assert!(content.contains("\"CVE-2024-1234\""), "Should have advisory ID");
-        assert!(content.contains("security#cat-security"), "Should have advisoryType as SKOS concept");
-        assert!(content.contains("security#sev-important"), "Should have severity as SKOS concept");
-        assert!(content.contains("security#addressesVulnerability"), "Should link to CVE");
-        assert!(content.contains("cve/CVE-2024-1234"), "Should link to CVE entity URI");
+        assert!(
+            content.contains("security#SecurityAdvisory"),
+            "Should have SecurityAdvisory type"
+        );
+        assert!(
+            content.contains("\"CVE-2024-1234\""),
+            "Should have advisory ID"
+        );
+        assert!(
+            content.contains("security#cat-security"),
+            "Should have advisoryType as SKOS concept"
+        );
+        assert!(
+            content.contains("security#sev-important"),
+            "Should have severity as SKOS concept"
+        );
+        assert!(
+            content.contains("security#addressesVulnerability"),
+            "Should link to CVE"
+        );
+        assert!(
+            content.contains("cve/CVE-2024-1234"),
+            "Should link to CVE entity URI"
+        );
     }
 
     #[test]
@@ -284,7 +350,10 @@ mod tests {
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 
         let result = enricher.emit_rhsa_advisory(&mut writer, &entry).unwrap();
-        assert!(result.is_none(), "Should return None for entries without CVE");
+        assert!(
+            result.is_none(),
+            "Should return None for entries without CVE"
+        );
     }
 
     #[test]
@@ -294,17 +363,33 @@ mod tests {
 
         // Simulate DSA tracker data structure
         let advisory_uri = format!("{DATA}advisory/dsa/CVE-2024-5678");
-        writer.write_triple(&advisory_uri, RDF_TYPE, &format!("{SEC}SecurityAdvisory")).unwrap();
-        writer.write_literal(&advisory_uri, &format!("{SEC}advisoryId"), "CVE-2024-5678").unwrap();
+        writer
+            .write_triple(&advisory_uri, RDF_TYPE, &format!("{SEC}SecurityAdvisory"))
+            .unwrap();
+        writer
+            .write_literal(&advisory_uri, &format!("{SEC}advisoryId"), "CVE-2024-5678")
+            .unwrap();
         let sev_uri = severity_concept_uri("high").unwrap();
-        writer.write_triple(&advisory_uri, &format!("{SEC}advisorySeverity"), &sev_uri).unwrap();
+        writer
+            .write_triple(&advisory_uri, &format!("{SEC}advisorySeverity"), &sev_uri)
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("advisory/dsa/CVE-2024-5678"), "Should use DSA advisory URI");
+        assert!(
+            content.contains("advisory/dsa/CVE-2024-5678"),
+            "Should use DSA advisory URI"
+        );
         assert!(content.contains("security#SecurityAdvisory"));
-        assert!(content.contains("security#sev-important"), "high maps to sev-important");
+        assert!(
+            content.contains("security#sev-important"),
+            "high maps to sev-important"
+        );
     }
 }
