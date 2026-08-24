@@ -1,13 +1,18 @@
-use serde::{Deserialize, Serialize};
 use crate::ntriples::NTriplesWriter;
-use crate::uris::{cve_uri, vuln_uri, version_uri, package_identity_uri, cwe_uri, cve_entity_uri, cvss_score_uri, ecosystem_uri, event_type_uri, range_type_uri, PKG, SEC, VCS, DATA, RDF_TYPE, RDFS_LABEL};
+use crate::uris::{
+    cve_entity_uri, cve_uri, cvss_score_uri, cwe_uri, ecosystem_uri, event_type_uri,
+    package_identity_uri, range_type_uri, version_uri, vuln_uri, DATA, PKG, RDFS_LABEL, RDF_TYPE,
+    SEC, VCS,
+};
+use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Cursor, Result};
 use std::time::Duration;
-use reqwest::blocking::Client;
 
 pub struct OsvCollector {
     client: Client,
+    pub graph_uri: Option<String>,
 }
 
 impl OsvCollector {
@@ -18,12 +23,21 @@ impl OsvCollector {
             .build()
             .expect("Failed to create HTTP client");
 
-        Self { client }
+        Self {
+            client,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn collect(&self, ecosystem: &str, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         let (vuln_count, triple_count) = process_ecosystem(&self.client, ecosystem, &mut writer)?;
 
@@ -43,18 +57,54 @@ pub struct EcosystemMapping {
 /// Returns `Some` for language ecosystems, `None` for distros (no version linking).
 pub fn ecosystem_mapping(osv_ecosystem: &str) -> Option<EcosystemMapping> {
     match osv_ecosystem {
-        "npm" => Some(EcosystemMapping { distro: "npm", release: "registry" }),
-        "PyPI" => Some(EcosystemMapping { distro: "pypi", release: "index" }),
-        "crates.io" => Some(EcosystemMapping { distro: "cargo", release: "crates.io" }),
-        "Go" => Some(EcosystemMapping { distro: "go", release: "modules" }),
-        "Maven" => Some(EcosystemMapping { distro: "maven", release: "central" }),
-        "NuGet" => Some(EcosystemMapping { distro: "nuget", release: "gallery" }),
-        "Packagist" => Some(EcosystemMapping { distro: "packagist", release: "registry" }),
-        "RubyGems" => Some(EcosystemMapping { distro: "rubygems", release: "registry" }),
-        "Hex" => Some(EcosystemMapping { distro: "hex", release: "registry" }),
-        "Pub" => Some(EcosystemMapping { distro: "pub", release: "registry" }),
-        "Hackage" => Some(EcosystemMapping { distro: "hackage", release: "registry" }),
-        "SwiftURL" => Some(EcosystemMapping { distro: "swift", release: "registry" }),
+        "npm" => Some(EcosystemMapping {
+            distro: "npm",
+            release: "registry",
+        }),
+        "PyPI" => Some(EcosystemMapping {
+            distro: "pypi",
+            release: "index",
+        }),
+        "crates.io" => Some(EcosystemMapping {
+            distro: "cargo",
+            release: "crates.io",
+        }),
+        "Go" => Some(EcosystemMapping {
+            distro: "go",
+            release: "modules",
+        }),
+        "Maven" => Some(EcosystemMapping {
+            distro: "maven",
+            release: "central",
+        }),
+        "NuGet" => Some(EcosystemMapping {
+            distro: "nuget",
+            release: "gallery",
+        }),
+        "Packagist" => Some(EcosystemMapping {
+            distro: "packagist",
+            release: "registry",
+        }),
+        "RubyGems" => Some(EcosystemMapping {
+            distro: "rubygems",
+            release: "registry",
+        }),
+        "Hex" => Some(EcosystemMapping {
+            distro: "hex",
+            release: "registry",
+        }),
+        "Pub" => Some(EcosystemMapping {
+            distro: "pub",
+            release: "registry",
+        }),
+        "Hackage" => Some(EcosystemMapping {
+            distro: "hackage",
+            release: "registry",
+        }),
+        "SwiftURL" => Some(EcosystemMapping {
+            distro: "swift",
+            release: "registry",
+        }),
         // Distros and unknown ecosystems return None (no version linking)
         _ => None,
     }
@@ -80,7 +130,9 @@ pub fn emit_vulnerability_triples(
     let mut triples = 0;
 
     // Resolve subject URI: CVE-keyed if CVE alias exists, else OSV-ID-keyed
-    let subject_uri = vuln.aliases.iter()
+    let subject_uri = vuln
+        .aliases
+        .iter()
         .find(|alias| alias.starts_with("CVE-"))
         .map(|cve| cve_uri(cve))
         .unwrap_or_else(|| vuln_uri(&vuln.id));
@@ -90,11 +142,17 @@ pub fn emit_vulnerability_triples(
     triples += 1;
 
     // rdfs:label
-    let label = vuln.aliases.iter()
+    let label = vuln
+        .aliases
+        .iter()
         .find(|alias| alias.starts_with("CVE-"))
         .map(|cve| cve.as_str())
         .unwrap_or(&vuln.id);
-    writer.write_literal(&subject_uri, "http://www.w3.org/2000/01/rdf-schema#label", label)?;
+    writer.write_literal(
+        &subject_uri,
+        "http://www.w3.org/2000/01/rdf-schema#label",
+        label,
+    )?;
     triples += 1;
 
     // sec:cveId (exactly one, owl:FunctionalProperty)
@@ -136,10 +194,20 @@ pub fn emit_vulnerability_triples(
 
     // CVSSScore reification (v0.6.0) — emit all severity entries as CVSSScore entities
     // Also keep deprecated flat cvssVector for the best-available entry (backward compat)
-    let best_cvss = vuln.severity.iter()
+    let best_cvss = vuln
+        .severity
+        .iter()
         .find(|s| matches!(s.severity_type, OsvSeverityType::CvssV3))
-        .or_else(|| vuln.severity.iter().find(|s| matches!(s.severity_type, OsvSeverityType::CvssV4)))
-        .or_else(|| vuln.severity.iter().find(|s| matches!(s.severity_type, OsvSeverityType::CvssV2)));
+        .or_else(|| {
+            vuln.severity
+                .iter()
+                .find(|s| matches!(s.severity_type, OsvSeverityType::CvssV4))
+        })
+        .or_else(|| {
+            vuln.severity
+                .iter()
+                .find(|s| matches!(s.severity_type, OsvSeverityType::CvssV2))
+        });
 
     if let Some(cvss) = best_cvss {
         // Deprecated flat properties (backward compat)
@@ -221,14 +289,38 @@ pub fn emit_vulnerability_triples(
             };
 
             let range_bnode = format!("ar_{}_{}_{}_{}", label, mapping.distro, pkg.name, range_idx)
-                .chars().map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' }).collect::<String>();
-            writer.write_bnode_object(&subject_uri, &format!("{SEC}hasAffectedRange"), &range_bnode)?;
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>();
+            writer.write_bnode_object(
+                &subject_uri,
+                &format!("{SEC}hasAffectedRange"),
+                &range_bnode,
+            )?;
             writer.write_bnode_subject(&range_bnode, RDF_TYPE, &format!("{SEC}AffectedRange"))?;
-            writer.write_bnode_subject(&range_bnode, &format!("{SEC}rangeType"), &range_type_uri(range_type_str))?;
-            writer.write_bnode_literal(&range_bnode, &format!("{SEC}affectsPackageName"), &pkg.name)?;
+            writer.write_bnode_subject(
+                &range_bnode,
+                &format!("{SEC}rangeType"),
+                &range_type_uri(range_type_str),
+            )?;
+            writer.write_bnode_literal(
+                &range_bnode,
+                &format!("{SEC}affectsPackageName"),
+                &pkg.name,
+            )?;
             // Link to ecosystem entity
             let eco_entity = ecosystem_uri(mapping.distro);
-            writer.write_bnode_subject(&range_bnode, &format!("{SEC}affectsEcosystem"), &eco_entity)?;
+            writer.write_bnode_subject(
+                &range_bnode,
+                &format!("{SEC}affectsEcosystem"),
+                &eco_entity,
+            )?;
             writer.write_triple(&eco_entity, RDF_TYPE, &format!("{PKG}Ecosystem"))?;
             writer.write_literal(&eco_entity, RDFS_LABEL, &pkg.ecosystem)?;
             triples += 7;
@@ -237,31 +329,71 @@ pub fn emit_vulnerability_triples(
                 let event_bnode = format!("{range_bnode}_e{event_idx}");
 
                 if let Some(ref introduced) = event.introduced {
-                    writer.write_bnode_to_bnode(&range_bnode, &format!("{SEC}hasRangeEvent"), &event_bnode)?;
-                    writer.write_bnode_subject(&event_bnode, RDF_TYPE, &format!("{SEC}RangeEvent"))?;
-                    writer.write_bnode_subject(&event_bnode, &format!("{SEC}eventType"), &event_type_uri("introduced"))?;
-                    writer.write_bnode_literal(&event_bnode, &format!("{SEC}eventVersion"), introduced)?;
+                    writer.write_bnode_to_bnode(
+                        &range_bnode,
+                        &format!("{SEC}hasRangeEvent"),
+                        &event_bnode,
+                    )?;
+                    writer.write_bnode_subject(
+                        &event_bnode,
+                        RDF_TYPE,
+                        &format!("{SEC}RangeEvent"),
+                    )?;
+                    writer.write_bnode_subject(
+                        &event_bnode,
+                        &format!("{SEC}eventType"),
+                        &event_type_uri("introduced"),
+                    )?;
+                    writer.write_bnode_literal(
+                        &event_bnode,
+                        &format!("{SEC}eventVersion"),
+                        introduced,
+                    )?;
                     triples += 4;
 
                     if range_type_str == "GIT" {
                         let commit_uri = format!("{DATA}commit/{}", introduced);
-                        writer.write_bnode_subject(&event_bnode, &format!("{SEC}eventCommit"), &commit_uri)?;
+                        writer.write_bnode_subject(
+                            &event_bnode,
+                            &format!("{SEC}eventCommit"),
+                            &commit_uri,
+                        )?;
                         writer.write_triple(&commit_uri, RDF_TYPE, &format!("{VCS}Commit"))?;
-                        writer.write_literal(&commit_uri, &format!("{VCS}commitHash"), introduced)?;
+                        writer.write_literal(
+                            &commit_uri,
+                            &format!("{VCS}commitHash"),
+                            introduced,
+                        )?;
                         triples += 3;
                     }
                 }
                 if let Some(ref fixed) = event.fixed {
                     let fix_bnode = format!("{event_bnode}_fix");
-                    writer.write_bnode_to_bnode(&range_bnode, &format!("{SEC}hasRangeEvent"), &fix_bnode)?;
-                    writer.write_bnode_subject(&fix_bnode, RDF_TYPE, &format!("{SEC}RangeEvent"))?;
-                    writer.write_bnode_subject(&fix_bnode, &format!("{SEC}eventType"), &event_type_uri("fixed"))?;
+                    writer.write_bnode_to_bnode(
+                        &range_bnode,
+                        &format!("{SEC}hasRangeEvent"),
+                        &fix_bnode,
+                    )?;
+                    writer.write_bnode_subject(
+                        &fix_bnode,
+                        RDF_TYPE,
+                        &format!("{SEC}RangeEvent"),
+                    )?;
+                    writer.write_bnode_subject(
+                        &fix_bnode,
+                        &format!("{SEC}eventType"),
+                        &event_type_uri("fixed"),
+                    )?;
                     writer.write_bnode_literal(&fix_bnode, &format!("{SEC}eventVersion"), fixed)?;
                     triples += 4;
 
                     if range_type_str == "GIT" {
                         let commit_uri = format!("{DATA}commit/{}", fixed);
-                        writer.write_bnode_subject(&fix_bnode, &format!("{SEC}eventCommit"), &commit_uri)?;
+                        writer.write_bnode_subject(
+                            &fix_bnode,
+                            &format!("{SEC}eventCommit"),
+                            &commit_uri,
+                        )?;
                         writer.write_triple(&commit_uri, RDF_TYPE, &format!("{VCS}Commit"))?;
                         writer.write_literal(&commit_uri, &format!("{VCS}commitHash"), fixed)?;
                         triples += 3;
@@ -274,17 +406,37 @@ pub fn emit_vulnerability_triples(
                 }
                 if let Some(ref last_affected) = event.last_affected {
                     let la_bnode = format!("{event_bnode}_la");
-                    writer.write_bnode_to_bnode(&range_bnode, &format!("{SEC}hasRangeEvent"), &la_bnode)?;
+                    writer.write_bnode_to_bnode(
+                        &range_bnode,
+                        &format!("{SEC}hasRangeEvent"),
+                        &la_bnode,
+                    )?;
                     writer.write_bnode_subject(&la_bnode, RDF_TYPE, &format!("{SEC}RangeEvent"))?;
-                    writer.write_bnode_subject(&la_bnode, &format!("{SEC}eventType"), &event_type_uri("last_affected"))?;
-                    writer.write_bnode_literal(&la_bnode, &format!("{SEC}eventVersion"), last_affected)?;
+                    writer.write_bnode_subject(
+                        &la_bnode,
+                        &format!("{SEC}eventType"),
+                        &event_type_uri("last_affected"),
+                    )?;
+                    writer.write_bnode_literal(
+                        &la_bnode,
+                        &format!("{SEC}eventVersion"),
+                        last_affected,
+                    )?;
                     triples += 4;
 
                     if range_type_str == "GIT" {
                         let commit_uri = format!("{DATA}commit/{}", last_affected);
-                        writer.write_bnode_subject(&la_bnode, &format!("{SEC}eventCommit"), &commit_uri)?;
+                        writer.write_bnode_subject(
+                            &la_bnode,
+                            &format!("{SEC}eventCommit"),
+                            &commit_uri,
+                        )?;
                         writer.write_triple(&commit_uri, RDF_TYPE, &format!("{VCS}Commit"))?;
-                        writer.write_literal(&commit_uri, &format!("{VCS}commitHash"), last_affected)?;
+                        writer.write_literal(
+                            &commit_uri,
+                            &format!("{VCS}commitHash"),
+                            last_affected,
+                        )?;
                         triples += 3;
                     }
                 }
@@ -316,7 +468,8 @@ fn derive_cvss_severity(vector: &str) -> Option<&'static str> {
         // Check for critical indicators
         let has_network = vector.contains("/AV:N");
         let has_low_complexity = vector.contains("/AC:L");
-        let has_high_impact = vector.contains("/C:H") || vector.contains("/I:H") || vector.contains("/A:H");
+        let has_high_impact =
+            vector.contains("/C:H") || vector.contains("/I:H") || vector.contains("/A:H");
         let has_no_privs = vector.contains("/PR:N");
 
         if has_network && has_low_complexity && has_high_impact && has_no_privs {
@@ -429,7 +582,10 @@ pub fn process_ecosystem(
     ecosystem: &str,
     writer: &mut NTriplesWriter,
 ) -> Result<(usize, usize)> {
-    let url = format!("https://osv-vulnerabilities.storage.googleapis.com/{}/all.zip", ecosystem);
+    let url = format!(
+        "https://osv-vulnerabilities.storage.googleapis.com/{}/all.zip",
+        ecosystem
+    );
 
     eprintln!("Downloading {} from {}...", ecosystem, url);
 
@@ -456,7 +612,8 @@ fn download_with_retry(client: &Client, url: &str) -> std::io::Result<Vec<u8>> {
 
 /// Download bytes from a URL.
 fn download_bytes(client: &Client, url: &str) -> std::io::Result<Vec<u8>> {
-    let response = client.get(url)
+    let response = client
+        .get(url)
         .send()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -464,7 +621,8 @@ fn download_bytes(client: &Client, url: &str) -> std::io::Result<Vec<u8>> {
         return Err(std::io::Error::other(format!("HTTP {}", response.status())));
     }
 
-    let bytes = response.bytes()
+    let bytes = response
+        .bytes()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     Ok(bytes.to_vec())
@@ -480,8 +638,7 @@ pub fn process_zip_from_bytes(
     use zip::ZipArchive;
 
     let cursor = Cursor::new(zip_bytes);
-    let mut archive = ZipArchive::new(cursor)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut archive = ZipArchive::new(cursor).map_err(|e| std::io::Error::other(e.to_string()))?;
 
     let entry_count = archive.len();
     eprintln!("Processing {} entries from ZIP...", entry_count);
@@ -491,7 +648,8 @@ pub fn process_zip_from_bytes(
     let mut errors_skipped = 0;
 
     for i in 0..archive.len() {
-        let mut file = archive.by_index(i)
+        let mut file = archive
+            .by_index(i)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Skip non-JSON files
@@ -525,8 +683,13 @@ pub fn process_zip_from_bytes(
 
         // Progress logging every 10,000 entries
         if (i + 1) % 10_000 == 0 {
-            eprintln!("Progress: {}/{} entries, {} vulnerabilities, {} triples",
-                     i + 1, entry_count, vuln_count, triple_count);
+            eprintln!(
+                "Progress: {}/{} entries, {} vulnerabilities, {} triples",
+                i + 1,
+                entry_count,
+                vuln_count,
+                triple_count
+            );
         }
     }
 
@@ -673,8 +836,8 @@ mod tests {
 
     #[test]
     fn test_deserialize_ghsa_npm() {
-        let vuln: OsvVulnerability = serde_json::from_str(GHSA_NPM_JSON)
-            .expect("Failed to deserialize GHSA npm record");
+        let vuln: OsvVulnerability =
+            serde_json::from_str(GHSA_NPM_JSON).expect("Failed to deserialize GHSA npm record");
 
         assert_eq!(vuln.id, "GHSA-2g4f-4pwh-qvx6");
         assert_eq!(vuln.aliases.len(), 1);
@@ -688,18 +851,27 @@ mod tests {
         assert_eq!(first_affected.package.as_ref().unwrap().ecosystem, "npm");
         assert_eq!(first_affected.ranges.len(), 1);
         assert_eq!(first_affected.ranges[0].events.len(), 2);
-        assert_eq!(first_affected.ranges[0].events[0].introduced.as_deref(), Some("7.0.0-alpha.0"));
-        assert_eq!(first_affected.ranges[0].events[1].fixed.as_deref(), Some("8.18.0"));
+        assert_eq!(
+            first_affected.ranges[0].events[0].introduced.as_deref(),
+            Some("7.0.0-alpha.0")
+        );
+        assert_eq!(
+            first_affected.ranges[0].events[1].fixed.as_deref(),
+            Some("8.18.0")
+        );
 
         // Check severity
         assert_eq!(vuln.severity.len(), 1);
-        assert!(matches!(vuln.severity[0].severity_type, OsvSeverityType::CvssV4));
+        assert!(matches!(
+            vuln.severity[0].severity_type,
+            OsvSeverityType::CvssV4
+        ));
     }
 
     #[test]
     fn test_deserialize_pysec_pypi() {
-        let vuln: OsvVulnerability = serde_json::from_str(PYSEC_PYPI_JSON)
-            .expect("Failed to deserialize PYSEC PyPI record");
+        let vuln: OsvVulnerability =
+            serde_json::from_str(PYSEC_PYPI_JSON).expect("Failed to deserialize PYSEC PyPI record");
 
         assert_eq!(vuln.id, "PYSEC-2024-1");
         assert_eq!(vuln.aliases.len(), 0); // No CVE alias
@@ -718,8 +890,8 @@ mod tests {
     #[test]
     fn test_handles_missing_fields() {
         let minimal = r#"{"id": "TEST-001"}"#;
-        let vuln: OsvVulnerability = serde_json::from_str(minimal)
-            .expect("Failed to deserialize minimal record");
+        let vuln: OsvVulnerability =
+            serde_json::from_str(minimal).expect("Failed to deserialize minimal record");
 
         assert_eq!(vuln.id, "TEST-001");
         assert_eq!(vuln.aliases.len(), 0);
@@ -732,19 +904,31 @@ mod tests {
     fn test_ecosystem_mapping_language_ecosystems() {
         assert_eq!(
             ecosystem_mapping("npm"),
-            Some(EcosystemMapping { distro: "npm", release: "registry" })
+            Some(EcosystemMapping {
+                distro: "npm",
+                release: "registry"
+            })
         );
         assert_eq!(
             ecosystem_mapping("PyPI"),
-            Some(EcosystemMapping { distro: "pypi", release: "index" })
+            Some(EcosystemMapping {
+                distro: "pypi",
+                release: "index"
+            })
         );
         assert_eq!(
             ecosystem_mapping("crates.io"),
-            Some(EcosystemMapping { distro: "cargo", release: "crates.io" })
+            Some(EcosystemMapping {
+                distro: "cargo",
+                release: "crates.io"
+            })
         );
         assert_eq!(
             ecosystem_mapping("Go"),
-            Some(EcosystemMapping { distro: "go", release: "modules" })
+            Some(EcosystemMapping {
+                distro: "go",
+                release: "modules"
+            })
         );
     }
 
@@ -774,43 +958,37 @@ mod tests {
             published: Some("2024-01-01T00:00:00Z".to_string()),
             modified: Some("2024-01-02T00:00:00Z".to_string()),
             withdrawn: None,
-            affected: vec![
-                OsvAffected {
-                    package: Some(OsvPackage {
-                        name: "test-pkg".to_string(),
-                        ecosystem: "npm".to_string(),
-                        purl: None,
-                    }),
-                    versions: vec!["1.0.0".to_string(), "1.0.1".to_string()],
-                    ranges: vec![
-                        OsvRange {
-                            range_type: OsvRangeType::Semver,
-                            events: vec![
-                                OsvEvent {
-                                    introduced: Some("0".to_string()),
-                                    fixed: None,
-                                    last_affected: None,
-                                    limit: None,
-                                },
-                                OsvEvent {
-                                    introduced: None,
-                                    fixed: Some("1.1.0".to_string()),
-                                    last_affected: None,
-                                    limit: None,
-                                },
-                            ],
-                            repo: None,
-                        }
+            affected: vec![OsvAffected {
+                package: Some(OsvPackage {
+                    name: "test-pkg".to_string(),
+                    ecosystem: "npm".to_string(),
+                    purl: None,
+                }),
+                versions: vec!["1.0.0".to_string(), "1.0.1".to_string()],
+                ranges: vec![OsvRange {
+                    range_type: OsvRangeType::Semver,
+                    events: vec![
+                        OsvEvent {
+                            introduced: Some("0".to_string()),
+                            fixed: None,
+                            last_affected: None,
+                            limit: None,
+                        },
+                        OsvEvent {
+                            introduced: None,
+                            fixed: Some("1.1.0".to_string()),
+                            last_affected: None,
+                            limit: None,
+                        },
                     ],
-                    database_specific: None,
-                }
-            ],
-            severity: vec![
-                OsvSeverity {
-                    severity_type: OsvSeverityType::CvssV3,
-                    score: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".to_string(),
-                }
-            ],
+                    repo: None,
+                }],
+                database_specific: None,
+            }],
+            severity: vec![OsvSeverity {
+                severity_type: OsvSeverityType::CvssV3,
+                score: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".to_string(),
+            }],
             references: vec![],
             database_specific: Some(serde_json::json!({
                 "cwe_ids": ["CWE-79", "CWE-89"]
@@ -823,7 +1001,11 @@ mod tests {
         assert!(triples > 0);
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Verify CVE-keyed subject
         assert!(content.contains("cve/CVE-2024-1234"));
@@ -841,7 +1023,10 @@ mod tests {
 
         // Verify severity derived from CVSS vector (plain string, not SKOS — sec:severity is DatatypeProperty)
         assert!(content.contains("security#severity"));
-        assert!(content.contains("\"CRITICAL\""), "AV:N/AC:L/PR:N with high impact should be CRITICAL");
+        assert!(
+            content.contains("\"CRITICAL\""),
+            "AV:N/AC:L/PR:N with high impact should be CRITICAL"
+        );
 
         // Verify CWE literal
         assert!(content.contains("security#cweId"));
@@ -876,25 +1061,67 @@ mod tests {
         assert!(content.contains("2024-01-02T00:00:00Z"));
 
         // Verify CVSSScore reification (v0.6.0)
-        assert!(content.contains("security#hasCVSSScore"), "Should link to reified CVSSScore");
-        assert!(content.contains("security#CVSSScore"), "Should type as CVSSScore");
-        assert!(content.contains("security#vectorString"), "Should have vectorString on CVSSScore");
-        assert!(content.contains("security#cvssVersion"), "Should have cvssVersion");
+        assert!(
+            content.contains("security#hasCVSSScore"),
+            "Should link to reified CVSSScore"
+        );
+        assert!(
+            content.contains("security#CVSSScore"),
+            "Should type as CVSSScore"
+        );
+        assert!(
+            content.contains("security#vectorString"),
+            "Should have vectorString on CVSSScore"
+        );
+        assert!(
+            content.contains("security#cvssVersion"),
+            "Should have cvssVersion"
+        );
         assert!(content.contains("\"3.1\""), "Should have CVSS version 3.1");
 
         // Verify AffectedRange reification (v0.7.0 — SKOS concept URIs)
-        assert!(content.contains("security#hasAffectedRange"), "Should link to AffectedRange");
-        assert!(content.contains("security#AffectedRange"), "Should type as AffectedRange");
-        assert!(content.contains("security#rangeType"), "Should have rangeType");
-        assert!(content.contains("security#range-semver"), "Should have range-semver SKOS concept");
-        assert!(content.contains("security#affectsPackageName"), "Should have affectsPackageName");
+        assert!(
+            content.contains("security#hasAffectedRange"),
+            "Should link to AffectedRange"
+        );
+        assert!(
+            content.contains("security#AffectedRange"),
+            "Should type as AffectedRange"
+        );
+        assert!(
+            content.contains("security#rangeType"),
+            "Should have rangeType"
+        );
+        assert!(
+            content.contains("security#range-semver"),
+            "Should have range-semver SKOS concept"
+        );
+        assert!(
+            content.contains("security#affectsPackageName"),
+            "Should have affectsPackageName"
+        );
 
         // Verify RangeEvent reification (v0.7.0 — SKOS concept URIs)
-        assert!(content.contains("security#hasRangeEvent"), "Should link to RangeEvent");
-        assert!(content.contains("security#RangeEvent"), "Should type as RangeEvent");
-        assert!(content.contains("security#eventType"), "Should have eventType");
-        assert!(content.contains("security#event-introduced"), "Should have event-introduced SKOS concept");
-        assert!(content.contains("security#event-fixed"), "Should have event-fixed SKOS concept");
+        assert!(
+            content.contains("security#hasRangeEvent"),
+            "Should link to RangeEvent"
+        );
+        assert!(
+            content.contains("security#RangeEvent"),
+            "Should type as RangeEvent"
+        );
+        assert!(
+            content.contains("security#eventType"),
+            "Should have eventType"
+        );
+        assert!(
+            content.contains("security#event-introduced"),
+            "Should have event-introduced SKOS concept"
+        );
+        assert!(
+            content.contains("security#event-fixed"),
+            "Should have event-fixed SKOS concept"
+        );
     }
 
     #[test]
@@ -922,7 +1149,11 @@ mod tests {
         assert!(triples > 0);
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Should use vuln_uri, not cve_uri
         assert!(content.contains("vuln/PYSEC-2024-001"));
@@ -958,20 +1189,36 @@ mod tests {
         assert_eq!(triples, 0);
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
         assert_eq!(content, "");
     }
 
     #[test]
     fn test_derive_cvss_severity() {
         // CRITICAL: network + low complexity + no privileges + high impact
-        assert_eq!(derive_cvss_severity("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"), Some("CRITICAL"));
+        assert_eq!(
+            derive_cvss_severity("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+            Some("CRITICAL")
+        );
         // HIGH: network + high impact but requires privileges
-        assert_eq!(derive_cvss_severity("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N"), Some("HIGH"));
+        assert_eq!(
+            derive_cvss_severity("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N"),
+            Some("HIGH")
+        );
         // MEDIUM: local + high impact
-        assert_eq!(derive_cvss_severity("CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N"), Some("MEDIUM"));
+        assert_eq!(
+            derive_cvss_severity("CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N"),
+            Some("MEDIUM")
+        );
         // LOW: no high impact
-        assert_eq!(derive_cvss_severity("CVSS:3.1/AV:N/AC:H/PR:L/UI:R/S:U/C:L/I:N/A:N"), Some("LOW"));
+        assert_eq!(
+            derive_cvss_severity("CVSS:3.1/AV:N/AC:H/PR:L/UI:R/S:U/C:L/I:N/A:N"),
+            Some("LOW")
+        );
         // Non-CVSS string
         assert_eq!(derive_cvss_severity("not a cvss vector"), None);
     }
@@ -987,8 +1234,10 @@ mod tests {
             let mut zip = ZipWriter::new(&mut zip_buffer);
 
             // Entry 1: CVE-aliased npm vulnerability
-            zip.start_file::<&str, ()>("npm/GHSA-test.json", Default::default()).unwrap();
-            zip.write_all(br#"{
+            zip.start_file::<&str, ()>("npm/GHSA-test.json", Default::default())
+                .unwrap();
+            zip.write_all(
+                br#"{
                 "id": "GHSA-test-xxxx-yyyy",
                 "aliases": ["CVE-2024-9999"],
                 "summary": "Test vulnerability",
@@ -996,10 +1245,13 @@ mod tests {
                     "package": {"name": "test-pkg", "ecosystem": "npm"},
                     "versions": ["1.0.0"]
                 }]
-            }"#).unwrap();
+            }"#,
+            )
+            .unwrap();
 
             // Entry 2: Non-JSON file (should be skipped)
-            zip.start_file::<&str, ()>("README.md", Default::default()).unwrap();
+            zip.start_file::<&str, ()>("README.md", Default::default())
+                .unwrap();
             zip.write_all(b"# Test README").unwrap();
 
             zip.finish().unwrap();
@@ -1018,7 +1270,11 @@ mod tests {
         assert!(triple_count > 0);
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
         assert!(content.contains("CVE-2024-9999"));
     }
 }

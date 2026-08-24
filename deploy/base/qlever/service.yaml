@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: qlever
+  namespace: packagegraph
+  labels:
+    app: qlever
+    app.kubernetes.io/name: qlever
+    app.kubernetes.io/part-of: packagegraph
+spec:
+  selector:
+    app: qlever
+  ports:
+    - port: 7001
+      targetPort: 7001
+      name: sparql

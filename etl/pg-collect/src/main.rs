@@ -1,43 +1,44 @@
 use clap::{Parser, Subcommand};
 use pg_collect::alpine::AlpineCollector;
 use pg_collect::arch::ArchCollector;
-use pg_collect::debian::{DebianCollector, normalize_arch};
-use pg_collect::homebrew::HomebrewCollector;
-use pg_collect::rpm::RpmCollector;
-use pg_collect::rubygems::RubyGemsCollector;
-use pg_collect::maven::MavenCollector;
-use pg_collect::cpan::CpanCollector;
-use pg_collect::cran::CranCollector;
-use pg_collect::hackage::HackageCollector;
-use pg_collect::nuget::NugetCollector;
-use pg_collect::hex_collect::HexCollector;
-use pg_collect::freebsd::FreebsdCollector;
-use pg_collect::nix::NixCollector;
-use pg_collect::chocolatey::ChocolateyCollector;
-use pg_collect::yocto::YoctoCollector;
 use pg_collect::buildroot::BuildrootCollector;
-use pg_collect::openwrt::OpenWrtCollector;
-use pg_collect::enrich_github::GitHubEnricher;
-use pg_collect::enrich_advisory::{AdvisoryEnricher, AdvisoryType};
-use pg_collect::enrich_npm_provenance::NpmProvenanceEnricher;
-use pg_collect::enrich_koji::KojiEnricher;
-use pg_collect::enrich_repology::RepologyEnricher;
-use pg_collect::enrich_security::SecurityEnricher;
-use pg_collect::derive_releases::ReleaseDeriver;
+use pg_collect::cache::MinioConfig;
+use pg_collect::chocolatey::ChocolateyCollector;
 use pg_collect::collect_bodhi::BodhiCollector;
 use pg_collect::collect_glsa::GlsaCollector;
-use pg_collect::enrich_nvd::NvdEnricher;
-use pg_collect::enrich_forge_version::ForgeVersionEnricher;
-use pg_collect::enrich_epss::EpssEnricher;
-use pg_collect::enrich_taxonomy::TaxonomyEnricher;
-use pg_collect::enrich_revdeps::RevdepsEnricher;
-use pg_collect::enrich_blast_radius::BlastRadiusEnricher;
-use pg_collect::collect_spec::SpecCollector;
-use pg_collect::collect_sources::SourcesCollector;
 use pg_collect::collect_salsa::SalsaCollector;
+use pg_collect::collect_sources::SourcesCollector;
+use pg_collect::collect_spec::SpecCollector;
+use pg_collect::cpan::CpanCollector;
+use pg_collect::cran::CranCollector;
+use pg_collect::debian::{normalize_arch, DebianCollector};
+use pg_collect::derive_releases::ReleaseDeriver;
+use pg_collect::enrich_advisory::{AdvisoryEnricher, AdvisoryType};
+use pg_collect::enrich_blast_radius::BlastRadiusEnricher;
+use pg_collect::enrich_epss::EpssEnricher;
+use pg_collect::enrich_forge_version::ForgeVersionEnricher;
+use pg_collect::enrich_github::GitHubEnricher;
+use pg_collect::enrich_koji::KojiEnricher;
+use pg_collect::enrich_npm_provenance::NpmProvenanceEnricher;
+use pg_collect::enrich_nvd::NvdEnricher;
+use pg_collect::enrich_repology::RepologyEnricher;
+use pg_collect::enrich_revdeps::RevdepsEnricher;
+use pg_collect::enrich_security::SecurityEnricher;
+use pg_collect::enrich_taxonomy::TaxonomyEnricher;
+use pg_collect::freebsd::FreebsdCollector;
+use pg_collect::hackage::HackageCollector;
+use pg_collect::hex_collect::HexCollector;
+use pg_collect::homebrew::HomebrewCollector;
+use pg_collect::maven::MavenCollector;
+use pg_collect::nix::NixCollector;
 use pg_collect::ntriples::NTriplesWriter;
+use pg_collect::nuget::NugetCollector;
+use pg_collect::openwrt::OpenWrtCollector;
+use pg_collect::rpm::RpmCollector;
+use pg_collect::rubygems::RubyGemsCollector;
 use pg_collect::seed;
-use pg_collect::cache::MinioConfig;
+use pg_collect::sparql::{SparqlAuth, SparqlBackend};
+use pg_collect::yocto::YoctoCollector;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -47,6 +48,45 @@ use std::time::Instant;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// SPARQL endpoint username for Basic Auth
+    #[arg(long, global = true, env = "FUSEKI_USERNAME")]
+    sparql_username: Option<String>,
+
+    /// SPARQL endpoint password for Basic Auth
+    #[arg(long, global = true, env = "FUSEKI_PASSWORD")]
+    sparql_password: Option<String>,
+
+    /// SPARQL backend type (fuseki or qlever)
+    #[arg(long, global = true, default_value = "fuseki", env = "SPARQL_BACKEND")]
+    sparql_backend: String,
+
+    /// QLever access token (required when --sparql-backend=qlever)
+    #[arg(long, global = true, env = "QLEVER_ACCESS_TOKEN")]
+    qlever_access_token: Option<String>,
+
+    /// Write backend for load/drop (fuseki or minio)
+    #[arg(long, global = true, default_value = "fuseki", env = "WRITE_BACKEND")]
+    write_backend: String,
+
+    /// Minio endpoint URL (required when --write-backend=minio)
+    #[arg(long, global = true, env = "MINIO_ENDPOINT")]
+    minio_endpoint: Option<String>,
+
+    /// Minio bucket name (required when --write-backend=minio)
+    #[arg(
+        long,
+        global = true,
+        default_value = "packagegraph",
+        env = "MINIO_BUCKET"
+    )]
+    minio_bucket: String,
+
+    /// Graph URI for N-Quads output (appends graph term to each triple).
+    /// Pass explicitly — not bound to GRAPH_URI env var to avoid conflict
+    /// with scheduled collector jobs that set GRAPH_URI for the load command.
+    #[arg(long, global = true)]
+    graph: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -857,7 +897,6 @@ enum Commands {
     },
 
     // ─── Enricher Commands ─────────────────────────────────────────────
-
     /// Enrich package graph with GitHub VCS metadata, language metrics, and license
     EnrichGithub {
         /// Fuseki SPARQL endpoint URL
@@ -1340,6 +1379,48 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
 
+    let auth: SparqlAuth = match (&cli.sparql_username, &cli.sparql_password) {
+        (Some(u), Some(p)) => Some((u.clone(), p.clone())),
+        _ => None,
+    };
+
+    let backend_type = cli.sparql_backend.clone();
+    let backend_token = cli.qlever_access_token.clone();
+    let write_backend = cli.write_backend.clone();
+    let minio_endpoint = cli.minio_endpoint.clone();
+    let minio_bucket = cli.minio_bucket.clone();
+    let graph_uri: Option<String> = cli.graph.clone();
+
+    let make_backend = || -> SparqlBackend {
+        match backend_type.as_str() {
+            "fuseki" => SparqlBackend::Fuseki,
+            "qlever" => {
+                let token = backend_token.clone().unwrap_or_else(|| {
+                    eprintln!("ERROR: --qlever-access-token required when --sparql-backend=qlever");
+                    std::process::exit(1);
+                });
+                SparqlBackend::QLever {
+                    access_token: token,
+                }
+            }
+            other => {
+                eprintln!(
+                    "ERROR: unknown --sparql-backend '{}' (expected 'fuseki' or 'qlever')",
+                    other
+                );
+                std::process::exit(1);
+            }
+        }
+    };
+
+    if !["fuseki", "minio"].contains(&write_backend.as_str()) {
+        eprintln!(
+            "ERROR: unknown --write-backend '{}' (expected 'fuseki' or 'minio')",
+            write_backend
+        );
+        std::process::exit(1);
+    }
+
     let start = Instant::now();
 
     let result = match cli.command {
@@ -1365,7 +1446,8 @@ fn main() {
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = DebianCollector::new(repo, distro, dist, component);
+            let collector =
+                DebianCollector::new(repo, distro, dist, component).with_graph(graph_uri.clone());
             let collector = match cache_dir {
                 Some(ref cd) => collector.with_cache(cd).expect("Failed to create cache"),
                 None => collector,
@@ -1389,16 +1471,30 @@ fn main() {
 
             let use_tls = sslclientcert.is_some();
             if use_tls {
-                eprintln!("TLS client cert: {}", sslclientcert.as_deref().unwrap_or(""));
+                eprintln!(
+                    "TLS client cert: {}",
+                    sslclientcert.as_deref().unwrap_or("")
+                );
             }
 
             // Helper to create collector with or without TLS
             let make_collector = |url: String, distro: String, release: String| -> RpmCollector {
-                if let (Some(cert), Some(key), Some(ca)) = (&sslclientcert, &sslclientkey, &sslcacert) {
-                    RpmCollector::new_with_tls_and_repo_type(url, distro, release, cert, key, ca, repo_type.clone())
+                let c = if let (Some(cert), Some(key), Some(ca)) =
+                    (&sslclientcert, &sslclientkey, &sslcacert)
+                {
+                    RpmCollector::new_with_tls_and_repo_type(
+                        url,
+                        distro,
+                        release,
+                        cert,
+                        key,
+                        ca,
+                        repo_type.clone(),
+                    )
                 } else {
                     RpmCollector::new_with_repo_type(url, distro, release, repo_type.clone())
-                }
+                };
+                c.with_graph(graph_uri.clone())
             };
 
             if let Some(url) = repo {
@@ -1425,14 +1521,23 @@ fn main() {
                 for (idx, repo_spec) in rpm_repos.iter().enumerate() {
                     let parts: Vec<&str> = repo_spec.splitn(3, ':').collect();
                     if parts.len() < 3 {
-                        eprintln!("Error: --rpm-repo format is name:release:url, got: {}", repo_spec);
+                        eprintln!(
+                            "Error: --rpm-repo format is name:release:url, got: {}",
+                            repo_spec
+                        );
                         std::process::exit(1);
                     }
                     let rpm_distro = parts[0];
                     let rpm_release = parts[1];
                     let rpm_url = parts[2];
 
-                    eprintln!("\n--- [{}/{}] {}/{} ---", idx + 1, rpm_repos.len(), rpm_distro, rpm_release);
+                    eprintln!(
+                        "\n--- [{}/{}] {}/{} ---",
+                        idx + 1,
+                        rpm_repos.len(),
+                        rpm_distro,
+                        rpm_release
+                    );
                     eprintln!("Repository: {}", rpm_url);
 
                     // Each repo gets its own output file
@@ -1487,18 +1592,25 @@ fn main() {
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = AlpineCollector::new(mirror, distro, branch, repos, arch);
+            let collector = AlpineCollector::new(mirror, distro, branch, repos, arch)
+                .with_graph(graph_uri.clone());
             collector.collect(&output)
         }
 
-        Commands::Homebrew { api_base, distro, release, output } => {
+        Commands::Homebrew {
+            api_base,
+            distro,
+            release,
+            output,
+        } => {
             eprintln!("=== PackageGraph Homebrew Collector ===");
             eprintln!("Distro: {} / Release: {}", distro, release);
             eprintln!("API: {}", api_base);
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = HomebrewCollector::new(api_base, distro, release);
+            let collector =
+                HomebrewCollector::new(api_base, distro, release).with_graph(graph_uri.clone());
             collector.collect(&output)
         }
 
@@ -1519,30 +1631,50 @@ fn main() {
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = ArchCollector::new(mirror, distro, release, arch, repos, include_aur);
+            let collector = ArchCollector::new(mirror, distro, release, arch, repos, include_aur)
+                .with_graph(graph_uri.clone());
             collector.collect(&output)
         }
 
-        Commands::Npm { packages_file, endpoint, output } => {
+        Commands::Npm {
+            packages_file,
+            endpoint,
+            output,
+        } => {
             eprintln!("=== PackageGraph NPM Collector ===");
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = pg_collect::npm::NpmCollector::new("https://registry.npmjs.org".into());
+            let collector = pg_collect::npm::NpmCollector::new("https://registry.npmjs.org".into())
+                .with_graph(graph_uri.clone());
             if let Some(ref seed) = packages_file {
                 eprintln!("Seed: {}", seed);
                 collector.collect(seed, &output)
             } else if let Some(ref ep) = endpoint {
                 eprintln!("Mode: auto-discover from Fuseki at {}", ep);
-                collector.collect_discover(ep, &output)
+                collector.collect_discover(ep, &auth, make_backend(), &output)
             } else {
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Either --packages-file or --endpoint required"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Either --packages-file or --endpoint required",
+                ))
             }
         }
 
-        Commands::Pypi { packages_file, endpoint, max_depth, max_packages, output, cache_dir, cache_ttl_hours } => {
+        Commands::Pypi {
+            packages_file,
+            endpoint,
+            max_depth,
+            max_packages,
+            output,
+            cache_dir,
+            cache_ttl_hours,
+        } => {
             eprintln!("=== PackageGraph PyPI Collector ===");
-            eprintln!("Spider: max_depth={}, max_packages={}", max_depth, max_packages);
+            eprintln!(
+                "Spider: max_depth={}, max_packages={}",
+                max_depth, max_packages
+            );
             eprintln!("Output: {}", output);
             if let Some(ref cd) = cache_dir {
                 eprintln!("Cache: {} (TTL={}h)", cd, cache_ttl_hours);
@@ -1550,14 +1682,19 @@ fn main() {
             eprintln!();
 
             let collector = pg_collect::pypi::PypiCollector::new()
-                .with_cache_ttl_hours(cache_ttl_hours);
+                .with_cache_ttl_hours(cache_ttl_hours)
+                .with_graph(graph_uri.clone());
             let collector = match cache_dir {
                 Some(ref cd) => match collector.with_cache(cd) {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("WARNING: cache init failed for {}: {}, proceeding without cache", cd, e);
+                        eprintln!(
+                            "WARNING: cache init failed for {}: {}, proceeding without cache",
+                            cd, e
+                        );
                         pg_collect::pypi::PypiCollector::new()
                             .with_cache_ttl_hours(cache_ttl_hours)
+                            .with_graph(graph_uri.clone())
                     }
                 },
                 None => collector,
@@ -1567,50 +1704,108 @@ fn main() {
                 collector.collect(seed, max_depth, max_packages, &output)
             } else if let Some(ref ep) = endpoint {
                 eprintln!("Mode: auto-discover from Fuseki at {}", ep);
-                collector.collect_discover(ep, max_depth, max_packages, &output)
+                collector.collect_discover(
+                    ep,
+                    &auth,
+                    make_backend(),
+                    max_depth,
+                    max_packages,
+                    &output,
+                )
             } else {
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Either --packages-file or --endpoint required"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Either --packages-file or --endpoint required",
+                ))
             }
         }
 
-        Commands::Cargo { packages_file, endpoint, max_depth, max_packages, output } => {
+        Commands::Cargo {
+            packages_file,
+            endpoint,
+            max_depth,
+            max_packages,
+            output,
+        } => {
             eprintln!("=== PackageGraph Cargo Collector ===");
-            eprintln!("Spider: max_depth={}, max_packages={}", max_depth, max_packages);
+            eprintln!(
+                "Spider: max_depth={}, max_packages={}",
+                max_depth, max_packages
+            );
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = pg_collect::cargo_collect::CargoCollector::new();
+            let collector =
+                pg_collect::cargo_collect::CargoCollector::new().with_graph(graph_uri.clone());
             if let Some(ref seed) = packages_file {
                 eprintln!("Seed: {}", seed);
                 collector.collect(seed, max_depth, max_packages, &output)
             } else if let Some(ref ep) = endpoint {
                 eprintln!("Mode: auto-discover from Fuseki at {}", ep);
-                collector.collect_discover(ep, max_depth, max_packages, &output)
+                collector.collect_discover(
+                    ep,
+                    &auth,
+                    make_backend(),
+                    max_depth,
+                    max_packages,
+                    &output,
+                )
             } else {
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Either --packages-file or --endpoint required"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Either --packages-file or --endpoint required",
+                ))
             }
         }
 
-        Commands::Gomod { packages_file, endpoint, proxy, max_depth, max_packages, output } => {
+        Commands::Gomod {
+            packages_file,
+            endpoint,
+            proxy,
+            max_depth,
+            max_packages,
+            output,
+        } => {
             eprintln!("=== PackageGraph Go Modules Collector ===");
             eprintln!("Proxy: {}", proxy);
-            eprintln!("Spider: max_depth={}, max_packages={}", max_depth, max_packages);
+            eprintln!(
+                "Spider: max_depth={}, max_packages={}",
+                max_depth, max_packages
+            );
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = pg_collect::gomod::GoModCollector::new(proxy);
+            let collector =
+                pg_collect::gomod::GoModCollector::new(proxy).with_graph(graph_uri.clone());
             if let Some(ref seed) = packages_file {
                 eprintln!("Seed: {}", seed);
                 collector.collect(seed, max_depth, max_packages, &output)
             } else if let Some(ref ep) = endpoint {
                 eprintln!("Mode: auto-discover from Fuseki at {}", ep);
-                collector.collect_discover(ep, max_depth, max_packages, &output)
+                collector.collect_discover(
+                    ep,
+                    &auth,
+                    make_backend(),
+                    max_depth,
+                    max_packages,
+                    &output,
+                )
             } else {
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Either --packages-file or --endpoint required"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Either --packages-file or --endpoint required",
+                ))
             }
         }
 
-        Commands::Conda { packages_file, distro, release, channel_url, subdir, output } => {
+        Commands::Conda {
+            packages_file,
+            distro,
+            release,
+            channel_url,
+            subdir,
+            output,
+        } => {
             eprintln!("=== PackageGraph Conda Collector ===");
             eprintln!("Channel: {}", channel_url);
             eprintln!("Subdir: {}", subdir);
@@ -1622,7 +1817,9 @@ fn main() {
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = pg_collect::conda::CondaCollector::new(distro, release, channel_url, subdir);
+            let collector =
+                pg_collect::conda::CondaCollector::new(distro, release, channel_url, subdir)
+                    .with_graph(graph_uri.clone());
             if let Some(seed) = packages_file {
                 collector.collect_seeded(&seed, &output)
             } else {
@@ -1630,12 +1827,18 @@ fn main() {
             }
         }
 
-        Commands::Flatpak { packages_file, distro, release, output } => {
+        Commands::Flatpak {
+            packages_file,
+            distro,
+            release,
+            output,
+        } => {
             eprintln!("=== PackageGraph Flatpak Collector ===");
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = pg_collect::flatpak::FlatpakCollector::new(distro, release);
+            let collector = pg_collect::flatpak::FlatpakCollector::new(distro, release)
+                .with_graph(graph_uri.clone());
             if let Some(ref seed) = packages_file {
                 eprintln!("Seed: {}", seed);
                 collector.collect(seed, &output)
@@ -1645,12 +1848,18 @@ fn main() {
             }
         }
 
-        Commands::Snap { packages_file, distro, release, output } => {
+        Commands::Snap {
+            packages_file,
+            distro,
+            release,
+            output,
+        } => {
             eprintln!("=== PackageGraph Snap Collector ===");
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = pg_collect::snap::SnapCollector::new(distro, release);
+            let collector =
+                pg_collect::snap::SnapCollector::new(distro, release).with_graph(graph_uri.clone());
             if let Some(ref seed) = packages_file {
                 eprintln!("Seed: {}", seed);
                 collector.collect(seed, &output)
@@ -1660,53 +1869,84 @@ fn main() {
             }
         }
 
-        Commands::Gentoo { repo_path, distro, release, output } => {
+        Commands::Gentoo {
+            repo_path,
+            distro,
+            release,
+            output,
+        } => {
             eprintln!("=== PackageGraph Gentoo Collector ===");
             eprintln!("Repo: {}", repo_path);
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = pg_collect::gentoo::GentooCollector::new(distro, release, repo_path);
+            let collector = pg_collect::gentoo::GentooCollector::new(distro, release, repo_path)
+                .with_graph(graph_uri.clone());
             collector.collect(&output)
         }
 
-        Commands::Void { repo_path, distro, release, output } => {
+        Commands::Void {
+            repo_path,
+            distro,
+            release,
+            output,
+        } => {
             eprintln!("=== PackageGraph Void Collector ===");
             eprintln!("Repo: {}", repo_path);
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = pg_collect::void_collect::VoidCollector::new(distro, release, repo_path);
+            let collector =
+                pg_collect::void_collect::VoidCollector::new(distro, release, repo_path)
+                    .with_graph(graph_uri.clone());
             collector.collect(&output)
         }
 
-        Commands::Yocto { layer, distro, release, output } => {
+        Commands::Yocto {
+            layer,
+            distro,
+            release,
+            output,
+        } => {
             eprintln!("=== PackageGraph Yocto Collector ===");
             eprintln!("Layers: {}", layer.join(", "));
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = YoctoCollector::new(distro, release, layer);
+            let collector =
+                YoctoCollector::new(distro, release, layer).with_graph(graph_uri.clone());
             collector.collect(&output)
         }
 
-        Commands::Buildroot { repo_path, distro, release, output } => {
+        Commands::Buildroot {
+            repo_path,
+            distro,
+            release,
+            output,
+        } => {
             eprintln!("=== PackageGraph Buildroot Collector ===");
             eprintln!("Repo: {}", repo_path);
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = BuildrootCollector::new(distro, release, repo_path);
+            let collector =
+                BuildrootCollector::new(distro, release, repo_path).with_graph(graph_uri.clone());
             collector.collect(&output)
         }
 
-        Commands::Openwrt { feed_path, distro, release, output } => {
+        Commands::Openwrt {
+            feed_path,
+            distro,
+            release,
+            output,
+        } => {
             eprintln!("=== PackageGraph OpenWRT Collector ===");
             eprintln!("Feed: {}", feed_path);
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = OpenWrtCollector::new(distro, release, feed_path);
+            let collector =
+                OpenWrtCollector::new(distro, release, feed_path).with_graph(graph_uri.clone());
             collector.collect(&output)
         }
 
@@ -1733,7 +1973,10 @@ fn main() {
             eprintln!("Output: {}", output);
             if let Some(ref url) = release_url {
                 eprintln!("Release URL: {}", url);
-                eprintln!("Arch: {}", arch.as_ref().unwrap_or(&"<missing>".to_string()));
+                eprintln!(
+                    "Arch: {}",
+                    arch.as_ref().unwrap_or(&"<missing>".to_string())
+                );
             }
             eprintln!();
 
@@ -1753,100 +1996,130 @@ fn main() {
             }
 
             (|| -> std::io::Result<(usize, usize)> {
-                use pg_collect::collect_opkg_index::OpkgIndexCollector;
                 use pg_collect::collect_openwrt_upstream::OpenwrtUpstreamCollector;
+                use pg_collect::collect_opkg_index::OpkgIndexCollector;
                 use pg_collect::enrich_openwrt_attestation::OpenwrtAttestationEnricher;
                 use pg_collect::openwrt::OpenWrtCollector;
                 use std::collections::{HashMap, HashSet};
 
                 let file = std::fs::File::create(&output)?;
-            let mut writer = pg_collect::ntriples::NTriplesWriter::new(file);
+                let mut writer = pg_collect::ntriples::NTriplesWriter::new_maybe_graph(
+                    file,
+                    graph_uri.as_deref(),
+                );
 
-            // Emit distribution metadata (shared across all stages)
-            let temp_collector = OpenWrtCollector::new(distro.clone(), release.clone(), feeds[0].clone());
-            temp_collector.emit_distribution_metadata(&mut writer)?;
+                // Emit distribution metadata (shared across all stages)
+                let temp_collector =
+                    OpenWrtCollector::new(distro.clone(), release.clone(), feeds[0].clone());
+                temp_collector.emit_distribution_metadata(&mut writer)?;
 
-            // Shared dedup and maps
-            let mut seen = HashSet::new();
-            let mut identity_map = HashMap::new();
-            let mut parsed_meta = HashMap::new();
-            let mut parent_map = HashMap::new();
+                // Shared dedup and maps
+                let mut seen = HashSet::new();
+                let mut identity_map = HashMap::new();
+                let mut parsed_meta = HashMap::new();
+                let mut parent_map = HashMap::new();
 
-            let mut total_packages = 0;
-            let mut total_triples = 0;
+                let mut total_packages = 0;
+                let mut total_triples = 0;
 
-            // Stage 1: Multi-feed collection
-            eprintln!("--- Stage 1: Source Package Collection ---");
-            for (i, feed_path) in feeds.iter().enumerate() {
-                let is_secondary = i > 0;
-                let collector = OpenWrtCollector::new(distro.clone(), release.clone(), feed_path.clone());
+                // Stage 1: Multi-feed collection
+                eprintln!("--- Stage 1: Source Package Collection ---");
+                for (i, feed_path) in feeds.iter().enumerate() {
+                    let is_secondary = i > 0;
+                    let collector =
+                        OpenWrtCollector::new(distro.clone(), release.clone(), feed_path.clone());
 
-                eprintln!("Feed {} of {}: {}", i + 1, feeds.len(), feed_path);
+                    eprintln!("Feed {} of {}: {}", i + 1, feeds.len(), feed_path);
 
-                let (pkgs, triples) = collector.collect_with_writer(
-                    &mut writer,
-                    &mut seen,
-                    &mut identity_map,
-                    &mut parsed_meta,
-                    &mut parent_map,
-                    is_secondary,
-                )?;
-
-                total_packages += pkgs;
-                total_triples += triples;
-                eprintln!("  {} packages, {} triples", pkgs, triples);
-            }
-
-            eprintln!("Stage 1 complete: {} total packages, {} triples", total_packages, total_triples);
-
-            // Stage 2: Binary package index (if --release-url provided)
-            if let (Some(url), Some(a)) = (&release_url, &arch) {
-                eprintln!("\n--- Stage 2: Binary Package Index ---");
-                let index_collector = OpkgIndexCollector::new(distro.clone(), release.clone(), url.clone(), a.clone());
-                let (bin_count, digest_map) = index_collector.collect(&mut writer, &identity_map, None)?;
-                total_packages += bin_count; // Count binary packages too
-                eprintln!("  {} binary packages, {} digests", bin_count, digest_map.len());
-                total_triples += bin_count * 10; // Estimate (updated for dependencies)
-
-                // Stage 4: Attestation enrichment (if --with-attestation)
-                if with_attestation {
-                    eprintln!("\n--- Stage 4: SLSA Attestation Enrichment ---");
-
-                    let minio_cfg = if minio_endpoint.is_some() && minio_access_key.is_some() && minio_secret_key.is_some() {
-                        Some(pg_collect::cache::MinioConfig {
-                            endpoint: minio_endpoint.clone().unwrap(),
-                            bucket: minio_bucket.clone(),
-                            access_key: minio_access_key.clone().unwrap(),
-                            secret_key: minio_secret_key.clone().unwrap(),
-                        })
-                    } else {
-                        None
-                    };
-
-                    let enricher = OpenwrtAttestationEnricher::new(
-                        github_token.clone(),
-                        cache_dir.as_deref(),
-                        minio_cfg,
+                    let (pkgs, triples) = collector.collect_with_writer(
+                        &mut writer,
+                        &mut seen,
+                        &mut identity_map,
+                        &mut parsed_meta,
+                        &mut parent_map,
+                        is_secondary,
                     )?;
 
-                    let att_triples = enricher.enrich(&mut writer, &digest_map)?;
-                    total_triples += att_triples;
-                    eprintln!("  {} attestation triples", att_triples);
+                    total_packages += pkgs;
+                    total_triples += triples;
+                    eprintln!("  {} packages, {} triples", pkgs, triples);
                 }
-            }
 
-            // Stage 3: Upstream source enrichment (if --with-upstream)
-            if with_upstream {
-                eprintln!("\n--- Stage 3: Upstream Source Enrichment ---");
-                let upstream_collector = OpenwrtUpstreamCollector::new(distro.clone(), release.clone());
-                let upstream_triples = upstream_collector.collect(&mut writer, &identity_map, &parsed_meta, &parent_map)?;
-                total_triples += upstream_triples;
-                eprintln!("  {} upstream triples", upstream_triples);
-            }
+                eprintln!(
+                    "Stage 1 complete: {} total packages, {} triples",
+                    total_packages, total_triples
+                );
+
+                // Stage 2: Binary package index (if --release-url provided)
+                if let (Some(url), Some(a)) = (&release_url, &arch) {
+                    eprintln!("\n--- Stage 2: Binary Package Index ---");
+                    let index_collector = OpkgIndexCollector::new(
+                        distro.clone(),
+                        release.clone(),
+                        url.clone(),
+                        a.clone(),
+                    );
+                    let (bin_count, digest_map) =
+                        index_collector.collect(&mut writer, &identity_map, None)?;
+                    total_packages += bin_count; // Count binary packages too
+                    eprintln!(
+                        "  {} binary packages, {} digests",
+                        bin_count,
+                        digest_map.len()
+                    );
+                    total_triples += bin_count * 10; // Estimate (updated for dependencies)
+
+                    // Stage 4: Attestation enrichment (if --with-attestation)
+                    if with_attestation {
+                        eprintln!("\n--- Stage 4: SLSA Attestation Enrichment ---");
+
+                        let minio_cfg = if minio_endpoint.is_some()
+                            && minio_access_key.is_some()
+                            && minio_secret_key.is_some()
+                        {
+                            Some(pg_collect::cache::MinioConfig {
+                                endpoint: minio_endpoint.clone().unwrap(),
+                                bucket: minio_bucket.clone(),
+                                access_key: minio_access_key.clone().unwrap(),
+                                secret_key: minio_secret_key.clone().unwrap(),
+                            })
+                        } else {
+                            None
+                        };
+
+                        let enricher = OpenwrtAttestationEnricher::new(
+                            github_token.clone(),
+                            cache_dir.as_deref(),
+                            minio_cfg,
+                        )?;
+
+                        let att_triples = enricher.enrich(&mut writer, &digest_map)?;
+                        total_triples += att_triples;
+                        eprintln!("  {} attestation triples", att_triples);
+                    }
+                }
+
+                // Stage 3: Upstream source enrichment (if --with-upstream)
+                if with_upstream {
+                    eprintln!("\n--- Stage 3: Upstream Source Enrichment ---");
+                    let upstream_collector =
+                        OpenwrtUpstreamCollector::new(distro.clone(), release.clone());
+                    let upstream_triples = upstream_collector.collect(
+                        &mut writer,
+                        &identity_map,
+                        &parsed_meta,
+                        &parent_map,
+                    )?;
+                    total_triples += upstream_triples;
+                    eprintln!("  {} upstream triples", upstream_triples);
+                }
 
                 writer.flush()?;
                 eprintln!("\n=== Complete ===");
-                eprintln!("Total: {} packages, {} triples", total_packages, total_triples);
+                eprintln!(
+                    "Total: {} packages, {} triples",
+                    total_packages, total_triples
+                );
 
                 Ok((total_packages, total_triples))
             })()
@@ -1858,11 +2131,17 @@ fn main() {
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = pg_collect::osv::OsvCollector::new();
+            let collector = pg_collect::osv::OsvCollector::new().with_graph(graph_uri.clone());
             collector.collect(&ecosystem, &output)
         }
 
-        Commands::CollectBodhi { endpoint, release, output, since, cache_dir } => {
+        Commands::CollectBodhi {
+            endpoint,
+            release,
+            output,
+            since,
+            cache_dir,
+        } => {
             eprintln!("=== PackageGraph Bodhi Advisory Collector ===");
             eprintln!("Endpoint: {}", endpoint);
             eprintln!("Release: {}", release);
@@ -1875,13 +2154,25 @@ fn main() {
             eprintln!("Output: {}", output);
             eprintln!();
 
-            match BodhiCollector::new(&endpoint, release, since, cache_dir.as_deref()) {
-                Ok(collector) => collector.collect(&output),
+            match BodhiCollector::new(
+                &endpoint,
+                release,
+                since,
+                cache_dir.as_deref(),
+                auth.clone(),
+                make_backend(),
+            ) {
+                Ok(collector) => collector.with_graph(graph_uri.clone()).collect(&output),
                 Err(e) => Err(e),
             }
         }
 
-        Commands::CollectGlsa { endpoint, output, since, cache_dir } => {
+        Commands::CollectGlsa {
+            endpoint,
+            output,
+            since,
+            cache_dir,
+        } => {
             eprintln!("=== PackageGraph GLSA Advisory Collector ===");
             eprintln!("Endpoint: {}", endpoint);
             if let Some(ref s) = since {
@@ -1893,25 +2184,36 @@ fn main() {
             eprintln!("Output: {}", output);
             eprintln!();
 
-            match GlsaCollector::new(&endpoint, since, cache_dir.as_deref()) {
-                Ok(collector) => collector.collect(&output),
+            match GlsaCollector::new(
+                &endpoint,
+                since,
+                cache_dir.as_deref(),
+                auth.clone(),
+                make_backend(),
+            ) {
+                Ok(collector) => collector.with_graph(graph_uri.clone()).collect(&output),
                 Err(e) => Err(e),
             }
         }
 
-        Commands::Rubygems { packages_file, endpoint, api_base, output } => {
+        Commands::Rubygems {
+            packages_file,
+            endpoint,
+            api_base,
+            output,
+        } => {
             eprintln!("=== PackageGraph RubyGems Collector ===");
             eprintln!("API: {}", api_base);
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = RubyGemsCollector::new(api_base);
+            let collector = RubyGemsCollector::new(api_base).with_graph(graph_uri.clone());
             if let Some(ref seed) = packages_file {
                 eprintln!("Seed: {}", seed);
                 collector.collect(seed, &output)
             } else if let Some(ref ep) = endpoint {
                 eprintln!("Mode: auto-discover from Fuseki at {}", ep);
-                collector.collect_discover(ep, &output)
+                collector.collect_discover(ep, &auth, make_backend(), &output)
             } else {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -1920,7 +2222,19 @@ fn main() {
             }
         }
 
-        Commands::Maven { packages_file, endpoint, search_base, repo_base, output, cache_dir, cache_refresh, max_depth, max_roots, max_packages, delay_ms } => {
+        Commands::Maven {
+            packages_file,
+            endpoint,
+            search_base,
+            repo_base,
+            output,
+            cache_dir,
+            cache_refresh,
+            max_depth,
+            max_roots,
+            max_packages,
+            delay_ms,
+        } => {
             eprintln!("=== PackageGraph Maven Collector ===");
             eprintln!("Output: {}", output);
             eprintln!();
@@ -1941,30 +2255,39 @@ fn main() {
                     format!("Only Maven Central is supported. Got: {}", repo_base),
                 ))
             } else {
-                let http_cache = cache_dir.as_ref().and_then(|dir| {
-                    match pg_collect::http_cache::HttpCache::new(dir, "maven") {
-                        Ok(c) => {
-                            eprintln!("Cache: {} (refresh={})", dir, cache_refresh);
-                            Some(c)
-                        }
-                        Err(e) => {
-                            eprintln!("WARNING: cache init failed for {}: {}, proceeding without cache", dir, e);
-                            None
-                        }
-                    }
-                });
+                let http_cache =
+                    cache_dir.as_ref().and_then(
+                        |dir| match pg_collect::http_cache::HttpCache::new(dir, "maven") {
+                            Ok(c) => {
+                                eprintln!("Cache: {} (refresh={})", dir, cache_refresh);
+                                Some(c)
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                "WARNING: cache init failed for {}: {}, proceeding without cache",
+                                dir, e
+                            );
+                                None
+                            }
+                        },
+                    );
                 let mut collector = MavenCollector::new(search_base, repo_base);
                 if let Some(cache) = http_cache {
                     collector.set_cache(cache);
                 }
-                let mut collector = collector.with_refresh(cache_refresh);
+                let mut collector = collector
+                    .with_refresh(cache_refresh)
+                    .with_graph(graph_uri.clone());
                 collector.max_depth = max_depth;
                 collector.max_roots = max_roots;
                 collector.max_packages = max_packages;
                 collector.delay_ms = delay_ms;
 
                 if max_depth > 0 {
-                    eprintln!("Traversal: depth={}, max_roots={}, max_packages={}, delay={}ms", max_depth, max_roots, max_packages, delay_ms);
+                    eprintln!(
+                        "Traversal: depth={}, max_roots={}, max_packages={}, delay={}ms",
+                        max_depth, max_roots, max_packages, delay_ms
+                    );
                 }
 
                 // All modes route through collect_recursive
@@ -1973,27 +2296,38 @@ fn main() {
                     collector.collect(seed, &output)
                 } else if let Some(ref ep) = endpoint {
                     eprintln!("Mode: auto-discover from Fuseki at {}", ep);
-                    collector.collect_discover(ep, &output)
+                    collector.collect_discover(ep, &auth, make_backend(), &output)
                 } else {
-                    Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Either --packages-file or --endpoint required"))
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Either --packages-file or --endpoint required",
+                    ))
                 }
             }
         }
 
-        Commands::Cpan { packages_file, endpoint, api_base, output } => {
+        Commands::Cpan {
+            packages_file,
+            endpoint,
+            api_base,
+            output,
+        } => {
             eprintln!("=== PackageGraph CPAN Collector ===");
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = CpanCollector::new(api_base);
+            let collector = CpanCollector::new(api_base).with_graph(graph_uri.clone());
             if let Some(ref seed) = packages_file {
                 eprintln!("Seed: {}", seed);
                 collector.collect(seed, &output)
             } else if let Some(ref ep) = endpoint {
                 eprintln!("Mode: auto-discover from Fuseki at {}", ep);
-                collector.collect_discover(ep, &output)
+                collector.collect_discover(ep, &auth, make_backend(), &output)
             } else {
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Either --packages-file or --endpoint required"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Either --packages-file or --endpoint required",
+                ))
             }
         }
 
@@ -2003,66 +2337,97 @@ fn main() {
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = CranCollector::new(mirror);
+            let collector = CranCollector::new(mirror).with_graph(graph_uri.clone());
             collector.collect(&output)
         }
 
-        Commands::Hackage { packages_file, endpoint, base_url, output } => {
+        Commands::Hackage {
+            packages_file,
+            endpoint,
+            base_url,
+            output,
+        } => {
             eprintln!("=== PackageGraph Hackage Collector ===");
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = HackageCollector::new(base_url);
+            let collector = HackageCollector::new(base_url).with_graph(graph_uri.clone());
             if let Some(ref seed) = packages_file {
                 eprintln!("Seed: {}", seed);
                 collector.collect(seed, &output)
             } else if let Some(ref ep) = endpoint {
                 eprintln!("Mode: auto-discover from Fuseki at {}", ep);
-                collector.collect_discover(ep, &output)
+                collector.collect_discover(ep, &auth, make_backend(), &output)
             } else {
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Either --packages-file or --endpoint required"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Either --packages-file or --endpoint required",
+                ))
             }
         }
 
-        Commands::Nuget { packages_file, endpoint, service_index, output } => {
+        Commands::Nuget {
+            packages_file,
+            endpoint,
+            service_index,
+            output,
+        } => {
             eprintln!("=== PackageGraph NuGet Collector ===");
             eprintln!("Output: {}", output);
             eprintln!();
 
             match NugetCollector::new_from_service_index(&service_index) {
                 Ok(collector) => {
+                    let collector = collector.with_graph(graph_uri.clone());
                     if let Some(ref seed) = packages_file {
                         eprintln!("Seed: {}", seed);
                         collector.collect(seed, &output)
                     } else if let Some(ref ep) = endpoint {
                         eprintln!("Mode: auto-discover from Fuseki at {}", ep);
-                        collector.collect_discover(ep, &output)
+                        collector.collect_discover(ep, &auth, make_backend(), &output)
                     } else {
-                        Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Either --packages-file or --endpoint required"))
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "Either --packages-file or --endpoint required",
+                        ))
                     }
                 }
                 Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
             }
         }
 
-        Commands::Hex { packages_file, endpoint, api_base, output } => {
+        Commands::Hex {
+            packages_file,
+            endpoint,
+            api_base,
+            output,
+        } => {
             eprintln!("=== PackageGraph Hex Collector ===");
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = HexCollector::new(api_base);
+            let collector = HexCollector::new(api_base).with_graph(graph_uri.clone());
             if let Some(ref seed) = packages_file {
                 eprintln!("Seed: {}", seed);
                 collector.collect(seed, &output)
             } else if let Some(ref ep) = endpoint {
                 eprintln!("Mode: auto-discover from Fuseki at {}", ep);
-                collector.collect_discover(ep, &output)
+                collector.collect_discover(ep, &auth, make_backend(), &output)
             } else {
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Either --packages-file or --endpoint required"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Either --packages-file or --endpoint required",
+                ))
             }
         }
 
-        Commands::Freebsd { mirror, distro, release, arch, output } => {
+        Commands::Freebsd {
+            mirror,
+            distro,
+            release,
+            arch,
+            output,
+        } => {
             eprintln!("=== PackageGraph FreeBSD Collector ===");
             eprintln!("Mirror: {}", mirror);
             eprintln!("Release: {}", release);
@@ -2070,52 +2435,244 @@ fn main() {
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = FreebsdCollector::new(distro, mirror, release, arch);
+            let collector =
+                FreebsdCollector::new(distro, mirror, release, arch).with_graph(graph_uri.clone());
             collector.collect(&output)
         }
 
-        Commands::Nix { channel_url, distro, release, output } => {
+        Commands::Nix {
+            channel_url,
+            distro,
+            release,
+            output,
+        } => {
             eprintln!("=== PackageGraph Nix Collector ===");
             eprintln!("Channel: {}", channel_url);
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = NixCollector::new(distro, release, channel_url);
+            let collector =
+                NixCollector::new(distro, release, channel_url).with_graph(graph_uri.clone());
             collector.collect(&output)
         }
 
-        Commands::Chocolatey { api_url, distro, release, output } => {
+        Commands::Chocolatey {
+            api_url,
+            distro,
+            release,
+            output,
+        } => {
             eprintln!("=== PackageGraph Chocolatey Collector ===");
             eprintln!("API: {}", api_url);
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let collector = ChocolateyCollector::new(distro, release, api_url);
+            let collector =
+                ChocolateyCollector::new(distro, release, api_url).with_graph(graph_uri.clone());
             collector.collect(&output)
         }
 
-        Commands::Load { file, graph, endpoint, batch_size } => {
-            eprintln!("=== PackageGraph SPARQL Loader ===");
-            eprintln!("File: {}", file);
-            eprintln!("Graph: {}", graph);
-            eprintln!("Endpoint: {}", endpoint);
-            eprintln!("Batch size: {}", batch_size);
-            eprintln!();
+        Commands::Load {
+            file,
+            graph,
+            endpoint,
+            batch_size,
+        } => {
+            if write_backend == "minio" {
+                (|| -> std::io::Result<(usize, usize)> {
+                    eprintln!("=== PackageGraph Minio Loader ===");
+                    eprintln!("File: {}", file);
+                    eprintln!("Graph: {}", graph);
+                    eprintln!("Bucket: {}", minio_bucket);
+                    eprintln!();
 
-            let client = pg_collect::sparql::SparqlClient::new(&endpoint);
-            client.load_file(&file, &graph, batch_size)
-                .map(|count| (count, count))
+                    let filename = std::path::Path::new(&file)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&file);
+                    let nt_path = format!("pgraph/{}/nt-output/{}", minio_bucket, filename);
+                    let graph_path =
+                        format!("pgraph/{}/nt-output/{}.graph", minio_bucket, filename);
+
+                    let mc = |args: &[&str]| -> std::io::Result<String> {
+                        let output = std::process::Command::new("mc")
+                            .args(args)
+                            .output()
+                            .map_err(|e| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!("mc failed: {}", e),
+                                )
+                            })?;
+                        if !output.status.success() {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("mc error: {}", stderr),
+                            ));
+                        }
+                        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+                    };
+
+                    let minio_ep = minio_endpoint.as_deref().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "--minio-endpoint is required for --write-backend=minio",
+                        )
+                    })?;
+                    let minio_ak = std::env::var("MINIO_ACCESS_KEY").map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "MINIO_ACCESS_KEY env var is required for --write-backend=minio",
+                        )
+                    })?;
+                    let minio_sk = std::env::var("MINIO_SECRET_KEY").map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "MINIO_SECRET_KEY env var is required for --write-backend=minio",
+                        )
+                    })?;
+                    mc(&[
+                        "alias", "set", "pgraph", minio_ep, &minio_ak, &minio_sk, "--api", "S3v4",
+                    ])?;
+
+                    eprintln!("Uploading {} → {}...", file, nt_path);
+                    mc(&["cp", &file, &nt_path])?;
+
+                    let tmp_graph = std::env::temp_dir().join(format!("{}.graph", filename));
+                    std::fs::write(&tmp_graph, &graph)?;
+                    mc(&["cp", tmp_graph.to_str().unwrap(), &graph_path])?;
+                    std::fs::remove_file(&tmp_graph).ok();
+
+                    let count = pg_collect::sparql::count_triples_pub(&file)?;
+                    eprintln!("✓ Loaded {} triples to Minio ({})", count, nt_path);
+                    Ok((count, count))
+                })()
+            } else {
+                eprintln!("=== PackageGraph SPARQL Loader ===");
+                eprintln!("File: {}", file);
+                eprintln!("Graph: {}", graph);
+                eprintln!("Endpoint: {}", endpoint);
+                eprintln!("Batch size: {}", batch_size);
+                eprintln!();
+
+                let client =
+                    pg_collect::sparql::make_sparql_client(&endpoint, &auth, make_backend());
+                client
+                    .load_file(&file, &graph, batch_size)
+                    .map(|count| (count, count))
+            }
         }
 
         Commands::Drop { graph, endpoint } => {
-            eprintln!("=== PackageGraph Graph Drop ===");
-            eprintln!("Graph: {}", graph);
-            eprintln!("Endpoint: {}", endpoint);
-            eprintln!();
+            if write_backend == "minio" {
+                (|| -> std::io::Result<(usize, usize)> {
+                    eprintln!("=== PackageGraph Minio Graph Drop ===");
+                    eprintln!("Graph: {}", graph);
+                    eprintln!("Bucket: {}", minio_bucket);
+                    eprintln!();
 
-            let client = pg_collect::sparql::SparqlClient::new(&endpoint);
-            client.drop_graph(&graph)
-                .map(|_| (0, 0))
+                    let nt_dir = format!("pgraph/{}/nt-output/", minio_bucket);
+
+                    let mc = |args: &[&str]| -> std::io::Result<String> {
+                        let output = std::process::Command::new("mc")
+                            .args(args)
+                            .output()
+                            .map_err(|e| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!("mc failed: {}", e),
+                                )
+                            })?;
+                        if !output.status.success() {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("mc error: {}", stderr),
+                            ));
+                        }
+                        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+                    };
+
+                    let minio_ep = minio_endpoint.as_deref().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "--minio-endpoint is required for --write-backend=minio",
+                        )
+                    })?;
+                    let minio_ak = std::env::var("MINIO_ACCESS_KEY").map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "MINIO_ACCESS_KEY env var is required for --write-backend=minio",
+                        )
+                    })?;
+                    let minio_sk = std::env::var("MINIO_SECRET_KEY").map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "MINIO_SECRET_KEY env var is required for --write-backend=minio",
+                        )
+                    })?;
+                    mc(&[
+                        "alias", "set", "pgraph", minio_ep, &minio_ak, &minio_sk, "--api", "S3v4",
+                    ])?;
+
+                    let listing = mc(&["ls", &nt_dir])?;
+                    let mut removed = 0;
+                    let mut errors = 0;
+                    for line in listing.lines() {
+                        let name = line.split_whitespace().last().unwrap_or("");
+                        if !name.ends_with(".graph") {
+                            continue;
+                        }
+                        let graph_file = format!("{}{}", nt_dir, name);
+                        let stored_uri = match mc(&["cat", &graph_file]) {
+                            Ok(uri) => uri,
+                            Err(e) => {
+                                eprintln!("WARNING: failed to read {}: {}", graph_file, e);
+                                errors += 1;
+                                continue;
+                            }
+                        };
+                        if stored_uri.trim() == graph {
+                            let nt_file = graph_file.trim_end_matches(".graph");
+                            eprintln!("Removing {} + {}...", nt_file, name);
+                            // Remove .graph first: if it fails, skip .nt to avoid
+                            // orphan sidecar that blocks QLever rebuilds
+                            if let Err(e) = mc(&["rm", &graph_file]) {
+                                eprintln!("WARNING: failed to remove {}: {} — skipping .nt to avoid orphan sidecar", graph_file, e);
+                                errors += 1;
+                                continue;
+                            }
+                            if let Err(e) = mc(&["rm", nt_file]) {
+                                eprintln!("WARNING: failed to remove {}: {}", nt_file, e);
+                                errors += 1;
+                            }
+                            removed += 1;
+                        }
+                    }
+
+                    if errors > 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "Dropped graph <{}> with {} errors ({} files removed)",
+                                graph, errors, removed
+                            ),
+                        ));
+                    }
+                    eprintln!("✓ Dropped graph <{}> ({} files removed)", graph, removed);
+                    Ok((0, 0))
+                })()
+            } else {
+                eprintln!("=== PackageGraph Graph Drop ===");
+                eprintln!("Graph: {}", graph);
+                eprintln!("Endpoint: {}", endpoint);
+                eprintln!();
+
+                let client =
+                    pg_collect::sparql::make_sparql_client(&endpoint, &auth, make_backend());
+                client.drop_graph(&graph).map(|_| (0, 0))
+            }
         }
 
         Commands::ExtractTestCorpus {
@@ -2126,21 +2683,32 @@ fn main() {
             max_triples,
             depth,
             fan_out,
-        } => {
-            pg_collect::extract::run(
-                &endpoint,
-                std::path::Path::new(&config),
-                std::path::Path::new(&ontology_dir),
-                std::path::Path::new(&output_dir),
-                max_triples,
-                depth,
-                fan_out,
-            ).map(|_| (0, 0))
-        }
+        } => pg_collect::extract::run(
+            &endpoint,
+            std::path::Path::new(&config),
+            std::path::Path::new(&ontology_dir),
+            std::path::Path::new(&output_dir),
+            max_triples,
+            depth,
+            fan_out,
+            auth.clone(),
+            make_backend(),
+        )
+        .map(|_| (0, 0)),
 
         // ─── Enricher Commands ─────────────────────────────────────────
-
-        Commands::EnrichGithub { endpoint, output, github_token, cache_dir, minio_endpoint, minio_bucket, minio_access_key, minio_secret_key, max_repos, load_graph } => {
+        Commands::EnrichGithub {
+            endpoint,
+            output,
+            github_token,
+            cache_dir,
+            minio_endpoint,
+            minio_bucket,
+            minio_access_key,
+            minio_secret_key,
+            max_repos,
+            load_graph,
+        } => {
             eprintln!("=== PackageGraph GitHub Enricher ===");
             eprintln!("Endpoint: {}", endpoint);
             eprintln!("Output: {}", output);
@@ -2149,29 +2717,47 @@ fn main() {
             // Validate flag combination
             if load_graph.is_some() && max_repos.is_none() {
                 eprintln!("Error: --load-graph requires --max-repos to be specified");
-                eprintln!("Usage: pg-collect enrich-github --max-repos 5000 --load-graph <graph_uri>");
+                eprintln!(
+                    "Usage: pg-collect enrich-github --max-repos 5000 --load-graph <graph_uri>"
+                );
                 std::process::exit(1);
             }
             if max_repos.is_some() && load_graph.is_none() {
                 eprintln!("Error: --max-repos requires --load-graph to be specified");
-                eprintln!("For incremental mode, use both: --max-repos 5000 --load-graph <graph_uri>");
+                eprintln!(
+                    "For incremental mode, use both: --max-repos 5000 --load-graph <graph_uri>"
+                );
                 eprintln!("For full corpus file-only mode, omit both flags");
                 std::process::exit(1);
             }
 
             let minio = match (minio_endpoint, minio_access_key, minio_secret_key) {
                 (Some(ep), Some(ak), Some(sk)) => Some(MinioConfig {
-                    endpoint: ep, bucket: minio_bucket, access_key: ak, secret_key: sk,
+                    endpoint: ep,
+                    bucket: minio_bucket,
+                    access_key: ak,
+                    secret_key: sk,
                 }),
                 _ => None,
             };
 
-            let enricher = GitHubEnricher::new(&endpoint, github_token, cache_dir.as_deref(), minio);
+            let enricher = GitHubEnricher::new(
+                &endpoint,
+                github_token,
+                cache_dir.as_deref(),
+                minio,
+                auth.clone(),
+                make_backend(),
+            )
+            .with_graph(graph_uri.clone());
 
             // Choose execution mode
             match (max_repos, load_graph) {
                 (Some(max), Some(graph_uri)) => {
-                    eprintln!("Mode: Incremental (max {} repos, loading to {})", max, graph_uri);
+                    eprintln!(
+                        "Mode: Incremental (max {} repos, loading to {})",
+                        max, graph_uri
+                    );
                     enricher.enrich_incremental(&output, max, &graph_uri)
                 }
                 _ => {
@@ -2181,13 +2767,26 @@ fn main() {
             }
         }
 
-        Commands::EnrichAdvisory { advisory_type, output, days_back, cache_dir } => {
-            let at = if advisory_type == "rhsa" { AdvisoryType::Rhsa } else { AdvisoryType::Dsa };
-            eprintln!("=== PackageGraph Advisory Enricher ({}) ===", advisory_type.to_uppercase());
+        Commands::EnrichAdvisory {
+            advisory_type,
+            output,
+            days_back,
+            cache_dir,
+        } => {
+            let at = if advisory_type == "rhsa" {
+                AdvisoryType::Rhsa
+            } else {
+                AdvisoryType::Dsa
+            };
+            eprintln!(
+                "=== PackageGraph Advisory Enricher ({}) ===",
+                advisory_type.to_uppercase()
+            );
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let enricher = AdvisoryEnricher::new(at, days_back, cache_dir.as_deref());
+            let enricher = AdvisoryEnricher::new(at, days_back, cache_dir.as_deref())
+                .with_graph(graph_uri.clone());
             enricher.enrich(&output)
         }
 
@@ -2197,11 +2796,21 @@ fn main() {
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let enricher = NpmProvenanceEnricher::new(&endpoint);
+            let enricher = NpmProvenanceEnricher::new(&endpoint, auth.clone(), make_backend())
+                .with_graph(graph_uri.clone());
             enricher.enrich(&output)
         }
 
-        Commands::EnrichKoji { endpoint, output, koji_hub, distro, release, cache_dir, limit, srpm_list } => {
+        Commands::EnrichKoji {
+            endpoint,
+            output,
+            koji_hub,
+            distro,
+            release,
+            cache_dir,
+            limit,
+            srpm_list,
+        } => {
             eprintln!("=== PackageGraph Koji Enricher ===");
             eprintln!("Koji: {}", koji_hub);
             if let Some(ref path) = srpm_list {
@@ -2223,39 +2832,83 @@ fn main() {
                     .filter(|l| !l.trim().is_empty())
                     .map(|l| l.trim().to_string())
                     .collect();
-                let enricher = KojiEnricher::new_standalone(&koji_hub, &distro, &release, cache_dir.as_deref());
+                let enricher = KojiEnricher::new_standalone(
+                    &koji_hub,
+                    &distro,
+                    &release,
+                    cache_dir.as_deref(),
+                )
+                .with_graph_uri(graph_uri.clone());
                 enricher.enrich_from_nvrs(&nvrs, &output, limit)
             } else {
                 if endpoint.is_empty() {
                     panic!("Either --endpoint or --srpm-list is required for enrich-koji");
                 }
-                let enricher = KojiEnricher::new(&endpoint, &koji_hub, &distro, &release, cache_dir.as_deref());
+                let enricher = KojiEnricher::new(
+                    &endpoint,
+                    &koji_hub,
+                    &distro,
+                    &release,
+                    cache_dir.as_deref(),
+                    auth.clone(),
+                    make_backend(),
+                )
+                .with_graph_uri(graph_uri.clone());
                 enricher.enrich_with_limit(&output, limit)
             }
         }
 
-        Commands::EnrichRepology { endpoint, output, cache_dir } => {
+        Commands::EnrichRepology {
+            endpoint,
+            output,
+            cache_dir,
+        } => {
             eprintln!("=== PackageGraph Repology Enricher ===");
             eprintln!("Endpoint: {}", endpoint);
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let enricher = RepologyEnricher::new(&endpoint, cache_dir.as_deref());
+            let enricher = RepologyEnricher::new(
+                &endpoint,
+                cache_dir.as_deref(),
+                auth.clone(),
+                make_backend(),
+            )
+            .with_graph(graph_uri.clone());
             enricher.enrich(&output)
         }
 
-        Commands::EnrichSecurity { endpoint, ecosystem, output, cache_dir } => {
+        Commands::EnrichSecurity {
+            endpoint,
+            ecosystem,
+            output,
+            cache_dir,
+        } => {
             eprintln!("=== PackageGraph Security Enricher ===");
             eprintln!("Endpoint: {}", endpoint);
             eprintln!("Ecosystem: {}", ecosystem);
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let enricher = SecurityEnricher::new(&endpoint, &ecosystem, cache_dir.as_deref());
+            let enricher = SecurityEnricher::new(
+                &endpoint,
+                &ecosystem,
+                cache_dir.as_deref(),
+                auth.clone(),
+                make_backend(),
+            )
+            .with_graph(graph_uri.clone());
             enricher.enrich(&output)
         }
 
-        Commands::EnrichNvd { endpoint, output, mode, graph, nvd_api_key, cache_dir } => {
+        Commands::EnrichNvd {
+            endpoint,
+            output,
+            mode,
+            graph,
+            nvd_api_key,
+            cache_dir,
+        } => {
             eprintln!("=== PackageGraph NVD CVE Metadata Enricher ===");
             eprintln!("Mode: {}", mode);
             eprintln!("Endpoint: {}", endpoint);
@@ -2265,7 +2918,10 @@ fn main() {
                     "feed" => {
                         // Feed mode requires --output
                         let output_path = output.ok_or_else(|| {
-                            std::io::Error::new(std::io::ErrorKind::InvalidInput, "--output is required for feed mode")
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "--output is required for feed mode",
+                            )
                         })?;
 
                         if let Some(ref cd) = cache_dir {
@@ -2274,7 +2930,14 @@ fn main() {
                         eprintln!("Output: {}", output_path);
                         eprintln!();
 
-                        let enricher = NvdEnricher::new(&endpoint, nvd_api_key, cache_dir.as_deref())?;
+                        let enricher = NvdEnricher::new(
+                            &endpoint,
+                            nvd_api_key,
+                            cache_dir.as_deref(),
+                            auth.clone(),
+                            make_backend(),
+                        )?
+                        .with_graph(graph_uri.clone());
                         enricher.enrich(&output_path)
                     }
                     "api" => {
@@ -2286,7 +2949,14 @@ fn main() {
                         }
                         eprintln!();
 
-                        let enricher = NvdEnricher::new(&endpoint, nvd_api_key, None)?;
+                        let enricher = NvdEnricher::new(
+                            &endpoint,
+                            nvd_api_key,
+                            None,
+                            auth.clone(),
+                            make_backend(),
+                        )?
+                        .with_graph(graph_uri.clone());
                         enricher.enrich_api(&graph)
                     }
                     _ => Err(std::io::Error::new(
@@ -2297,17 +2967,34 @@ fn main() {
             })()
         }
 
-        Commands::EnrichForgeVersion { endpoint, output, cache_dir, gitlab_token } => {
+        Commands::EnrichForgeVersion {
+            endpoint,
+            output,
+            cache_dir,
+            gitlab_token,
+        } => {
             eprintln!("=== PackageGraph Forge Version Enricher ===");
             eprintln!("Endpoint: {}", endpoint);
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let enricher = ForgeVersionEnricher::new(&endpoint, cache_dir.as_deref(), gitlab_token);
+            let enricher = ForgeVersionEnricher::new(
+                &endpoint,
+                cache_dir.as_deref(),
+                gitlab_token,
+                auth.clone(),
+                make_backend(),
+            )
+            .with_graph(graph_uri.clone());
             enricher.enrich(&output)
         }
 
-        Commands::EnrichDiff { endpoint, output, github_token, cache_dir } => {
+        Commands::EnrichDiff {
+            endpoint,
+            output,
+            github_token,
+            cache_dir,
+        } => {
             eprintln!("=== PackageGraph Diff Enricher ===");
             eprintln!("Endpoint: {}", endpoint);
             eprintln!("Output: {}", output);
@@ -2317,19 +3004,27 @@ fn main() {
                 &endpoint,
                 github_token,
                 cache_dir.as_deref(),
-            );
+                auth.clone(),
+                make_backend(),
+            )
+            .with_graph(graph_uri.clone());
 
             enricher.enrich(&output)
         }
 
-        Commands::EnrichEpss { endpoint, output, min_score } => {
+        Commands::EnrichEpss {
+            endpoint,
+            output,
+            min_score,
+        } => {
             eprintln!("=== PackageGraph EPSS Enricher ===");
             eprintln!("Endpoint: {}", endpoint);
             eprintln!("Output: {}", output);
             eprintln!("Min score: {}", min_score);
             eprintln!();
 
-            let enricher = EpssEnricher::new(&endpoint, min_score);
+            let enricher = EpssEnricher::new(&endpoint, min_score, auth.clone(), make_backend())
+                .with_graph(graph_uri.clone());
             enricher.enrich(&output)
         }
 
@@ -2339,11 +3034,16 @@ fn main() {
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let enricher = TaxonomyEnricher::new(&endpoint);
+            let enricher = TaxonomyEnricher::new(&endpoint, auth.clone(), make_backend())
+                .with_graph(graph_uri.clone());
             enricher.enrich(&output)
         }
 
-        Commands::EnrichRevdeps { endpoint, output, graph } => {
+        Commands::EnrichRevdeps {
+            endpoint,
+            output,
+            graph,
+        } => {
             eprintln!("=== PackageGraph Reverse Dependency Count Enricher ===");
             eprintln!("Endpoint: {}", endpoint);
             eprintln!("Output: {}", output);
@@ -2352,7 +3052,9 @@ fn main() {
             }
             eprintln!();
 
-            let enricher = RevdepsEnricher::new(&endpoint, graph.as_deref());
+            let enricher =
+                RevdepsEnricher::new(&endpoint, graph.as_deref(), auth.clone(), make_backend())
+                    .with_graph(graph_uri.clone());
             enricher.enrich(&output)
         }
 
@@ -2362,18 +3064,25 @@ fn main() {
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let enricher = BlastRadiusEnricher::new(&endpoint);
+            let enricher = BlastRadiusEnricher::new(&endpoint, auth.clone(), make_backend())
+                .with_graph(graph_uri.clone());
             enricher.enrich(&output)
         }
 
-        Commands::DerivePackageHistory { endpoint, output, graph: graph_args, load } => {
+        Commands::DerivePackageHistory {
+            endpoint,
+            output,
+            graph: graph_args,
+            load,
+        } => {
             eprintln!("=== PackageGraph Release Date Deriver ===");
             eprintln!("Endpoint: {}", endpoint);
             eprintln!("Output: {}", output);
             eprintln!();
 
             (|| -> std::io::Result<(usize, usize)> {
-                let deriver = ReleaseDeriver::new(&endpoint);
+                let deriver = ReleaseDeriver::new(&endpoint, auth.clone(), make_backend())
+                    .with_graph(graph_uri.clone());
 
                 // Track whether this is a full run (all graphs) or targeted run (subset)
                 let is_full_run = graph_args.is_empty();
@@ -2394,10 +3103,16 @@ fn main() {
                     let mut discovered = Vec::new();
                     for prefix in allowlist_prefixes {
                         let sparql = format!(
-                            r#"SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ ?s ?p ?o }} FILTER(STRSTARTS(STR(?g), "{}")) }}"#,
+                            r#"SELECT ?g WHERE {{ GRAPH ?g {{ ?s ?p ?o }} FILTER(STRSTARTS(STR(?g), "{}")) }} GROUP BY ?g"#,
                             prefix
                         );
-                        match pg_collect::sparql::SparqlClient::new(&endpoint).query(&sparql) {
+                        match pg_collect::sparql::make_sparql_client(
+                            &endpoint,
+                            &auth,
+                            make_backend(),
+                        )
+                        .query(&sparql)
+                        {
                             Ok(bindings) => {
                                 for binding in bindings {
                                     if let Some(g) = binding.get("g") {
@@ -2406,13 +3121,18 @@ fn main() {
                                 }
                             }
                             Err(e) => {
-                                eprintln!("Warning: failed to discover graphs for {}: {}", prefix, e);
+                                eprintln!(
+                                    "Warning: failed to discover graphs for {}: {}",
+                                    prefix, e
+                                );
                             }
                         }
                     }
 
                     if discovered.is_empty() {
-                        eprintln!("No graphs found matching allowlist. Use --graph to specify manually.");
+                        eprintln!(
+                            "No graphs found matching allowlist. Use --graph to specify manually."
+                        );
                         return Ok((0, 0));
                     }
 
@@ -2428,15 +3148,19 @@ fn main() {
                 // Optionally load into derived graph
                 if load {
                     eprintln!();
-                    let client = pg_collect::sparql::SparqlClient::new(&endpoint);
-                    let derived_graph = "https://packagegraph.github.io/graph/derived/package-history";
+                    let client =
+                        pg_collect::sparql::make_sparql_client(&endpoint, &auth, make_backend());
+                    let derived_graph =
+                        "https://packagegraph.github.io/graph/derived/package-history";
 
                     if is_full_run {
                         // Full run: drop-and-replace (safe — we recomputed everything)
                         eprintln!("Full run: dropping existing graph before load...");
                         match client.drop_graph(derived_graph) {
                             Ok(_) => eprintln!("Dropped existing graph"),
-                            Err(e) => eprintln!("Note: could not drop graph (may not exist): {}", e),
+                            Err(e) => {
+                                eprintln!("Note: could not drop graph (may not exist): {}", e)
+                            }
                         }
                     } else {
                         // Partial run: upsert-by-identity — delete existing lastReleaseDate
@@ -2444,11 +3168,13 @@ fn main() {
                         // GSP POST is additive, so without this step a partial rerun
                         // would append a second triple rather than replacing the old one.
                         eprintln!("Partial run: deleting stale lastReleaseDate for affected identities...");
-                        let identities = pg_collect::derive_releases::extract_identity_uris(&output)?;
+                        let identities =
+                            pg_collect::derive_releases::extract_identity_uris(&output)?;
                         let pkg_lrd = "https://purl.org/packagegraph/ontology/core#lastReleaseDate";
                         let batch_size = 200;
                         for chunk in identities.chunks(batch_size) {
-                            let values: String = chunk.iter()
+                            let values: String = chunk
+                                .iter()
                                 .map(|uri| format!("<{}>", uri))
                                 .collect::<Vec<_>>()
                                 .join(" ");
@@ -2458,7 +3184,10 @@ fn main() {
                             );
                             client.update(&sparql)?;
                         }
-                        eprintln!("  Deleted stale triples for {} identities", identities.len());
+                        eprintln!(
+                            "  Deleted stale triples for {} identities",
+                            identities.len()
+                        );
                     }
 
                     // Load new triples
@@ -2469,17 +3198,30 @@ fn main() {
             })()
         }
 
-        Commands::Seed { endpoint, graph, output } => {
+        Commands::Seed {
+            endpoint,
+            graph,
+            output,
+        } => {
             eprintln!("=== PackageGraph Seed Generator ===");
             eprintln!("Endpoint: {}", endpoint);
             eprintln!("Graph: {}", graph);
             eprintln!("Output: {}", output);
             eprintln!();
 
-            seed::generate_seed(&endpoint, &graph, &output).map(|_| (0, 0))
+            seed::generate_seed(&endpoint, &graph, &output, auth.clone(), make_backend())
+                .map(|_| (0, 0))
         }
 
-        Commands::Fetch { collector, cache_dir, url, distro, release, arch, repo } => {
+        Commands::Fetch {
+            collector,
+            cache_dir,
+            url,
+            distro,
+            release,
+            arch,
+            repo,
+        } => {
             eprintln!("=== PackageGraph Artifact Fetcher ===");
             eprintln!("Collector: {}", collector);
             eprintln!("Cache: {}", cache_dir);
@@ -2505,7 +3247,11 @@ fn main() {
             })()
         }
 
-        Commands::Normalize { collector, from_cache, output_ir } => {
+        Commands::Normalize {
+            collector,
+            from_cache,
+            output_ir,
+        } => {
             eprintln!("=== PackageGraph IR Normalizer ===");
             eprintln!("Collector: {}", collector);
             eprintln!("Cache: {}", from_cache);
@@ -2518,7 +3264,10 @@ fn main() {
                     // Standalone normalize (read cache → write IR without emitting .nt) requires
                     // exposing the parse methods publicly or adding dedicated normalize() methods.
                     // This is deferred — use the all-in-one collect with cache for now.
-                    eprintln!("Normalize stage: use pg-collect {} --cache-dir {} --output <file.nt>", collector, from_cache);
+                    eprintln!(
+                        "Normalize stage: use pg-collect {} --cache-dir {} --output <file.nt>",
+                        collector, from_cache
+                    );
                     eprintln!("(Standalone normalize → IR output is not yet decoupled from emit)");
                     Ok((0, 0))
                 }
@@ -2529,9 +3278,15 @@ fn main() {
             }
         }
 
-        Commands::EmitFromIr { from_ir, output, collector, distro, release } => {
+        Commands::EmitFromIr {
+            from_ir,
+            output,
+            collector,
+            distro,
+            release,
+        } => {
             use pg_collect::emit::debian_ext::emit_debian_extras;
-            use pg_collect::emit::rdf::{emit_rdf, emit_distribution_metadata, EmitPolicy};
+            use pg_collect::emit::rdf::{emit_distribution_metadata, emit_rdf, EmitPolicy};
             use pg_collect::emit::rpm_ext::emit_rpm_extras;
             use pg_collect::ir::IrReader;
             use std::collections::HashSet;
@@ -2553,7 +3308,10 @@ fn main() {
             (|| -> std::io::Result<(usize, usize)> {
                 let ir_dir = std::path::Path::new(&from_ir);
                 let nt_file = std::fs::File::create(&output)?;
-                let mut writer = pg_collect::ntriples::NTriplesWriter::new(nt_file);
+                let mut writer = pg_collect::ntriples::NTriplesWriter::new_maybe_graph(
+                    nt_file,
+                    graph_uri.as_deref(),
+                );
                 let policy = EmitPolicy::default();
 
                 let mut total_records = 0;
@@ -2631,23 +3389,43 @@ fn main() {
         }
 
         Commands::RpmFull {
-            urls, distro, release, output, with_koji, koji_hub,
-            with_spec, with_buildrequires, with_maintainers, cache_dir,
-            minio_endpoint, minio_bucket, minio_access_key, minio_secret_key, limit,
+            urls,
+            distro,
+            release,
+            output,
+            with_koji,
+            koji_hub,
+            with_spec,
+            with_buildrequires,
+            with_maintainers,
+            cache_dir,
+            minio_endpoint,
+            minio_bucket,
+            minio_access_key,
+            minio_secret_key,
+            limit,
         } => {
             eprintln!("=== PackageGraph Consolidated RPM Collector ===");
             eprintln!("Distro: {} / Release: {}", distro, release);
             eprintln!("URLs: {:?}", urls);
-            if with_koji { eprintln!("Koji: {}", koji_hub); }
-            if with_spec { eprintln!("Spec: enabled"); }
-            if with_buildrequires { eprintln!("BuildRequires: enabled"); }
-            if with_maintainers { eprintln!("Maintainers: enabled"); }
+            if with_koji {
+                eprintln!("Koji: {}", koji_hub);
+            }
+            if with_spec {
+                eprintln!("Spec: enabled");
+            }
+            if with_buildrequires {
+                eprintln!("BuildRequires: enabled");
+            }
+            if with_maintainers {
+                eprintln!("Maintainers: enabled");
+            }
             eprintln!("Output: {}", output);
             eprintln!();
 
             (|| -> std::io::Result<(usize, usize)> {
                 let file = std::fs::File::create(&output)?;
-                let mut writer = NTriplesWriter::new(file);
+                let mut writer = NTriplesWriter::new_maybe_graph(file, graph_uri.as_deref());
 
                 // Shared dedup sets across arches
                 let mut noarch_seen = std::collections::HashSet::new();
@@ -2670,8 +3448,12 @@ fn main() {
                     };
 
                     let (pkgs, triples) = collector.collect_with_writer_limit(
-                        &mut writer, &mut noarch_seen, &mut srpm_seen,
-                        &mut srpm_nvrs, &mut srpm_names, &mut srpm_identity_map,
+                        &mut writer,
+                        &mut noarch_seen,
+                        &mut srpm_seen,
+                        &mut srpm_nvrs,
+                        &mut srpm_names,
+                        &mut srpm_identity_map,
                         i > 0, // is_secondary for all after first
                         limit,
                     )?;
@@ -2679,16 +3461,25 @@ fn main() {
                     total_triples += triples;
                 }
 
-                eprintln!("\nSRPM dedup: {} unique names, {} unique NVRs", srpm_names.len(), srpm_nvrs.len());
+                eprintln!(
+                    "\nSRPM dedup: {} unique names, {} unique NVRs",
+                    srpm_names.len(),
+                    srpm_nvrs.len()
+                );
 
                 // Stage 2: Spec file collection (optional)
                 if with_spec {
                     eprintln!("\n--- Spec File Collection ---");
-                    let spec_collector = SpecCollector::new(&distro, &release, cache_dir.as_deref())?;
+                    let spec_collector =
+                        SpecCollector::new(&distro, &release, cache_dir.as_deref())?;
                     let existing_ecosystem = std::collections::HashSet::new(); // TODO: track from RPM Provides
                     let (specs, triples) = spec_collector.collect(
-                        &mut writer, &srpm_names, &srpm_identity_map,
-                        &existing_ecosystem, with_buildrequires, with_maintainers,
+                        &mut writer,
+                        &srpm_names,
+                        &srpm_identity_map,
+                        &existing_ecosystem,
+                        with_buildrequires,
+                        with_maintainers,
                     )?;
                     total_packages += specs;
                     total_triples += triples;
@@ -2698,7 +3489,8 @@ fn main() {
                 if with_koji {
                     eprintln!("\n--- Koji Enrichment ---");
                     let nvr_list: Vec<String> = srpm_nvrs.into_iter().collect();
-                    let minio_config = match (&minio_endpoint, &minio_access_key, &minio_secret_key) {
+                    let minio_config = match (&minio_endpoint, &minio_access_key, &minio_secret_key)
+                    {
                         (Some(ep), Some(ak), Some(sk)) => Some(MinioConfig {
                             endpoint: ep.clone(),
                             bucket: minio_bucket.clone(),
@@ -2708,20 +3500,22 @@ fn main() {
                         _ => None,
                     };
                     let koji_enricher = KojiEnricher::new_standalone_with_minio(
-                        &koji_hub, &distro, &release, cache_dir.as_deref(), minio_config,
-                    );
+                        &koji_hub,
+                        &distro,
+                        &release,
+                        cache_dir.as_deref(),
+                        minio_config,
+                    )
+                    .with_graph_uri(graph_uri.clone());
                     // Write to a temp file, then append (Koji enricher creates its own writer)
                     let koji_tmp = format!("{}.koji.tmp", output);
-                    let (builds, triples) = koji_enricher.enrich_from_nvrs(
-                        &nvr_list, &koji_tmp, limit,
-                    )?;
+                    let (builds, triples) =
+                        koji_enricher.enrich_from_nvrs(&nvr_list, &koji_tmp, limit)?;
                     // Append Koji triples to main output
                     let koji_content = std::fs::read_to_string(&koji_tmp)?;
                     use std::io::Write;
                     writer.flush()?;
-                    let mut main_file = std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(&output)?;
+                    let mut main_file = std::fs::OpenOptions::new().append(true).open(&output)?;
                     main_file.write_all(koji_content.as_bytes())?;
                     let _ = std::fs::remove_file(&koji_tmp);
                     total_packages += builds;
@@ -2734,23 +3528,44 @@ fn main() {
         }
 
         Commands::DebFull {
-            repo, distro, dist, component, arch, output,
-            with_sources, with_builddeps, with_maintainers, with_salsa, cache_dir, limit,
+            repo,
+            distro,
+            dist,
+            component,
+            arch,
+            output,
+            with_sources,
+            with_builddeps,
+            with_maintainers,
+            with_salsa,
+            cache_dir,
+            limit,
         } => {
             eprintln!("=== PackageGraph Consolidated Debian Collector ===");
-            eprintln!("Distro: {} / Dist: {} / Component: {}", distro, dist, component);
+            eprintln!(
+                "Distro: {} / Dist: {} / Component: {}",
+                distro, dist, component
+            );
             eprintln!("Repository: {}", repo);
             eprintln!("Architectures: {:?}", arch);
-            if with_sources { eprintln!("Sources.gz: enabled"); }
-            if with_builddeps { eprintln!("Build-Depends: enabled"); }
-            if with_maintainers { eprintln!("Maintainers: enabled"); }
-            if with_salsa { eprintln!("salsa.debian.org: enabled"); }
+            if with_sources {
+                eprintln!("Sources.gz: enabled");
+            }
+            if with_builddeps {
+                eprintln!("Build-Depends: enabled");
+            }
+            if with_maintainers {
+                eprintln!("Maintainers: enabled");
+            }
+            if with_salsa {
+                eprintln!("salsa.debian.org: enabled");
+            }
             eprintln!("Output: {}", output);
             eprintln!();
 
             (|| -> std::io::Result<(usize, usize)> {
                 let file = std::fs::File::create(&output)?;
-                let mut writer = NTriplesWriter::new(file);
+                let mut writer = NTriplesWriter::new_maybe_graph(file, graph_uri.as_deref());
 
                 // Stage 0: Create collector instance and emit distribution metadata once
                 let collector = DebianCollector::new(
@@ -2766,10 +3581,13 @@ fn main() {
                 };
 
                 // Normalize arch args (amd64 → binary-amd64)
-                let normalized_arches: Vec<String> = arch.iter().map(|a| {
-                    let (repo_path, _) = normalize_arch(a);
-                    repo_path
-                }).collect();
+                let normalized_arches: Vec<String> = arch
+                    .iter()
+                    .map(|a| {
+                        let (repo_path, _) = normalize_arch(a);
+                        repo_path
+                    })
+                    .collect();
 
                 // Get release info and emit distribution metadata once
                 let release_info = collector.get_release_info()?;
@@ -2777,7 +3595,11 @@ fn main() {
                     "Resolved '{}' to Origin='{}', Suite='{}', Codename='{}'",
                     dist, release_info.origin, release_info.suite, release_info.codename
                 );
-                collector.emit_distribution_metadata(&mut writer, &release_info, &normalized_arches)?;
+                collector.emit_distribution_metadata(
+                    &mut writer,
+                    &release_info,
+                    &normalized_arches,
+                )?;
 
                 // Shared dedup sets across arches
                 let mut all_arch_seen = std::collections::HashSet::new();
@@ -2815,13 +3637,19 @@ fn main() {
                     total_triples += triples;
                 }
 
-                eprintln!("\nSource package dedup: {} unique names", source_names.len());
+                eprintln!(
+                    "\nSource package dedup: {} unique names",
+                    source_names.len()
+                );
 
                 // Stage 2: Sources.gz parsing (optional)
                 if with_sources {
                     eprintln!("\n--- Sources.gz Collection ---");
                     let sources_collector = SourcesCollector::new(
-                        repo.clone(), distro.clone(), dist.clone(), component.clone(),
+                        repo.clone(),
+                        distro.clone(),
+                        dist.clone(),
+                        component.clone(),
                     );
                     let sources_collector = if let Some(ref dir) = cache_dir {
                         sources_collector.with_cache(dir)?
@@ -2830,8 +3658,14 @@ fn main() {
                     };
 
                     let (sources, triples) = sources_collector.collect(
-                        &mut writer, &source_names, &source_identity_map, &source_pkg_uris, &vcs_urls,
-                        &release_info.codename, with_builddeps, with_maintainers,
+                        &mut writer,
+                        &source_names,
+                        &source_identity_map,
+                        &source_pkg_uris,
+                        &vcs_urls,
+                        &release_info.codename,
+                        with_builddeps,
+                        with_maintainers,
                     )?;
                     total_packages += sources;
                     total_triples += triples;
@@ -2840,7 +3674,8 @@ fn main() {
                 // Stage 3: salsa.debian.org enrichment (optional)
                 if with_salsa {
                     eprintln!("\n--- salsa.debian.org Enrichment ---");
-                    let salsa_collector = SalsaCollector::new(dist.clone());
+                    let salsa_collector =
+                        SalsaCollector::new(dist.clone()).with_graph(graph_uri.clone());
                     let salsa_collector = if let Some(ref dir) = cache_dir {
                         salsa_collector.with_cache(dir)?
                     } else {
@@ -2848,7 +3683,12 @@ fn main() {
                     };
 
                     let (salsa_pkgs, triples) = salsa_collector.collect(
-                        &mut writer, &source_names, &source_identity_map, &source_pkg_uris, &vcs_urls, with_maintainers,
+                        &mut writer,
+                        &source_names,
+                        &source_identity_map,
+                        &source_pkg_uris,
+                        &vcs_urls,
+                        with_maintainers,
                     )?;
                     total_packages += salsa_pkgs;
                     total_triples += triples;
@@ -2878,4 +3718,3 @@ fn main() {
         }
     }
 }
-

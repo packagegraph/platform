@@ -1,0 +1,1038 @@
+[
+  {
+    "id": "CQ-PM-01",
+    "title": "Distribution Package Listing",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 207,
+      "wall_ms": 388
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 2665,
+      "wall_ms": 2665
+    }
+  },
+  {
+    "id": "CQ-PM-02",
+    "title": "Source-to-Binary Mapping",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 21,
+      "wall_ms": 305
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1447,
+      "wall_ms": 1447
+    }
+  },
+  {
+    "id": "CQ-PM-03",
+    "title": "Virtual Package Providers",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 16,
+      "wall_ms": 351
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1264,
+      "wall_ms": 1264
+    }
+  },
+  {
+    "id": "CQ-PM-03b",
+    "title": "Virtual Package and Capability Providers (UNION)",
+    "qlever": {
+      "status": "OK",
+      "rows": 30,
+      "engine_ms": 15,
+      "wall_ms": 107
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 30,
+      "engine_ms": 1153,
+      "wall_ms": 1153
+    }
+  },
+  {
+    "id": "CQ-PM-04",
+    "title": "Dependency Chain Depth",
+    "qlever": {
+      "status": "OK",
+      "rows": 1,
+      "engine_ms": 9,
+      "wall_ms": 116
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 1,
+      "engine_ms": 1159,
+      "wall_ms": 1159
+    }
+  },
+  {
+    "id": "CQ-PM-05",
+    "title": "Packages by Maintainer",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 7,
+      "wall_ms": 84
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1119,
+      "wall_ms": 1119
+    }
+  },
+  {
+    "id": "CQ-PM-06",
+    "title": "Architecture Support Coverage",
+    "qlever": {
+      "status": "OK",
+      "rows": 1,
+      "engine_ms": 14,
+      "wall_ms": 109
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 1,
+      "engine_ms": 1905,
+      "wall_ms": 1905
+    }
+  },
+  {
+    "id": "CQ-PM-07",
+    "title": "License Distribution",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 39,
+      "wall_ms": 127
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 2918,
+      "wall_ms": 2918
+    }
+  },
+  {
+    "id": "CQ-PM-08",
+    "title": "Installed File Overlap",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 6,
+      "wall_ms": 101
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1173,
+      "wall_ms": 1173
+    }
+  },
+  {
+    "id": "CQ-PM-09",
+    "title": "Package Size Distribution",
+    "qlever": {
+      "status": "OK",
+      "rows": 1,
+      "engine_ms": 12,
+      "wall_ms": 96
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 1,
+      "engine_ms": 1348,
+      "wall_ms": 1348
+    }
+  },
+  {
+    "id": "CQ-PM-10",
+    "title": "Package Update Frequency",
+    "qlever": {
+      "status": "OK",
+      "rows": 20,
+      "engine_ms": 185,
+      "wall_ms": 280
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 20,
+      "engine_ms": 10132,
+      "wall_ms": 10132
+    }
+  },
+  {
+    "id": "CQ-LIC-01",
+    "title": "License Distribution by SPDX Identifier",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 3,
+      "wall_ms": 86
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 2113,
+      "wall_ms": 2113
+    }
+  },
+  {
+    "id": "CQ-LIC-02",
+    "title": "Packages with Non-SPDX Licenses",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 13,
+      "wall_ms": 98
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 26802,
+      "wall_ms": 26802
+    }
+  },
+  {
+    "id": "CQ-LIC-03",
+    "title": "Cross-Release License Changes",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 3,
+      "wall_ms": 90
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 3131,
+      "wall_ms": 3131
+    }
+  },
+  {
+    "id": "CQ-SEC-01",
+    "title": "Affected Packages by CVE",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 9,
+      "wall_ms": 93
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1093,
+      "wall_ms": 1093
+    }
+  },
+  {
+    "id": "CQ-SEC-02",
+    "title": "Unpatched Vulnerabilities",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 143,
+      "wall_ms": 246
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1263,
+      "wall_ms": 1263
+    }
+  },
+  {
+    "id": "CQ-SEC-03",
+    "title": "Vulnerability Version Range",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 14,
+      "wall_ms": 106
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1087,
+      "wall_ms": 1087
+    }
+  },
+  {
+    "id": "CQ-SEC-04",
+    "title": "Security Advisory Coverage",
+    "stale": true,
+    "stale_reason": "Query updated to add GRAPH ?g {} scoping — needs re-profiling against live cluster",
+    "qlever": {
+      "status": "STALE",
+      "rows": null
+    },
+    "fuseki": {
+      "status": "STALE",
+      "rows": null
+    }
+  },
+  {
+    "id": "CQ-SEC-05",
+    "title": "CVSS Version Comparison",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 6,
+      "wall_ms": 106
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1091,
+      "wall_ms": 1091
+    }
+  },
+  {
+    "id": "CQ-SEC-06",
+    "title": "Critical Vulnerabilities Without CVE",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 20,
+      "wall_ms": 113
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1095,
+      "wall_ms": 1095
+    }
+  },
+  {
+    "id": "CQ-SEC-07",
+    "title": "Patch Provenance Chain",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 4,
+      "wall_ms": 83
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1094,
+      "wall_ms": 1094
+    }
+  },
+  {
+    "id": "CQ-SEC-08",
+    "title": "CWE Classification",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 4,
+      "wall_ms": 88
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1270,
+      "wall_ms": 1270
+    }
+  },
+  {
+    "id": "CQ-TEMP-01",
+    "title": "Vulnerability Window Analysis",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 14,
+      "wall_ms": 99
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1098,
+      "wall_ms": 1098
+    }
+  },
+  {
+    "id": "CQ-TEMP-02",
+    "title": "Package Obsolescence Between Releases",
+    "qlever": {
+      "status": "OK",
+      "rows": 500,
+      "engine_ms": 243,
+      "wall_ms": 401
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 500,
+      "engine_ms": 8497,
+      "wall_ms": 8497
+    }
+  },
+  {
+    "id": "CQ-TEMP-03",
+    "title": "Maintainer Tenure Analysis",
+    "qlever": {
+      "status": "OK",
+      "rows": 1,
+      "engine_ms": 4,
+      "wall_ms": 85
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 1,
+      "engine_ms": 2611,
+      "wall_ms": 2611
+    }
+  },
+  {
+    "id": "CQ-SCR-01",
+    "title": "Bus Factor \u2014 Single-Maintainer Packages",
+    "qlever": {
+      "status": "OK",
+      "rows": 68588,
+      "engine_ms": 252,
+      "wall_ms": 1053
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 68588,
+      "engine_ms": 3601,
+      "wall_ms": 3601
+    }
+  },
+  {
+    "id": "CQ-SCR-02",
+    "title": "Maintainer Overload \u2014 Most Packages Per Person",
+    "qlever": {
+      "status": "OK",
+      "rows": 50,
+      "engine_ms": 160,
+      "wall_ms": 268
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 50,
+      "engine_ms": 20566,
+      "wall_ms": 20566
+    }
+  },
+  {
+    "id": "CQ-SCR-03",
+    "title": "Orphan Risk \u2014 Stale Maintainership Without Recent Releases",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 14,
+      "wall_ms": 93
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 25548,
+      "wall_ms": 25548
+    }
+  },
+  {
+    "id": "CQ-SCR-04",
+    "title": "Maintainer Turnover Between Releases",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 2018,
+      "wall_ms": 2156
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 3163,
+      "wall_ms": 3163
+    }
+  },
+  {
+    "id": "CQ-SCR-05",
+    "title": "Cross-Distribution Maintainer Overlap",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 17,
+      "wall_ms": 116
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 12327,
+      "wall_ms": 12327
+    }
+  },
+  {
+    "id": "CQ-SCR-06",
+    "title": "Patch Lag by Distribution \u2014 Comparative Time-to-Fix",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 31,
+      "wall_ms": 120
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1271,
+      "wall_ms": 1271
+    }
+  },
+  {
+    "id": "CQ-SCR-07",
+    "title": "Unpatched Critical Vulnerabilities Beyond Threshold",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 478,
+      "wall_ms": 611
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1115,
+      "wall_ms": 1115
+    }
+  },
+  {
+    "id": "CQ-SCR-08",
+    "title": "Vulnerability Density \u2014 Most Affected Packages",
+    "qlever": {
+      "status": "OK",
+      "rows": 50,
+      "engine_ms": 5,
+      "wall_ms": 113
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 50,
+      "engine_ms": 1121,
+      "wall_ms": 1121
+    }
+  },
+  {
+    "id": "CQ-SCR-09",
+    "title": "Mean Time to Remediate (MTTR) by Distribution",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 11,
+      "wall_ms": 98
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1134,
+      "wall_ms": 1134
+    }
+  },
+  {
+    "id": "CQ-SCR-10",
+    "title": "Forge Version Vulnerability Exposure",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 806,
+      "wall_ms": 896
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 4221,
+      "wall_ms": 4221
+    }
+  },
+  {
+    "id": "CQ-XD-01",
+    "title": "Equivalent Packages Across Distributions",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 301,
+      "wall_ms": 388
+    },
+    "fuseki": {
+      "status": "TIMEOUT",
+      "error": "timed out",
+      "wall_ms": 120004
+    }
+  },
+  {
+    "id": "CQ-XD-02",
+    "title": "Version Skew Analysis",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 9,
+      "wall_ms": 101
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 4498,
+      "wall_ms": 4498
+    }
+  },
+  {
+    "id": "CQ-XD-03",
+    "title": "Distribution-Specific Packages",
+    "qlever": {
+      "status": "OK",
+      "rows": 500,
+      "engine_ms": 70,
+      "wall_ms": 187
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 500,
+      "engine_ms": 63153,
+      "wall_ms": 63153
+    }
+  },
+  {
+    "id": "CQ-XD-04",
+    "title": "Shared Upstream Projects",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 5,
+      "wall_ms": 90
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1106,
+      "wall_ms": 1106
+    }
+  },
+  {
+    "id": "CQ-XD-05",
+    "title": "Repology Cross-Ecosystem Equivalence",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 734,
+      "wall_ms": 819
+    },
+    "fuseki": {
+      "status": "TIMEOUT",
+      "error": "timed out",
+      "wall_ms": 120004
+    }
+  },
+  {
+    "id": "CQ-PROV-01",
+    "title": "Build Activity Chain",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 17,
+      "wall_ms": 102
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1541,
+      "wall_ms": 1541
+    }
+  },
+  {
+    "id": "CQ-PROV-02",
+    "title": "SLSA Provenance Level",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 81,
+      "wall_ms": 163
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 5158,
+      "wall_ms": 5158
+    }
+  },
+  {
+    "id": "CQ-PROV-03",
+    "title": "Build Environment",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 7,
+      "wall_ms": 87
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1141,
+      "wall_ms": 1141
+    }
+  },
+  {
+    "id": "CQ-PROV-04",
+    "title": "Contributor Activity",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 7,
+      "wall_ms": 91
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1137,
+      "wall_ms": 1137
+    }
+  },
+  {
+    "id": "CQ-DEP-01",
+    "title": "Direct vs Transitive Dependencies",
+    "qlever": {
+      "status": "OK",
+      "rows": 1,
+      "engine_ms": 3706,
+      "wall_ms": 3795
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 1,
+      "engine_ms": 1322,
+      "wall_ms": 1322
+    }
+  },
+  {
+    "id": "CQ-DEP-02",
+    "title": "Dependency Type Distribution",
+    "qlever": {
+      "status": "OK",
+      "rows": 1,
+      "engine_ms": 137,
+      "wall_ms": 222
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 1,
+      "engine_ms": 12879,
+      "wall_ms": 12879
+    }
+  },
+  {
+    "id": "CQ-DEP-03",
+    "title": "Version Constraint Patterns",
+    "qlever": {
+      "status": "OK",
+      "rows": 100,
+      "engine_ms": 762,
+      "wall_ms": 875
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 100,
+      "engine_ms": 1704,
+      "wall_ms": 1704
+    }
+  },
+  {
+    "id": "CQ-DEP-04",
+    "title": "Circular Dependencies",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 66,
+      "wall_ms": 157
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1156,
+      "wall_ms": 1156
+    }
+  },
+  {
+    "id": "CQ-DEP-05",
+    "title": "Dependency Consistency Check",
+    "qlever": {
+      "status": "OK",
+      "rows": 50,
+      "engine_ms": 1236,
+      "wall_ms": 1358
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 50,
+      "engine_ms": 2189,
+      "wall_ms": 2189
+    }
+  },
+  {
+    "id": "CQ-VCS-01",
+    "title": "Repository Language Distribution",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 9,
+      "wall_ms": 92
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 6198,
+      "wall_ms": 6198
+    }
+  },
+  {
+    "id": "CQ-VCS-02",
+    "title": "Commit-to-Release Tracing",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 216,
+      "wall_ms": 305
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 3401,
+      "wall_ms": 3401
+    }
+  },
+  {
+    "id": "CQ-SET-01",
+    "title": "Package Set Membership",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 14,
+      "wall_ms": 104
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1093,
+      "wall_ms": 1093
+    }
+  },
+  {
+    "id": "CQ-ECO-01",
+    "title": "RPM Spec File Sources",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 8,
+      "wall_ms": 96
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 5021,
+      "wall_ms": 5021
+    }
+  },
+  {
+    "id": "CQ-ECO-02",
+    "title": "Debian Section Distribution",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 5,
+      "wall_ms": 98
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1410,
+      "wall_ms": 1410
+    }
+  },
+  {
+    "id": "CQ-ECO-03",
+    "title": "npm Dependency Depth",
+    "qlever": {
+      "status": "OK",
+      "rows": 1,
+      "engine_ms": 4081,
+      "wall_ms": 4217
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 1,
+      "engine_ms": 64203,
+      "wall_ms": 64203
+    }
+  },
+  {
+    "id": "CQ-MVN-01",
+    "title": "CVEs for a Maven Artifact",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 11,
+      "wall_ms": 104
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1124,
+      "wall_ms": 1124
+    }
+  },
+  {
+    "id": "CQ-MVN-02",
+    "title": "Vulnerable Versions for a CVE",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 17,
+      "wall_ms": 109
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1127,
+      "wall_ms": 1127
+    }
+  },
+  {
+    "id": "CQ-MVN-03",
+    "title": "Fix Commit for a CVE",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 10,
+      "wall_ms": 98
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1090,
+      "wall_ms": 1090
+    }
+  },
+  {
+    "id": "CQ-MVN-04",
+    "title": "Source Location for an Artifact Version",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 11,
+      "wall_ms": 95
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1087,
+      "wall_ms": 1087
+    }
+  },
+  {
+    "id": "CQ-MVN-05",
+    "title": "Source Diff to Previous Version",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 103,
+      "wall_ms": 183
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1092,
+      "wall_ms": 1092
+    }
+  },
+  {
+    "id": "CQ-PID-01",
+    "title": "High-Confidence Cross-Ecosystem Matches",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 369,
+      "wall_ms": 464
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 22797,
+      "wall_ms": 22797
+    }
+  },
+  {
+    "id": "CQ-CLASS-01",
+    "title": "Web Frameworks with Unpatched CVEs",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 18,
+      "wall_ms": 111
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1090,
+      "wall_ms": 1090
+    }
+  },
+  {
+    "id": "CQ-CLASS-02",
+    "title": "Taxonomy Facet Distribution",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 5,
+      "wall_ms": 88
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1090,
+      "wall_ms": 1090
+    }
+  },
+  {
+    "id": "CQ-ERA-01",
+    "title": "EPSS-Ranked Unpatched Vulnerabilities",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 9,
+      "wall_ms": 87
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1428,
+      "wall_ms": 1428
+    }
+  },
+  {
+    "id": "CQ-ERA-02",
+    "title": "EPSS vs CVSS Disagreement",
+    "qlever": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 6,
+      "wall_ms": 90
+    },
+    "fuseki": {
+      "status": "OK",
+      "rows": 0,
+      "engine_ms": 1097,
+      "wall_ms": 1097
+    }
+  }
+]

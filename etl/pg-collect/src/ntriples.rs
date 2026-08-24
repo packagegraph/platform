@@ -1,6 +1,6 @@
-use std::fs::File;
-use std::io::{BufWriter, Write, Result};
 use crate::uris::{PKG, SEC, VCS};
+use std::fs::File;
+use std::io::{BufWriter, Result, Write};
 
 /// Look up the inverse predicate for a given forward predicate.
 ///
@@ -21,13 +21,17 @@ fn lookup_inverse(predicate: &str) -> Option<String> {
     }
 }
 
-/// Streaming N-Triples writer.
+/// Streaming N-Triples / N-Quads writer.
 ///
 /// Uses BufWriter for I/O buffering. Flush happens automatically on drop.
+/// When constructed with `with_graph`, emits N-Quads (each line includes a graph URI).
+/// When constructed with `new`, emits standard N-Triples (no graph term).
 pub struct NTriplesWriter {
     writer: BufWriter<File>,
     /// Count of triples skipped due to invalid IRI characters.
     pub skipped_invalid_iri: usize,
+    /// Pre-formatted line suffix: " ." for N-Triples, " <graph_uri> ." for N-Quads.
+    line_suffix: String,
 }
 
 impl NTriplesWriter {
@@ -36,6 +40,24 @@ impl NTriplesWriter {
         Self {
             writer: BufWriter::new(file),
             skipped_invalid_iri: 0,
+            line_suffix: " .".to_string(),
+        }
+    }
+
+    /// Create a new N-Quads writer that includes the given graph URI on every line.
+    pub fn with_graph(file: File, graph_uri: String) -> Self {
+        Self {
+            writer: BufWriter::new(file),
+            skipped_invalid_iri: 0,
+            line_suffix: format!(" <{}> .", graph_uri),
+        }
+    }
+
+    /// Create a writer, choosing N-Quads or N-Triples mode based on the optional graph URI.
+    pub fn new_maybe_graph(file: File, graph_uri: Option<&str>) -> Self {
+        match graph_uri {
+            Some(uri) => Self::with_graph(file, uri.to_string()),
+            None => Self::new(file),
         }
     }
 
@@ -46,23 +68,36 @@ impl NTriplesWriter {
     ///
     /// Auto-emits the inverse triple if the predicate has a known inverse mapping.
     pub fn write_triple(&mut self, subject: &str, predicate: &str, object: &str) -> Result<()> {
-        if has_invalid_iri_chars(subject) || has_invalid_iri_chars(predicate) || has_invalid_iri_chars(object) {
+        if has_invalid_iri_chars(subject)
+            || has_invalid_iri_chars(predicate)
+            || has_invalid_iri_chars(object)
+        {
             self.skipped_invalid_iri += 1;
             if self.skipped_invalid_iri <= 10 {
-                eprintln!("WARNING: skipping triple with invalid URI character: <{}> <{}> <{}>",
+                eprintln!(
+                    "WARNING: skipping triple with invalid URI character: <{}> <{}> <{}>",
                     &subject[..subject.len().min(80)],
                     &predicate[..predicate.len().min(80)],
-                    &object[..object.len().min(80)]);
+                    &object[..object.len().min(80)]
+                );
             } else if self.skipped_invalid_iri == 11 {
                 eprintln!("WARNING: suppressing further invalid URI warnings (total so far: 11)");
             }
             return Ok(());
         }
-        writeln!(self.writer, "<{subject}> <{predicate}> <{object}> .")?;
+        writeln!(
+            self.writer,
+            "<{subject}> <{predicate}> <{object}>{}",
+            self.line_suffix
+        )?;
 
         // Auto-emit inverse triple if predicate has a known inverse
         if let Some(inverse_pred) = lookup_inverse(predicate) {
-            writeln!(self.writer, "<{object}> <{inverse_pred}> <{subject}> .")?;
+            writeln!(
+                self.writer,
+                "<{object}> <{inverse_pred}> <{subject}>{}",
+                self.line_suffix
+            )?;
         }
 
         Ok(())
@@ -73,7 +108,11 @@ impl NTriplesWriter {
     /// Escapes: \\ \" \n \r \t in the literal value.
     pub fn write_literal(&mut self, subject: &str, predicate: &str, value: &str) -> Result<()> {
         let escaped = escape_literal(value);
-        writeln!(self.writer, "<{subject}> <{predicate}> \"{escaped}\" .")
+        writeln!(
+            self.writer,
+            "<{subject}> <{predicate}> \"{escaped}\"{}",
+            self.line_suffix
+        )
     }
 
     /// Write a typed literal: `<subject> <predicate> "value"^^<datatype> .\n`
@@ -87,7 +126,8 @@ impl NTriplesWriter {
         let escaped = escape_literal(value);
         writeln!(
             self.writer,
-            "<{subject}> <{predicate}> \"{escaped}\"^^<{datatype}> ."
+            "<{subject}> <{predicate}> \"{escaped}\"^^<{datatype}>{}",
+            self.line_suffix
         )
     }
 
@@ -95,7 +135,8 @@ impl NTriplesWriter {
     pub fn write_integer(&mut self, subject: &str, predicate: &str, value: i64) -> Result<()> {
         writeln!(
             self.writer,
-            "<{subject}> <{predicate}> \"{value}\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
+            "<{subject}> <{predicate}> \"{value}\"^^<http://www.w3.org/2001/XMLSchema#integer>{}",
+            self.line_suffix
         )
     }
 
@@ -104,7 +145,7 @@ impl NTriplesWriter {
         let bool_str = if value { "true" } else { "false" };
         writeln!(
             self.writer,
-            "<{subject}> <{predicate}> \"{bool_str}\"^^<http://www.w3.org/2001/XMLSchema#boolean> ."
+            "<{subject}> <{predicate}> \"{bool_str}\"^^<http://www.w3.org/2001/XMLSchema#boolean>{}", self.line_suffix
         )
     }
 
@@ -113,7 +154,7 @@ impl NTriplesWriter {
         let escaped = escape_literal(value);
         writeln!(
             self.writer,
-            "<{subject}> <{predicate}> \"{escaped}\"^^<http://www.w3.org/2001/XMLSchema#dateTime> ."
+            "<{subject}> <{predicate}> \"{escaped}\"^^<http://www.w3.org/2001/XMLSchema#dateTime>{}", self.line_suffix
         )
     }
 
@@ -122,34 +163,71 @@ impl NTriplesWriter {
         let escaped = escape_literal(value);
         writeln!(
             self.writer,
-            "<{subject}> <{predicate}> \"{escaped}\"^^<http://www.w3.org/2001/XMLSchema#date> ."
+            "<{subject}> <{predicate}> \"{escaped}\"^^<http://www.w3.org/2001/XMLSchema#date>{}",
+            self.line_suffix
         )
     }
 
     /// Write a blank node triple: `<subject> <predicate> _:bnode .\n`
-    pub fn write_bnode_object(&mut self, subject: &str, predicate: &str, bnode: &str) -> Result<()> {
-        writeln!(self.writer, "<{subject}> <{predicate}> _:{bnode} .")
+    pub fn write_bnode_object(
+        &mut self,
+        subject: &str,
+        predicate: &str,
+        bnode: &str,
+    ) -> Result<()> {
+        writeln!(
+            self.writer,
+            "<{subject}> <{predicate}> _:{bnode}{}",
+            self.line_suffix
+        )
     }
 
     /// Write a triple with blank node subject: `_:bnode <predicate> <object> .\n`
-    pub fn write_bnode_subject(&mut self, bnode: &str, predicate: &str, object: &str) -> Result<()> {
-        writeln!(self.writer, "_:{bnode} <{predicate}> <{object}> .")
+    pub fn write_bnode_subject(
+        &mut self,
+        bnode: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<()> {
+        writeln!(
+            self.writer,
+            "_:{bnode} <{predicate}> <{object}>{}",
+            self.line_suffix
+        )
     }
 
     /// Write a triple with both blank node subject and blank node object: `_:s <predicate> _:o .\n`
-    pub fn write_bnode_to_bnode(&mut self, subject_bnode: &str, predicate: &str, object_bnode: &str) -> Result<()> {
-        writeln!(self.writer, "_:{subject_bnode} <{predicate}> _:{object_bnode} .")
+    pub fn write_bnode_to_bnode(
+        &mut self,
+        subject_bnode: &str,
+        predicate: &str,
+        object_bnode: &str,
+    ) -> Result<()> {
+        writeln!(
+            self.writer,
+            "_:{subject_bnode} <{predicate}> _:{object_bnode}{}",
+            self.line_suffix
+        )
     }
 
     /// Write a literal with blank node subject: `_:bnode <predicate> "literal" .\n`
     pub fn write_bnode_literal(&mut self, bnode: &str, predicate: &str, value: &str) -> Result<()> {
         let escaped = escape_literal(value);
-        writeln!(self.writer, "_:{bnode} <{predicate}> \"{escaped}\" .")
+        writeln!(
+            self.writer,
+            "_:{bnode} <{predicate}> \"{escaped}\"{}",
+            self.line_suffix
+        )
     }
 
     /// Write a raw N-Triple line directly (for pre-formatted triples from format functions).
+    /// In N-Quads mode, replaces the trailing " ." with " <graph> .".
     pub fn write_raw_line(&mut self, line: &str) -> Result<()> {
-        writeln!(self.writer, "{}", line)
+        if let Some(stripped) = line.strip_suffix(" .") {
+            writeln!(self.writer, "{}{}", stripped, self.line_suffix)
+        } else {
+            writeln!(self.writer, "{}", line)
+        }
     }
 
     /// Flush the buffer (called automatically on drop).
@@ -165,7 +243,8 @@ pub(crate) fn has_invalid_iri_chars(uri: &str) -> bool {
     let bytes = uri.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
         match b {
-            b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`' | b'\\' | b' ' | b'\t' | b'\n' | b'\r' => {
+            b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`' | b'\\' | b' ' | b'\t'
+            | b'\n' | b'\r' => {
                 return true;
             }
             b'%' => {
@@ -410,7 +489,11 @@ mod tests {
             "https://example.org/hasDep",
             "dep1",
         )?;
-        writer.write_bnode_subject("dep1", "http://www.w3.org/1999/02/22-rdf-syntax-ns#type", "https://example.org/Dependency")?;
+        writer.write_bnode_subject(
+            "dep1",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            "https://example.org/Dependency",
+        )?;
         writer.flush()?;
 
         let mut content = String::new();
@@ -423,14 +506,14 @@ mod tests {
     #[test]
     fn test_has_invalid_iri_chars() {
         assert!(!has_invalid_iri_chars("https://example.org/foo/bar"));
-        assert!(!has_invalid_iri_chars("https://example.org/foo%2Fbar"));  // valid percent-encoding
-        assert!(!has_invalid_iri_chars("https://example.org/foo%25bar"));  // encoded %
-        assert!(has_invalid_iri_chars("https://example.org/foo bar"));     // space
-        assert!(has_invalid_iri_chars("https://example.org/foo%xyz"));     // bare % (not followed by hex)
-        assert!(has_invalid_iri_chars("https://example.org/foo%GGbar"));   // % followed by non-hex
-        assert!(has_invalid_iri_chars("https://example.org/<foo>"));       // angle brackets
-        assert!(has_invalid_iri_chars("https://example.org/foo\"bar"));    // quote
-        assert!(has_invalid_iri_chars("https://example.org/foo\\bar"));    // backslash
+        assert!(!has_invalid_iri_chars("https://example.org/foo%2Fbar")); // valid percent-encoding
+        assert!(!has_invalid_iri_chars("https://example.org/foo%25bar")); // encoded %
+        assert!(has_invalid_iri_chars("https://example.org/foo bar")); // space
+        assert!(has_invalid_iri_chars("https://example.org/foo%xyz")); // bare % (not followed by hex)
+        assert!(has_invalid_iri_chars("https://example.org/foo%GGbar")); // % followed by non-hex
+        assert!(has_invalid_iri_chars("https://example.org/<foo>")); // angle brackets
+        assert!(has_invalid_iri_chars("https://example.org/foo\"bar")); // quote
+        assert!(has_invalid_iri_chars("https://example.org/foo\\bar")); // backslash
     }
 
     #[test]
@@ -457,7 +540,11 @@ mod tests {
         let mut content = String::new();
         temp_file.reopen()?.read_to_string(&mut content)?;
 
-        assert_eq!(content.lines().count(), 1, "Only valid triple should be written");
+        assert_eq!(
+            content.lines().count(),
+            1,
+            "Only valid triple should be written"
+        );
         assert!(content.contains("example.org/o"));
         assert!(!content.contains("bad%object"));
 
@@ -516,7 +603,11 @@ mod tests {
         temp_file.reopen()?.read_to_string(&mut content)?;
 
         // Should emit only the forward triple (no inverse for unmapped predicate)
-        assert_eq!(content.lines().count(), 1, "Should emit only forward triple");
+        assert_eq!(
+            content.lines().count(),
+            1,
+            "Should emit only forward triple"
+        );
 
         Ok(())
     }
@@ -539,7 +630,11 @@ mod tests {
             let full_forward = format!("https://purl.org/packagegraph/ontology/core#{}", forward);
             let result = lookup_inverse(&full_forward);
             assert!(result.is_some(), "Missing inverse for {}", forward);
-            assert!(result.unwrap().contains(inverse), "Wrong inverse for {}", forward);
+            assert!(
+                result.unwrap().contains(inverse),
+                "Wrong inverse for {}",
+                forward
+            );
         }
     }
 
@@ -620,10 +715,24 @@ mod tests {
         let mut content = String::new();
         temp.reopen()?.read_to_string(&mut content)?;
 
-        assert!(content.contains("_:dep1"), "Subject should be blank node _:dep1, got: {}", content);
-        assert!(content.contains("_:constraint1"), "Object should be blank node _:constraint1, got: {}", content);
-        assert!(!content.contains("<dep1>"), "Subject should NOT be a URI <dep1>");
-        assert!(!content.contains("<constraint1>"), "Object should NOT be a URI <constraint1>");
+        assert!(
+            content.contains("_:dep1"),
+            "Subject should be blank node _:dep1, got: {}",
+            content
+        );
+        assert!(
+            content.contains("_:constraint1"),
+            "Object should be blank node _:constraint1, got: {}",
+            content
+        );
+        assert!(
+            !content.contains("<dep1>"),
+            "Subject should NOT be a URI <dep1>"
+        );
+        assert!(
+            !content.contains("<constraint1>"),
+            "Object should NOT be a URI <constraint1>"
+        );
 
         Ok(())
     }
@@ -633,15 +742,210 @@ mod tests {
         let temp = NamedTempFile::new()?;
         let mut writer = NTriplesWriter::new(temp.reopen()?);
 
-        writer.write_bnode_object("http://example.org/pkg1", "http://example.org/hasDep", "dep1")?;
+        writer.write_bnode_object(
+            "http://example.org/pkg1",
+            "http://example.org/hasDep",
+            "dep1",
+        )?;
         writer.flush()?;
 
         let mut content = String::new();
         temp.reopen()?.read_to_string(&mut content)?;
 
-        assert!(content.contains("<http://example.org/pkg1>"), "Subject should be a URI");
+        assert!(
+            content.contains("<http://example.org/pkg1>"),
+            "Subject should be a URI"
+        );
         assert!(content.contains("_:dep1"), "Object should be blank node");
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_nquads_write_triple() -> Result<()> {
+        let tmp = NamedTempFile::new()?;
+        let mut writer =
+            NTriplesWriter::with_graph(tmp.reopen()?, "https://example.org/graph/test".to_string());
+        writer.write_triple(
+            "https://example.org/s",
+            "https://example.org/p",
+            "https://example.org/o",
+        )?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        tmp.reopen()?.read_to_string(&mut content)?;
+        assert_eq!(
+            content,
+            "<https://example.org/s> <https://example.org/p> <https://example.org/o> <https://example.org/graph/test> .\n"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_nquads_write_literal() -> Result<()> {
+        let tmp = NamedTempFile::new()?;
+        let mut writer =
+            NTriplesWriter::with_graph(tmp.reopen()?, "https://example.org/graph/test".to_string());
+        writer.write_literal("https://example.org/s", "https://example.org/p", "hello")?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        tmp.reopen()?.read_to_string(&mut content)?;
+        assert_eq!(
+            content,
+            "<https://example.org/s> <https://example.org/p> \"hello\" <https://example.org/graph/test> .\n"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ntriples_mode_unchanged() -> Result<()> {
+        let tmp = NamedTempFile::new()?;
+        let mut writer = NTriplesWriter::new(tmp.reopen()?);
+        writer.write_triple(
+            "https://example.org/s",
+            "https://example.org/p",
+            "https://example.org/o",
+        )?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        tmp.reopen()?.read_to_string(&mut content)?;
+        // Standard N-Triples: no graph term
+        assert_eq!(
+            content,
+            "<https://example.org/s> <https://example.org/p> <https://example.org/o> .\n"
+        );
+        assert!(!content.contains("graph"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_nquads_bnode() -> Result<()> {
+        let tmp = NamedTempFile::new()?;
+        let mut writer =
+            NTriplesWriter::with_graph(tmp.reopen()?, "https://example.org/graph/test".to_string());
+        writer.write_bnode_object("https://example.org/s", "https://example.org/p", "b1")?;
+        writer.write_bnode_subject("b1", "https://example.org/q", "https://example.org/o")?;
+        writer.write_bnode_to_bnode("b1", "https://example.org/r", "b2")?;
+        writer.write_bnode_literal("b1", "https://example.org/name", "test")?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        tmp.reopen()?.read_to_string(&mut content)?;
+        // All lines should contain the graph URI
+        for line in content.lines() {
+            assert!(
+                line.contains("<https://example.org/graph/test> ."),
+                "Line missing graph URI: {}",
+                line
+            );
+        }
+        assert_eq!(content.lines().count(), 4);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_nquads_inverse_triple_includes_graph() -> Result<()> {
+        let tmp = NamedTempFile::new()?;
+        let mut writer =
+            NTriplesWriter::with_graph(tmp.reopen()?, "https://example.org/graph/test".to_string());
+        writer.write_triple(
+            "https://packagegraph.github.io/d/pkg/debian/trixie/amd64/libc6/2.36-1",
+            "https://purl.org/packagegraph/ontology/core#hasVersion",
+            "https://packagegraph.github.io/d/ver/debian/trixie/libc6/2.36-1",
+        )?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        tmp.reopen()?.read_to_string(&mut content)?;
+        // Both forward and inverse triples should include the graph URI
+        assert_eq!(content.lines().count(), 2, "Should emit forward + inverse");
+        for line in content.lines() {
+            assert!(
+                line.contains("<https://example.org/graph/test> ."),
+                "Line missing graph URI: {}",
+                line
+            );
+        }
+        assert!(content.contains("hasVersion"));
+        assert!(content.contains("versionOf"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_maybe_graph_with_some() -> Result<()> {
+        let tmp = NamedTempFile::new()?;
+        let mut writer =
+            NTriplesWriter::new_maybe_graph(tmp.reopen()?, Some("https://example.org/g"));
+        writer.write_triple(
+            "https://example.org/s",
+            "https://example.org/p",
+            "https://example.org/o",
+        )?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        tmp.reopen()?.read_to_string(&mut content)?;
+        assert!(content.contains("<https://example.org/g> ."));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_maybe_graph_with_none() -> Result<()> {
+        let tmp = NamedTempFile::new()?;
+        let mut writer = NTriplesWriter::new_maybe_graph(tmp.reopen()?, None);
+        writer.write_triple(
+            "https://example.org/s",
+            "https://example.org/p",
+            "https://example.org/o",
+        )?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        tmp.reopen()?.read_to_string(&mut content)?;
+        assert_eq!(
+            content,
+            "<https://example.org/s> <https://example.org/p> <https://example.org/o> .\n"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_raw_line_ntriples() -> Result<()> {
+        let tmp = NamedTempFile::new()?;
+        let mut writer = NTriplesWriter::new(tmp.reopen()?);
+        writer.write_raw_line("<https://ex.org/s> <https://ex.org/p> \"val\" .")?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        tmp.reopen()?.read_to_string(&mut content)?;
+        assert_eq!(content, "<https://ex.org/s> <https://ex.org/p> \"val\" .\n");
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_raw_line_nquads() -> Result<()> {
+        let tmp = NamedTempFile::new()?;
+        let mut writer =
+            NTriplesWriter::with_graph(tmp.reopen()?, "https://example.org/graph".to_string());
+        writer.write_raw_line("<https://ex.org/s> <https://ex.org/p> \"val\" .")?;
+        writer.flush()?;
+
+        let mut content = String::new();
+        tmp.reopen()?.read_to_string(&mut content)?;
+        assert_eq!(
+            content,
+            "<https://ex.org/s> <https://ex.org/p> \"val\" <https://example.org/graph> .\n"
+        );
         Ok(())
     }
 }

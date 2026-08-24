@@ -1,12 +1,12 @@
 # packagegraph/platform
 
-Rust collectors and enrichers for building an RDF knowledge graph of Linux and language-ecosystem package metadata, plus Kustomize manifests for deploying Apache Jena Fuseki as a SPARQL endpoint.
+Rust collectors and enrichers for building an RDF knowledge graph of Linux and language-ecosystem package metadata. Deploys both Apache Jena Fuseki (read-write SPARQL) and QLever (high-performance read-only SPARQL) with Kustomize manifests for MicroShift/OpenShift.
 
 ## What It Does
 
-`pg-collect` streams package repository metadata into [N-Triples](https://www.w3.org/TR/n-triples/), conforming to the [PackageGraph ontology](https://github.com/packagegraph/ontology). Fuseki stores the triples and serves SPARQL queries.
+`pg-collect` streams package repository metadata into [N-Triples](https://www.w3.org/TR/n-triples/) or [N-Quads](https://www.w3.org/TR/n-quads/), conforming to the [PackageGraph ontology](https://github.com/packagegraph/ontology). Data is loaded into Fuseki via Graph Store Protocol or into Minio for QLever batch indexing.
 
-**Current dataset:** ~37.5M triples across 10 named graphs — Fedora 43, Fedora Rawhide, Debian trixie, openSUSE Tumbleweed, RHEL 9/10, CentOS Stream 9/10, Homebrew, Gentoo, plus security and enrichment graphs.
+**Current dataset:** ~121M quads across 39 named graphs — Fedora 42-44, Debian trixie, openSUSE Tumbleweed, Alpine, Arch, Ubuntu, CentOS Stream, Homebrew, conda-forge, and 15 language ecosystem + security enrichment graphs. QLever serves queries with a median 15× speedup over Fuseki.
 
 ## Repository Relationship
 
@@ -18,15 +18,17 @@ Rust collectors and enrichers for building an RDF knowledge graph of Linux and l
 ```
 platform/
   etl/
-    pg-collect/       Rust crate — 28 collectors, 7 enrichers, CLI
-    scripts/          Shell helpers (upload, snapshot, pipeline orchestration)
-    Containerfile     Multi-stage build: Rust → runtime with Jena + mc
-  fuseki/             Apache Jena Fuseki configuration
-  deploy/             Kustomize manifests for MicroShift / OpenShift
-    base/
-    overlays/dev/
-  docs/               Reports, validation results, architecture decisions
-  Makefile            Build, push, and deploy targets
+    pg-collect/                Rust crate — 28 collectors, 7 enrichers, CLI
+    scripts/                   Shell helpers (upload, snapshot, migration)
+    Containerfile              Multi-stage build: Rust → runtime with Jena + mc
+    Containerfile.qlever-rebuild  QLever base + mc/kubectl/jq for index rebuilds
+  fuseki/                      Apache Jena Fuseki configuration
+  deploy/
+    base/                      Shared resources (Fuseki, QLever, Minio, proxy)
+    overlays/dev/              Dev overlay with CronJobs and RBAC
+    archive/fuseki/            Archived Fuseki manifests for rollback
+  spike/                       QLever evaluation results and benchmark scripts
+  Makefile                     Build, push, and deploy targets
 ```
 
 ## pg-collect
@@ -62,9 +64,9 @@ A streaming collector that reads package repository metadata and emits N-Triples
 
 | Command | Purpose |
 |---------|---------|
-| `load` | Load N-Triples into a Fuseki named graph (GSP, chunked) |
-| `drop` | Drop a named graph from Fuseki |
-| `seed` | Query Fuseki for package names to feed into language collectors |
+| `load` | Load N-Triples into Fuseki (GSP) or Minio (`--write-backend minio`) |
+| `drop` | Drop a named graph from Fuseki or Minio |
+| `seed` | Query SPARQL endpoint for package names to feed into language collectors |
 | `rpm-full` | Consolidated multi-arch RPM collection with optional koji + spec enrichment |
 | `deb-full` | Consolidated multi-arch Debian collection with sources + salsa enrichment |
 | `openwrt-full` | Multi-feed OpenWrt collection with upstream + attestation enrichment |
@@ -87,13 +89,24 @@ cargo run --release -- debian \
   --dist trixie --component main --arch amd64 \
   -o debian-trixie.nt
 
-# Load into Fuseki
+# Load into Fuseki (default)
 cargo run --release -- load \
   --endpoint http://localhost:3031/packagegraph \
   --graph https://packagegraph.github.io/graph/fedora/43 \
   fedora-43.nt
 
-# Run tests (420 tests)
+# Or load into Minio for QLever indexing
+cargo run --release -- \
+  --write-backend minio \
+  load fedora-43.nt \
+  --graph https://packagegraph.github.io/graph/fedora/43 \
+  --endpoint http://unused
+
+# Output N-Quads directly (graph URI in every line)
+cargo run --release -- --graph https://packagegraph.github.io/graph/fedora/43 \
+  rpm --url ... -o fedora-43.nq
+
+# Run tests (723 tests)
 cargo test
 ```
 
@@ -122,7 +135,7 @@ cargo run --release -- deb-full \
 
 ### Enrichment
 
-Enrichers query Fuseki for packages and call external APIs to add metadata:
+Enrichers query the SPARQL endpoint for packages and call external APIs to add metadata. They support `--sparql-backend qlever` to query QLever instead of Fuseki, and `--sparql-username`/`--sparql-password` for Basic Auth:
 
 ```bash
 # GitHub VCS metadata (requires GITHUB_TOKEN)
@@ -131,16 +144,13 @@ cargo run --release -- enrich-github \
   --github-token "$GITHUB_TOKEN" \
   -o github.nt
 
-# OSV security vulnerabilities for Debian packages
-cargo run --release -- enrich-security \
-  --endpoint http://localhost:3031/packagegraph \
-  --ecosystem debian \
-  -o security-debian.nt
-
-# Cross-distribution equivalences from Repology
-cargo run --release -- enrich-repology \
-  --endpoint http://localhost:3031/packagegraph \
-  -o repology.nt
+# Same enricher against QLever
+cargo run --release -- \
+  --sparql-backend qlever --qlever-access-token "$TOKEN" \
+  enrich-github \
+  --endpoint http://localhost:7001 \
+  --github-token "$GITHUB_TOKEN" \
+  -o github.nt
 ```
 
 All enrichers support `--cache-dir` for file-based API response caching with TTL, and optional Minio S3 sync for persistence across container restarts.
@@ -150,9 +160,10 @@ All enrichers support `--cache-dir` for file-based API response caching with TTL
 ### Building Images
 
 ```bash
-make build              # Build both etl and fuseki images (podman)
-make build TAG=v0.10.0  # Pin a version tag
-make push               # Push to ghcr.io/packagegraph
+make build                   # Build etl + fuseki images (podman on berstuk)
+make build-qlever-rebuild    # Build QLever index rebuild image
+make push                    # Push to ghcr.io/packagegraph
+make push-qlever-rebuild     # Push qlever-rebuild image
 ```
 
 Container builds target `linux/amd64` via the `berstuk` podman system connection (see CLAUDE.md).
@@ -167,45 +178,56 @@ make port-forward       # Forward Fuseki to localhost:3031
 ### Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  MicroShift / OpenShift  (namespace: packagegraph)  │
-│                                                     │
-│  CronJobs (weekly)     Fuseki (writer, replicas=1)  │
-│  ┌──────────────┐      ┌──────────────────┐         │
-│  │ pg-collect   │─────>│ TDB2 on PVC      │         │
-│  │ collect +    │      │ SPARQL endpoint   │         │
-│  │ enrich +     │      └──────────────────┘         │
-│  │ load         │              │                    │
-│  └──────────────┘        TDB2 snapshot              │
-│         │                      │                    │
-│  ┌──────────────┐      ┌──────────────────┐         │
-│  │ Minio (S3)   │<─────│ fuseki-reader ×N │         │
-│  │ .nt archives │      │ (read replicas)  │         │
-│  │ + cache      │      └──────────────────┘         │
-│  └──────────────┘                                   │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  MicroShift / OpenShift  (namespace: packagegraph)           │
+│                                                              │
+│  CronJobs (weekly)      Fuseki (read-write SPARQL)           │
+│  ┌──────────────┐       ┌──────────────────┐                 │
+│  │ pg-collect   │──GSP─>│ TDB2 on PVC      │                 │
+│  │ collect +    │       │ /sparql, /update  │                 │
+│  │ enrich +     │       └──────────────────┘                 │
+│  │ load         │                                            │
+│  └──────┬───────┘       QLever (read-only SPARQL, 15× faster)│
+│         │               ┌──────────────────┐                 │
+│         │  .nt + .graph  │ Pre-built index  │                 │
+│         └──Minio────────>│ on PVC (2.3 GiB) │                 │
+│                          │ port 7001        │                 │
+│  ┌──────────────┐        └────────┬─────────┘                │
+│  │ Minio (S3)   │                 │                          │
+│  │ .nt files    │   rebuild-qlever-index CronJob (daily)     │
+│  │ .graph       │   ┌──────────────────────────────┐         │
+│  │ sidecars     │<──│ mc mirror → qlever-index →   │         │
+│  │ qlever-index │   │ upload → promote → restart   │         │
+│  │ archives     │   │ (completeness gate: ≥75% of  │         │
+│  └──────────────┘   │  previous successful run)    │         │
+│                     └──────────────────────────────┘         │
+│  ┌──────────────┐                                            │
+│  │ sparql-proxy │  nginx TLS + Basic Auth                    │
+│  │ :8443/sparql │  (routes to Fuseki, switchable to QLever)  │
+│  └──────────────┘                                            │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ## Querying the Data
 
 ```bash
-# Port-forward Fuseki
+# Via Fuseki (read-write, slower)
 oc port-forward svc/fuseki 3031:3030 -n packagegraph
-
-# Count triples
 curl -H 'Accept: text/tab-separated-values' \
   'http://localhost:3031/packagegraph/sparql' \
   --data-urlencode 'query=SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }'
 
-# Find packages by name
-curl -H 'Accept: text/tab-separated-values' \
-  'http://localhost:3031/packagegraph/sparql' \
-  --data-urlencode 'query=
-    PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
-    SELECT ?name ?version WHERE {
-      ?p pkg:packageName "openssl" ; pkg:hasVersion ?v .
-      ?v pkg:versionString ?version .
-    } LIMIT 20'
+# Via QLever (read-only, 15× faster)
+oc port-forward svc/qlever 7001:7001 -n packagegraph
+curl -H 'Accept: application/sparql-results+json' \
+  'http://localhost:7001/' \
+  -d 'query=SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }' \
+  -d "access-token=$QLEVER_ACCESS_TOKEN"
+
+# Via SPARQL proxy (TLS + Basic Auth, external access)
+curl -k -u sparqluser:pass \
+  'https://localhost:8443/packagegraph/sparql' \
+  --data-urlencode 'query=SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }'
 ```
 
-See [docs/QUERYING.md](docs/QUERYING.md) for YASGUI setup, Jupyter notebooks, SPARQL reference, namespace prefixes, administration, and troubleshooting.
+See [docs/QUERYING.md](docs/QUERYING.md) for SPARQL reference, namespace prefixes, and troubleshooting.

@@ -240,9 +240,8 @@ mod tests {
 
     #[test]
     fn test_quoted_comma_mixed_with_multi() {
-        let result = parse_mailbox_list(
-            "\"Doe, Jane\" <jane@example.org>, John Smith <john@example.org>",
-        );
+        let result =
+            parse_mailbox_list("\"Doe, Jane\" <jane@example.org>, John Smith <john@example.org>");
         assert_eq!(result.mailboxes.len(), 2);
         assert_eq!(result.malformed_count, 0);
         assert_eq!(result.mailboxes[0].name, "Doe, Jane");
@@ -308,8 +307,7 @@ mod tests {
 
     #[test]
     fn test_single_standard() {
-        let result =
-            parse_mailbox_list("GNU Libc Maintainers <debian-glibc@lists.debian.org>");
+        let result = parse_mailbox_list("GNU Libc Maintainers <debian-glibc@lists.debian.org>");
         assert_eq!(result.mailboxes.len(), 1);
         assert_eq!(result.malformed_count, 0);
         assert_eq!(result.mailboxes[0].name, "GNU Libc Maintainers");
@@ -367,18 +365,14 @@ mod tests {
 
     #[test]
     fn test_three_maintainers() {
-        let result = parse_mailbox_list(
-            "A <a@x.org>, B <b@x.org>, C <c@x.org>",
-        );
+        let result = parse_mailbox_list("A <a@x.org>, B <b@x.org>, C <c@x.org>");
         assert_eq!(result.mailboxes.len(), 3);
         assert_eq!(result.malformed_count, 0);
     }
 
     #[test]
     fn test_mixed_valid_and_malformed() {
-        let result = parse_mailbox_list(
-            "Good Person <good@x.org>, Bad <, Also Good <also@x.org>",
-        );
+        let result = parse_mailbox_list("Good Person <good@x.org>, Bad <, Also Good <also@x.org>");
         assert_eq!(result.mailboxes.len(), 2);
         assert_eq!(result.malformed_count, 1);
     }
@@ -417,8 +411,8 @@ mod tests {
         // The RDF emitter path (emit/rdf.rs) is tested separately in
         // emit::rdf::tests::test_emit_maintainer_name_only_uses_name_uri
         // which verifies the actual emitter calls maintainer_name_uri().
-        use crate::uris::maintainer_name_uri;
         use crate::ir::MaintainerIr;
+        use crate::uris::maintainer_name_uri;
 
         let name = "Debian QA Group";
 
@@ -437,12 +431,18 @@ mod tests {
         };
         let uri_from_ir = maintainer_name_uri(&maint_ir.name);
 
-        assert_eq!(uri_direct, uri_from_ir,
-            "Name-only URIs must be identical across direct and normalize paths");
-        assert!(uri_direct.contains("/maintainer/name/"),
-            "Name-only URIs must use the /maintainer/name/ path");
-        assert!(!uri_direct.contains("/maintainer/debian"),
-            "Name-only URIs must NOT use the old slugified format");
+        assert_eq!(
+            uri_direct, uri_from_ir,
+            "Name-only URIs must be identical across direct and normalize paths"
+        );
+        assert!(
+            uri_direct.contains("/maintainer/name/"),
+            "Name-only URIs must use the /maintainer/name/ path"
+        );
+        assert!(
+            !uri_direct.contains("/maintainer/debian"),
+            "Name-only URIs must NOT use the old slugified format"
+        );
     }
 
     // --- Percent-encoding in emails ---

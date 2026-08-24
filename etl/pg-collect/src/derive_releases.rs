@@ -5,7 +5,7 @@
 //! pkg:lastReleaseDate as N-Triples to a dedicated derived graph.
 
 use crate::ntriples::NTriplesWriter;
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::PKG;
 use chrono::DateTime;
 use std::collections::HashMap;
@@ -33,13 +33,21 @@ pub struct DeriveReport {
 /// Deriver that computes pkg:lastReleaseDate from ecosystem build timestamps.
 pub struct ReleaseDeriver {
     sparql: SparqlClient,
+    pub graph_uri: Option<String>,
 }
 
 impl ReleaseDeriver {
-    pub fn new(endpoint: &str) -> Self {
+    pub fn new(endpoint: &str, auth: SparqlAuth, backend: SparqlBackend) -> Self {
         Self {
-            sparql: SparqlClient::new(endpoint),
+            sparql: make_sparql_client(endpoint, &auth, backend),
+            graph_uri: None,
         }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     /// Derive pkg:lastReleaseDate for all PackageIdentities in the specified graphs.
@@ -70,7 +78,8 @@ impl ReleaseDeriver {
                     eprintln!("  RPM: {} identities found", dates.len());
                     report.by_ecosystem.rpm += dates.len();
                     for (identity, date) in dates {
-                        identity_dates.entry(identity)
+                        identity_dates
+                            .entry(identity)
                             .and_modify(|existing| {
                                 if date > *existing {
                                     *existing = date.clone();
@@ -84,7 +93,8 @@ impl ReleaseDeriver {
                     eprintln!("  Alpine: {} identities found", dates.len());
                     report.by_ecosystem.alpine += dates.len();
                     for (identity, date) in dates {
-                        identity_dates.entry(identity)
+                        identity_dates
+                            .entry(identity)
                             .and_modify(|existing| {
                                 if date > *existing {
                                     *existing = date.clone();
@@ -103,7 +113,7 @@ impl ReleaseDeriver {
 
         // Emit deduplicated results
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         for (identity_uri, date_str) in &identity_dates {
             writer.write_date(identity_uri, &format!("{PKG}lastReleaseDate"), date_str)?;
@@ -122,10 +132,10 @@ impl ReleaseDeriver {
         eprintln!("Derived: {}", report.derived);
         eprintln!("Unsupported: {}", report.unsupported);
         eprintln!("Triples emitted: {}", report.triples);
-        eprintln!("By ecosystem: RPM={}, Alpine={}, Unsupported={}",
-                  report.by_ecosystem.rpm,
-                  report.by_ecosystem.alpine,
-                  report.by_ecosystem.unsupported);
+        eprintln!(
+            "By ecosystem: RPM={}, Alpine={}, Unsupported={}",
+            report.by_ecosystem.rpm, report.by_ecosystem.alpine, report.by_ecosystem.unsupported
+        );
 
         Ok(report)
     }
@@ -150,10 +160,9 @@ GROUP BY ?identity"#
         let mut dates = HashMap::new();
 
         for binding in &bindings {
-            if let (Some(identity_uri), Some(datetime_str)) = (
-                binding.get("identity"),
-                binding.get("maxBuildTime"),
-            ) {
+            if let (Some(identity_uri), Some(datetime_str)) =
+                (binding.get("identity"), binding.get("maxBuildTime"))
+            {
                 // Extract date from dateTime (YYYY-MM-DD from YYYY-MM-DDTHH:MM:SSZ)
                 if let Some(date_str) = datetime_to_date(datetime_str) {
                     dates.insert(identity_uri.clone(), date_str);
@@ -184,10 +193,9 @@ GROUP BY ?identity"#
         let mut dates = HashMap::new();
 
         for binding in &bindings {
-            if let (Some(identity_uri), Some(epoch_str)) = (
-                binding.get("identity"),
-                binding.get("maxBuildDate"),
-            ) {
+            if let (Some(identity_uri), Some(epoch_str)) =
+                (binding.get("identity"), binding.get("maxBuildDate"))
+            {
                 // Parse epoch as i64, convert to date
                 if let Ok(epoch) = epoch_str.parse::<i64>() {
                     if let Some(date_str) = epoch_to_date(epoch) {

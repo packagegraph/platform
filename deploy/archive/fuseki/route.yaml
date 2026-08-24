@@ -1,0 +1,15 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: fuseki
+  namespace: packagegraph
+  labels:
+    app: fuseki
+spec:
+  to:
+    kind: Service
+    name: fuseki
+  port:
+    targetPort: http
+  tls:
+    termination: edge

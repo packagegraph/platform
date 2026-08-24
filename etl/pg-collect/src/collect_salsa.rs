@@ -4,7 +4,7 @@
 //! temporal maintainer data. Uses Vcs-Git URLs from Phase 1 (not constructed paths).
 
 use crate::enricher::rate_limit;
-use crate::forge::{extract_forge_url_with_field, emit_upstream_repo, emit_dq_issue};
+use crate::forge::{emit_dq_issue, emit_upstream_repo, extract_forge_url_with_field};
 use crate::ntriples::NTriplesWriter;
 use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
@@ -18,6 +18,7 @@ pub struct SalsaCollector {
     client: Client,
     dist: String,
     source_cache: Option<SourceCache>,
+    pub graph_uri: Option<String>,
 }
 
 impl SalsaCollector {
@@ -28,7 +29,14 @@ impl SalsaCollector {
             client,
             dist,
             source_cache: None,
+            graph_uri: None,
         }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
@@ -73,7 +81,10 @@ impl SalsaCollector {
             };
 
             // Get identity URIs for this source
-            let identity_uris = source_identity_map.get(src_name).cloned().unwrap_or_default();
+            let identity_uris = source_identity_map
+                .get(src_name)
+                .cloned()
+                .unwrap_or_default();
             if identity_uris.is_empty() {
                 continue;
             }
@@ -99,11 +110,17 @@ impl SalsaCollector {
             rate_limit(Duration::from_millis(200));
 
             if src_count % 100 == 0 {
-                eprintln!("Processed {} salsa packages ({} triples)", src_count, triple_count);
+                eprintln!(
+                    "Processed {} salsa packages ({} triples)",
+                    src_count, triple_count
+                );
             }
         }
 
-        eprintln!("Salsa enrichment: {} packages, {} triples", src_count, triple_count);
+        eprintln!(
+            "Salsa enrichment: {} packages, {} triples",
+            src_count, triple_count
+        );
         Ok((src_count, triple_count))
     }
 
@@ -132,50 +149,60 @@ impl SalsaCollector {
         let mut triples = 0;
 
         // Try to find the correct branch
-        let branch = if let Some(cached_branch) = branch_cache.get(&format!("{}/{}", group, project)) {
-            cached_branch.clone()
-        } else {
-            // Try branch fallback
-            let branches = vec![
-                format!("debian/{}", self.dist),
-                "debian/latest".to_string(),
-                "debian/main".to_string(),
-                "master".to_string(),
-            ];
+        let branch =
+            if let Some(cached_branch) = branch_cache.get(&format!("{}/{}", group, project)) {
+                cached_branch.clone()
+            } else {
+                // Try branch fallback
+                let branches = vec![
+                    format!("debian/{}", self.dist),
+                    "debian/latest".to_string(),
+                    "debian/main".to_string(),
+                    "master".to_string(),
+                ];
 
-            let mut found_branch = None;
-            for branch in &branches {
-                let test_url = format!(
-                    "https://salsa.debian.org/{}/{}/-/raw/{}/debian/control",
-                    group, project, branch
-                );
-                if let Ok(resp) = self.client.get(&test_url).send() {
-                    if resp.status().is_success() {
-                        found_branch = Some(branch.clone());
-                        break;
+                let mut found_branch = None;
+                for branch in &branches {
+                    let test_url = format!(
+                        "https://salsa.debian.org/{}/{}/-/raw/{}/debian/control",
+                        group, project, branch
+                    );
+                    if let Ok(resp) = self.client.get(&test_url).send() {
+                        if resp.status().is_success() {
+                            found_branch = Some(branch.clone());
+                            break;
+                        }
                     }
                 }
-            }
 
-            match found_branch {
-                Some(branch) => {
-                    branch_cache.insert(format!("{}/{}", group, project), branch.clone());
-                    branch
+                match found_branch {
+                    Some(branch) => {
+                        branch_cache.insert(format!("{}/{}", group, project), branch.clone());
+                        branch
+                    }
+                    None => {
+                        // DQ: salsa fetch failed
+                        triples += emit_dq_issue(
+                            writer,
+                            "debian-salsa",
+                            "branch-detection",
+                            src_name,
+                            "salsa-fetch-failed",
+                            "warning",
+                        )?;
+                        return Ok(triples);
+                    }
                 }
-                None => {
-                    // DQ: salsa fetch failed
-                    triples += emit_dq_issue(writer, "debian-salsa", "branch-detection",
-                        src_name, "salsa-fetch-failed", "warning")?;
-                    return Ok(triples);
-                }
-            }
-        };
+            };
 
         // Fetch debian/upstream/metadata (simple Key: Value format)
         // Track whether metadata yielded upstream repo triples (not DQ triples)
         let mut metadata_emitted_repo = false;
-        if let Ok(metadata) = self.fetch_debian_file(group, project, &branch, "debian/upstream/metadata") {
-            let (repo_triples, total) = self.parse_upstream_metadata(writer, &metadata, identity_uris)?;
+        if let Ok(metadata) =
+            self.fetch_debian_file(group, project, &branch, "debian/upstream/metadata")
+        {
+            let (repo_triples, total) =
+                self.parse_upstream_metadata(writer, &metadata, identity_uris)?;
             triples += total;
             metadata_emitted_repo = repo_triples > 0;
         }
@@ -189,7 +216,9 @@ impl SalsaCollector {
 
         // Fetch debian/changelog (if emit_maintainers enabled)
         if emit_maintainers {
-            if let Ok(changelog) = self.fetch_debian_file(group, project, &branch, "debian/changelog") {
+            if let Ok(changelog) =
+                self.fetch_debian_file(group, project, &branch, "debian/changelog")
+            {
                 triples += self.parse_debian_changelog(writer, &changelog, source_pkg_uri)?;
             }
         }
@@ -197,7 +226,13 @@ impl SalsaCollector {
         Ok(triples)
     }
 
-    fn fetch_debian_file(&self, group: &str, project: &str, branch: &str, path: &str) -> Result<String> {
+    fn fetch_debian_file(
+        &self,
+        group: &str,
+        project: &str,
+        branch: &str,
+        path: &str,
+    ) -> Result<String> {
         let url = format!(
             "https://salsa.debian.org/{}/{}/-/raw/{}/{}",
             group, project, branch, path
@@ -217,16 +252,17 @@ impl SalsaCollector {
 
             let bytes_vec = match cache.fetch_or_reuse(&url, &scope, &logical_name)? {
                 CacheResult::Fresh(bytes) => bytes,
-                CacheResult::Cached(path) | CacheResult::NotModified(path) => {
-                    std::fs::read(&path)?
-                }
+                CacheResult::Cached(path) | CacheResult::NotModified(path) => std::fs::read(&path)?,
             };
             return String::from_utf8(bytes_vec)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
         }
 
         // Fallback to direct fetch
-        let resp = self.client.get(&url).send()
+        let resp = self
+            .client
+            .get(&url)
+            .send()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
         if !resp.status().is_success() {
@@ -239,7 +275,12 @@ impl SalsaCollector {
 
     /// Parse debian/upstream/metadata. Returns (repo_triples, total_triples).
     /// repo_triples counts only upstream repository triples (not DQ annotations).
-    fn parse_upstream_metadata(&self, writer: &mut NTriplesWriter, metadata: &str, identity_uris: &[String]) -> Result<(usize, usize)> {
+    fn parse_upstream_metadata(
+        &self,
+        writer: &mut NTriplesWriter,
+        metadata: &str,
+        identity_uris: &[String],
+    ) -> Result<(usize, usize)> {
         let mut repo_triples = 0;
         let mut total_triples = 0;
 
@@ -251,7 +292,9 @@ impl SalsaCollector {
                     if repo_url.is_empty() {
                         continue;
                     }
-                    if let Some(extraction) = extract_forge_url_with_field(repo_url, "upstream-metadata") {
+                    if let Some(extraction) =
+                        extract_forge_url_with_field(repo_url, "upstream-metadata")
+                    {
                         // Emit upstreamRepository for each identity
                         for identity_uri in identity_uris {
                             let t = emit_upstream_repo(writer, identity_uri, &extraction, None)?;
@@ -260,8 +303,14 @@ impl SalsaCollector {
                         }
                     } else {
                         // DQ: upstream/metadata has Repository but not a forge URL
-                        total_triples += emit_dq_issue(writer, "debian-salsa", "upstream-metadata",
-                            repo_url, "upstream-metadata-no-repo", "info")?;
+                        total_triples += emit_dq_issue(
+                            writer,
+                            "debian-salsa",
+                            "upstream-metadata",
+                            repo_url,
+                            "upstream-metadata-no-repo",
+                            "info",
+                        )?;
                     }
                 }
             }
@@ -270,7 +319,12 @@ impl SalsaCollector {
         Ok((repo_triples, total_triples))
     }
 
-    fn parse_debian_watch(&self, writer: &mut NTriplesWriter, watch: &str, identity_uris: &[String]) -> Result<usize> {
+    fn parse_debian_watch(
+        &self,
+        writer: &mut NTriplesWriter,
+        watch: &str,
+        identity_uris: &[String],
+    ) -> Result<usize> {
         let mut triples = 0;
         let mut found_upstream = false;
 
@@ -285,10 +339,18 @@ impl SalsaCollector {
                 if let Some((ecosystem, upstream_name)) = extract_registry_name(url_part) {
                     let eco_uri = ecosystem_uri(ecosystem);
                     for identity_uri in identity_uris {
-                        writer.write_triple(identity_uri, &format!("{PKG}upstreamEcosystem"), &eco_uri)?;
+                        writer.write_triple(
+                            identity_uri,
+                            &format!("{PKG}upstreamEcosystem"),
+                            &eco_uri,
+                        )?;
                         writer.write_triple(&eco_uri, RDF_TYPE, &format!("{PKG}Ecosystem"))?;
                         writer.write_literal(&eco_uri, RDFS_LABEL, ecosystem)?;
-                        writer.write_literal(identity_uri, &format!("{PKG}upstreamPackageName"), &upstream_name)?;
+                        writer.write_literal(
+                            identity_uri,
+                            &format!("{PKG}upstreamPackageName"),
+                            &upstream_name,
+                        )?;
                         triples += 4;
                     }
                     found_upstream = true;
@@ -317,18 +379,34 @@ impl SalsaCollector {
         }
 
         if !found_upstream && !watch.trim().is_empty() {
-            let first_url = watch.lines()
-                .find(|l| !l.trim().starts_with('#') && !l.trim().starts_with("version=") && !l.trim().is_empty())
+            let first_url = watch
+                .lines()
+                .find(|l| {
+                    !l.trim().starts_with('#')
+                        && !l.trim().starts_with("version=")
+                        && !l.trim().is_empty()
+                })
                 .and_then(|l| l.split_whitespace().next())
                 .unwrap_or("(unparseable)");
-            triples += emit_dq_issue(writer, "debian-salsa", "watch",
-                first_url, "watch-file-no-upstream", "info")?;
+            triples += emit_dq_issue(
+                writer,
+                "debian-salsa",
+                "watch",
+                first_url,
+                "watch-file-no-upstream",
+                "info",
+            )?;
         }
 
         Ok(triples)
     }
 
-    fn parse_debian_changelog(&self, writer: &mut NTriplesWriter, changelog: &str, source_pkg_uri: Option<&str>) -> Result<usize> {
+    fn parse_debian_changelog(
+        &self,
+        writer: &mut NTriplesWriter,
+        changelog: &str,
+        source_pkg_uri: Option<&str>,
+    ) -> Result<usize> {
         // Parse first entry for latest maintainer
         // Format: "package (version) dist; urgency=...\n\n  * changes\n\n -- Name <email>  Date"
         let re = Regex::new(r"--\s*([^<]+?)\s*<(.+?)>\s+").unwrap();
@@ -341,7 +419,11 @@ impl SalsaCollector {
             writer.write_triple(&maint_uri, RDF_TYPE, &format!("{PKG}Person"))?;
             writer.write_literal(&maint_uri, &format!("{FOAF}name"), name)?;
             writer.write_literal(&maint_uri, RDFS_LABEL, name)?;
-            writer.write_triple(&maint_uri, &format!("{FOAF}mbox"), &format!("mailto:{email}"))?;
+            writer.write_triple(
+                &maint_uri,
+                &format!("{FOAF}mbox"),
+                &format!("mailto:{email}"),
+            )?;
 
             let mut triples = 4;
 
@@ -443,7 +525,12 @@ fn extract_registry_name(url: &str) -> Option<(&'static str, String)> {
     if lower.contains("hackage.haskell.org/package/") {
         let after = url.split("hackage.haskell.org/package/").nth(1)?;
         // name-version.tar.gz → split at first digit after hyphen
-        let name = after.split(|c: char| c == '-' && after[after.find('-').unwrap_or(0)+1..].starts_with(|d: char| d.is_ascii_digit()))
+        let name = after
+            .split(|c: char| {
+                c == '-'
+                    && after[after.find('-').unwrap_or(0) + 1..]
+                        .starts_with(|d: char| d.is_ascii_digit())
+            })
             .next()
             .unwrap_or(after)
             .trim_end_matches('/');
@@ -479,12 +566,16 @@ mod tests {
     fn test_parse_salsa_url() {
         let collector = SalsaCollector::new("trixie".to_string());
 
-        let (group, project) = collector.parse_salsa_url("https://salsa.debian.org/glibc-team/glibc.git").unwrap();
+        let (group, project) = collector
+            .parse_salsa_url("https://salsa.debian.org/glibc-team/glibc.git")
+            .unwrap();
         assert_eq!(group, "glibc-team");
         assert_eq!(project, "glibc");
 
         // Without .git suffix
-        let (group2, project2) = collector.parse_salsa_url("https://salsa.debian.org/debian/openssl").unwrap();
+        let (group2, project2) = collector
+            .parse_salsa_url("https://salsa.debian.org/debian/openssl")
+            .unwrap();
         assert_eq!(group2, "debian");
         assert_eq!(project2, "openssl");
     }
@@ -503,18 +594,31 @@ Repository: https://github.com/openssl/openssl
 Bug-Database: https://github.com/openssl/openssl/issues
 "#;
 
-        let identity_uris = vec!["https://packagegraph.github.io/d/pkg/debian/trixie/amd64/openssl".to_string()];
-        let (repo_triples, total_triples) = collector.parse_upstream_metadata(&mut writer, metadata, &identity_uris).unwrap();
+        let identity_uris =
+            vec!["https://packagegraph.github.io/d/pkg/debian/trixie/amd64/openssl".to_string()];
+        let (repo_triples, total_triples) = collector
+            .parse_upstream_metadata(&mut writer, metadata, &identity_uris)
+            .unwrap();
 
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(repo_triples > 0, "Should emit repo triples");
         assert!(total_triples > 0, "Should emit total triples");
-        assert!(content.contains("upstreamRepository"), "Should emit upstreamRepository");
-        assert!(content.contains("github.com/openssl/openssl"), "Should extract GitHub repo");
+        assert!(
+            content.contains("upstreamRepository"),
+            "Should emit upstreamRepository"
+        );
+        assert!(
+            content.contains("github.com/openssl/openssl"),
+            "Should extract GitHub repo"
+        );
     }
 
     #[test]
@@ -530,17 +634,30 @@ Bug-Database: https://github.com/openssl/openssl/issues
 https://github.com/openssl/openssl/releases .*/v?([\d.]+)\.tar\.gz
 "#;
 
-        let identity_uris = vec!["https://packagegraph.github.io/d/pkg/debian/trixie/amd64/openssl".to_string()];
-        let triples = collector.parse_debian_watch(&mut writer, watch, &identity_uris).unwrap();
+        let identity_uris =
+            vec!["https://packagegraph.github.io/d/pkg/debian/trixie/amd64/openssl".to_string()];
+        let triples = collector
+            .parse_debian_watch(&mut writer, watch, &identity_uris)
+            .unwrap();
 
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(triples > 0, "Should emit triples");
-        assert!(content.contains("upstreamRepository"), "Should emit upstreamRepository from watch");
-        assert!(content.contains("github.com/openssl/openssl"), "Should extract base URL");
+        assert!(
+            content.contains("upstreamRepository"),
+            "Should emit upstreamRepository from watch"
+        );
+        assert!(
+            content.contains("github.com/openssl/openssl"),
+            "Should extract base URL"
+        );
     }
 
     #[test]
@@ -558,10 +675,15 @@ https://github.com/openssl/openssl/releases .*/v?([\d.]+)\.tar\.gz
 
         // Metadata with valid Repository → should emit upstream repo
         let metadata = "Repository: https://github.com/test/repo\n";
-        let (repo_triples, _total) = collector.parse_upstream_metadata(&mut writer, metadata, &identity_uris).unwrap();
+        let (repo_triples, _total) = collector
+            .parse_upstream_metadata(&mut writer, metadata, &identity_uris)
+            .unwrap();
 
         // repo_triples > 0 means forge extraction succeeded → watch should be skipped
-        assert!(repo_triples > 0, "Metadata should emit repo triples for github.com URL");
+        assert!(
+            repo_triples > 0,
+            "Metadata should emit repo triples for github.com URL"
+        );
 
         // When metadata succeeds, the fallback check is:
         // let metadata_emitted_repo = triples > metadata_triples_before;
@@ -573,10 +695,15 @@ https://github.com/openssl/openssl/releases .*/v?([\d.]+)\.tar\.gz
         let mut writer2 = NTriplesWriter::new(temp_file2.reopen().unwrap());
 
         let bad_metadata = "Repository: not-a-url-at-all\nBug-Database: foo\n";
-        let (bad_repo_triples, bad_total) = collector.parse_upstream_metadata(&mut writer2, bad_metadata, &identity_uris).unwrap();
+        let (bad_repo_triples, bad_total) = collector
+            .parse_upstream_metadata(&mut writer2, bad_metadata, &identity_uris)
+            .unwrap();
 
         // Non-parseable URL yields 0 repo triples (but DQ triples emitted) → watch fallback should activate
-        assert_eq!(bad_repo_triples, 0, "Non-forge metadata should emit 0 repo triples, enabling watch fallback");
+        assert_eq!(
+            bad_repo_triples, 0,
+            "Non-forge metadata should emit 0 repo triples, enabling watch fallback"
+        );
         assert!(bad_total > 0, "DQ annotation should still be emitted");
     }
 
@@ -610,46 +737,84 @@ https://github.com/openssl/openssl/releases .*/v?([\d.]+)\.tar\.gz
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 
-        let identity_uris = vec![
-            "https://packagegraph.github.io/d/pkg/debian/trixie/amd64/openssl".to_string(),
-        ];
-        let source_pkg_uri = Some("https://packagegraph.github.io/d/src/debian/trixie/openssl/3.2.2-1");
+        let identity_uris =
+            vec!["https://packagegraph.github.io/d/pkg/debian/trixie/amd64/openssl".to_string()];
+        let source_pkg_uri =
+            Some("https://packagegraph.github.io/d/src/debian/trixie/openssl/3.2.2-1");
 
         let mut total_triples = 0;
 
         // Simulate process_salsa_package flow:
         // Step 1: Parse upstream/metadata → should emit upstream repo
         let metadata = "Repository: https://github.com/openssl/openssl\nBug-Database: https://github.com/openssl/openssl/issues\n";
-        let (repo_triples, metadata_total) = collector.parse_upstream_metadata(&mut writer, metadata, &identity_uris).unwrap();
+        let (repo_triples, metadata_total) = collector
+            .parse_upstream_metadata(&mut writer, metadata, &identity_uris)
+            .unwrap();
         total_triples += metadata_total;
         let metadata_emitted_repo = repo_triples > 0;
 
-        assert!(metadata_emitted_repo, "Metadata should emit upstream repo for github.com");
-        assert!(repo_triples >= 7, "Should emit ~7 triples (upstreamRepository + repositoryURL + forge)");
+        assert!(
+            metadata_emitted_repo,
+            "Metadata should emit upstream repo for github.com"
+        );
+        assert!(
+            repo_triples >= 7,
+            "Should emit ~7 triples (upstreamRepository + repositoryURL + forge)"
+        );
 
         // Step 2: debian/watch should be SKIPPED because metadata succeeded
-        assert!(metadata_emitted_repo, "Watch should be skipped — metadata already emitted repo");
+        assert!(
+            metadata_emitted_repo,
+            "Watch should be skipped — metadata already emitted repo"
+        );
 
         // Step 3: Parse changelog → should link maintainer to SourcePackage
         let changelog = "openssl (3.2.2-1) trixie; urgency=medium\n\n  * New upstream release\n\n -- Security Team <security@debian.org>  Mon, 01 Apr 2026 10:00:00 +0000\n";
-        let changelog_triples = collector.parse_debian_changelog(&mut writer, changelog, source_pkg_uri).unwrap();
+        let changelog_triples = collector
+            .parse_debian_changelog(&mut writer, changelog, source_pkg_uri)
+            .unwrap();
         total_triples += changelog_triples;
 
-        assert_eq!(changelog_triples, 6, "Changelog should emit 6 triples (4 Person + 2 maintainedBy/maintains)");
+        assert_eq!(
+            changelog_triples, 6,
+            "Changelog should emit 6 triples (4 Person + 2 maintainedBy/maintains)"
+        );
 
         writer.flush().unwrap();
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Verify combined output
-        assert!(content.contains("upstreamRepository"), "Should have upstream repo from metadata");
-        assert!(content.contains("github.com/openssl/openssl"), "Should reference GitHub");
+        assert!(
+            content.contains("upstreamRepository"),
+            "Should have upstream repo from metadata"
+        );
+        assert!(
+            content.contains("github.com/openssl/openssl"),
+            "Should reference GitHub"
+        );
         assert!(content.contains("hostedOn"), "Should have forge triples");
-        assert!(content.contains("maintainedBy"), "Should link maintainer to SourcePackage");
-        assert!(content.contains("Security Team"), "Should have changelog maintainer name");
-        assert!(content.contains("mailto:security@debian.org"), "Should have changelog maintainer email");
+        assert!(
+            content.contains("maintainedBy"),
+            "Should link maintainer to SourcePackage"
+        );
+        assert!(
+            content.contains("Security Team"),
+            "Should have changelog maintainer name"
+        );
+        assert!(
+            content.contains("mailto:security@debian.org"),
+            "Should have changelog maintainer email"
+        );
 
-        assert!(total_triples >= 13, "Should emit at least 13 triples total (7 repo + 6 changelog)");
+        assert!(
+            total_triples >= 13,
+            "Should emit at least 13 triples total (7 repo + 6 changelog)"
+        );
     }
 
     #[test]
@@ -712,6 +877,9 @@ https://github.com/openssl/openssl/releases .*/v?([\d.]+)\.tar\.gz
     #[test]
     fn test_extract_registry_name_none() {
         assert_eq!(extract_registry_name("https://github.com/foo/bar"), None);
-        assert_eq!(extract_registry_name("https://example.com/foo.tar.gz"), None);
+        assert_eq!(
+            extract_registry_name("https://example.com/foo.tar.gz"),
+            None
+        );
     }
 }

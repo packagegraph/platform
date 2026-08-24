@@ -1,5 +1,6 @@
-use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::npm::read_seed_file;
+use crate::ntriples::{bnode_id, NTriplesWriter};
+use crate::sparql::{SparqlAuth, SparqlBackend};
 use crate::uris::*;
 use regex::Regex;
 use reqwest::blocking::Client;
@@ -16,6 +17,7 @@ pub struct GoModCollector {
     known_modules: std::cell::RefCell<HashSet<String>>,
     /// Cache of paths known NOT to be modules
     known_non_modules: std::cell::RefCell<HashSet<String>>,
+    pub graph_uri: Option<String>,
 }
 
 impl GoModCollector {
@@ -31,7 +33,14 @@ impl GoModCollector {
             proxy_url,
             known_modules: std::cell::RefCell::new(HashSet::new()),
             known_non_modules: std::cell::RefCell::new(HashSet::new()),
+            graph_uri: None,
         }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     /// Resolve an import path to its module root by trying progressively shorter
@@ -63,7 +72,11 @@ impl GoModCollector {
         // Try progressively shorter prefixes
         let parts: Vec<&str> = import_path.split('/').collect();
         // Minimum module path: domain + at least one segment (e.g., "golang.org/x")
-        let min_segments = if parts.first().map(|d| d.contains('.')) == Some(true) { 2 } else { 2 };
+        let min_segments = if parts.first().map(|d| d.contains('.')) == Some(true) {
+            2
+        } else {
+            2
+        };
 
         // Start from the full path and work down
         for end in (min_segments..=parts.len()).rev() {
@@ -94,24 +107,41 @@ impl GoModCollector {
         None
     }
 
-    pub fn collect_discover(&self, endpoint: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
-        let names = crate::seed::discover_by_ecosystem(endpoint, "gomod")?;
+    pub fn collect_discover(
+        &self,
+        endpoint: &str,
+        auth: &SparqlAuth,
+        backend: SparqlBackend,
+        max_depth: u32,
+        max_packages: usize,
+        output_path: &str,
+    ) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "gomod", auth, backend.clone())?;
         let seed_path = "/tmp/seed-gomod-discover.txt";
         std::fs::write(seed_path, names.join("\n"))?;
         self.collect(seed_path, max_depth, max_packages, output_path)
     }
 
-    pub fn collect(&self, packages_file: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
-        use std::collections::{HashSet, HashMap, VecDeque};
+    pub fn collect(
+        &self,
+        packages_file: &str,
+        max_depth: u32,
+        max_packages: usize,
+        output_path: &str,
+    ) -> Result<(usize, usize)> {
+        use std::collections::{HashMap, HashSet, VecDeque};
 
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         self.emit_distribution_metadata(&mut writer)?;
 
         let seeds = read_seed_file(packages_file)?;
         eprintln!("Loaded {} seed modules", seeds.len());
-        eprintln!("Spider config: max_depth={}, max_packages={}", max_depth, max_packages);
+        eprintln!(
+            "Spider config: max_depth={}, max_packages={}",
+            max_depth, max_packages
+        );
 
         // BFS state
         let mut queue: VecDeque<String> = seeds.into_iter().collect();
@@ -178,7 +208,11 @@ impl GoModCollector {
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        eprintln!("Collected {} modules ({} total in graph)", total_packages, visited.len());
+        eprintln!(
+            "Collected {} modules ({} total in graph)",
+            total_packages,
+            visited.len()
+        );
         writer.flush()?;
         Ok((total_packages, total_triples))
     }
@@ -239,12 +273,15 @@ impl GoModCollector {
         let go_mod = parse_go_mod(&go_mod_content);
 
         // Extract dep paths before emitting (for spidering)
-        let dep_paths: Vec<String> = go_mod.requires.iter()
+        let dep_paths: Vec<String> = go_mod
+            .requires
+            .iter()
             .map(|r| r.module_path.clone())
             .collect();
 
         // Emit triples
-        let triples = self.emit_module_triples(writer, module_path, version, &go_mod)
+        let triples = self
+            .emit_module_triples(writer, module_path, version, &go_mod)
             .map_err(|e| e.to_string())?;
 
         Ok((triples, dep_paths))
@@ -322,15 +359,27 @@ impl GoModCollector {
             writer.write_bnode_object(&pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri("depends"))?;
+            writer.write_bnode_subject(
+                &bnode,
+                &format!("{PKG}dependencyType"),
+                &dep_type_uri("depends"),
+            )?;
             triples += 4;
 
             if !dep.version.is_empty() {
                 let cb = bnode_id("constraint", &format!("{}-{}", pkg_uri, dep.module_path));
                 writer.write_bnode_to_bnode(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
                 writer.write_bnode_subject(&cb, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
-                writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintOperator"), "exact")?;
-                writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintValue"), &dep.version)?;
+                writer.write_bnode_literal(
+                    &cb,
+                    &format!("{PKG}versionConstraintOperator"),
+                    "exact",
+                )?;
+                writer.write_bnode_literal(
+                    &cb,
+                    &format!("{PKG}versionConstraintValue"),
+                    &dep.version,
+                )?;
                 triples += 4;
             }
 
@@ -458,7 +507,10 @@ mod tests {
     #[test]
     fn test_sanitize_module_path() {
         // Normal paths pass through
-        assert_eq!(sanitize_module_path("github.com/go-chi/chi"), "github.com/go-chi/chi");
+        assert_eq!(
+            sanitize_module_path("github.com/go-chi/chi"),
+            "github.com/go-chi/chi"
+        );
 
         // Strip commit annotations
         assert_eq!(
@@ -476,14 +528,26 @@ mod tests {
         assert_eq!(sanitize_module_path("has spaces.com/foo"), "");
 
         // Trim trailing slashes
-        assert_eq!(sanitize_module_path("github.com/foo/bar/"), "github.com/foo/bar");
+        assert_eq!(
+            sanitize_module_path("github.com/foo/bar/"),
+            "github.com/foo/bar"
+        );
     }
 
     #[test]
     fn test_encode_go_module_path() {
-        assert_eq!(encode_go_module_path("github.com/go-chi/chi"), "github.com/go-chi/chi");
-        assert_eq!(encode_go_module_path("github.com/Azure/go-autorest"), "github.com/!azure/go-autorest");
-        assert_eq!(encode_go_module_path("github.com/BurntSushi/toml"), "github.com/!burnt!sushi/toml");
+        assert_eq!(
+            encode_go_module_path("github.com/go-chi/chi"),
+            "github.com/go-chi/chi"
+        );
+        assert_eq!(
+            encode_go_module_path("github.com/Azure/go-autorest"),
+            "github.com/!azure/go-autorest"
+        );
+        assert_eq!(
+            encode_go_module_path("github.com/BurntSushi/toml"),
+            "github.com/!burnt!sushi/toml"
+        );
     }
 
     #[test]
@@ -501,7 +565,10 @@ require (
         let go_mod = parse_go_mod(content);
         assert_eq!(go_mod.go_version.as_deref(), Some("1.22"));
         assert_eq!(go_mod.requires.len(), 2);
-        assert_eq!(go_mod.requires[0].module_path, "github.com/stretchr/testify");
+        assert_eq!(
+            go_mod.requires[0].module_path,
+            "github.com/stretchr/testify"
+        );
         assert_eq!(go_mod.requires[0].version, "v1.9.0");
         assert!(!go_mod.requires[0].indirect);
         assert_eq!(go_mod.requires[1].module_path, "golang.org/x/net");
@@ -516,13 +583,11 @@ require (
 
         let go_mod = GoMod {
             go_version: Some("1.22".into()),
-            requires: vec![
-                GoRequire {
-                    module_path: "github.com/stretchr/testify".into(),
-                    version: "v1.9.0".into(),
-                    indirect: false,
-                },
-            ],
+            requires: vec![GoRequire {
+                module_path: "github.com/stretchr/testify".into(),
+                version: "v1.9.0".into(),
+                indirect: false,
+            }],
         };
 
         let triples = collector
@@ -531,7 +596,11 @@ require (
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("gomod#GoModule"));

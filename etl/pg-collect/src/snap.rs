@@ -1,5 +1,5 @@
-use crate::ntriples::NTriplesWriter;
 use crate::npm::read_seed_file;
+use crate::ntriples::NTriplesWriter;
 use crate::uris::*;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -12,6 +12,7 @@ pub struct SnapCollector {
     distro_name: String,
     release_name: String,
     client: Client,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,12 +77,23 @@ struct SnapChannelInfo {
 }
 
 impl SnapCollector {
-    pub fn new(distro_name: String, release_name: String, ) -> Self {
+    pub fn new(distro_name: String, release_name: String) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
             .expect("Failed to create HTTP client");
-        Self { distro_name, release_name, client }
+        Self {
+            distro_name,
+            release_name,
+            client,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     /// Collect from a seed file of snap names.
@@ -110,7 +122,9 @@ impl SnapCollector {
                 "https://api.snapcraft.io/api/v1/snaps/search?fields=package_name&page={}&size={}",
                 page, page_size
             );
-            let response = self.client.get(&url)
+            let response = self
+                .client
+                .get(&url)
                 .header("X-Ubuntu-Series", "16")
                 .send()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
@@ -125,7 +139,8 @@ impl SnapCollector {
                 ));
             }
 
-            let data: serde_json::Value = response.json()
+            let data: serde_json::Value = response
+                .json()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
             let packages = match data["_embedded"]["clickindex:package"].as_array() {
@@ -140,7 +155,12 @@ impl SnapCollector {
                 }
             }
 
-            eprintln!("  Page {}: {} snaps (total: {})", page, batch_count, names.len());
+            eprintln!(
+                "  Page {}: {} snaps (total: {})",
+                page,
+                batch_count,
+                names.len()
+            );
 
             // Check if there's a next page
             if data["_links"]["next"].is_null() || batch_count < page_size {
@@ -155,14 +175,16 @@ impl SnapCollector {
 
     fn collect_names(&self, names: &[String], output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
         self.emit_distribution_metadata(&mut writer)?;
 
         let mut total_packages = 0;
         let mut total_triples = 0;
 
         for (idx, name) in names.iter().enumerate() {
-            if (idx + 1) % 50 == 0 { eprintln!("Progress: {}/{}", idx + 1, names.len()); }
+            if (idx + 1) % 50 == 0 {
+                eprintln!("Progress: {}/{}", idx + 1, names.len());
+            }
 
             match self.fetch_snap_info(name) {
                 Ok(info) => {
@@ -194,7 +216,9 @@ impl SnapCollector {
 
     fn fetch_snap_info(&self, name: &str) -> std::result::Result<SnapInfoResponse, String> {
         let url = format!("https://api.snapcraft.io/v2/snaps/info/{}", name);
-        let response = self.client.get(&url)
+        let response = self
+            .client
+            .get(&url)
             .header("Snap-Device-Series", "16")
             .send()
             .map_err(|e| e.to_string())?;
@@ -218,18 +242,21 @@ impl SnapCollector {
         });
 
         let channel_map = v["channel-map"].as_array().map(|channels| {
-            channels.iter().filter_map(|ch| {
-                let channel_obj = ch.get("channel")?;
-                Some(SnapChannel {
-                    channel: SnapChannelInfo {
-                        name: channel_obj["name"].as_str().map(|s| s.to_string()),
-                        risk: channel_obj["risk"].as_str().map(|s| s.to_string()),
-                        track: channel_obj["track"].as_str().map(|s| s.to_string()),
-                    },
-                    version: ch["version"].as_str().map(|s| s.to_string()),
-                    confinement: ch["confinement"].as_str().map(|s| s.to_string()),
+            channels
+                .iter()
+                .filter_map(|ch| {
+                    let channel_obj = ch.get("channel")?;
+                    Some(SnapChannel {
+                        channel: SnapChannelInfo {
+                            name: channel_obj["name"].as_str().map(|s| s.to_string()),
+                            risk: channel_obj["risk"].as_str().map(|s| s.to_string()),
+                            track: channel_obj["track"].as_str().map(|s| s.to_string()),
+                        },
+                        version: ch["version"].as_str().map(|s| s.to_string()),
+                        confinement: ch["confinement"].as_str().map(|s| s.to_string()),
+                    })
                 })
-            }).collect()
+                .collect()
         });
 
         Ok(SnapInfoResponse {
@@ -241,21 +268,39 @@ impl SnapCollector {
         })
     }
 
-    fn emit_snap_triples(&self, writer: &mut NTriplesWriter, info: &SnapInfoResponse) -> Result<usize> {
+    fn emit_snap_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        info: &SnapInfoResponse,
+    ) -> Result<usize> {
         // Get version from stable channel
-        let version = info.channel_map.as_ref()
-            .and_then(|channels| channels.iter()
-                .find(|c| c.channel.risk.as_deref() == Some("stable"))
-                .and_then(|c| c.version.as_deref()))
+        let version = info
+            .channel_map
+            .as_ref()
+            .and_then(|channels| {
+                channels
+                    .iter()
+                    .find(|c| c.channel.risk.as_deref() == Some("stable"))
+                    .and_then(|c| c.version.as_deref())
+            })
             .unwrap_or("latest");
 
-        let confinement = info.channel_map.as_ref()
-            .and_then(|channels| channels.iter()
+        let confinement = info.channel_map.as_ref().and_then(|channels| {
+            channels
+                .iter()
                 .find(|c| c.channel.risk.as_deref() == Some("stable"))
-                .and_then(|c| c.confinement.as_deref()));
+                .and_then(|c| c.confinement.as_deref())
+        });
 
-        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", &info.name, version);
-        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", &info.name);
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            &self.release_name,
+            "any",
+            &info.name,
+            version,
+        );
+        let identity_uri =
+            package_identity_uri(&self.distro_name, &self.release_name, "any", &info.name);
         let mut triples = 0;
 
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{PKG}Package"))?;
@@ -337,8 +382,14 @@ mod tests {
 
         let info: SnapInfoResponse = serde_json::from_str(json).unwrap();
         assert_eq!(info.name, "firefox");
-        assert_eq!(info.snap.as_ref().unwrap().summary.as_deref(), Some("Mozilla Firefox web browser"));
-        assert_eq!(info.channel_map.as_ref().unwrap()[0].version.as_deref(), Some("125.0"));
+        assert_eq!(
+            info.snap.as_ref().unwrap().summary.as_deref(),
+            Some("Mozilla Firefox web browser")
+        );
+        assert_eq!(
+            info.channel_map.as_ref().unwrap()[0].version.as_deref(),
+            Some("125.0")
+        );
     }
 
     #[test]
@@ -357,7 +408,11 @@ mod tests {
             }),
             default_track: Some("latest".into()),
             channel_map: Some(vec![SnapChannel {
-                channel: SnapChannelInfo { name: Some("stable".into()), risk: Some("stable".into()), track: Some("latest".into()) },
+                channel: SnapChannelInfo {
+                    name: Some("stable".into()),
+                    risk: Some("stable".into()),
+                    track: Some("latest".into()),
+                },
                 version: Some("125.0".into()),
                 confinement: Some("strict".into()),
             }]),
@@ -367,7 +422,11 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("snap#SnapPackage"));

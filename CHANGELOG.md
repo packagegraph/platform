@@ -235,7 +235,7 @@ All notable changes to the PackageGraph platform are documented in this file.
 - **Fuseki memory** — Increased pod limit to 6Gi with JVM heap at `-Xmx2g`, leaving 4Gi for TDB2 memory-mapped file cache per [Jena guidance](https://github.com/apache/jena/discussions/2099).
 - **Fuseki query timeout** — Added `arq:queryTimeout "30000,120000"` (30s soft / 120s hard) to protect against runaway YASGUI queries.
 - **Fuseki GSP endpoint** — Enabled `fuseki:gsp-rw` at `/data` for Graph Store Protocol bulk uploads.
-- **TDB2 snapshot archival** — New `snapshot-tdb2` CronJob archives TDB2 to Minio after collection. Future Fuseki restarts restore from snapshot via init container instead of re-running collectors (~2 min restore vs ~40 min re-collect).
+- **TDB2 snapshot archival** — The `rebuild-tdb2` CronJob produces consistent offline TDB2 snapshots from source N-Triples via `tdb2.tdbloader` and archives them to Minio. Fuseki restarts restore from snapshot via init container (~2 min restore vs ~40 min re-collect). The previous `snapshot-tdb2` live-tar approach was removed because raw tar of active TDB2 files is not transactionally safe.
 - **Job TTL cleanup** — All CronJobs now set `ttlSecondsAfterFinished: 600` and `successfulJobsHistoryLimit: 1` / `failedJobsHistoryLimit: 1` to auto-clean completed pods and prevent disk exhaustion.
 - **Removed base `etl-collect` job** — Redundant with distro-specific CronJobs. Removed from base kustomization along with `etl-single-distro.yaml` patch.
 - **GitHub token secret** — Removed `secrets/github-token.yaml` from base kustomization to prevent `oc apply` overwriting the real token with the placeholder. Managed out-of-band via `oc create secret`.

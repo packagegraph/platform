@@ -12,6 +12,7 @@ pub struct ChocolateyCollector {
     release_name: String,
     client: Client,
     api_url: String,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -32,12 +33,24 @@ impl ChocolateyCollector {
     pub fn new(distro_name: String, release_name: String, api_url: String) -> Self {
         let client = crate::enricher::default_http_client();
 
-        Self { distro_name, release_name, client, api_url }
+        Self {
+            distro_name,
+            release_name,
+            client,
+            api_url,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         self.emit_distribution_metadata(&mut writer)?;
 
@@ -141,7 +154,8 @@ impl ChocolateyCollector {
                         current = ChocolateyPackage::default();
                     } else if name == "m:properties" {
                         in_properties = true;
-                    } else if name == "title" && in_entry && !in_properties && current.id.is_empty() {
+                    } else if name == "title" && in_entry && !in_properties && current.id.is_empty()
+                    {
                         // Chocolatey API no longer includes d:Id in properties;
                         // extract package ID from <title> element instead
                         current_element = "atom:title".to_string();
@@ -179,7 +193,9 @@ impl ChocolateyCollector {
                         "d:PackageHash" => current.package_hash = Some(text),
                         "d:PackageHashAlgorithm" => current.package_hash_algorithm = Some(text),
                         "d:DownloadCount" => current.download_count = text.parse().ok(),
-                        "d:VersionDownloadCount" => current.version_download_count = text.parse().ok(),
+                        "d:VersionDownloadCount" => {
+                            current.version_download_count = text.parse().ok()
+                        }
                         "d:IsPrerelease" => current.is_prerelease = text == "true",
                         _ => {}
                     }
@@ -197,9 +213,20 @@ impl ChocolateyCollector {
         Ok(packages)
     }
 
-    fn emit_package_triples(&self, writer: &mut NTriplesWriter, pkg: &ChocolateyPackage) -> Result<usize> {
-        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "windows", &pkg.id, &pkg.version);
-        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "windows", &pkg.id);
+    fn emit_package_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        pkg: &ChocolateyPackage,
+    ) -> Result<usize> {
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            &self.release_name,
+            "windows",
+            &pkg.id,
+            &pkg.version,
+        );
+        let identity_uri =
+            package_identity_uri(&self.distro_name, &self.release_name, "windows", &pkg.id);
         let mut triples = 0;
 
         // Dual typing
@@ -277,7 +304,11 @@ mod tests {
   </entry>
 </feed>"#;
 
-        let collector = ChocolateyCollector::new("chocolatey".into(), "community".into(), "https://community.chocolatey.org/api/v2".into());
+        let collector = ChocolateyCollector::new(
+            "chocolatey".into(),
+            "community".into(),
+            "https://community.chocolatey.org/api/v2".into(),
+        );
         let packages = collector.parse_odata_feed(xml).unwrap();
 
         assert_eq!(packages.len(), 1);
@@ -293,7 +324,11 @@ mod tests {
         use std::io::{Read, Write};
         use tempfile::NamedTempFile;
 
-        let collector = ChocolateyCollector::new("chocolatey".into(), "community".into(), "https://community.chocolatey.org/api/v2".into());
+        let collector = ChocolateyCollector::new(
+            "chocolatey".into(),
+            "community".into(),
+            "https://community.chocolatey.org/api/v2".into(),
+        );
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 
@@ -314,7 +349,11 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("chocolatey#ChocolateyPackage"));

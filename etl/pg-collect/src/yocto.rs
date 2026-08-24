@@ -9,9 +9,8 @@ use std::path::Path;
 use walkdir::WalkDir;
 
 // Regex for parsing BitBake variable assignments
-static VAR_ASSIGN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"^\s*([A-Z_]+)\s*(=|\?=|\+=|=\+|\.=|=\.)\s*"([^"]*)""#).unwrap()
-});
+static VAR_ASSIGN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"^\s*([A-Z_]+)\s*(=|\?=|\+=|=\+|\.=|=\.)\s*"([^"]*)""#).unwrap());
 
 #[derive(Debug, Clone)]
 struct YoctoRecipe {
@@ -34,16 +33,28 @@ pub struct YoctoCollector {
     distro_name: String,
     release_name: String,
     layers: Vec<String>,
+    pub graph_uri: Option<String>,
 }
 
 impl YoctoCollector {
     pub fn new(distro_name: String, release_name: String, layers: Vec<String>) -> Self {
-        Self { distro_name, release_name, layers }
+        Self {
+            distro_name,
+            release_name,
+            layers,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
         self.emit_distribution_metadata(&mut writer)?;
 
         let mut total_packages = 0;
@@ -61,13 +72,15 @@ impl YoctoCollector {
             for entry in WalkDir::new(layer_path)
                 .into_iter()
                 .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path().extension().and_then(|s| s.to_str()) == Some("bb")
-                })
+                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("bb"))
             {
                 match self.parse_recipe(entry.path(), layer_name) {
                     Ok(recipe) => {
-                        let key = format!("{}_{}", recipe.name, recipe.version.as_ref().unwrap_or(&"0".to_string()));
+                        let key = format!(
+                            "{}_{}",
+                            recipe.name,
+                            recipe.version.as_ref().unwrap_or(&"0".to_string())
+                        );
                         recipes.insert(key, recipe);
                     }
                     Err(e) => {
@@ -82,9 +95,7 @@ impl YoctoCollector {
             for entry in WalkDir::new(layer_path)
                 .into_iter()
                 .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path().extension().and_then(|s| s.to_str()) == Some("bbappend")
-                })
+                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("bbappend"))
             {
                 if let Err(e) = self.apply_bbappend(entry.path(), &mut recipes) {
                     eprintln!("  Error applying {:?}: {}", entry.path(), e);
@@ -122,12 +133,22 @@ impl YoctoCollector {
         Ok(triples)
     }
 
-    fn parse_recipe(&self, recipe_path: &Path, layer: &str) -> std::result::Result<YoctoRecipe, String> {
-        let filename = recipe_path.file_stem().and_then(|s| s.to_str()).ok_or("Invalid filename")?;
+    fn parse_recipe(
+        &self,
+        recipe_path: &Path,
+        layer: &str,
+    ) -> std::result::Result<YoctoRecipe, String> {
+        let filename = recipe_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or("Invalid filename")?;
 
         // Extract name and version from filename: packagename_1.2.3.bb
         let (name, version) = if let Some(idx) = filename.rfind('_') {
-            (filename[..idx].to_string(), Some(filename[idx + 1..].to_string()))
+            (
+                filename[..idx].to_string(),
+                Some(filename[idx + 1..].to_string()),
+            )
         } else {
             (filename.to_string(), None)
         };
@@ -157,16 +178,37 @@ impl YoctoCollector {
             description: variables.get("DESCRIPTION").cloned(),
             license: variables.get("LICENSE").cloned(),
             homepage: variables.get("HOMEPAGE").cloned(),
-            src_uri: variables.get("SRC_URI").map(|s| vec![s.clone()]).unwrap_or_default(),
+            src_uri: variables
+                .get("SRC_URI")
+                .map(|s| vec![s.clone()])
+                .unwrap_or_default(),
             section: variables.get("SECTION").cloned(),
-            depends: variables.get("DEPENDS").map(|s| s.split_whitespace().map(|x| x.to_string()).collect()).unwrap_or_default(),
-            rdepends: variables.get("RDEPENDS").map(|s| s.split_whitespace().map(|x| x.to_string()).collect()).unwrap_or_default(),
-            rrecommends: variables.get("RRECOMMENDS").map(|s| s.split_whitespace().map(|x| x.to_string()).collect()).unwrap_or_default(),
-            inherits: variables.get("inherit").map(|s| s.split_whitespace().map(|x| x.to_string()).collect()).unwrap_or_default(),
+            depends: variables
+                .get("DEPENDS")
+                .map(|s| s.split_whitespace().map(|x| x.to_string()).collect())
+                .unwrap_or_default(),
+            rdepends: variables
+                .get("RDEPENDS")
+                .map(|s| s.split_whitespace().map(|x| x.to_string()).collect())
+                .unwrap_or_default(),
+            rrecommends: variables
+                .get("RRECOMMENDS")
+                .map(|s| s.split_whitespace().map(|x| x.to_string()).collect())
+                .unwrap_or_default(),
+            inherits: variables
+                .get("inherit")
+                .map(|s| s.split_whitespace().map(|x| x.to_string()).collect())
+                .unwrap_or_default(),
         })
     }
 
-    fn apply_variable_operation(&self, variables: &mut HashMap<String, String>, var_name: &str, operator: &str, value: &str) {
+    fn apply_variable_operation(
+        &self,
+        variables: &mut HashMap<String, String>,
+        var_name: &str,
+        operator: &str,
+        value: &str,
+    ) {
         match operator {
             "=" => {
                 // Set/override
@@ -174,11 +216,15 @@ impl YoctoCollector {
             }
             "?=" => {
                 // Set if unset
-                variables.entry(var_name.to_string()).or_insert_with(|| value.to_string());
+                variables
+                    .entry(var_name.to_string())
+                    .or_insert_with(|| value.to_string());
             }
             "+=" => {
                 // Append with space
-                let entry = variables.entry(var_name.to_string()).or_insert_with(String::new);
+                let entry = variables
+                    .entry(var_name.to_string())
+                    .or_insert_with(String::new);
                 if !entry.is_empty() {
                     entry.push(' ');
                 }
@@ -186,7 +232,9 @@ impl YoctoCollector {
             }
             "=+" => {
                 // Prepend with space
-                let entry = variables.entry(var_name.to_string()).or_insert_with(String::new);
+                let entry = variables
+                    .entry(var_name.to_string())
+                    .or_insert_with(String::new);
                 let new_value = if entry.is_empty() {
                     value.to_string()
                 } else {
@@ -196,11 +244,16 @@ impl YoctoCollector {
             }
             ".=" => {
                 // Concatenate append (no space)
-                variables.entry(var_name.to_string()).or_insert_with(String::new).push_str(value);
+                variables
+                    .entry(var_name.to_string())
+                    .or_insert_with(String::new)
+                    .push_str(value);
             }
             "=." => {
                 // Concatenate prepend (no space)
-                let entry = variables.entry(var_name.to_string()).or_insert_with(String::new);
+                let entry = variables
+                    .entry(var_name.to_string())
+                    .or_insert_with(String::new);
                 let new_value = format!("{}{}", value, entry);
                 *entry = new_value;
             }
@@ -208,8 +261,15 @@ impl YoctoCollector {
         }
     }
 
-    fn apply_bbappend(&self, append_path: &Path, recipes: &mut HashMap<String, YoctoRecipe>) -> std::result::Result<(), String> {
-        let filename = append_path.file_stem().and_then(|s| s.to_str()).ok_or("Invalid filename")?;
+    fn apply_bbappend(
+        &self,
+        append_path: &Path,
+        recipes: &mut HashMap<String, YoctoRecipe>,
+    ) -> std::result::Result<(), String> {
+        let filename = append_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or("Invalid filename")?;
 
         // Extract name and version from .bbappend filename: packagename_1.2.3.bbappend
         let (name, version_pattern) = if let Some(idx) = filename.rfind('_') {
@@ -248,7 +308,9 @@ impl YoctoCollector {
                 recipe.description = Some(description.clone());
             }
             if let Some(depends) = variables.get("DEPENDS") {
-                recipe.depends.extend(depends.split_whitespace().map(|s| s.to_string()));
+                recipe
+                    .depends
+                    .extend(depends.split_whitespace().map(|s| s.to_string()));
             }
             if let Some(src_uri) = variables.get("SRC_URI") {
                 recipe.src_uri.push(src_uri.clone());
@@ -258,11 +320,22 @@ impl YoctoCollector {
         Ok(())
     }
 
-    fn emit_package_triples(&self, writer: &mut NTriplesWriter, recipe: &YoctoRecipe) -> Result<usize> {
+    fn emit_package_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        recipe: &YoctoRecipe,
+    ) -> Result<usize> {
         let default_version = "0".to_string();
         let version = recipe.version.as_ref().unwrap_or(&default_version);
-        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", &recipe.name, version);
-        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", &recipe.name);
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            &self.release_name,
+            "any",
+            &recipe.name,
+            version,
+        );
+        let identity_uri =
+            package_identity_uri(&self.distro_name, &self.release_name, "any", &recipe.name);
         let dist_uri = distro_uri(&self.distro_name);
         let rel_uri = release_uri(&self.distro_name, &self.release_name);
         let mut triples = 0;
@@ -337,7 +410,8 @@ impl YoctoCollector {
             // Extract forge URL from SRC_URI (handles git://, archive URLs, Yocto params)
             if !repo_emitted {
                 if let Some(extraction) = crate::forge::extract_forge_url(uri) {
-                    triples += crate::forge::emit_upstream_repo(writer, &identity_uri, &extraction, None)?;
+                    triples +=
+                        crate::forge::emit_upstream_repo(writer, &identity_uri, &extraction, None)?;
                     repo_emitted = true;
                 }
             }
@@ -357,7 +431,8 @@ impl YoctoCollector {
                 "build"
             };
 
-            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
+            let target_uri =
+                package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
             writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
 
@@ -365,12 +440,17 @@ impl YoctoCollector {
             writer.write_bnode_object(&pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri(dep_type))?;
+            writer.write_bnode_subject(
+                &bnode,
+                &format!("{PKG}dependencyType"),
+                &dep_type_uri(dep_type),
+            )?;
             triples += 4;
         }
 
         for dep in &recipe.rdepends {
-            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
+            let target_uri =
+                package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
             writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
 
@@ -378,12 +458,17 @@ impl YoctoCollector {
             writer.write_bnode_object(&pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri("runtime"))?;
+            writer.write_bnode_subject(
+                &bnode,
+                &format!("{PKG}dependencyType"),
+                &dep_type_uri("runtime"),
+            )?;
             triples += 4;
         }
 
         for dep in &recipe.rrecommends {
-            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
+            let target_uri =
+                package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
             writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
 
@@ -391,7 +476,11 @@ impl YoctoCollector {
             writer.write_bnode_object(&pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri("recommended"))?;
+            writer.write_bnode_subject(
+                &bnode,
+                &format!("{PKG}dependencyType"),
+                &dep_type_uri("recommended"),
+            )?;
             triples += 4;
         }
 
@@ -405,7 +494,13 @@ mod tests {
     use std::io::{Read, Write};
     use tempfile::{NamedTempFile, TempDir};
 
-    fn create_test_recipe(dir: &Path, layer: &str, name: &str, version: &str, content: &str) -> std::path::PathBuf {
+    fn create_test_recipe(
+        dir: &Path,
+        layer: &str,
+        name: &str,
+        version: &str,
+        content: &str,
+    ) -> std::path::PathBuf {
         let layer_path = dir.join(layer);
         let recipe_dir = layer_path.join("recipes-test").join(name);
         fs::create_dir_all(&recipe_dir).unwrap();
@@ -432,9 +527,16 @@ SECTION = "devel"
 
         create_test_recipe(temp_dir.path(), "meta-test", "testpkg", "1.0", content);
 
-        let collector = YoctoCollector::new("yocto".into(), "yocto".into(), vec![
-            temp_dir.path().join("meta-test").to_str().unwrap().to_string()
-        ]);
+        let collector = YoctoCollector::new(
+            "yocto".into(),
+            "yocto".into(),
+            vec![temp_dir
+                .path()
+                .join("meta-test")
+                .to_str()
+                .unwrap()
+                .to_string()],
+        );
 
         let temp_file = NamedTempFile::new().unwrap();
         let output_path = temp_file.path().to_str().unwrap();
@@ -446,27 +548,61 @@ SECTION = "devel"
 
         // Read output and verify
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Check for dual typing
-        assert!(content.contains("core#SourcePackage"), "Should have SourcePackage type");
-        assert!(content.contains("bitbake#BitBakeRecipe"), "Should have BitBakeRecipe type");
+        assert!(
+            content.contains("core#SourcePackage"),
+            "Should have SourcePackage type"
+        );
+        assert!(
+            content.contains("bitbake#BitBakeRecipe"),
+            "Should have BitBakeRecipe type"
+        );
 
         // Check for metadata — DESCRIPTION takes precedence over SUMMARY
-        assert!(content.contains("\"A test package for unit tests\""), "Should have DESCRIPTION");
-        assert!(content.contains("licenseName"), "Should use licenseName property");
+        assert!(
+            content.contains("\"A test package for unit tests\""),
+            "Should have DESCRIPTION"
+        );
+        assert!(
+            content.contains("licenseName"),
+            "Should use licenseName property"
+        );
         assert!(content.contains("\"MIT\""), "Should have LICENSE");
-        assert!(content.contains("\"https://example.com\""), "Should have HOMEPAGE");
+        assert!(
+            content.contains("\"https://example.com\""),
+            "Should have HOMEPAGE"
+        );
         assert!(content.contains("\"meta-test\""), "Should have layer name");
 
         // Check correct ontology alignment
-        assert!(content.contains("isVersionOf"), "Should use isVersionOf for identity link");
-        assert!(content.contains("core#Version"), "Should create Version node");
-        assert!(content.contains("versionString"), "Should use versionString on Version node");
-        assert!(content.contains("partOfDistribution"), "Should link to distribution");
+        assert!(
+            content.contains("isVersionOf"),
+            "Should use isVersionOf for identity link"
+        );
+        assert!(
+            content.contains("core#Version"),
+            "Should create Version node"
+        );
+        assert!(
+            content.contains("versionString"),
+            "Should use versionString on Version node"
+        );
+        assert!(
+            content.contains("partOfDistribution"),
+            "Should link to distribution"
+        );
         assert!(content.contains("partOfRelease"), "Should link to release");
         assert!(content.contains("bitbake#srcUri"), "Should emit SRC_URI");
-        assert!(!content.contains("packageVersion"), "Should NOT use packageVersion");
+        assert!(
+            !content.contains("packageVersion"),
+            "Should NOT use packageVersion"
+        );
     }
 
     #[test]
@@ -495,10 +631,24 @@ SRC_URI += "file://extra.patch"
         let mut file = File::create(&append_file).unwrap();
         file.write_all(append_content.as_bytes()).unwrap();
 
-        let collector = YoctoCollector::new("yocto".into(), "yocto".into(), vec![
-            temp_dir.path().join("meta-base").to_str().unwrap().to_string(),
-            temp_dir.path().join("meta-extra").to_str().unwrap().to_string(),
-        ]);
+        let collector = YoctoCollector::new(
+            "yocto".into(),
+            "yocto".into(),
+            vec![
+                temp_dir
+                    .path()
+                    .join("meta-base")
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                temp_dir
+                    .path()
+                    .join("meta-extra")
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            ],
+        );
 
         let temp_file = NamedTempFile::new().unwrap();
         let output_path = temp_file.path().to_str().unwrap();
@@ -508,11 +658,21 @@ SRC_URI += "file://extra.patch"
 
         // Read output and verify merged values
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // SUMMARY should be overridden (= operator)
-        assert!(content.contains("\"Extended package\""), "SUMMARY should be overridden");
-        assert!(!content.contains("\"Base package\""), "Old SUMMARY should be replaced");
+        assert!(
+            content.contains("\"Extended package\""),
+            "SUMMARY should be overridden"
+        );
+        assert!(
+            !content.contains("\"Base package\""),
+            "Old SUMMARY should be replaced"
+        );
     }
 
     #[test]
@@ -528,9 +688,16 @@ RRECOMMENDS = "optional-tool"
 
         create_test_recipe(temp_dir.path(), "meta-test", "testdeps", "1.0", content);
 
-        let collector = YoctoCollector::new("yocto".into(), "yocto".into(), vec![
-            temp_dir.path().join("meta-test").to_str().unwrap().to_string()
-        ]);
+        let collector = YoctoCollector::new(
+            "yocto".into(),
+            "yocto".into(),
+            vec![temp_dir
+                .path()
+                .join("meta-test")
+                .to_str()
+                .unwrap()
+                .to_string()],
+        );
 
         let temp_file = NamedTempFile::new().unwrap();
         let output_path = temp_file.path().to_str().unwrap();
@@ -538,13 +705,29 @@ RRECOMMENDS = "optional-tool"
         collector.collect(output_path).unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Check for dependency type property URIs (v0.6.0)
-        assert!(content.contains("core#buildDependsOn"), "Should have buildDependsOn dependency type");
-        assert!(content.contains("core#dependsOn"), "Should have dependsOn dependency type for runtime");
-        assert!(content.contains("core#recommends"), "Should have recommends dependency type");
-        assert!(content.contains("core#buildDependsOn"), "Should have buildDependsOn for native deps");
+        assert!(
+            content.contains("core#buildDependsOn"),
+            "Should have buildDependsOn dependency type"
+        );
+        assert!(
+            content.contains("core#dependsOn"),
+            "Should have dependsOn dependency type for runtime"
+        );
+        assert!(
+            content.contains("core#recommends"),
+            "Should have recommends dependency type"
+        );
+        assert!(
+            content.contains("core#buildDependsOn"),
+            "Should have buildDependsOn for native deps"
+        );
     }
 
     #[test]
@@ -555,11 +738,24 @@ SUMMARY = "Version test"
 LICENSE = "MIT"
 "#;
 
-        create_test_recipe(temp_dir.path(), "meta-test", "versiontest", "2.3.4", content);
+        create_test_recipe(
+            temp_dir.path(),
+            "meta-test",
+            "versiontest",
+            "2.3.4",
+            content,
+        );
 
-        let collector = YoctoCollector::new("yocto".into(), "yocto".into(), vec![
-            temp_dir.path().join("meta-test").to_str().unwrap().to_string()
-        ]);
+        let collector = YoctoCollector::new(
+            "yocto".into(),
+            "yocto".into(),
+            vec![temp_dir
+                .path()
+                .join("meta-test")
+                .to_str()
+                .unwrap()
+                .to_string()],
+        );
 
         let temp_file = NamedTempFile::new().unwrap();
         let output_path = temp_file.path().to_str().unwrap();
@@ -567,9 +763,16 @@ LICENSE = "MIT"
         collector.collect(output_path).unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Should extract version from filename
-        assert!(content.contains("\"2.3.4\""), "Should extract version from filename");
+        assert!(
+            content.contains("\"2.3.4\""),
+            "Should extract version from filename"
+        );
     }
 }

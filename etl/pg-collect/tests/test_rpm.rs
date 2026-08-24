@@ -1,9 +1,9 @@
 // RPM collector unit tests
 
+use pg_collect::ntriples::NTriplesWriter;
 use pg_collect::rpm::{RpmCollector, RpmDep, RpmPackageData};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use pg_collect::ntriples::NTriplesWriter;
 use tempfile::NamedTempFile;
 
 fn make_pkg_data(fields: Vec<(&str, &str)>, deps: Vec<RpmDep>) -> RpmPackageData {
@@ -25,16 +25,24 @@ fn test_emit_package_triples_basic() -> std::io::Result<()> {
     let temp_file = NamedTempFile::new()?;
     let mut writer = NTriplesWriter::new(temp_file.reopen()?);
 
-    let pkg_data = make_pkg_data(vec![
-        ("name", "bash"),
-        ("arch", "x86_64"),
-        ("ver", "5.2.15"),
-        ("rel", "1.fc39"),
-        ("epoch", "0"),
-        ("summary", "The GNU Bourne Again shell"),
-    ], vec![]);
+    let pkg_data = make_pkg_data(
+        vec![
+            ("name", "bash"),
+            ("arch", "x86_64"),
+            ("ver", "5.2.15"),
+            ("rel", "1.fc39"),
+            ("epoch", "0"),
+            ("summary", "The GNU Bourne Again shell"),
+        ],
+        vec![],
+    );
 
-    let triple_count = collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
+    let triple_count = collector.emit_package_triples(
+        &mut writer,
+        &pkg_data,
+        None,
+        &mut std::collections::HashSet::new(),
+    )?;
 
     writer.flush()?;
 
@@ -45,16 +53,28 @@ fn test_emit_package_triples_basic() -> std::io::Result<()> {
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
     // Check for dual typing
-    assert!(lines.iter().any(|l| l.contains("BinaryRPM")), "Should have rpm:BinaryRPM type");
-    assert!(lines.iter().any(|l| l.contains("BinaryPackage")), "Should have pkg:BinaryPackage type");
+    assert!(
+        lines.iter().any(|l| l.contains("BinaryRPM")),
+        "Should have rpm:BinaryRPM type"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("BinaryPackage")),
+        "Should have pkg:BinaryPackage type"
+    );
 
     // Check for package name
-    assert!(lines.iter().any(|l| l.contains("packageName") && l.contains("bash")),
-            "Should have packageName triple");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("packageName") && l.contains("bash")),
+        "Should have packageName triple"
+    );
 
     // Check for version
-    assert!(lines.iter().any(|l| l.contains("versionString")),
-            "Should have version triple");
+    assert!(
+        lines.iter().any(|l| l.contains("versionString")),
+        "Should have version triple"
+    );
 
     Ok(())
 }
@@ -70,17 +90,25 @@ fn test_emit_package_with_rpm_specific_properties() -> std::io::Result<()> {
     let temp_file = NamedTempFile::new()?;
     let mut writer = NTriplesWriter::new(temp_file.reopen()?);
 
-    let pkg_data = make_pkg_data(vec![
-        ("name", "kernel"),
-        ("arch", "x86_64"),
-        ("ver", "6.5.6"),
-        ("rel", "300.fc39"),
-        ("epoch", "1"),
-        ("sourcerpm", "kernel-6.5.6-300.fc39.src.rpm"),
-        ("group", "System Environment/Kernel"),
-    ], vec![]);
+    let pkg_data = make_pkg_data(
+        vec![
+            ("name", "kernel"),
+            ("arch", "x86_64"),
+            ("ver", "6.5.6"),
+            ("rel", "300.fc39"),
+            ("epoch", "1"),
+            ("sourcerpm", "kernel-6.5.6-300.fc39.src.rpm"),
+            ("group", "System Environment/Kernel"),
+        ],
+        vec![],
+    );
 
-    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
+    collector.emit_package_triples(
+        &mut writer,
+        &pkg_data,
+        None,
+        &mut std::collections::HashSet::new(),
+    )?;
 
     writer.flush()?;
 
@@ -89,22 +117,36 @@ fn test_emit_package_with_rpm_specific_properties() -> std::io::Result<()> {
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
     // Check for sourceRPM
-    assert!(lines.iter().any(|l| l.contains("sourceRPM") && l.contains("kernel-6.5.6-300.fc39.src.rpm")),
-            "Should have sourceRPM property");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("sourceRPM") && l.contains("kernel-6.5.6-300.fc39.src.rpm")),
+        "Should have sourceRPM property"
+    );
 
     // Check for RPM group
-    assert!(lines.iter().any(|l| l.contains("RPMGroup") && l.contains("System Environment/Kernel")),
-            "Should have RPMGroup property");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("RPMGroup") && l.contains("System Environment/Kernel")),
+        "Should have RPMGroup property"
+    );
 
     // Check for epoch (when non-zero)
-    assert!(lines.iter().any(|l| l.contains("epoch")),
-            "Should have epoch property");
+    assert!(
+        lines.iter().any(|l| l.contains("epoch")),
+        "Should have epoch property"
+    );
 
     // Check for SourcePackage entity from sourcerpm
-    assert!(lines.iter().any(|l| l.contains("SourcePackage")),
-            "Should create SourcePackage entity from sourcerpm");
-    assert!(lines.iter().any(|l| l.contains("builtFromSource")),
-            "Should link binary to source via builtFromSource");
+    assert!(
+        lines.iter().any(|l| l.contains("SourcePackage")),
+        "Should create SourcePackage entity from sourcerpm"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("builtFromSource")),
+        "Should link binary to source via builtFromSource"
+    );
 
     Ok(())
 }
@@ -120,14 +162,22 @@ fn test_version_string_format() -> std::io::Result<()> {
     let temp_file = NamedTempFile::new()?;
     let mut writer = NTriplesWriter::new(temp_file.reopen()?);
 
-    let pkg_data = make_pkg_data(vec![
-        ("name", "test"),
-        ("arch", "x86_64"),
-        ("ver", "1.0"),
-        ("rel", "1.fc39"),
-    ], vec![]);
+    let pkg_data = make_pkg_data(
+        vec![
+            ("name", "test"),
+            ("arch", "x86_64"),
+            ("ver", "1.0"),
+            ("rel", "1.fc39"),
+        ],
+        vec![],
+    );
 
-    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
+    collector.emit_package_triples(
+        &mut writer,
+        &pkg_data,
+        None,
+        &mut std::collections::HashSet::new(),
+    )?;
 
     writer.flush()?;
 
@@ -136,8 +186,10 @@ fn test_version_string_format() -> std::io::Result<()> {
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
     // RPM version format: {ver}-{rel}.{arch}
-    assert!(lines.iter().any(|l| l.contains("1.0-1.fc39.x86_64")),
-            "Version string should follow RPM format: ver-rel.arch");
+    assert!(
+        lines.iter().any(|l| l.contains("1.0-1.fc39.x86_64")),
+        "Version string should follow RPM format: ver-rel.arch"
+    );
 
     Ok(())
 }
@@ -188,15 +240,23 @@ fn test_emit_package_with_dependencies() -> std::io::Result<()> {
         },
     ];
 
-    let pkg_data = make_pkg_data(vec![
-        ("name", "bash"),
-        ("arch", "x86_64"),
-        ("ver", "5.2.15"),
-        ("rel", "1.fc41"),
-        ("epoch", "0"),
-    ], deps);
+    let pkg_data = make_pkg_data(
+        vec![
+            ("name", "bash"),
+            ("arch", "x86_64"),
+            ("ver", "5.2.15"),
+            ("rel", "1.fc41"),
+            ("epoch", "0"),
+        ],
+        deps,
+    );
 
-    let triple_count = collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
+    let triple_count = collector.emit_package_triples(
+        &mut writer,
+        &pkg_data,
+        None,
+        &mut std::collections::HashSet::new(),
+    )?;
 
     writer.flush()?;
 
@@ -207,34 +267,54 @@ fn test_emit_package_with_dependencies() -> std::io::Result<()> {
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
     // Should have directlyDependsOn for glibc (requires)
-    assert!(lines.iter().any(|l| l.contains("directlyDependsOn")),
-            "Should emit directlyDependsOn for requires");
+    assert!(
+        lines.iter().any(|l| l.contains("directlyDependsOn")),
+        "Should emit directlyDependsOn for requires"
+    );
 
     // Should have rpmRequires
-    assert!(lines.iter().any(|l| l.contains("rpmRequires")),
-            "Should emit rpmRequires property");
+    assert!(
+        lines.iter().any(|l| l.contains("rpmRequires")),
+        "Should emit rpmRequires property"
+    );
 
     // Should NOT emit rpmlib() virtual deps
-    assert!(!lines.iter().any(|l| l.contains("rpmlib(") && l.contains("packageName")),
-            "Should skip rpmlib() virtual dependencies");
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("rpmlib(") && l.contains("packageName")),
+        "Should skip rpmlib() virtual dependencies"
+    );
 
     // Should have Dependency bnode
-    assert!(lines.iter().any(|l| l.contains("Dependency")),
-            "Should create reified Dependency");
+    assert!(
+        lines.iter().any(|l| l.contains("Dependency")),
+        "Should create reified Dependency"
+    );
 
     // Should have VersionConstraint for glibc (has flags GE + ver)
-    assert!(lines.iter().any(|l| l.contains("VersionConstraint")),
-            "Should create VersionConstraint for versioned deps");
-    assert!(lines.iter().any(|l| l.contains("versionConstraintOperator")),
-            "Should emit version constraint operator");
+    assert!(
+        lines.iter().any(|l| l.contains("VersionConstraint")),
+        "Should create VersionConstraint for versioned deps"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("versionConstraintOperator")),
+        "Should emit version constraint operator"
+    );
 
     // Should have directlyConflictsWith for old-bash
-    assert!(lines.iter().any(|l| l.contains("directlyConflictsWith")),
-            "Should emit directlyConflictsWith for conflicts");
+    assert!(
+        lines.iter().any(|l| l.contains("directlyConflictsWith")),
+        "Should emit directlyConflictsWith for conflicts"
+    );
 
     // Should have rpmConflicts
-    assert!(lines.iter().any(|l| l.contains("rpmConflicts")),
-            "Should emit rpmConflicts property");
+    assert!(
+        lines.iter().any(|l| l.contains("rpmConflicts")),
+        "Should emit rpmConflicts property"
+    );
 
     Ok(())
 }
@@ -250,15 +330,23 @@ fn test_emit_maintainer_triples() -> std::io::Result<()> {
     let temp_file = NamedTempFile::new()?;
     let mut writer = NTriplesWriter::new(temp_file.reopen()?);
 
-    let pkg_data = make_pkg_data(vec![
-        ("name", "bash"),
-        ("arch", "x86_64"),
-        ("ver", "5.2.15"),
-        ("rel", "1.fc41"),
-        ("packager", "Fedora Project <packager@fedoraproject.org>"),
-    ], vec![]);
+    let pkg_data = make_pkg_data(
+        vec![
+            ("name", "bash"),
+            ("arch", "x86_64"),
+            ("ver", "5.2.15"),
+            ("rel", "1.fc41"),
+            ("packager", "Fedora Project <packager@fedoraproject.org>"),
+        ],
+        vec![],
+    );
 
-    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
+    collector.emit_package_triples(
+        &mut writer,
+        &pkg_data,
+        None,
+        &mut std::collections::HashSet::new(),
+    )?;
 
     writer.flush()?;
 
@@ -267,18 +355,28 @@ fn test_emit_maintainer_triples() -> std::io::Result<()> {
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
     // Should emit Person type (SD-3 data contract — not Maintainer)
-    assert!(lines.iter().any(|l| l.contains("Person")),
-            "Should create Person resource per SD-3");
-    assert!(!lines.iter().any(|l| l.contains("core#Maintainer")),
-            "Should NOT type as Maintainer per SD-3");
+    assert!(
+        lines.iter().any(|l| l.contains("Person")),
+        "Should create Person resource per SD-3"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("core#Maintainer")),
+        "Should NOT type as Maintainer per SD-3"
+    );
 
     // Should emit maintainedBy link
-    assert!(lines.iter().any(|l| l.contains("maintainedBy")),
-            "Should link package to maintainer");
+    assert!(
+        lines.iter().any(|l| l.contains("maintainedBy")),
+        "Should link package to maintainer"
+    );
 
     // Should emit foaf:name
-    assert!(lines.iter().any(|l| l.contains("foaf") && l.contains("name") && l.contains("Fedora Project")),
-            "Should emit maintainer name");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("foaf") && l.contains("name") && l.contains("Fedora Project")),
+        "Should emit maintainer name"
+    );
 
     Ok(())
 }
@@ -295,15 +393,23 @@ fn test_emit_maintainer_triples_name_only() -> std::io::Result<()> {
     let temp_file = NamedTempFile::new()?;
     let mut writer = NTriplesWriter::new(temp_file.reopen()?);
 
-    let pkg_data = make_pkg_data(vec![
-        ("name", "bash"),
-        ("arch", "x86_64"),
-        ("ver", "5.2.15"),
-        ("rel", "1.fc43"),
-        ("packager", "Fedora Project"),
-    ], vec![]);
+    let pkg_data = make_pkg_data(
+        vec![
+            ("name", "bash"),
+            ("arch", "x86_64"),
+            ("ver", "5.2.15"),
+            ("rel", "1.fc43"),
+            ("packager", "Fedora Project"),
+        ],
+        vec![],
+    );
 
-    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
+    collector.emit_package_triples(
+        &mut writer,
+        &pkg_data,
+        None,
+        &mut std::collections::HashSet::new(),
+    )?;
 
     writer.flush()?;
 
@@ -312,24 +418,38 @@ fn test_emit_maintainer_triples_name_only() -> std::io::Result<()> {
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
     // Should emit Person type (SD-3 data contract)
-    assert!(lines.iter().any(|l| l.contains("Person")),
-            "Should create Person resource per SD-3");
+    assert!(
+        lines.iter().any(|l| l.contains("Person")),
+        "Should create Person resource per SD-3"
+    );
 
     // Should emit maintainedBy link
-    assert!(lines.iter().any(|l| l.contains("maintainedBy")),
-            "Should link package to maintainer");
+    assert!(
+        lines.iter().any(|l| l.contains("maintainedBy")),
+        "Should link package to maintainer"
+    );
 
     // Should emit foaf:name
-    assert!(lines.iter().any(|l| l.contains("foaf") && l.contains("name") && l.contains("Fedora Project")),
-            "Should emit maintainer name");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("foaf") && l.contains("name") && l.contains("Fedora Project")),
+        "Should emit maintainer name"
+    );
 
     // Should NOT emit foaf:mbox when there's no email
-    assert!(!lines.iter().any(|l| l.contains("foaf") && l.contains("mbox")),
-            "Should not emit mbox when packager has no email");
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("foaf") && l.contains("mbox")),
+        "Should not emit mbox when packager has no email"
+    );
 
     // URI should use stable ID (lowercase, hyphenated)
-    assert!(lines.iter().any(|l| l.contains("fedora-project")),
-            "Should use stable ID in maintainer URI");
+    assert!(
+        lines.iter().any(|l| l.contains("fedora-project")),
+        "Should use stable ID in maintainer URI"
+    );
 
     Ok(())
 }
@@ -364,32 +484,59 @@ fn test_emit_ecosystem_from_provides_cargo() -> std::io::Result<()> {
         },
     ];
 
-    let pkg_data = make_pkg_data(vec![
-        ("name", "rust-tokio"),
-        ("arch", "noarch"),
-        ("ver", "1.36.0"),
-        ("rel", "1.fc43"),
-        ("epoch", "0"),
-    ], deps);
+    let pkg_data = make_pkg_data(
+        vec![
+            ("name", "rust-tokio"),
+            ("arch", "noarch"),
+            ("ver", "1.36.0"),
+            ("rel", "1.fc43"),
+            ("epoch", "0"),
+        ],
+        deps,
+    );
 
-    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
+    collector.emit_package_triples(
+        &mut writer,
+        &pkg_data,
+        None,
+        &mut std::collections::HashSet::new(),
+    )?;
     writer.flush()?;
 
     let output_file = temp_file.reopen()?;
     let reader = BufReader::new(output_file);
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
-    assert!(lines.iter().any(|l| l.contains("upstreamEcosystem") && l.contains("cargo")),
-            "Should identify cargo ecosystem");
-    assert!(lines.iter().any(|l| l.contains("upstreamPackageName") && l.contains("\"tokio\"")),
-            "Should extract crate name 'tokio'");
-    assert!(lines.iter().any(|l| l.contains("upstreamPackageName") && l.contains("\"tokio/rt\"")),
-            "Should extract crate feature 'tokio/rt'");
-    assert!(lines.iter().any(|l| l.contains("upstreamPackageVersion") && l.contains("\"1.36.0\"")),
-            "Should extract upstream version");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("upstreamEcosystem") && l.contains("cargo")),
+        "Should identify cargo ecosystem"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("upstreamPackageName") && l.contains("\"tokio\"")),
+        "Should extract crate name 'tokio'"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("upstreamPackageName") && l.contains("\"tokio/rt\"")),
+        "Should extract crate feature 'tokio/rt'"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("upstreamPackageVersion") && l.contains("\"1.36.0\"")),
+        "Should extract upstream version"
+    );
 
     // Should only emit ecosystem once
-    let eco_count = lines.iter().filter(|l| l.contains("upstreamEcosystem")).count();
+    let eco_count = lines
+        .iter()
+        .filter(|l| l.contains("upstreamEcosystem"))
+        .count();
     assert_eq!(eco_count, 1, "Should emit upstreamEcosystem exactly once");
 
     Ok(())
@@ -406,38 +553,56 @@ fn test_emit_ecosystem_from_provides_python() -> std::io::Result<()> {
     let temp_file = NamedTempFile::new()?;
     let mut writer = NTriplesWriter::new(temp_file.reopen()?);
 
-    let deps = vec![
-        RpmDep {
-            name: "python3dist(requests)".to_string(),
-            flags: Some("EQ".to_string()),
-            epoch: None,
-            ver: Some("2.31.0".to_string()),
-            rel: None,
-            dep_type: "provides".to_string(),
-        },
-    ];
+    let deps = vec![RpmDep {
+        name: "python3dist(requests)".to_string(),
+        flags: Some("EQ".to_string()),
+        epoch: None,
+        ver: Some("2.31.0".to_string()),
+        rel: None,
+        dep_type: "provides".to_string(),
+    }];
 
-    let pkg_data = make_pkg_data(vec![
-        ("name", "python3-requests"),
-        ("arch", "noarch"),
-        ("ver", "2.31.0"),
-        ("rel", "1.fc43"),
-        ("epoch", "0"),
-    ], deps);
+    let pkg_data = make_pkg_data(
+        vec![
+            ("name", "python3-requests"),
+            ("arch", "noarch"),
+            ("ver", "2.31.0"),
+            ("rel", "1.fc43"),
+            ("epoch", "0"),
+        ],
+        deps,
+    );
 
-    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
+    collector.emit_package_triples(
+        &mut writer,
+        &pkg_data,
+        None,
+        &mut std::collections::HashSet::new(),
+    )?;
     writer.flush()?;
 
     let output_file = temp_file.reopen()?;
     let reader = BufReader::new(output_file);
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
-    assert!(lines.iter().any(|l| l.contains("upstreamEcosystem") && l.contains("pypi")),
-            "Should identify pypi ecosystem");
-    assert!(lines.iter().any(|l| l.contains("upstreamPackageName") && l.contains("\"requests\"")),
-            "Should extract Python package name");
-    assert!(lines.iter().any(|l| l.contains("upstreamPackageVersion") && l.contains("\"2.31.0\"")),
-            "Should extract upstream version");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("upstreamEcosystem") && l.contains("pypi")),
+        "Should identify pypi ecosystem"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("upstreamPackageName") && l.contains("\"requests\"")),
+        "Should extract Python package name"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("upstreamPackageVersion") && l.contains("\"2.31.0\"")),
+        "Should extract upstream version"
+    );
 
     Ok(())
 }
@@ -453,36 +618,50 @@ fn test_emit_ecosystem_from_provides_golang() -> std::io::Result<()> {
     let temp_file = NamedTempFile::new()?;
     let mut writer = NTriplesWriter::new(temp_file.reopen()?);
 
-    let deps = vec![
-        RpmDep {
-            name: "golang(github.com/gorilla/mux)".to_string(),
-            flags: None,
-            epoch: None,
-            ver: None,
-            rel: None,
-            dep_type: "provides".to_string(),
-        },
-    ];
+    let deps = vec![RpmDep {
+        name: "golang(github.com/gorilla/mux)".to_string(),
+        flags: None,
+        epoch: None,
+        ver: None,
+        rel: None,
+        dep_type: "provides".to_string(),
+    }];
 
-    let pkg_data = make_pkg_data(vec![
-        ("name", "golang-github-gorilla-mux"),
-        ("arch", "noarch"),
-        ("ver", "1.8.1"),
-        ("rel", "1.fc43"),
-        ("epoch", "0"),
-    ], deps);
+    let pkg_data = make_pkg_data(
+        vec![
+            ("name", "golang-github-gorilla-mux"),
+            ("arch", "noarch"),
+            ("ver", "1.8.1"),
+            ("rel", "1.fc43"),
+            ("epoch", "0"),
+        ],
+        deps,
+    );
 
-    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
+    collector.emit_package_triples(
+        &mut writer,
+        &pkg_data,
+        None,
+        &mut std::collections::HashSet::new(),
+    )?;
     writer.flush()?;
 
     let output_file = temp_file.reopen()?;
     let reader = BufReader::new(output_file);
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
-    assert!(lines.iter().any(|l| l.contains("upstreamEcosystem") && l.contains("gomod")),
-            "Should identify gomod ecosystem");
-    assert!(lines.iter().any(|l| l.contains("upstreamPackageName") && l.contains("github.com/gorilla/mux")),
-            "Should extract Go import path");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("upstreamEcosystem") && l.contains("gomod")),
+        "Should identify gomod ecosystem"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("upstreamPackageName") && l.contains("github.com/gorilla/mux")),
+        "Should extract Go import path"
+    );
 
     Ok(())
 }
@@ -499,36 +678,46 @@ fn test_no_ecosystem_for_plain_rpm() -> std::io::Result<()> {
     let mut writer = NTriplesWriter::new(temp_file.reopen()?);
 
     // Regular RPM with no language ecosystem provides
-    let deps = vec![
-        RpmDep {
-            name: "bash".to_string(),
-            flags: Some("EQ".to_string()),
-            epoch: None,
-            ver: Some("5.2.15".to_string()),
-            rel: None,
-            dep_type: "provides".to_string(),
-        },
-    ];
+    let deps = vec![RpmDep {
+        name: "bash".to_string(),
+        flags: Some("EQ".to_string()),
+        epoch: None,
+        ver: Some("5.2.15".to_string()),
+        rel: None,
+        dep_type: "provides".to_string(),
+    }];
 
-    let pkg_data = make_pkg_data(vec![
-        ("name", "bash"),
-        ("arch", "x86_64"),
-        ("ver", "5.2.15"),
-        ("rel", "1.fc43"),
-        ("epoch", "0"),
-    ], deps);
+    let pkg_data = make_pkg_data(
+        vec![
+            ("name", "bash"),
+            ("arch", "x86_64"),
+            ("ver", "5.2.15"),
+            ("rel", "1.fc43"),
+            ("epoch", "0"),
+        ],
+        deps,
+    );
 
-    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
+    collector.emit_package_triples(
+        &mut writer,
+        &pkg_data,
+        None,
+        &mut std::collections::HashSet::new(),
+    )?;
     writer.flush()?;
 
     let output_file = temp_file.reopen()?;
     let reader = BufReader::new(output_file);
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
-    assert!(!lines.iter().any(|l| l.contains("upstreamEcosystem")),
-            "Plain RPMs should NOT have upstreamEcosystem");
-    assert!(!lines.iter().any(|l| l.contains("upstreamPackageName")),
-            "Plain RPMs should NOT have upstreamPackageName");
+    assert!(
+        !lines.iter().any(|l| l.contains("upstreamEcosystem")),
+        "Plain RPMs should NOT have upstreamEcosystem"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("upstreamPackageName")),
+        "Plain RPMs should NOT have upstreamPackageName"
+    );
 
     Ok(())
 }
@@ -559,15 +748,23 @@ fn test_emit_rpm_build_time() -> std::io::Result<()> {
     let mut writer = NTriplesWriter::new(temp_file.reopen()?);
 
     // Package with build time from <time build="1713456000"/> (2024-04-18 16:00:00 UTC)
-    let pkg_data = make_pkg_data(vec![
-        ("name", "openssl"),
-        ("arch", "x86_64"),
-        ("ver", "3.0.9"),
-        ("rel", "1.fc43"),
-        ("build", "1713456000"),  // Unix epoch from <time build="epoch"/>
-    ], vec![]);
+    let pkg_data = make_pkg_data(
+        vec![
+            ("name", "openssl"),
+            ("arch", "x86_64"),
+            ("ver", "3.0.9"),
+            ("rel", "1.fc43"),
+            ("build", "1713456000"), // Unix epoch from <time build="epoch"/>
+        ],
+        vec![],
+    );
 
-    collector.emit_package_triples(&mut writer, &pkg_data, None, &mut std::collections::HashSet::new())?;
+    collector.emit_package_triples(
+        &mut writer,
+        &pkg_data,
+        None,
+        &mut std::collections::HashSet::new(),
+    )?;
     writer.flush()?;
 
     let output_file = temp_file.reopen()?;
@@ -575,15 +772,21 @@ fn test_emit_rpm_build_time() -> std::io::Result<()> {
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
     // Verify rpm:buildTime is emitted
-    let build_time_line = lines.iter()
+    let build_time_line = lines
+        .iter()
         .find(|l| l.contains("rpm#buildTime"))
         .expect("Should emit rpm:buildTime triple");
 
     // Verify format is xsd:dateTime with ISO 8601 format
-    assert!(build_time_line.contains("^^<http://www.w3.org/2001/XMLSchema#dateTime>"),
-            "buildTime should be typed as xsd:dateTime");
-    assert!(build_time_line.contains("2024-04-18T16:00:00Z"),
-            "buildTime should be formatted as ISO 8601: {}", build_time_line);
+    assert!(
+        build_time_line.contains("^^<http://www.w3.org/2001/XMLSchema#dateTime>"),
+        "buildTime should be typed as xsd:dateTime"
+    );
+    assert!(
+        build_time_line.contains("2024-04-18T16:00:00Z"),
+        "buildTime should be formatted as ISO 8601: {}",
+        build_time_line
+    );
 
     Ok(())
 }

@@ -1,5 +1,5 @@
-use crate::ntriples::NTriplesWriter;
 use crate::npm::read_seed_file;
+use crate::ntriples::NTriplesWriter;
 use crate::uris::*;
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -11,6 +11,7 @@ pub struct FlatpakCollector {
     distro_name: String,
     release_name: String,
     client: Client,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -27,12 +28,23 @@ struct FlatpakBundle {
 }
 
 impl FlatpakCollector {
-    pub fn new(distro_name: String, release_name: String, ) -> Self {
+    pub fn new(distro_name: String, release_name: String) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
             .expect("Failed to create HTTP client");
-        Self { distro_name, release_name, client }
+        Self {
+            distro_name,
+            release_name,
+            client,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     /// Collect from a seed file of app IDs.
@@ -53,7 +65,9 @@ impl FlatpakCollector {
     fn discover_apps(&self) -> Result<Vec<String>> {
         eprintln!("Discovering Flatpak apps from Flathub...");
         let url = "https://flathub.org/api/v2/appstream";
-        let response = self.client.get(url)
+        let response = self
+            .client
+            .get(url)
             .send()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
@@ -64,7 +78,8 @@ impl FlatpakCollector {
             ));
         }
 
-        let app_ids: Vec<String> = response.json()
+        let app_ids: Vec<String> = response
+            .json()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         Ok(app_ids)
@@ -72,7 +87,7 @@ impl FlatpakCollector {
 
     fn collect_apps(&self, app_ids: &[String], output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
         self.emit_distribution_metadata(&mut writer)?;
 
         let mut total_apps = 0;
@@ -113,9 +128,7 @@ impl FlatpakCollector {
 
     fn fetch_app_metadata(&self, app_id: &str) -> std::result::Result<FlatpakAppResponse, String> {
         let url = format!("https://flathub.org/api/v2/appstream/{}", app_id);
-        let response = self.client.get(&url)
-            .send()
-            .map_err(|e| e.to_string())?;
+        let response = self.client.get(&url).send().map_err(|e| e.to_string())?;
 
         if !response.status().is_success() {
             return Err(format!("HTTP {}: {}", response.status(), app_id));
@@ -125,11 +138,22 @@ impl FlatpakCollector {
         serde_json::from_str(&text).map_err(|e| e.to_string())
     }
 
-    fn emit_app_triples(&self, writer: &mut NTriplesWriter, app: &FlatpakAppResponse) -> Result<usize> {
+    fn emit_app_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        app: &FlatpakAppResponse,
+    ) -> Result<usize> {
         // Use app ID as version since Flatpak apps don't expose versions in the API
         let version = "latest";
-        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", &app.id, version);
-        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", &app.id);
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            &self.release_name,
+            "any",
+            &app.id,
+            version,
+        );
+        let identity_uri =
+            package_identity_uri(&self.distro_name, &self.release_name, "any", &app.id);
         let mut triples = 0;
 
         // Dual typing: pkg:Package + flatpak:FlatpakApp
@@ -160,7 +184,12 @@ impl FlatpakCollector {
 
         if let Some(desc) = &app.description {
             // Strip HTML tags from description
-            let plain_desc = desc.replace("<p>", "").replace("</p>", " ").replace("\n", " ").trim().to_string();
+            let plain_desc = desc
+                .replace("<p>", "")
+                .replace("</p>", " ")
+                .replace("\n", " ")
+                .trim()
+                .to_string();
             if !plain_desc.is_empty() {
                 writer.write_literal(&pkg_uri, &format!("{PKG}description"), &plain_desc)?;
                 triples += 1;
@@ -172,14 +201,23 @@ impl FlatpakCollector {
             if let Some(runtime) = &bundle.runtime {
                 // Parse runtime string like "org.gnome.Platform/x86_64/50"
                 if let Some(runtime_name) = runtime.split('/').next() {
-                    let runtime_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", runtime_name);
+                    let runtime_uri = package_identity_uri(
+                        &self.distro_name,
+                        &self.release_name,
+                        "any",
+                        runtime_name,
+                    );
                     writer.write_triple(&pkg_uri, &format!("{FLATPAK}runtime"), &runtime_uri)?;
                     triples += 1;
 
                     // Extract runtime version if present
                     let parts: Vec<&str> = runtime.split('/').collect();
                     if parts.len() >= 3 {
-                        writer.write_literal(&pkg_uri, &format!("{FLATPAK}runtimeVersion"), parts[2])?;
+                        writer.write_literal(
+                            &pkg_uri,
+                            &format!("{FLATPAK}runtimeVersion"),
+                            parts[2],
+                        )?;
                         triples += 1;
                     }
                 }
@@ -232,7 +270,11 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("flatpak#FlatpakApp"));

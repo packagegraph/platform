@@ -1,0 +1,159 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qlever
+  namespace: packagegraph
+  labels:
+    app: qlever
+    app.kubernetes.io/name: qlever
+    app.kubernetes.io/part-of: packagegraph
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: qlever
+  template:
+    metadata:
+      labels:
+        app: qlever
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: load-index
+          image: ghcr.io/packagegraph/etl:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              INDEX_DIR=/data/index
+              BUCKET="${MINIO_BUCKET:-packagegraph}"
+              MARKER="$INDEX_DIR/.loaded"
+
+              # Recover from interrupted swap: .prev exists but INDEX_DIR doesn't
+              if [ ! -d "$INDEX_DIR" ] && [ -d "${INDEX_DIR}.prev" ]; then
+                echo "Recovering from interrupted swap — restoring .prev"
+                mv "${INDEX_DIR}.prev" "$INDEX_DIR"
+              fi
+              # Clean up stale staging from interrupted extract
+              rm -rf "${INDEX_DIR}.staging"
+
+              mkdir -p "$INDEX_DIR"
+
+              mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
+
+              LATEST=$(mc cat "pgraph/${BUCKET}/qlever-index/latest" 2>/dev/null || echo "")
+              if [ -z "$LATEST" ]; then
+                echo "ERROR: No index available in Minio"
+                exit 1
+              fi
+
+              if [ -f "$MARKER" ]; then
+                CURRENT=$(cat "$MARKER")
+                if [ "$CURRENT" = "$LATEST" ]; then
+                  echo "Index $CURRENT already loaded, skipping"
+                  exit 0
+                fi
+                echo "Index changed: $CURRENT → $LATEST"
+              fi
+
+              echo "Downloading index $LATEST..."
+              mc cp "pgraph/${BUCKET}/qlever-index/${LATEST}/index.tar.gz" /tmp/index.tar.gz
+
+              STAGING="$INDEX_DIR.staging"
+              rm -rf "$STAGING"
+              mkdir -p "$STAGING"
+              if ! tar xzf /tmp/index.tar.gz -C "$STAGING"; then
+                echo "ERROR: Failed to extract index — keeping current"
+                rm -rf "$STAGING" /tmp/index.tar.gz
+                exit 1
+              fi
+              rm -f /tmp/index.tar.gz
+
+              if [ ! -f "$STAGING/packagegraph.index.pos" ]; then
+                echo "ERROR: Extracted index missing expected files — keeping current"
+                rm -rf "$STAGING"
+                exit 1
+              fi
+
+              # Atomic swap: rename old → .prev, move staging → active
+              if [ -d "$INDEX_DIR" ]; then
+                mv "$INDEX_DIR" "${INDEX_DIR}.prev"
+              fi
+              if ! mv "$STAGING" "$INDEX_DIR"; then
+                echo "ERROR: Failed to swap index — restoring previous"
+                mv "${INDEX_DIR}.prev" "$INDEX_DIR" 2>/dev/null
+                exit 1
+              fi
+              rm -rf "${INDEX_DIR}.prev"
+              echo "$LATEST" > "$INDEX_DIR/.loaded"
+              echo "Index $LATEST loaded ($(du -sh $INDEX_DIR | cut -f1))"
+          env:
+            - {name: HOME, value: /tmp}
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          volumeMounts:
+            - name: qlever-data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+      containers:
+        - name: qlever
+          image: docker.io/adfreiburg/qlever:commit-1075455fae
+          command: ["/qlever/qlever-server"]
+          args: ["-i", "/data/index/packagegraph", "-j", "4", "-p", "7001",
+                 "-m", "4G", "-c", "1G", "-e", "500M", "-k", "200", "-s", "300s",
+                 "-a", "$(QLEVER_ACCESS_TOKEN)"]
+          env:
+            - name: HOME
+              value: /tmp
+            - name: QLEVER_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: qlever-credentials
+                  key: access-token
+          ports:
+            - containerPort: 7001
+              name: sparql
+          volumeMounts:
+            - name: qlever-data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "4", memory: 6Gi}
+          livenessProbe:
+            tcpSocket: {port: 7001}
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              port: 7001
+              path: "/?query=SELECT+%2A+WHERE+%7B+%3Fs+%3Fp+%3Fo+%7D+LIMIT+1"
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: qlever-data
+          persistentVolumeClaim:
+            claimName: qlever-data
+        - name: tmp
+          emptyDir: {}

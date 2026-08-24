@@ -138,11 +138,7 @@ impl HttpCache {
     /// share the clock for deterministic testing.
     pub fn sibling(&self, collector: &str) -> io::Result<Self> {
         let parent = self.base_dir.parent().unwrap_or(&self.base_dir);
-        Self::with_clock(
-            parent.to_str().unwrap_or(""),
-            collector,
-            self.clock.clone(),
-        )
+        Self::with_clock(parent.to_str().unwrap_or(""), collector, self.clock.clone())
     }
 
     /// Return a fresh (non-expired) cached entry, or None.

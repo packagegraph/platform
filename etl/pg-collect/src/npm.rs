@@ -1,4 +1,5 @@
 use crate::ntriples::{bnode_id, NTriplesWriter};
+use crate::sparql::{SparqlAuth, SparqlBackend};
 use crate::uris::*;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -11,6 +12,7 @@ use std::time::Duration;
 pub struct NpmCollector {
     client: Client,
     registry_url: String,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,11 +55,23 @@ impl NpmCollector {
         Self {
             client,
             registry_url,
+            graph_uri: None,
         }
     }
 
-    pub fn collect_discover(&self, endpoint: &str, output_path: &str) -> Result<(usize, usize)> {
-        let names = crate::seed::discover_by_ecosystem(endpoint, "npm")?;
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
+    }
+
+    pub fn collect_discover(
+        &self,
+        endpoint: &str,
+        auth: &SparqlAuth,
+        backend: SparqlBackend,
+        output_path: &str,
+    ) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "npm", auth, backend.clone())?;
         let seed_path = "/tmp/seed-npm-discover.txt";
         std::fs::write(seed_path, names.join("\n"))?;
         self.collect(seed_path, output_path)
@@ -65,12 +79,15 @@ impl NpmCollector {
 
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         self.emit_distribution_metadata(&mut writer)?;
 
         let package_names = read_seed_file(packages_file)?;
-        eprintln!("Loaded {} package names from seed file", package_names.len());
+        eprintln!(
+            "Loaded {} package names from seed file",
+            package_names.len()
+        );
 
         let mut total_packages = 0;
         let mut total_triples = 0;
@@ -134,7 +151,10 @@ impl NpmCollector {
                             .unwrap_or_else(|| 2u64.pow(attempt as u32));
 
                         let delay_ms = retry_after_secs * 1000;
-                        eprintln!("  Rate limited on {}, waiting {}s...", name, retry_after_secs);
+                        eprintln!(
+                            "  Rate limited on {}, waiting {}s...",
+                            name, retry_after_secs
+                        );
                         std::thread::sleep(Duration::from_millis(delay_ms));
                         *base_delay_ms = (*base_delay_ms * 2).min(5000); // Increase base delay
                         continue;
@@ -271,7 +291,11 @@ impl NpmCollector {
             writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri(dep_type))?;
+            writer.write_bnode_subject(
+                &bnode,
+                &format!("{PKG}dependencyType"),
+                &dep_type_uri(dep_type),
+            )?;
             triples += 4;
 
             // Version constraint (NPM uses semver ranges like "^1.2.3", "~2.0.0")
@@ -279,8 +303,16 @@ impl NpmCollector {
                 let cb = bnode_id("constraint", &format!("{}-{}", pkg_uri, dep_name));
                 writer.write_bnode_to_bnode(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
                 writer.write_bnode_subject(&cb, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
-                writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintOperator"), "semver")?;
-                writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintValue"), version_range)?;
+                writer.write_bnode_literal(
+                    &cb,
+                    &format!("{PKG}versionConstraintOperator"),
+                    "semver",
+                )?;
+                writer.write_bnode_literal(
+                    &cb,
+                    &format!("{PKG}versionConstraintValue"),
+                    version_range,
+                )?;
                 triples += 4;
             }
         }
@@ -397,7 +429,11 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("npm#NpmPackage"));

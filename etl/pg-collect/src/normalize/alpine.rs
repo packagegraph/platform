@@ -43,7 +43,8 @@ pub fn normalize_alpine_package(
                 .split_whitespace()
                 .filter(|d| !d.starts_with("so:") && !d.starts_with("pc:"))
                 .map(|d| {
-                    let (name, constraint) = if let Some(idx) = d.find(|c: char| ">=<~".contains(c)) {
+                    let (name, constraint) = if let Some(idx) = d.find(|c: char| ">=<~".contains(c))
+                    {
                         (&d[..idx], Some(d[idx..].to_string()))
                     } else {
                         (d, None)
@@ -109,7 +110,10 @@ mod tests {
         fields.insert("P".to_string(), "musl".to_string());
         fields.insert("V".to_string(), "1.2.5-r0".to_string());
         fields.insert("A".to_string(), "x86_64".to_string());
-        fields.insert("m".to_string(), "Natanael Copa <ncopa@alpinelinux.org>".to_string());
+        fields.insert(
+            "m".to_string(),
+            "Natanael Copa <ncopa@alpinelinux.org>".to_string(),
+        );
         fields.insert("o".to_string(), "musl".to_string());
         fields.insert("T".to_string(), "musl C library".to_string());
         fields.insert("D".to_string(), "so:ld-musl-x86_64.so.1".to_string());

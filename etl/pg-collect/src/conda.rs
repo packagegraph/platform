@@ -1,5 +1,5 @@
-use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::npm::read_seed_file;
+use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use regex::Regex;
@@ -16,6 +16,7 @@ pub struct CondaCollector {
     channel_url: String,
     subdir: String,
     source_cache: Option<SourceCache>,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,9 +42,28 @@ struct CondaPackageEntry {
 }
 
 impl CondaCollector {
-    pub fn new(distro_name: String, release_name: String, channel_url: String, subdir: String) -> Self {
+    pub fn new(
+        distro_name: String,
+        release_name: String,
+        channel_url: String,
+        subdir: String,
+    ) -> Self {
         let client = crate::enricher::default_http_client();
-        Self { distro_name, release_name, client, channel_url, subdir, source_cache: None }
+        Self {
+            distro_name,
+            release_name,
+            client,
+            channel_url,
+            subdir,
+            source_cache: None,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
@@ -53,13 +73,20 @@ impl CondaCollector {
 
     pub fn collect_full(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
         self.emit_distribution_metadata(&mut writer)?;
 
-        let url = format!("{}/{}/repodata.json", self.channel_url.trim_end_matches('/'), self.subdir);
+        let url = format!(
+            "{}/{}/repodata.json",
+            self.channel_url.trim_end_matches('/'),
+            self.subdir
+        );
         eprintln!("Fetching {}", url);
 
-        let response = self.client.get(&url).send()
+        let response = self
+            .client
+            .get(&url)
+            .send()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         let reader = std::io::BufReader::new(response);
         let repodata: RepodataJson = serde_json::from_reader(reader)
@@ -74,11 +101,15 @@ impl CondaCollector {
             if let Some(pkgs) = packages {
                 for entry in pkgs.values() {
                     let key = format!("{}-{}", entry.name, entry.version);
-                    if seen.contains(&key) { continue; }
+                    if seen.contains(&key) {
+                        continue;
+                    }
                     seen.insert(key);
                     total_triples += self.emit_package_triples(&mut writer, entry)?;
                     total_packages += 1;
-                    if total_packages % 5000 == 0 { eprintln!("Progress: {} packages", total_packages); }
+                    if total_packages % 5000 == 0 {
+                        eprintln!("Progress: {} packages", total_packages);
+                    }
                 }
             }
         }
@@ -92,13 +123,20 @@ impl CondaCollector {
         eprintln!("Loaded {} package names from seed file", names.len());
         // For seeded mode, fetch full repodata but only emit matching packages
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
         self.emit_distribution_metadata(&mut writer)?;
 
-        let url = format!("{}/{}/repodata.json", self.channel_url.trim_end_matches('/'), self.subdir);
+        let url = format!(
+            "{}/{}/repodata.json",
+            self.channel_url.trim_end_matches('/'),
+            self.subdir
+        );
         eprintln!("Fetching {}", url);
 
-        let response = self.client.get(&url).send()
+        let response = self
+            .client
+            .get(&url)
+            .send()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         let reader = std::io::BufReader::new(response);
         let repodata: RepodataJson = serde_json::from_reader(reader)
@@ -112,9 +150,13 @@ impl CondaCollector {
         for packages in [&repodata.packages, &repodata.packages_conda] {
             if let Some(pkgs) = packages {
                 for entry in pkgs.values() {
-                    if !name_set.contains(entry.name.as_str()) { continue; }
+                    if !name_set.contains(entry.name.as_str()) {
+                        continue;
+                    }
                     let key = format!("{}-{}", entry.name, entry.version);
-                    if seen.contains(&key) { continue; }
+                    if seen.contains(&key) {
+                        continue;
+                    }
                     seen.insert(key);
                     total_triples += self.emit_package_triples(&mut writer, entry)?;
                     total_packages += 1;
@@ -141,9 +183,24 @@ impl CondaCollector {
         Ok(triples)
     }
 
-    fn emit_package_triples(&self, writer: &mut NTriplesWriter, entry: &CondaPackageEntry) -> Result<usize> {
-        let pkg_uri = package_uri(&self.distro_name, &self.release_name, &self.subdir, &entry.name, &entry.version);
-        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, &self.subdir, &entry.name);
+    fn emit_package_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        entry: &CondaPackageEntry,
+    ) -> Result<usize> {
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            &self.release_name,
+            &self.subdir,
+            &entry.name,
+            &entry.version,
+        );
+        let identity_uri = package_identity_uri(
+            &self.distro_name,
+            &self.release_name,
+            &self.subdir,
+            &entry.name,
+        );
         let mut triples = 0;
 
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{PKG}Package"))?;
@@ -158,7 +215,12 @@ impl CondaCollector {
         writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), &entry.name)?;
         triples += 1;
 
-        let ver_uri = version_uri(&self.distro_name, &self.release_name, &entry.name, &entry.version);
+        let ver_uri = version_uri(
+            &self.distro_name,
+            &self.release_name,
+            &entry.name,
+            &entry.version,
+        );
         writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
         writer.write_literal(&ver_uri, &format!("{PKG}versionString"), &entry.version)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
@@ -217,23 +279,56 @@ impl CondaCollector {
                         has_python = true;
                     }
 
-                    let target_uri = package_identity_uri(&self.distro_name, &self.release_name, &self.subdir, dep_name);
-                    writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
+                    let target_uri = package_identity_uri(
+                        &self.distro_name,
+                        &self.release_name,
+                        &self.subdir,
+                        dep_name,
+                    );
+                    writer.write_triple(
+                        &pkg_uri,
+                        &format!("{PKG}directlyDependsOn"),
+                        &target_uri,
+                    )?;
                     triples += 1;
 
                     let bnode = bnode_id("depends", &format!("{}-{}", pkg_uri, dep_name));
                     writer.write_bnode_object(&pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
                     writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
-                    writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-                    writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri("run"))?;
+                    writer.write_bnode_subject(
+                        &bnode,
+                        &format!("{PKG}dependencyTarget"),
+                        &target_uri,
+                    )?;
+                    writer.write_bnode_subject(
+                        &bnode,
+                        &format!("{PKG}dependencyType"),
+                        &dep_type_uri("run"),
+                    )?;
                     triples += 4;
 
                     if !constraint.is_empty() {
                         let cb = bnode_id("constraint", &format!("{}-{}", pkg_uri, dep_name));
-                        writer.write_bnode_to_bnode(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
-                        writer.write_bnode_subject(&cb, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
-                        writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintOperator"), "conda")?;
-                        writer.write_bnode_literal(&cb, &format!("{PKG}versionConstraintValue"), constraint)?;
+                        writer.write_bnode_to_bnode(
+                            &bnode,
+                            &format!("{PKG}hasVersionConstraint"),
+                            &cb,
+                        )?;
+                        writer.write_bnode_subject(
+                            &cb,
+                            RDF_TYPE,
+                            &format!("{PKG}VersionConstraint"),
+                        )?;
+                        writer.write_bnode_literal(
+                            &cb,
+                            &format!("{PKG}versionConstraintOperator"),
+                            "conda",
+                        )?;
+                        writer.write_bnode_literal(
+                            &cb,
+                            &format!("{PKG}versionConstraintValue"),
+                            constraint,
+                        )?;
                         triples += 4;
                     }
                 }
@@ -267,7 +362,11 @@ impl CondaCollector {
             } else {
                 &entry.name
             };
-            writer.write_literal(&pkg_uri, &format!("{PKG}upstreamPackageName"), upstream_name)?;
+            writer.write_literal(
+                &pkg_uri,
+                &format!("{PKG}upstreamPackageName"),
+                upstream_name,
+            )?;
             triples += 3;
         }
 
@@ -310,7 +409,12 @@ mod tests {
 
     #[test]
     fn test_emit_conda_package_dual_typing() {
-        let collector = CondaCollector::new("conda".into(), "conda-forge".into(), "https://conda.anaconda.org/conda-forge".into(), "linux-64".into());
+        let collector = CondaCollector::new(
+            "conda".into(),
+            "conda-forge".into(),
+            "https://conda.anaconda.org/conda-forge".into(),
+            "linux-64".into(),
+        );
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 
@@ -332,7 +436,11 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("conda#CondaPackage"));

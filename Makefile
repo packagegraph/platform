@@ -1,26 +1,33 @@
-.PHONY: build-etl build-fuseki push-etl push-fuseki deploy-dev deploy-prod \
+.PHONY: build-etl build-qlever-rebuild build-fuseki push-etl push-qlever-rebuild push-fuseki deploy-dev deploy-prod \
        scale-readers port-forward
 
 REGISTRY ?= ghcr.io/packagegraph
 ETL_IMAGE = $(REGISTRY)/etl
+QLEVER_REBUILD_IMAGE = $(REGISTRY)/qlever-rebuild
 FUSEKI_IMAGE = $(REGISTRY)/fuseki
 TAG ?= latest
 
 build-etl:
 	podman build -t $(ETL_IMAGE):$(TAG) -f etl/Containerfile etl/
 
+build-qlever-rebuild:
+	podman build -t $(QLEVER_REBUILD_IMAGE):$(TAG) -f etl/Containerfile.qlever-rebuild etl/
+
 build-fuseki:
 	podman build -t $(FUSEKI_IMAGE):$(TAG) -f fuseki/Containerfile fuseki/
 
-build: build-etl build-fuseki
+build: build-etl build-qlever-rebuild build-fuseki
 
 push-etl:
 	podman push $(ETL_IMAGE):$(TAG)
 
+push-qlever-rebuild:
+	podman push $(QLEVER_REBUILD_IMAGE):$(TAG)
+
 push-fuseki:
 	podman push $(FUSEKI_IMAGE):$(TAG)
 
-push: push-etl push-fuseki
+push: push-etl push-qlever-rebuild push-fuseki
 
 deploy-dev:
 	oc apply -k deploy/overlays/dev

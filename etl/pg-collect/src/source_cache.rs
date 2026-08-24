@@ -162,7 +162,11 @@ impl SourceCache {
         scope: &CacheScope,
         logical_name: &str,
     ) -> io::Result<CacheResult> {
-        let etag = resp.headers().get(ETAG).and_then(|v| v.to_str().ok()).map(String::from);
+        let etag = resp
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
         let last_modified = resp
             .headers()
             .get(LAST_MODIFIED)
