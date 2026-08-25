@@ -14,9 +14,8 @@ static PKG_VAR: Lazy<Regex> = Lazy::new(|| {
 });
 
 // Regex for define Package/<name> blocks
-static DEFINE_PKG: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"^\s*define\s+Package/(\S+)\s*$"#).unwrap()
-});
+static DEFINE_PKG: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"^\s*define\s+Package/(\S+)\s*$"#).unwrap());
 
 #[derive(Debug)]
 struct OpenWrtPackage {
@@ -49,16 +48,28 @@ pub struct OpenWrtCollector {
     distro_name: String,
     release_name: String,
     feed_path: String,
+    pub graph_uri: Option<String>,
 }
 
 impl OpenWrtCollector {
     pub fn new(distro_name: String, release_name: String, feed_path: String) -> Self {
-        Self { distro_name, release_name, feed_path }
+        Self {
+            distro_name,
+            release_name,
+            feed_path,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
         self.emit_distribution_metadata(&mut writer)?;
 
         let mut seen = HashSet::new();
@@ -66,7 +77,14 @@ impl OpenWrtCollector {
         let mut parsed_meta = HashMap::new();
         let mut parent_map = HashMap::new();
 
-        let result = self.collect_with_writer(&mut writer, &mut seen, &mut identity_map, &mut parsed_meta, &mut parent_map, false)?;
+        let result = self.collect_with_writer(
+            &mut writer,
+            &mut seen,
+            &mut identity_map,
+            &mut parsed_meta,
+            &mut parent_map,
+            false,
+        )?;
         writer.flush()?;
         Ok(result)
     }
@@ -93,9 +111,7 @@ impl OpenWrtCollector {
         for entry in WalkDir::new(&self.feed_path)
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path().file_name().and_then(|s| s.to_str()) == Some("Makefile")
-            })
+            .filter(|e| e.path().file_name().and_then(|s| s.to_str()) == Some("Makefile"))
         {
             match self.parse_makefile(entry.path(), feed_name) {
                 Ok(packages) => {
@@ -106,27 +122,44 @@ impl OpenWrtCollector {
 
                         if seen.contains(&dedup_key) {
                             // Duplicate from another feed - only emit feed triple
-                            let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", &pkg.name, version);
+                            let pkg_uri = package_uri(
+                                &self.distro_name,
+                                &self.release_name,
+                                "any",
+                                &pkg.name,
+                                version,
+                            );
                             writer.write_literal(&pkg_uri, &format!("{OPENWRT}feed"), &pkg.feed)?;
                             total_triples += 1;
                         } else {
                             // New package - emit full triples
-                            total_triples += self.emit_package_triples(writer, &pkg, is_secondary)?;
+                            total_triples +=
+                                self.emit_package_triples(writer, &pkg, is_secondary)?;
                             total_packages += 1;
 
                             // Track in dedup set
                             seen.insert(dedup_key);
 
                             // Build identity map (name → source_uri), first-wins
-                            let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", &pkg.name, version);
-                            identity_map.entry(pkg.name.clone()).or_insert(pkg_uri.clone());
+                            let pkg_uri = package_uri(
+                                &self.distro_name,
+                                &self.release_name,
+                                "any",
+                                &pkg.name,
+                                version,
+                            );
+                            identity_map
+                                .entry(pkg.name.clone())
+                                .or_insert(pkg_uri.clone());
 
                             // Build parsed metadata, first-wins
-                            parsed_meta.entry(pkg.name.clone()).or_insert(OpenWrtPackageMeta {
-                                source_url: pkg.source_url.clone(),
-                                source_proto: pkg.source_proto.clone(),
-                                source_hash: pkg.source_hash.clone(),
-                            });
+                            parsed_meta
+                                .entry(pkg.name.clone())
+                                .or_insert(OpenWrtPackageMeta {
+                                    source_url: pkg.source_url.clone(),
+                                    source_proto: pkg.source_proto.clone(),
+                                    source_hash: pkg.source_hash.clone(),
+                                });
 
                             // Build parent map
                             if let Some(ref parent) = pkg.parent_package {
@@ -165,7 +198,11 @@ impl OpenWrtCollector {
         Ok(triples)
     }
 
-    fn parse_makefile(&self, makefile_path: &Path, feed_name: &str) -> std::result::Result<Vec<OpenWrtPackage>, String> {
+    fn parse_makefile(
+        &self,
+        makefile_path: &Path,
+        feed_name: &str,
+    ) -> std::result::Result<Vec<OpenWrtPackage>, String> {
         let file = File::open(makefile_path).map_err(|e| e.to_string())?;
         let reader = BufReader::new(file);
 
@@ -214,7 +251,8 @@ impl OpenWrtCollector {
                         };
 
                         // Resolve hash: prefer MIRROR_HASH, fall back to HASH
-                        let hash = global_vars.get("MIRROR_HASH")
+                        let hash = global_vars
+                            .get("MIRROR_HASH")
                             .or_else(|| global_vars.get("HASH"))
                             .cloned();
 
@@ -262,11 +300,23 @@ impl OpenWrtCollector {
             .collect()
     }
 
-    fn emit_package_triples(&self, writer: &mut NTriplesWriter, pkg: &OpenWrtPackage, is_secondary: bool) -> Result<usize> {
+    fn emit_package_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        pkg: &OpenWrtPackage,
+        is_secondary: bool,
+    ) -> Result<usize> {
         let default_version = "0".to_string();
         let version = pkg.version.as_ref().unwrap_or(&default_version);
-        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", &pkg.name, version);
-        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", &pkg.name);
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            &self.release_name,
+            "any",
+            &pkg.name,
+            version,
+        );
+        let identity_uri =
+            package_identity_uri(&self.distro_name, &self.release_name, "any", &pkg.name);
         let dist_uri = distro_uri(&self.distro_name);
         let rel_uri = release_uri(&self.distro_name, &self.release_name);
         let mut triples = 0;
@@ -350,7 +400,8 @@ impl OpenWrtCollector {
             // Upstream repo extraction: git proto URLs are explicit repo refs,
             // archive URLs can be normalized to repo root
             if let Some(extraction) = crate::forge::extract_forge_url(source_url) {
-                triples += crate::forge::emit_upstream_repo(writer, &identity_uri, &extraction, None)?;
+                triples +=
+                    crate::forge::emit_upstream_repo(writer, &identity_uri, &extraction, None)?;
             }
         }
 
@@ -366,14 +417,16 @@ impl OpenWrtCollector {
 
         // Parent package link (sub-packages link back to primary)
         if let Some(ref parent) = pkg.parent_package {
-            let parent_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", parent);
+            let parent_uri =
+                package_identity_uri(&self.distro_name, &self.release_name, "any", parent);
             writer.write_triple(&pkg_uri, &format!("{OPENWRT}parentPackage"), &parent_uri)?;
             triples += 1;
         }
 
         // Dependencies
         for dep in &pkg.depends {
-            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
+            let target_uri =
+                package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
             writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
 
@@ -381,7 +434,11 @@ impl OpenWrtCollector {
             writer.write_bnode_object(&pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri("runtime"))?;
+            writer.write_bnode_subject(
+                &bnode,
+                &format!("{PKG}dependencyType"),
+                &dep_type_uri("runtime"),
+            )?;
             triples += 4;
         }
 
@@ -395,7 +452,12 @@ mod tests {
     use std::io::{Read, Write};
     use tempfile::{NamedTempFile, TempDir};
 
-    fn create_test_makefile(dir: &Path, category: &str, name: &str, content: &str) -> std::path::PathBuf {
+    fn create_test_makefile(
+        dir: &Path,
+        category: &str,
+        name: &str,
+        content: &str,
+    ) -> std::path::PathBuf {
         let pkg_dir = dir.join(category).join(name);
         fs::create_dir_all(&pkg_dir).unwrap();
 
@@ -426,7 +488,11 @@ endef
 
         create_test_makefile(temp_dir.path(), "network", "testpkg", content);
 
-        let collector = OpenWrtCollector::new("openwrt".into(), "openwrt".into(), temp_dir.path().to_str().unwrap().to_string());
+        let collector = OpenWrtCollector::new(
+            "openwrt".into(),
+            "openwrt".into(),
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
 
         let temp_file = NamedTempFile::new().unwrap();
         let output_path = temp_file.path().to_str().unwrap();
@@ -438,11 +504,21 @@ endef
 
         // Read output and verify
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Check for OpkgPackage typing (pkg:Package is inferred via subClassOf, not explicit)
-        assert!(content.contains("opkg#OpkgPackage"), "Should have OpkgPackage type");
-        assert!(!content.contains("core#Package>"), "Should NOT have explicit Package type (inferred)");
+        assert!(
+            content.contains("opkg#OpkgPackage"),
+            "Should have OpkgPackage type"
+        );
+        assert!(
+            !content.contains("core#Package>"),
+            "Should NOT have explicit Package type (inferred)"
+        );
 
         // Check for metadata
         assert!(content.contains("\"1.0\""), "Should have version");
@@ -465,7 +541,11 @@ endef
 
         create_test_makefile(temp_dir.path(), "utils", "deptest", content);
 
-        let collector = OpenWrtCollector::new("openwrt".into(), "openwrt".into(), temp_dir.path().to_str().unwrap().to_string());
+        let collector = OpenWrtCollector::new(
+            "openwrt".into(),
+            "openwrt".into(),
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
 
         let temp_file = NamedTempFile::new().unwrap();
         let output_path = temp_file.path().to_str().unwrap();
@@ -473,12 +553,19 @@ endef
         collector.collect(output_path).unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Should include libfoo and libbar (both required), but skip @FEATURE_X
         assert!(content.contains("libfoo"), "Should have libfoo dependency");
         assert!(content.contains("libbar"), "Should have libbar dependency");
-        assert!(!content.contains("FEATURE_X"), "Should skip @FEATURE_X Kconfig conditional");
+        assert!(
+            !content.contains("FEATURE_X"),
+            "Should skip @FEATURE_X Kconfig conditional"
+        );
     }
 
     #[test]
@@ -497,7 +584,11 @@ endef
 
         create_test_makefile(temp_dir.path(), "net", "testpkg", content);
 
-        let collector = OpenWrtCollector::new("openwrt".into(), "24.10".into(), temp_dir.path().to_str().unwrap().to_string());
+        let collector = OpenWrtCollector::new(
+            "openwrt".into(),
+            "24.10".into(),
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
 
         let temp_file = NamedTempFile::new().unwrap();
         let output_path = temp_file.path().to_str().unwrap();
@@ -505,12 +596,22 @@ endef
         collector.collect(output_path).unwrap();
 
         let mut nt_content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut nt_content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut nt_content)
+            .unwrap();
 
         // Should have OpkgPackage type
-        assert!(nt_content.contains("opkg#OpkgPackage"), "Should have OpkgPackage type");
+        assert!(
+            nt_content.contains("opkg#OpkgPackage"),
+            "Should have OpkgPackage type"
+        );
         // Should NOT have explicit Package type (inferred via subClassOf)
-        assert!(!nt_content.contains("core#Package>"), "Should NOT emit explicit Package type (redundant after reclassification)");
+        assert!(
+            !nt_content.contains("core#Package>"),
+            "Should NOT emit explicit Package type (redundant after reclassification)"
+        );
     }
 
     #[test]
@@ -542,13 +643,39 @@ endef
         let mut parsed_meta = std::collections::HashMap::new();
         let mut parent_map = std::collections::HashMap::new();
 
-        let collector1 = OpenWrtCollector::new("openwrt".into(), "24.10".into(), feed1.path().join("net").to_str().unwrap().to_string());
-        let collector2 = OpenWrtCollector::new("openwrt".into(), "24.10".into(), feed2.path().join("utils").to_str().unwrap().to_string());
+        let collector1 = OpenWrtCollector::new(
+            "openwrt".into(),
+            "24.10".into(),
+            feed1.path().join("net").to_str().unwrap().to_string(),
+        );
+        let collector2 = OpenWrtCollector::new(
+            "openwrt".into(),
+            "24.10".into(),
+            feed2.path().join("utils").to_str().unwrap().to_string(),
+        );
 
         // Primary feed
-        let (pkgs1, _) = collector1.collect_with_writer(&mut writer, &mut seen, &mut identity_map, &mut parsed_meta, &mut parent_map, false).unwrap();
+        let (pkgs1, _) = collector1
+            .collect_with_writer(
+                &mut writer,
+                &mut seen,
+                &mut identity_map,
+                &mut parsed_meta,
+                &mut parent_map,
+                false,
+            )
+            .unwrap();
         // Secondary feed (should dedup)
-        let (pkgs2, _) = collector2.collect_with_writer(&mut writer, &mut seen, &mut identity_map, &mut parsed_meta, &mut parent_map, true).unwrap();
+        let (pkgs2, _) = collector2
+            .collect_with_writer(
+                &mut writer,
+                &mut seen,
+                &mut identity_map,
+                &mut parsed_meta,
+                &mut parent_map,
+                true,
+            )
+            .unwrap();
 
         assert_eq!(pkgs1, 1, "First feed: 1 package");
         assert_eq!(pkgs2, 0, "Second feed: deduped, no new packages");
@@ -557,21 +684,34 @@ endef
 
         // Verify identity_map and parsed_meta populated
         assert_eq!(identity_map.len(), 1, "Should have 1 entry in identity_map");
-        assert!(identity_map.contains_key("shared"), "identity_map should have 'shared'");
+        assert!(
+            identity_map.contains_key("shared"),
+            "identity_map should have 'shared'"
+        );
         assert_eq!(parsed_meta.len(), 1, "Should have 1 entry in parsed_meta");
 
         let meta = parsed_meta.get("shared").unwrap();
-        assert_eq!(meta.source_url, Some("https://example.com/shared.tar.gz".to_string()));
+        assert_eq!(
+            meta.source_url,
+            Some("https://example.com/shared.tar.gz".to_string())
+        );
 
         // Read output and verify opkg:feed preserved for both feeds
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Should have BOTH feed values emitted (net from first, utils from second)
         assert!(content.contains("opkg#feed"), "Should have feed property");
         // Count occurrences of feed triple - should be 2 (one per feed even with dedup)
         let feed_count = content.matches("opkg#feed").count();
-        assert_eq!(feed_count, 2, "Should preserve feed membership for both feeds despite dedup");
+        assert_eq!(
+            feed_count, 2,
+            "Should preserve feed membership for both feeds despite dedup"
+        );
     }
 
     #[test]
@@ -592,7 +732,11 @@ endef
 
         create_test_makefile(temp_dir.path(), "utils", "multi", content);
 
-        let collector = OpenWrtCollector::new("openwrt".into(), "openwrt".into(), temp_dir.path().to_str().unwrap().to_string());
+        let collector = OpenWrtCollector::new(
+            "openwrt".into(),
+            "openwrt".into(),
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
 
         let temp_file = NamedTempFile::new().unwrap();
         let output_path = temp_file.path().to_str().unwrap();
@@ -600,13 +744,25 @@ endef
         let (packages, _) = collector.collect(output_path).unwrap();
 
         // Should collect both sub-packages
-        assert_eq!(packages, 2, "Should collect 2 sub-packages from one Makefile");
+        assert_eq!(
+            packages, 2,
+            "Should collect 2 sub-packages from one Makefile"
+        );
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("\"Main package\""), "Should have main package title");
-        assert!(content.contains("\"Utilities package\""), "Should have utils package title");
+        assert!(
+            content.contains("\"Main package\""),
+            "Should have main package title"
+        );
+        assert!(
+            content.contains("\"Utilities package\""),
+            "Should have utils package title"
+        );
     }
 }
-

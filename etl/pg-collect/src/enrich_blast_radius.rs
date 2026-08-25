@@ -11,38 +11,46 @@
 //! exists in the target graph.
 
 use crate::ntriples::NTriplesWriter;
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use std::fs::File;
 use std::io::Result;
 
 pub struct BlastRadiusEnricher {
     sparql: SparqlClient,
+    pub graph_uri: Option<String>,
 }
 
 impl BlastRadiusEnricher {
-    pub fn new(endpoint: &str) -> Self {
-        let sparql = SparqlClient::new(endpoint);
-        Self { sparql }
+    pub fn new(endpoint: &str, auth: SparqlAuth, backend: SparqlBackend) -> Self {
+        let sparql = make_sparql_client(endpoint, &auth, backend);
+        Self {
+            sparql,
+            graph_uri: None,
+        }
+    }
+
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn enrich(&self, output_path: &str) -> Result<(usize, usize)> {
         self.check_ontology_property()?;
 
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         let vulns = self.query_vuln_data()?;
-        eprintln!("Found {} vulnerabilities with both CVSS and revdep data", vulns.len());
+        eprintln!(
+            "Found {} vulnerabilities with both CVSS and revdep data",
+            vulns.len()
+        );
 
         let mut total_triples = 0usize;
         for (vuln_uri, blast_radius) in &vulns {
             let rounded = blast_radius.round().max(0.0) as i64;
-            writer.write_integer(
-                vuln_uri,
-                &format!("{SEC}blastRadius"),
-                rounded,
-            )?;
+            writer.write_integer(vuln_uri, &format!("{SEC}blastRadius"), rounded)?;
             total_triples += 1;
         }
 

@@ -6,7 +6,7 @@
 use crate::enricher::rate_limit;
 use crate::forge::emit_dq_issue;
 use crate::ntriples::NTriplesWriter;
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use reqwest::blocking::Client;
 use std::fs::File;
@@ -16,44 +16,91 @@ use std::time::Duration;
 pub struct NpmProvenanceEnricher {
     sparql: SparqlClient,
     client: Client,
+    pub graph_uri: Option<String>,
 }
 
 impl NpmProvenanceEnricher {
-    pub fn new(endpoint: &str) -> Self {
-        let sparql = SparqlClient::new(endpoint);
+    pub fn new(endpoint: &str, auth: SparqlAuth, backend: SparqlBackend) -> Self {
+        let sparql = make_sparql_client(endpoint, &auth, backend);
         let client = crate::enricher::default_http_client();
 
-        Self { sparql, client }
+        Self {
+            sparql,
+            client,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn enrich(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         // Emit static Sigstore infrastructure metadata once per run
         emit_infrastructure_metadata(&mut writer)?;
 
-        let packages = self.sparql.query_packages_by_type(
-            &format!("{NPM}NpmPackage")
-        )?;
+        let packages = self
+            .sparql
+            .query_packages_by_type(&format!("{NPM}NpmPackage"))?;
 
-        eprintln!("Found {} npm packages to check for provenance", packages.len());
+        eprintln!(
+            "Found {} npm packages to check for provenance",
+            packages.len()
+        );
 
         let mut total_checked = 0;
         let mut total_triples = 0;
+        let mut total_errors = 0;
+        let mut consecutive_errors = 0;
 
         for (pkg_uri, name, version) in &packages {
             total_checked += 1;
             if total_checked % 100 == 0 {
-                eprintln!("Progress: {} packages checked", total_checked);
+                eprintln!(
+                    "Progress: {} packages checked, {} errors",
+                    total_checked, total_errors
+                );
             }
 
             match self.check_attestations(&mut writer, pkg_uri, name, version) {
-                Ok(triples) => total_triples += triples,
-                Err(e) => eprintln!("  Error checking {}: {}", name, e),
+                Ok(triples) => {
+                    total_triples += triples;
+                    consecutive_errors = 0;
+                }
+                Err(e) => {
+                    eprintln!("  Error checking {}: {}", name, e);
+                    total_errors += 1;
+                    consecutive_errors += 1;
+                    if consecutive_errors >= 20 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "Aborting: {} consecutive failures — registry may be down (last: {})",
+                                consecutive_errors, e
+                            ),
+                        ));
+                    }
+                }
             }
 
             rate_limit(Duration::from_millis(200));
+        }
+
+        if total_checked > 0 && total_errors as f64 / total_checked as f64 > 0.5 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "Aborting: error rate {}/{} ({:.0}%) exceeds 50% threshold",
+                    total_errors,
+                    total_checked,
+                    total_errors as f64 / total_checked as f64 * 100.0
+                ),
+            ));
         }
 
         writer.flush()?;
@@ -68,20 +115,42 @@ impl NpmProvenanceEnricher {
         version: &str,
     ) -> Result<usize> {
         // npm attestation API v1 endpoint (the /tgz/attestations pattern was removed)
-        let url = format!("https://registry.npmjs.org/-/npm/v1/attestations/{}@{}", name, version);
+        let url = format!(
+            "https://registry.npmjs.org/-/npm/v1/attestations/{}@{}",
+            name, version
+        );
 
-        let response = self.client.get(&url)
+        let response = self
+            .client
+            .get(&url)
             .header("Accept", "application/json")
             .send();
 
         let resp = match response {
             Ok(r) if r.status().is_success() => r,
-            _ => return Ok(0), // No attestations or error
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => return Ok(0),
+            Ok(r) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("HTTP {} for {}", r.status(), name),
+                ));
+            }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Network error for {}: {}", name, e),
+                ));
+            }
         };
 
         let data: serde_json::Value = match resp.json() {
             Ok(d) => d,
-            Err(_) => return Ok(0),
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("JSON parse error for {}: {}", name, e),
+                ));
+            }
         };
 
         let attestations = match data.get("attestations").and_then(|v| v.as_array()) {
@@ -93,11 +162,14 @@ impl NpmProvenanceEnricher {
         // npm returns two attestations per package:
         //   [0] npm publish (predicateType: github.com/npm/attestation/...)  — no x509 certs
         //   [1] SLSA provenance (predicateType: slsa.dev/provenance/v1)      — has certs + builder info
-        let slsa_att = attestations.iter()
-            .find(|a| a.get("predicateType")
-                .and_then(|v| v.as_str())
-                .map(|s| s.contains("slsa.dev/provenance"))
-                .unwrap_or(false))
+        let slsa_att = attestations
+            .iter()
+            .find(|a| {
+                a.get("predicateType")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.contains("slsa.dev/provenance"))
+                    .unwrap_or(false)
+            })
             .or_else(|| attestations.first());
 
         let slsa_att = match slsa_att {
@@ -109,7 +181,8 @@ impl NpmProvenanceEnricher {
         let att_uri = attestation_uri("npm", "registry", name, version);
 
         // Determine the actual predicate type from the attestation
-        let predicate_type = slsa_att.get("predicateType")
+        let predicate_type = slsa_att
+            .get("predicateType")
             .and_then(|v| v.as_str())
             .unwrap_or("https://slsa.dev/provenance/v1");
 
@@ -123,11 +196,17 @@ impl NpmProvenanceEnricher {
         triples += 1;
 
         // npm provenance via GitHub Actions = SLSA Build L2 (hosted build service)
-        writer.write_triple(&att_uri, &format!("{SLSA}attestsBuildLevel"),
-            &format!("{SLSA}L2"))?;
+        writer.write_triple(
+            &att_uri,
+            &format!("{SLSA}attestsBuildLevel"),
+            &format!("{SLSA}L2"),
+        )?;
         triples += 1;
 
-        if let Some(bundle) = slsa_att.get("bundle").or_else(|| slsa_att.get("attestationBundle")) {
+        if let Some(bundle) = slsa_att
+            .get("bundle")
+            .or_else(|| slsa_att.get("attestationBundle"))
+        {
             // Extract timestamp from DSSE payload
             if let Some(ts) = extract_attestation_timestamp(bundle) {
                 writer.write_datetime(&att_uri, &format!("{SLSA}attestationTimestamp"), &ts)?;
@@ -140,8 +219,18 @@ impl NpmProvenanceEnricher {
             // Emit att:DigitalSignature + transparency log triples (v0.8.0)
             triples += emit_signing_triples(writer, &att_uri, bundle, name, version)?;
         } else {
-            eprintln!("  Attestation for {}@{} missing bundle/attestationBundle field", name, version);
-            triples += emit_dq_issue(writer, "npm-provenance-enricher", "bundle", &format!("{}@{}", name, version), "attestation-incomplete", "info")?;
+            eprintln!(
+                "  Attestation for {}@{} missing bundle/attestationBundle field",
+                name, version
+            );
+            triples += emit_dq_issue(
+                writer,
+                "npm-provenance-enricher",
+                "bundle",
+                &format!("{}@{}", name, version),
+                "attestation-incomplete",
+                "info",
+            )?;
         }
 
         Ok(triples)
@@ -193,7 +282,11 @@ fn extract_attestation_timestamp(bundle: &serde_json::Value) -> Option<String> {
     // Fallback: transparency log integratedTime (Unix epoch → ISO 8601)
     let integrated = bundle
         .pointer("/verificationMaterial/tlogEntries/0/integratedTime")
-        .and_then(|v| v.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| v.as_i64()))?;
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse::<i64>().ok())
+                .or_else(|| v.as_i64())
+        })?;
 
     chrono::DateTime::from_timestamp(integrated, 0)
         .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
@@ -218,7 +311,14 @@ fn emit_provenance_metadata(
         Some(s) => s,
         None => {
             eprintln!("  Failed to decode DSSE payload for attestation");
-            let dq = emit_dq_issue(writer, "npm-provenance-enricher", "dsseEnvelope.payload", att_uri, "dsse-parse-failed", "warning")?;
+            let dq = emit_dq_issue(
+                writer,
+                "npm-provenance-enricher",
+                "dsseEnvelope.payload",
+                att_uri,
+                "dsse-parse-failed",
+                "warning",
+            )?;
             return Ok(dq);
         }
     };
@@ -239,7 +339,12 @@ fn emit_provenance_metadata(
         .pointer("/predicate/buildDefinition/buildType")
         .and_then(|v| v.as_str())
     {
-        writer.write_typed_literal(att_uri, &format!("{SLSA}buildType"), build_type, &format!("{XSD}anyURI"))?;
+        writer.write_typed_literal(
+            att_uri,
+            &format!("{SLSA}buildType"),
+            build_type,
+            &format!("{XSD}anyURI"),
+        )?;
         triples += 1;
     }
 
@@ -254,9 +359,17 @@ fn emit_provenance_metadata(
         writer.write_literal(&builder, &format!("{SLSA}builderId"), builder_id)?;
 
         let build_activity_uri = format!("{att_uri}/build");
-        writer.write_triple(&build_activity_uri, RDF_TYPE, &format!("{PKG}BuildActivity"))?;
+        writer.write_triple(
+            &build_activity_uri,
+            RDF_TYPE,
+            &format!("{PKG}BuildActivity"),
+        )?;
         writer.write_triple(&build_activity_uri, &format!("{SLSA}builtBy"), &builder)?;
-        writer.write_triple(att_uri, &format!("{SLSA}attestsBuildActivity"), &build_activity_uri)?;
+        writer.write_triple(
+            att_uri,
+            &format!("{SLSA}attestsBuildActivity"),
+            &build_activity_uri,
+        )?;
         triples += 5;
     }
 
@@ -314,20 +427,51 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9fAFwr\n\
 kBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw==\n\
 -----END PUBLIC KEY-----";
 
-    writer.write_typed_literal(&format!("{ATT}SigstorePublicGood"), &format!("{ATT}logUri"), "https://rekor.sigstore.dev", &format!("{XSD}anyURI"))?;
-    writer.write_literal(&format!("{ATT}SigstorePublicGood"), &format!("{ATT}logPublicKey"), rekor_pubkey)?;
-    writer.write_literal(&format!("{ATT}SigstorePublicGood"), RDFS_LABEL, "Sigstore Public Good Rekor")?;
+    writer.write_typed_literal(
+        &format!("{ATT}SigstorePublicGood"),
+        &format!("{ATT}logUri"),
+        "https://rekor.sigstore.dev",
+        &format!("{XSD}anyURI"),
+    )?;
+    writer.write_literal(
+        &format!("{ATT}SigstorePublicGood"),
+        &format!("{ATT}logPublicKey"),
+        rekor_pubkey,
+    )?;
+    writer.write_literal(
+        &format!("{ATT}SigstorePublicGood"),
+        RDFS_LABEL,
+        "Sigstore Public Good Rekor",
+    )?;
 
     // Fulcio certificate authority
     // Source: Sigstore TUF root https://github.com/sigstore/root-signing (fulcio_v1.crt.pem)
     // SHA-256 fingerprint of the Fulcio root certificate (retrieved 2026-04-26)
     // This anchors the certificate chain for offline verification
-    let fulcio_root_fingerprint = "2c7e9f3576de7f72c807f3c1c4a8b59b67a579e85e0e3cfc0f81c1e5fd56cf02";
+    let fulcio_root_fingerprint =
+        "2c7e9f3576de7f72c807f3c1c4a8b59b67a579e85e0e3cfc0f81c1e5fd56cf02";
 
-    writer.write_typed_literal(&format!("{ATT}SigstoreFulcio"), &format!("{ATT}caUri"), "https://fulcio.sigstore.dev", &format!("{XSD}anyURI"))?;
-    writer.write_literal(&format!("{ATT}SigstoreFulcio"), &format!("{ATT}caRootCertFingerprint"), fulcio_root_fingerprint)?;
-    writer.write_boolean(&format!("{ATT}SigstoreFulcio"), &format!("{ATT}issuesEphemeralCertificates"), true)?;
-    writer.write_literal(&format!("{ATT}SigstoreFulcio"), RDFS_LABEL, "Sigstore Fulcio")?;
+    writer.write_typed_literal(
+        &format!("{ATT}SigstoreFulcio"),
+        &format!("{ATT}caUri"),
+        "https://fulcio.sigstore.dev",
+        &format!("{XSD}anyURI"),
+    )?;
+    writer.write_literal(
+        &format!("{ATT}SigstoreFulcio"),
+        &format!("{ATT}caRootCertFingerprint"),
+        fulcio_root_fingerprint,
+    )?;
+    writer.write_boolean(
+        &format!("{ATT}SigstoreFulcio"),
+        &format!("{ATT}issuesEphemeralCertificates"),
+        true,
+    )?;
+    writer.write_literal(
+        &format!("{ATT}SigstoreFulcio"),
+        RDFS_LABEL,
+        "Sigstore Fulcio",
+    )?;
 
     Ok(())
 }
@@ -351,12 +495,18 @@ fn emit_signing_triples(
     // DigitalSignature entity
     writer.write_triple(attestation_uri, &format!("{ATT}hasSignature"), &sig_uri)?;
     writer.write_triple(&sig_uri, RDF_TYPE, &format!("{ATT}DigitalSignature"))?;
-    writer.write_triple(&sig_uri, &format!("{ATT}signatureMethod"),
-        &format!("{ATT}SigstoreKeyless"))?;
+    writer.write_triple(
+        &sig_uri,
+        &format!("{ATT}signatureMethod"),
+        &format!("{ATT}SigstoreKeyless"),
+    )?;
     // npm registry pre-verifies attestations before storing them
     writer.write_literal(&sig_uri, &format!("{ATT}signatureStatus"), "verified")?;
-    writer.write_triple(&sig_uri, &format!("{ATT}hasOIDCProvider"),
-        &format!("{ATT}GitHubActionsOIDC"))?;
+    writer.write_triple(
+        &sig_uri,
+        &format!("{ATT}hasOIDCProvider"),
+        &format!("{ATT}GitHubActionsOIDC"),
+    )?;
     triples += 5;
 
     // DSSE signature value
@@ -369,23 +519,32 @@ fn emit_signing_triples(
     }
 
     // Transparency log entry from verificationMaterial
-    if let Some(tlog) = bundle
-        .pointer("/verificationMaterial/tlogEntries/0")
-    {
-        if let Some(log_index) = tlog.get("logIndex").and_then(|v| v.as_str())
+    if let Some(tlog) = bundle.pointer("/verificationMaterial/tlogEntries/0") {
+        if let Some(log_index) = tlog
+            .get("logIndex")
+            .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<i64>().ok())
             .or_else(|| tlog.get("logIndex").and_then(|v| v.as_i64()))
         {
             let tlog_uri = tlog_entry_uri("rekor", log_index);
-            writer.write_triple(&sig_uri, &format!("{ATT}hasTransparencyLogEntry"), &tlog_uri)?;
+            writer.write_triple(
+                &sig_uri,
+                &format!("{ATT}hasTransparencyLogEntry"),
+                &tlog_uri,
+            )?;
             writer.write_triple(&tlog_uri, RDF_TYPE, &format!("{ATT}TransparencyLogEntry"))?;
             writer.write_integer(&tlog_uri, &format!("{ATT}logIndex"), log_index)?;
-            writer.write_triple(&tlog_uri, &format!("{ATT}inTransparencyLog"),
-                &format!("{ATT}SigstorePublicGood"))?;
+            writer.write_triple(
+                &tlog_uri,
+                &format!("{ATT}inTransparencyLog"),
+                &format!("{ATT}SigstorePublicGood"),
+            )?;
             triples += 4;
 
             // integratedTime (Unix epoch → xsd:dateTime)
-            if let Some(integrated) = tlog.get("integratedTime").and_then(|v| v.as_str())
+            if let Some(integrated) = tlog
+                .get("integratedTime")
+                .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<i64>().ok())
                 .or_else(|| tlog.get("integratedTime").and_then(|v| v.as_i64()))
             {
@@ -402,15 +561,22 @@ fn emit_signing_triples(
     // Signing certificate (Fulcio ephemeral)
     // Sigstore bundle v0.3+ uses verificationMaterial.certificate (singular)
     // Older bundles use verificationMaterial.x509CertificateChain.certificates[0]
-    let has_cert = bundle.pointer("/verificationMaterial/certificate").is_some()
-        || bundle.pointer("/verificationMaterial/x509CertificateChain/certificates/0").is_some();
+    let has_cert = bundle
+        .pointer("/verificationMaterial/certificate")
+        .is_some()
+        || bundle
+            .pointer("/verificationMaterial/x509CertificateChain/certificates/0")
+            .is_some();
     if has_cert {
         let cert_uri = format!("{sig_uri}/cert");
         writer.write_triple(&sig_uri, &format!("{ATT}hasCertificate"), &cert_uri)?;
         writer.write_triple(&cert_uri, RDF_TYPE, &format!("{ATT}SigningCertificate"))?;
         writer.write_boolean(&cert_uri, &format!("{ATT}isEphemeralCertificate"), true)?;
-        writer.write_triple(&cert_uri, &format!("{ATT}certificateIssuer"),
-            &format!("{ATT}SigstoreFulcio"))?;
+        writer.write_triple(
+            &cert_uri,
+            &format!("{ATT}certificateIssuer"),
+            &format!("{ATT}SigstoreFulcio"),
+        )?;
         triples += 4;
 
         // Parse x509 certificate for Fulcio extensions and metadata
@@ -438,9 +604,9 @@ fn parse_fulcio_extensions(
     cert_uri: &str,
     bundle: &serde_json::Value,
 ) -> std::io::Result<usize> {
-    use x509_parser::prelude::*;
-    use sha2::{Sha256, Digest};
     use base64::Engine;
+    use sha2::{Digest, Sha256};
+    use x509_parser::prelude::*;
 
     let mut triples = 0;
 
@@ -448,7 +614,11 @@ fn parse_fulcio_extensions(
     let cert_b64 = bundle
         .pointer("/verificationMaterial/x509CertificateChain/certificates/0/rawBytes")
         .and_then(|v| v.as_str())
-        .or_else(|| bundle.pointer("/verificationMaterial/certificate").and_then(|v| v.as_str()));
+        .or_else(|| {
+            bundle
+                .pointer("/verificationMaterial/certificate")
+                .and_then(|v| v.as_str())
+        });
 
     let cert_b64 = match cert_b64 {
         Some(s) => s,
@@ -460,7 +630,14 @@ fn parse_fulcio_extensions(
         Ok(b) => b,
         Err(_) => {
             eprintln!("  Malformed base64 in signing certificate");
-            let dq = emit_dq_issue(writer, "npm-provenance-enricher", "certificate.rawBytes", cert_b64, "cert-parse-failed", "info")?;
+            let dq = emit_dq_issue(
+                writer,
+                "npm-provenance-enricher",
+                "certificate.rawBytes",
+                cert_b64,
+                "cert-parse-failed",
+                "info",
+            )?;
             return Ok(dq);
         }
     };
@@ -470,18 +647,34 @@ fn parse_fulcio_extensions(
         Ok(parsed) => parsed,
         Err(_) => {
             eprintln!("  Failed to parse x509 certificate DER");
-            let dq = emit_dq_issue(writer, "npm-provenance-enricher", "certificate.x509", cert_b64, "cert-parse-failed", "info")?;
+            let dq = emit_dq_issue(
+                writer,
+                "npm-provenance-enricher",
+                "certificate.x509",
+                cert_b64,
+                "cert-parse-failed",
+                "info",
+            )?;
             return Ok(dq);
         }
     };
 
     // Certificate fingerprint (SHA-256 of DER bytes)
     let fingerprint = format!("{:x}", Sha256::digest(&der_bytes));
-    writer.write_literal(cert_uri, &format!("{ATT}certificateFingerprint"), &fingerprint)?;
+    writer.write_literal(
+        cert_uri,
+        &format!("{ATT}certificateFingerprint"),
+        &fingerprint,
+    )?;
     triples += 1;
 
     // Subject (from SAN or DN)
-    if let Some(san_ext) = cert.tbs_certificate.get_extension_unique(&oid_registry::OID_X509_EXT_SUBJECT_ALT_NAME).ok().flatten() {
+    if let Some(san_ext) = cert
+        .tbs_certificate
+        .get_extension_unique(&oid_registry::OID_X509_EXT_SUBJECT_ALT_NAME)
+        .ok()
+        .flatten()
+    {
         if let ParsedExtension::SubjectAlternativeName(san_data) = san_ext.parsed_extension() {
             for name in &san_data.general_names {
                 if let GeneralName::RFC822Name(email) = name {
@@ -502,14 +695,34 @@ fn parse_fulcio_extensions(
     let not_before = cert.validity().not_before.to_datetime();
     let not_after = cert.validity().not_after.to_datetime();
     // Format as RFC3339/ISO8601
-    let not_before_str = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        not_before.year(), not_before.month() as u8, not_before.day(),
-        not_before.hour(), not_before.minute(), not_before.second());
-    let not_after_str = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        not_after.year(), not_after.month() as u8, not_after.day(),
-        not_after.hour(), not_after.minute(), not_after.second());
-    writer.write_datetime(cert_uri, &format!("{ATT}certificateNotBefore"), &not_before_str)?;
-    writer.write_datetime(cert_uri, &format!("{ATT}certificateNotAfter"), &not_after_str)?;
+    let not_before_str = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        not_before.year(),
+        not_before.month() as u8,
+        not_before.day(),
+        not_before.hour(),
+        not_before.minute(),
+        not_before.second()
+    );
+    let not_after_str = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        not_after.year(),
+        not_after.month() as u8,
+        not_after.day(),
+        not_after.hour(),
+        not_after.minute(),
+        not_after.second()
+    );
+    writer.write_datetime(
+        cert_uri,
+        &format!("{ATT}certificateNotBefore"),
+        &not_before_str,
+    )?;
+    writer.write_datetime(
+        cert_uri,
+        &format!("{ATT}certificateNotAfter"),
+        &not_after_str,
+    )?;
     triples += 2;
 
     // Parse Fulcio OID extensions (1.3.6.1.4.1.57264.1.{8-13})
@@ -528,12 +741,22 @@ fn parse_fulcio_extensions(
         match oid_ref {
             "1.3.6.1.4.1.57264.1.8" => {
                 // fulcioIssuerV2 (OIDC issuer URI)
-                writer.write_typed_literal(cert_uri, &format!("{ATT}fulcioIssuerV2"), &value_str, &format!("{XSD}anyURI"))?;
+                writer.write_typed_literal(
+                    cert_uri,
+                    &format!("{ATT}fulcioIssuerV2"),
+                    &value_str,
+                    &format!("{XSD}anyURI"),
+                )?;
                 triples += 1;
             }
             "1.3.6.1.4.1.57264.1.9" => {
                 // buildSignerURI (workflow file path)
-                writer.write_typed_literal(cert_uri, &format!("{ATT}buildSignerURI"), &value_str, &format!("{XSD}anyURI"))?;
+                writer.write_typed_literal(
+                    cert_uri,
+                    &format!("{ATT}buildSignerURI"),
+                    &value_str,
+                    &format!("{XSD}anyURI"),
+                )?;
                 triples += 1;
             }
             "1.3.6.1.4.1.57264.1.10" => {
@@ -548,12 +771,21 @@ fn parse_fulcio_extensions(
             }
             "1.3.6.1.4.1.57264.1.12" => {
                 // sourceRepositoryURI
-                writer.write_typed_literal(cert_uri, &format!("{ATT}sourceRepositoryURI"), &value_str, &format!("{XSD}anyURI"))?;
+                writer.write_typed_literal(
+                    cert_uri,
+                    &format!("{ATT}sourceRepositoryURI"),
+                    &value_str,
+                    &format!("{XSD}anyURI"),
+                )?;
                 triples += 1;
             }
             "1.3.6.1.4.1.57264.1.13" => {
                 // sourceRepositoryDigest (source commit SHA)
-                writer.write_literal(cert_uri, &format!("{ATT}sourceRepositoryDigest"), &value_str)?;
+                writer.write_literal(
+                    cert_uri,
+                    &format!("{ATT}sourceRepositoryDigest"),
+                    &value_str,
+                )?;
                 triples += 1;
             }
             _ => {}
@@ -619,20 +851,48 @@ mod tests {
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 
         let att_uri = attestation_uri("npm", "registry", "sigstore", "2.0.0");
-        writer.write_triple(&att_uri, RDF_TYPE, &format!("{SLSA}ProvenanceAttestation")).unwrap();
-        writer.write_literal(&att_uri, &format!("{SLSA}predicateType"),
-            "https://slsa.dev/provenance/v1").unwrap();
-        writer.write_triple(&att_uri, &format!("{SLSA}attestsBuildLevel"),
-            &format!("{SLSA}L2")).unwrap();
+        writer
+            .write_triple(&att_uri, RDF_TYPE, &format!("{SLSA}ProvenanceAttestation"))
+            .unwrap();
+        writer
+            .write_literal(
+                &att_uri,
+                &format!("{SLSA}predicateType"),
+                "https://slsa.dev/provenance/v1",
+            )
+            .unwrap();
+        writer
+            .write_triple(
+                &att_uri,
+                &format!("{SLSA}attestsBuildLevel"),
+                &format!("{SLSA}L2"),
+            )
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("slsa#ProvenanceAttestation"), "Should have ProvenanceAttestation type");
-        assert!(content.contains("slsa#predicateType"), "Should have predicate type");
-        assert!(content.contains("slsa.dev/provenance"), "Should reference SLSA provenance");
-        assert!(content.contains("slsa#attestsBuildLevel"), "Should attest build level");
+        assert!(
+            content.contains("slsa#ProvenanceAttestation"),
+            "Should have ProvenanceAttestation type"
+        );
+        assert!(
+            content.contains("slsa#predicateType"),
+            "Should have predicate type"
+        );
+        assert!(
+            content.contains("slsa.dev/provenance"),
+            "Should reference SLSA provenance"
+        );
+        assert!(
+            content.contains("slsa#attestsBuildLevel"),
+            "Should attest build level"
+        );
         assert!(content.contains("slsa#L2"), "Should be SLSA L2");
     }
 
@@ -659,26 +919,74 @@ mod tests {
             }
         });
 
-        let count = emit_signing_triples(&mut writer, &att_uri, &bundle, "sigstore", "2.0.0").unwrap();
+        let count =
+            emit_signing_triples(&mut writer, &att_uri, &bundle, "sigstore", "2.0.0").unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(count >= 14, "Should emit at least 14 triples, got {}", count);
-        assert!(content.contains("attestation#DigitalSignature"), "Should have DigitalSignature type");
-        assert!(content.contains("attestation#hasSignature"), "Should link attestation to signature");
-        assert!(content.contains("attestation#SigstoreKeyless"), "Should use Sigstore keyless method");
-        assert!(content.contains("attestation#signatureStatus"), "Should have verification status");
-        assert!(content.contains("attestation#GitHubActionsOIDC"), "Should reference OIDC provider");
-        assert!(content.contains("attestation#signatureValue"), "Should have DSSE signature");
-        assert!(content.contains("attestation#TransparencyLogEntry"), "Should have tlog entry");
-        assert!(content.contains("attestation#logIndex"), "Should have log index");
-        assert!(content.contains("attestation#SigstorePublicGood"), "Should reference public good log");
-        assert!(content.contains("attestation#integratedTime"), "Should have integrated time");
-        assert!(content.contains("attestation#SigningCertificate"), "Should have certificate");
-        assert!(content.contains("attestation#isEphemeralCertificate"), "Should mark as ephemeral");
-        assert!(content.contains("attestation#SigstoreFulcio"), "Should reference Fulcio CA");
+        assert!(
+            count >= 14,
+            "Should emit at least 14 triples, got {}",
+            count
+        );
+        assert!(
+            content.contains("attestation#DigitalSignature"),
+            "Should have DigitalSignature type"
+        );
+        assert!(
+            content.contains("attestation#hasSignature"),
+            "Should link attestation to signature"
+        );
+        assert!(
+            content.contains("attestation#SigstoreKeyless"),
+            "Should use Sigstore keyless method"
+        );
+        assert!(
+            content.contains("attestation#signatureStatus"),
+            "Should have verification status"
+        );
+        assert!(
+            content.contains("attestation#GitHubActionsOIDC"),
+            "Should reference OIDC provider"
+        );
+        assert!(
+            content.contains("attestation#signatureValue"),
+            "Should have DSSE signature"
+        );
+        assert!(
+            content.contains("attestation#TransparencyLogEntry"),
+            "Should have tlog entry"
+        );
+        assert!(
+            content.contains("attestation#logIndex"),
+            "Should have log index"
+        );
+        assert!(
+            content.contains("attestation#SigstorePublicGood"),
+            "Should reference public good log"
+        );
+        assert!(
+            content.contains("attestation#integratedTime"),
+            "Should have integrated time"
+        );
+        assert!(
+            content.contains("attestation#SigningCertificate"),
+            "Should have certificate"
+        );
+        assert!(
+            content.contains("attestation#isEphemeralCertificate"),
+            "Should mark as ephemeral"
+        );
+        assert!(
+            content.contains("attestation#SigstoreFulcio"),
+            "Should reference Fulcio CA"
+        );
     }
 
     #[test]
@@ -690,21 +998,52 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Rekor metadata
-        assert!(content.contains("attestation#SigstorePublicGood"), "Should have Rekor individual");
-        assert!(content.contains("attestation#logUri"), "Should have log URI");
-        assert!(content.contains("rekor.sigstore.dev"), "Should reference Rekor endpoint");
-        assert!(content.contains("attestation#logPublicKey"), "Should have log public key");
-        assert!(content.contains("BEGIN PUBLIC KEY"), "Should include PEM public key");
+        assert!(
+            content.contains("attestation#SigstorePublicGood"),
+            "Should have Rekor individual"
+        );
+        assert!(
+            content.contains("attestation#logUri"),
+            "Should have log URI"
+        );
+        assert!(
+            content.contains("rekor.sigstore.dev"),
+            "Should reference Rekor endpoint"
+        );
+        assert!(
+            content.contains("attestation#logPublicKey"),
+            "Should have log public key"
+        );
+        assert!(
+            content.contains("BEGIN PUBLIC KEY"),
+            "Should include PEM public key"
+        );
 
         // Fulcio metadata
-        assert!(content.contains("attestation#SigstoreFulcio"), "Should have Fulcio individual");
+        assert!(
+            content.contains("attestation#SigstoreFulcio"),
+            "Should have Fulcio individual"
+        );
         assert!(content.contains("attestation#caUri"), "Should have CA URI");
-        assert!(content.contains("fulcio.sigstore.dev"), "Should reference Fulcio endpoint");
-        assert!(content.contains("attestation#caRootCertFingerprint"), "Should have root cert fingerprint");
-        assert!(content.contains("attestation#issuesEphemeralCertificates"), "Should mark as ephemeral CA");
+        assert!(
+            content.contains("fulcio.sigstore.dev"),
+            "Should reference Fulcio endpoint"
+        );
+        assert!(
+            content.contains("attestation#caRootCertFingerprint"),
+            "Should have root cert fingerprint"
+        );
+        assert!(
+            content.contains("attestation#issuesEphemeralCertificates"),
+            "Should mark as ephemeral CA"
+        );
     }
 
     #[test]
@@ -722,14 +1061,25 @@ mod tests {
         // Construct a test bundle with ASN.1-encoded extension values
         // UTF8String DER format: 0x0C (tag) + length + UTF-8 bytes
         let issuer_value = create_asn1_utf8_string("https://token.actions.githubusercontent.com");
-        let workflow_value = create_asn1_utf8_string("https://github.com/example/repo/.github/workflows/release.yml@refs/heads/main");
+        let workflow_value = create_asn1_utf8_string(
+            "https://github.com/example/repo/.github/workflows/release.yml@refs/heads/main",
+        );
 
         // Test parse_asn1_utf8_string directly
         let decoded_issuer = parse_asn1_utf8_string(&issuer_value);
         let decoded_workflow = parse_asn1_utf8_string(&workflow_value);
 
-        assert_eq!(decoded_issuer, Some("https://token.actions.githubusercontent.com".to_string()));
-        assert_eq!(decoded_workflow, Some("https://github.com/example/repo/.github/workflows/release.yml@refs/heads/main".to_string()));
+        assert_eq!(
+            decoded_issuer,
+            Some("https://token.actions.githubusercontent.com".to_string())
+        );
+        assert_eq!(
+            decoded_workflow,
+            Some(
+                "https://github.com/example/repo/.github/workflows/release.yml@refs/heads/main"
+                    .to_string()
+            )
+        );
     }
 
     /// Helper to create ASN.1 UTF8String DER encoding for testing.
@@ -748,7 +1098,11 @@ mod tests {
             } else if len < 65536 {
                 vec![((len >> 8) & 0xFF) as u8, (len & 0xFF) as u8]
             } else {
-                vec![((len >> 16) & 0xFF) as u8, ((len >> 8) & 0xFF) as u8, (len & 0xFF) as u8]
+                vec![
+                    ((len >> 16) & 0xFF) as u8,
+                    ((len >> 8) & 0xFF) as u8,
+                    (len & 0xFF) as u8,
+                ]
             };
             result.push(0x80 | len_bytes.len() as u8);
             result.extend_from_slice(&len_bytes);

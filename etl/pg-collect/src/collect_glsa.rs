@@ -13,8 +13,8 @@
 
 use crate::cache::FileCache;
 use crate::enricher::rate_limit;
-use crate::ntriples::{NTriplesWriter, bnode_id};
-use crate::sparql::SparqlClient;
+use crate::ntriples::{bnode_id, NTriplesWriter};
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use once_cell::sync::Lazy;
 use quick_xml::events::Event;
@@ -27,9 +27,7 @@ use std::io::Result;
 use std::time::Duration;
 
 /// CVE identifier regex: CVE-YYYY-NNNNN
-static CVE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"CVE-\d{4}-\d{4,}").unwrap()
-});
+static CVE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"CVE-\d{4}-\d{4,}").unwrap());
 
 /// GLSA advisory collector with SPARQL-based atom resolution.
 pub struct GlsaCollector {
@@ -37,6 +35,7 @@ pub struct GlsaCollector {
     sparql: SparqlClient,
     since: Option<String>,
     cache: Option<FileCache>,
+    pub graph_uri: Option<String>,
 }
 
 impl GlsaCollector {
@@ -45,7 +44,13 @@ impl GlsaCollector {
     /// - `endpoint`: Fuseki SPARQL endpoint URL for atom→package resolution
     /// - `since`: Optional date filter (ISO format YYYY-MM-DD) — only GLSAs after this date
     /// - `cache_dir`: Optional cache directory for GLSA XML files
-    pub fn new(endpoint: &str, since: Option<String>, cache_dir: Option<&str>) -> Result<Self> {
+    pub fn new(
+        endpoint: &str,
+        since: Option<String>,
+        cache_dir: Option<&str>,
+        auth: SparqlAuth,
+        backend: SparqlBackend,
+    ) -> Result<Self> {
         let client = crate::enricher::default_http_client();
 
         let cache = cache_dir
@@ -54,10 +59,17 @@ impl GlsaCollector {
 
         Ok(Self {
             client,
-            sparql: SparqlClient::new(endpoint),
+            sparql: make_sparql_client(endpoint, &auth, backend),
             since,
             cache,
+            graph_uri: None,
         })
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     /// Collect GLSA advisories and emit N-Triples.
@@ -65,7 +77,7 @@ impl GlsaCollector {
     /// Returns (advisories_count, triples_count).
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         // Fetch RSS index to get GLSA IDs
         let glsa_ids = self.fetch_glsa_index()?;
@@ -110,7 +122,11 @@ impl GlsaCollector {
             // Advisory entity
             writer.write_triple(&advisory_uri, RDF_TYPE, &format!("{SEC}SecurityAdvisory"))?;
             writer.write_literal(&advisory_uri, &format!("{SEC}advisoryId"), &advisory.id)?;
-            writer.write_triple(&advisory_uri, &format!("{SEC}advisoryType"), &advisory_category_uri("security"))?;
+            writer.write_triple(
+                &advisory_uri,
+                &format!("{SEC}advisoryType"),
+                &advisory_category_uri("security"),
+            )?;
             advisory_triples += 3;
 
             // Publication date as xsd:dateTime (YYYY-MM-DD → YYYY-MM-DDT00:00:00Z)
@@ -121,7 +137,11 @@ impl GlsaCollector {
             // Severity
             if let Some(ref sev) = advisory.severity {
                 if let Some(sev_uri) = severity_concept_uri(sev) {
-                    writer.write_triple(&advisory_uri, &format!("{SEC}advisorySeverity"), &sev_uri)?;
+                    writer.write_triple(
+                        &advisory_uri,
+                        &format!("{SEC}advisorySeverity"),
+                        &sev_uri,
+                    )?;
                     advisory_triples += 1;
                 }
             }
@@ -129,14 +149,18 @@ impl GlsaCollector {
             // CVE cross-references (emit first — affected ranges attach to these)
             for cve_id in &advisory.cves {
                 let cve_uri = cve_entity_uri(cve_id);
-                writer.write_triple(&advisory_uri, &format!("{SEC}addressesVulnerability"), &cve_uri)?;
+                writer.write_triple(
+                    &advisory_uri,
+                    &format!("{SEC}addressesVulnerability"),
+                    &cve_uri,
+                )?;
                 advisory_triples += 1;
 
                 // Emit affected-range for this CVE (per affected package)
                 for (pkg_idx, affected_pkg) in advisory.affected_packages.iter().enumerate() {
                     let range_triples = self.emit_affected_range(
                         &mut writer,
-                        &cve_uri,  // Attach to vulnerability, not advisory
+                        &cve_uri, // Attach to vulnerability, not advisory
                         &advisory.id,
                         affected_pkg,
                         pkg_idx,
@@ -152,17 +176,27 @@ impl GlsaCollector {
                     Ok(packages) if !packages.is_empty() => {
                         // Emit advisoryForPackage for each matched package
                         for pkg_uri in &packages {
-                            writer.write_triple(&advisory_uri, &format!("{SEC}advisoryForPackage"), pkg_uri)?;
+                            writer.write_triple(
+                                &advisory_uri,
+                                &format!("{SEC}advisoryForPackage"),
+                                pkg_uri,
+                            )?;
                             advisory_triples += 1;
                             total_resolved_packages += 1;
                         }
                     }
                     Ok(_) => {
-                        eprintln!("  Warning: Atom {} has no matching packages in graph", affected_pkg.atom);
+                        eprintln!(
+                            "  Warning: Atom {} has no matching packages in graph",
+                            affected_pkg.atom
+                        );
                         unresolved_atoms += 1;
                     }
                     Err(e) => {
-                        eprintln!("  Warning: SPARQL query failed for atom {}: {}", affected_pkg.atom, e);
+                        eprintln!(
+                            "  Warning: SPARQL query failed for atom {}: {}",
+                            affected_pkg.atom, e
+                        );
                         unresolved_atoms += 1;
                     }
                 }
@@ -192,9 +226,10 @@ impl GlsaCollector {
         let xml = match self.cached_get(cache_key) {
             Some(data) => data,
             None => {
-                let resp = self.client.get(url)
-                    .send()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let resp =
+                    self.client.get(url).send().map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    })?;
 
                 if !resp.status().is_success() {
                     return Err(std::io::Error::new(
@@ -203,7 +238,8 @@ impl GlsaCollector {
                     ));
                 }
 
-                let xml = resp.text()
+                let xml = resp
+                    .text()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
                 self.cache_put(cache_key, &xml);
@@ -226,7 +262,9 @@ impl GlsaCollector {
                         // Extract GLSA ID from URL like "https://security.gentoo.org/glsa/202601-02"
                         // Skip non-advisory links (channel link, etc.)
                         if let Some(id_part) = link.split('/').last() {
-                            if id_part.contains('-') && id_part.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                            if id_part.contains('-')
+                                && id_part.chars().next().map_or(false, |c| c.is_ascii_digit())
+                            {
                                 glsa_ids.push(format!("GLSA-{}", id_part));
                             }
                         }
@@ -257,9 +295,10 @@ impl GlsaCollector {
         match self.cached_get(&cache_key) {
             Some(data) => Ok(data),
             None => {
-                let resp = self.client.get(&url)
-                    .send()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let resp =
+                    self.client.get(&url).send().map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    })?;
 
                 if !resp.status().is_success() {
                     return Err(std::io::Error::new(
@@ -268,7 +307,8 @@ impl GlsaCollector {
                     ));
                 }
 
-                let xml = resp.text()
+                let xml = resp
+                    .text()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
                 self.cache_put(&cache_key, &xml);
@@ -295,7 +335,8 @@ SELECT ?pkg WHERE {{
         );
 
         let bindings = self.sparql.query(&sparql)?;
-        Ok(bindings.into_iter()
+        Ok(bindings
+            .into_iter()
             .filter_map(|b| b.get("pkg").cloned())
             .collect())
     }
@@ -327,25 +368,45 @@ SELECT ?pkg WHERE {{
         let range_bnode = bnode_id("ar", &range_input);
 
         // Attach to vulnerability, not advisory (per ontology security.ttl:206)
-        writer.write_bnode_object(vulnerability_uri, &format!("{SEC}hasAffectedRange"), &range_bnode)?;
+        writer.write_bnode_object(
+            vulnerability_uri,
+            &format!("{SEC}hasAffectedRange"),
+            &range_bnode,
+        )?;
         writer.write_bnode_subject(&range_bnode, RDF_TYPE, &format!("{SEC}AffectedRange"))?;
-        writer.write_bnode_subject(&range_bnode, &format!("{SEC}rangeType"), &range_type_uri("ECOSYSTEM"))?;
+        writer.write_bnode_subject(
+            &range_bnode,
+            &format!("{SEC}rangeType"),
+            &range_type_uri("ECOSYSTEM"),
+        )?;
         triples += 3;
 
         // Introduced event: version "0" (all prior versions)
         let intro_bnode = format!("{}_intro", range_bnode);
         writer.write_bnode_to_bnode(&range_bnode, &format!("{SEC}hasRangeEvent"), &intro_bnode)?;
         writer.write_bnode_subject(&intro_bnode, RDF_TYPE, &format!("{SEC}RangeEvent"))?;
-        writer.write_bnode_subject(&intro_bnode, &format!("{SEC}eventType"), &event_type_uri("introduced"))?;
+        writer.write_bnode_subject(
+            &intro_bnode,
+            &format!("{SEC}eventType"),
+            &event_type_uri("introduced"),
+        )?;
         writer.write_bnode_literal(&intro_bnode, &format!("{SEC}eventVersion"), "0")?;
         triples += 4;
 
         // Fixed events: from unaffected ranges
         for (idx, (range_op, version)) in affected_pkg.unaffected_ranges.iter().enumerate() {
             let fix_bnode = format!("{}_fix{}", range_bnode, idx);
-            writer.write_bnode_to_bnode(&range_bnode, &format!("{SEC}hasRangeEvent"), &fix_bnode)?;
+            writer.write_bnode_to_bnode(
+                &range_bnode,
+                &format!("{SEC}hasRangeEvent"),
+                &fix_bnode,
+            )?;
             writer.write_bnode_subject(&fix_bnode, RDF_TYPE, &format!("{SEC}RangeEvent"))?;
-            writer.write_bnode_subject(&fix_bnode, &format!("{SEC}eventType"), &event_type_uri("fixed"))?;
+            writer.write_bnode_subject(
+                &fix_bnode,
+                &format!("{SEC}eventType"),
+                &event_type_uri("fixed"),
+            )?;
             writer.write_bnode_literal(&fix_bnode, &format!("{SEC}eventVersion"), version)?;
             triples += 4;
         }
@@ -354,7 +415,10 @@ SELECT ?pkg WHERE {{
     }
 
     fn cached_get(&self, key: &str) -> Option<String> {
-        self.cache.as_ref()?.get(key).and_then(|v| v.as_str().map(|s| s.to_string()))
+        self.cache
+            .as_ref()?
+            .get(key)
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
     }
 
     fn cache_put(&self, key: &str, data: &str) {
@@ -432,7 +496,8 @@ impl GlsaAdvisory {
                             // Extract type attribute
                             for attr in e.attributes().flatten() {
                                 if attr.key.as_ref() == b"type" {
-                                    severity = Some(String::from_utf8_lossy(&attr.value).to_string());
+                                    severity =
+                                        Some(String::from_utf8_lossy(&attr.value).to_string());
                                 }
                             }
                         }
@@ -448,12 +513,14 @@ impl GlsaAdvisory {
                             // Extract name attribute
                             for attr in e.attributes().flatten() {
                                 if attr.key.as_ref() == b"name" {
-                                    current_package = Some(String::from_utf8_lossy(&attr.value).to_string());
+                                    current_package =
+                                        Some(String::from_utf8_lossy(&attr.value).to_string());
                                 }
                             }
                         }
                         b"vulnerable" => {
-                            let range_op = e.attributes()
+                            let range_op = e
+                                .attributes()
                                 .flatten()
                                 .find(|a| a.key.as_ref() == b"range")
                                 .map(|a| String::from_utf8_lossy(&a.value).to_string());
@@ -465,7 +532,8 @@ impl GlsaAdvisory {
                             }
                         }
                         b"unaffected" => {
-                            let range_op = e.attributes()
+                            let range_op = e
+                                .attributes()
                                 .flatten()
                                 .find(|a| a.key.as_ref() == b"range")
                                 .map(|a| String::from_utf8_lossy(&a.value).to_string());
@@ -552,8 +620,8 @@ mod tests {
 
     #[test]
     fn test_parse_glsa_xml() {
-        let advisory = GlsaAdvisory::from_xml(SAMPLE_GLSA_XML)
-            .expect("Should parse valid GLSA XML");
+        let advisory =
+            GlsaAdvisory::from_xml(SAMPLE_GLSA_XML).expect("Should parse valid GLSA XML");
 
         assert_eq!(advisory.id, "GLSA-202601-02");
         assert_eq!(advisory.date, "2026-01-26");
@@ -563,14 +631,20 @@ mod tests {
 
         let vim_pkg = &advisory.affected_packages[0];
         assert_eq!(vim_pkg.atom, "app-editors/gvim");
-        assert_eq!(vim_pkg.vulnerable_ranges, vec![("lt".to_string(), "9.1.1652".to_string())]);
-        assert_eq!(vim_pkg.unaffected_ranges, vec![("ge".to_string(), "9.1.1652".to_string())]);
+        assert_eq!(
+            vim_pkg.vulnerable_ranges,
+            vec![("lt".to_string(), "9.1.1652".to_string())]
+        );
+        assert_eq!(
+            vim_pkg.unaffected_ranges,
+            vec![("ge".to_string(), "9.1.1652".to_string())]
+        );
     }
 
     #[test]
     fn test_parse_multi_package_glsa() {
-        let advisory = GlsaAdvisory::from_xml(SAMPLE_GLSA_XML)
-            .expect("Should parse multi-package GLSA");
+        let advisory =
+            GlsaAdvisory::from_xml(SAMPLE_GLSA_XML).expect("Should parse multi-package GLSA");
 
         assert_eq!(advisory.affected_packages.len(), 2);
         assert_eq!(advisory.affected_packages[0].atom, "app-editors/gvim");
@@ -579,8 +653,7 @@ mod tests {
 
     #[test]
     fn test_cve_extraction_from_references() {
-        let advisory = GlsaAdvisory::from_xml(SAMPLE_GLSA_XML)
-            .expect("Should parse GLSA");
+        let advisory = GlsaAdvisory::from_xml(SAMPLE_GLSA_XML).expect("Should parse GLSA");
 
         assert_eq!(advisory.cves.len(), 2);
         assert!(advisory.cves.contains(&"CVE-2025-53905".to_string()));
@@ -589,8 +662,8 @@ mod tests {
 
     #[test]
     fn test_affected_range_emission() {
-        use tempfile::NamedTempFile;
         use std::io::Read;
+        use tempfile::NamedTempFile;
 
         let tmp = NamedTempFile::new().unwrap();
         let file = tmp.reopen().unwrap();
@@ -609,23 +682,57 @@ mod tests {
 
         // NOTE: hasAffectedRange attaches to Vulnerability, not Advisory
         let cve_uri = "https://packagegraph.github.io/d/cve/CVE-2025-53905";
-        writer.write_bnode_object(cve_uri, &format!("{SEC}hasAffectedRange"), &range_bnode).unwrap();
-        writer.write_bnode_subject(&range_bnode, RDF_TYPE, &format!("{SEC}AffectedRange")).unwrap();
-        writer.write_bnode_subject(&range_bnode, &format!("{SEC}rangeType"), &range_type_uri("ECOSYSTEM")).unwrap();
+        writer
+            .write_bnode_object(cve_uri, &format!("{SEC}hasAffectedRange"), &range_bnode)
+            .unwrap();
+        writer
+            .write_bnode_subject(&range_bnode, RDF_TYPE, &format!("{SEC}AffectedRange"))
+            .unwrap();
+        writer
+            .write_bnode_subject(
+                &range_bnode,
+                &format!("{SEC}rangeType"),
+                &range_type_uri("ECOSYSTEM"),
+            )
+            .unwrap();
 
         // Introduced event
         let intro_bnode = format!("{}_intro", range_bnode);
-        writer.write_bnode_to_bnode(&range_bnode, &format!("{SEC}hasRangeEvent"), &intro_bnode).unwrap();
-        writer.write_bnode_subject(&intro_bnode, RDF_TYPE, &format!("{SEC}RangeEvent")).unwrap();
-        writer.write_bnode_subject(&intro_bnode, &format!("{SEC}eventType"), &event_type_uri("introduced")).unwrap();
-        writer.write_bnode_literal(&intro_bnode, &format!("{SEC}eventVersion"), "0").unwrap();
+        writer
+            .write_bnode_to_bnode(&range_bnode, &format!("{SEC}hasRangeEvent"), &intro_bnode)
+            .unwrap();
+        writer
+            .write_bnode_subject(&intro_bnode, RDF_TYPE, &format!("{SEC}RangeEvent"))
+            .unwrap();
+        writer
+            .write_bnode_subject(
+                &intro_bnode,
+                &format!("{SEC}eventType"),
+                &event_type_uri("introduced"),
+            )
+            .unwrap();
+        writer
+            .write_bnode_literal(&intro_bnode, &format!("{SEC}eventVersion"), "0")
+            .unwrap();
 
         // Fixed event
         let fix_bnode = format!("{}_fix0", range_bnode);
-        writer.write_bnode_to_bnode(&range_bnode, &format!("{SEC}hasRangeEvent"), &fix_bnode).unwrap();
-        writer.write_bnode_subject(&fix_bnode, RDF_TYPE, &format!("{SEC}RangeEvent")).unwrap();
-        writer.write_bnode_subject(&fix_bnode, &format!("{SEC}eventType"), &event_type_uri("fixed")).unwrap();
-        writer.write_bnode_literal(&fix_bnode, &format!("{SEC}eventVersion"), "9.1.1652").unwrap();
+        writer
+            .write_bnode_to_bnode(&range_bnode, &format!("{SEC}hasRangeEvent"), &fix_bnode)
+            .unwrap();
+        writer
+            .write_bnode_subject(&fix_bnode, RDF_TYPE, &format!("{SEC}RangeEvent"))
+            .unwrap();
+        writer
+            .write_bnode_subject(
+                &fix_bnode,
+                &format!("{SEC}eventType"),
+                &event_type_uri("fixed"),
+            )
+            .unwrap();
+        writer
+            .write_bnode_literal(&fix_bnode, &format!("{SEC}eventVersion"), "9.1.1652")
+            .unwrap();
 
         writer.flush().unwrap();
 

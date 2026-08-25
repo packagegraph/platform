@@ -12,9 +12,8 @@ static VAR_ASSIGN: Lazy<Regex> = Lazy::new(|| {
 });
 
 // Regex to detect infrastructure type: $(eval $(autotools-package))
-static INFRA_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"\$\(eval\s+\$\(([a-z0-9-]+)\)\)"#).unwrap()
-});
+static INFRA_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"\$\(eval\s+\$\(([a-z0-9-]+)\)\)"#).unwrap());
 
 #[derive(Debug)]
 struct BuildrootPackage {
@@ -39,16 +38,28 @@ pub struct BuildrootCollector {
     distro_name: String,
     release_name: String,
     repo_path: String,
+    pub graph_uri: Option<String>,
 }
 
 impl BuildrootCollector {
     pub fn new(distro_name: String, release_name: String, repo_path: String) -> Self {
-        Self { distro_name, release_name, repo_path }
+        Self {
+            distro_name,
+            release_name,
+            repo_path,
+            graph_uri: None,
+        }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn collect(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
         self.emit_distribution_metadata(&mut writer)?;
 
         let packages_path = Path::new(&self.repo_path).join("package");
@@ -108,7 +119,11 @@ impl BuildrootCollector {
         Ok(triples)
     }
 
-    fn parse_package(&self, pkg_name: &str, mk_path: &Path) -> std::result::Result<BuildrootPackage, String> {
+    fn parse_package(
+        &self,
+        pkg_name: &str,
+        mk_path: &Path,
+    ) -> std::result::Result<BuildrootPackage, String> {
         let file = File::open(mk_path).map_err(|e| e.to_string())?;
         let reader = BufReader::new(file);
 
@@ -206,11 +221,22 @@ impl BuildrootCollector {
         Ok(pkg)
     }
 
-    fn emit_package_triples(&self, writer: &mut NTriplesWriter, pkg: &BuildrootPackage) -> Result<usize> {
+    fn emit_package_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        pkg: &BuildrootPackage,
+    ) -> Result<usize> {
         let default_version = "0".to_string();
         let version = pkg.version.as_ref().unwrap_or(&default_version);
-        let pkg_uri = package_uri(&self.distro_name, &self.release_name, "any", &pkg.name, version);
-        let identity_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", &pkg.name);
+        let pkg_uri = package_uri(
+            &self.distro_name,
+            &self.release_name,
+            "any",
+            &pkg.name,
+            version,
+        );
+        let identity_uri =
+            package_identity_uri(&self.distro_name, &self.release_name, "any", &pkg.name);
         let dist_uri = distro_uri(&self.distro_name);
         let rel_uri = release_uri(&self.distro_name, &self.release_name);
         let mut triples = 0;
@@ -305,7 +331,8 @@ impl BuildrootCollector {
 
         // Build dependencies
         for dep in &pkg.dependencies {
-            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
+            let target_uri =
+                package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
             writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
 
@@ -313,13 +340,18 @@ impl BuildrootCollector {
             writer.write_bnode_object(&pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri("build"))?;
+            writer.write_bnode_subject(
+                &bnode,
+                &format!("{PKG}dependencyType"),
+                &dep_type_uri("build"),
+            )?;
             triples += 4;
         }
 
         // Host dependencies
         for dep in &pkg.host_dependencies {
-            let target_uri = package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
+            let target_uri =
+                package_identity_uri(&self.distro_name, &self.release_name, "any", dep);
             writer.write_triple(&pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
 
@@ -327,7 +359,11 @@ impl BuildrootCollector {
             writer.write_bnode_object(&pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-            writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri("host"))?;
+            writer.write_bnode_subject(
+                &bnode,
+                &format!("{PKG}dependencyType"),
+                &dep_type_uri("host"),
+            )?;
             triples += 4;
         }
 
@@ -366,7 +402,11 @@ LIBFOO_DEPENDENCIES = zlib openssl
 
         create_test_package(temp_dir.path(), "libfoo", content);
 
-        let collector = BuildrootCollector::new("buildroot".into(), "buildroot".into(), temp_dir.path().to_str().unwrap().to_string());
+        let collector = BuildrootCollector::new(
+            "buildroot".into(),
+            "buildroot".into(),
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
 
         let temp_file = NamedTempFile::new().unwrap();
         let output_path = temp_file.path().to_str().unwrap();
@@ -378,22 +418,50 @@ LIBFOO_DEPENDENCIES = zlib openssl
 
         // Read output and verify
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Check for dual typing
-        assert!(content.contains("core#SourcePackage"), "Should have SourcePackage type");
-        assert!(content.contains("buildroot#BuildrootPackage"), "Should have BuildrootPackage type");
+        assert!(
+            content.contains("core#SourcePackage"),
+            "Should have SourcePackage type"
+        );
+        assert!(
+            content.contains("buildroot#BuildrootPackage"),
+            "Should have BuildrootPackage type"
+        );
 
         // Check for metadata
-        assert!(content.contains("versionString"), "Should use versionString on Version node");
+        assert!(
+            content.contains("versionString"),
+            "Should use versionString on Version node"
+        );
         assert!(content.contains("\"1.2.3\""), "Should have version");
-        assert!(content.contains("licenseName"), "Should use licenseName property");
+        assert!(
+            content.contains("licenseName"),
+            "Should use licenseName property"
+        );
         assert!(content.contains("\"MIT\""), "Should have LICENSE");
-        assert!(content.contains("\"https://example.com/releases\""), "Should have SITE");
-        assert!(content.contains("isVersionOf"), "Should use isVersionOf for identity");
-        assert!(content.contains("partOfDistribution"), "Should link to distribution");
+        assert!(
+            content.contains("\"https://example.com/releases\""),
+            "Should have SITE"
+        );
+        assert!(
+            content.contains("isVersionOf"),
+            "Should use isVersionOf for identity"
+        );
+        assert!(
+            content.contains("partOfDistribution"),
+            "Should link to distribution"
+        );
         assert!(content.contains("partOfRelease"), "Should link to release");
-        assert!(!content.contains("packageVersion"), "Should NOT use packageVersion");
+        assert!(
+            !content.contains("packageVersion"),
+            "Should NOT use packageVersion"
+        );
     }
 
     #[test]
@@ -407,7 +475,11 @@ FOO_DEPENDENCIES = libbar host-pkgconf
 
         create_test_package(temp_dir.path(), "foo", content);
 
-        let collector = BuildrootCollector::new("buildroot".into(), "buildroot".into(), temp_dir.path().to_str().unwrap().to_string());
+        let collector = BuildrootCollector::new(
+            "buildroot".into(),
+            "buildroot".into(),
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
 
         let temp_file = NamedTempFile::new().unwrap();
         let output_path = temp_file.path().to_str().unwrap();
@@ -415,11 +487,21 @@ FOO_DEPENDENCIES = libbar host-pkgconf
         collector.collect(output_path).unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Check for dependency types (v0.6.0: property URIs, not string literals)
-        assert!(content.contains("core#buildDependsOn"), "Should have buildDependsOn dependency type for build deps");
-        assert!(content.contains("core#buildDependsOn"), "Should have buildDependsOn dependency type for host- prefix");
+        assert!(
+            content.contains("core#buildDependsOn"),
+            "Should have buildDependsOn dependency type for build deps"
+        );
+        assert!(
+            content.contains("core#buildDependsOn"),
+            "Should have buildDependsOn dependency type for host- prefix"
+        );
     }
 
     #[test]
@@ -433,7 +515,11 @@ LIB_FOO_LICENSE = BSD-3-Clause
 
         create_test_package(temp_dir.path(), "lib-foo", content);
 
-        let collector = BuildrootCollector::new("buildroot".into(), "buildroot".into(), temp_dir.path().to_str().unwrap().to_string());
+        let collector = BuildrootCollector::new(
+            "buildroot".into(),
+            "buildroot".into(),
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
 
         let temp_file = NamedTempFile::new().unwrap();
         let output_path = temp_file.path().to_str().unwrap();
@@ -442,9 +528,15 @@ LIB_FOO_LICENSE = BSD-3-Clause
         assert_eq!(packages, 1, "Should parse package with dash in name");
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("\"2.0\""), "Should extract version from LIB_FOO_ prefix");
+        assert!(
+            content.contains("\"2.0\""),
+            "Should extract version from LIB_FOO_ prefix"
+        );
     }
 }
-

@@ -152,10 +152,7 @@ pub fn maintainer_uri(email: &str) -> String {
 pub fn maintainer_name_uri(name: &str) -> String {
     // Canonicalize: trim, NFC normalize, collapse internal whitespace
     let nfc: String = name.trim().nfc().collect();
-    let canonical: String = nfc
-        .split_whitespace()
-        .collect::<Vec<&str>>()
-        .join(" ");
+    let canonical: String = nfc.split_whitespace().collect::<Vec<&str>>().join(" ");
     format!("{DATA}maintainer/name/{}", encode(&canonical))
 }
 
@@ -199,8 +196,10 @@ pub fn person_uri_from_email(email: &str) -> Option<String> {
     if normalized.is_empty() {
         return None;
     }
-    Some(format!("{DATA}person/{}",
-        normalized.replace('@', "-at-").replace('.', "-")))
+    Some(format!(
+        "{DATA}person/{}",
+        normalized.replace('@', "-at-").replace('.', "-")
+    ))
 }
 
 /// Build a GitHub Person URI from GitHub login.
@@ -277,15 +276,16 @@ pub fn normalize_forge_url(url: &str) -> Option<String> {
         .unwrap_or(url);
 
     // Strip trailing slashes, .git suffix, and common subpaths
-    let path = path
-        .trim_end_matches('/')
-        .trim_end_matches(".git");
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
 
     // GitHub: github.com/{owner}/{repo}[/tree/...][/wiki][/issues]
     if path.starts_with("github.com/") {
         let parts: Vec<&str> = path.splitn(4, '/').collect();
         if parts.len() >= 3 && !parts[1].is_empty() && !parts[2].is_empty() {
-            return Some(repo_uri(&format!("https://github.com/{}/{}", parts[1], parts[2])));
+            return Some(repo_uri(&format!(
+                "https://github.com/{}/{}",
+                parts[1], parts[2]
+            )));
         }
     }
 
@@ -294,7 +294,10 @@ pub fn normalize_forge_url(url: &str) -> Option<String> {
         let parts: Vec<&str> = path.splitn(4, '/').collect();
         if parts.len() >= 3 {
             let host = parts[0];
-            return Some(repo_uri(&format!("https://{}/{}/{}", host, parts[1], parts[2])));
+            return Some(repo_uri(&format!(
+                "https://{}/{}/{}",
+                host, parts[1], parts[2]
+            )));
         }
     }
 
@@ -302,7 +305,10 @@ pub fn normalize_forge_url(url: &str) -> Option<String> {
     if path.starts_with("codeberg.org/") {
         let parts: Vec<&str> = path.splitn(4, '/').collect();
         if parts.len() >= 3 {
-            return Some(repo_uri(&format!("https://codeberg.org/{}/{}", parts[1], parts[2])));
+            return Some(repo_uri(&format!(
+                "https://codeberg.org/{}/{}",
+                parts[1], parts[2]
+            )));
         }
     }
 
@@ -310,7 +316,10 @@ pub fn normalize_forge_url(url: &str) -> Option<String> {
     if path.starts_with("salsa.debian.org/") {
         let parts: Vec<&str> = path.splitn(4, '/').collect();
         if parts.len() >= 3 {
-            return Some(repo_uri(&format!("https://salsa.debian.org/{}/{}", parts[1], parts[2])));
+            return Some(repo_uri(&format!(
+                "https://salsa.debian.org/{}/{}",
+                parts[1], parts[2]
+            )));
         }
     }
 
@@ -326,14 +335,21 @@ pub fn normalize_forge_url(url: &str) -> Option<String> {
     if path.starts_with("src.fedoraproject.org/") {
         let parts: Vec<&str> = path.splitn(4, '/').collect();
         if parts.len() >= 3 {
-            return Some(repo_uri(&format!("https://src.fedoraproject.org/{}/{}", parts[1], parts[2])));
+            return Some(repo_uri(&format!(
+                "https://src.fedoraproject.org/{}/{}",
+                parts[1], parts[2]
+            )));
         }
     }
 
     // Savannah (GNU): git.savannah.gnu.org/git/{project} or savannah.gnu.org/projects/{project}
     if path.starts_with("git.savannah.gnu.org/") || path.starts_with("git.savannah.nongnu.org/") {
         // git.savannah.gnu.org/git/bash.git → savannah.gnu.org/git/bash
-        let host = if path.contains("nongnu") { "savannah.nongnu.org" } else { "savannah.gnu.org" };
+        let host = if path.contains("nongnu") {
+            "savannah.nongnu.org"
+        } else {
+            "savannah.gnu.org"
+        };
         if let Some(rest) = path.split_once('/').map(|(_, r)| r) {
             let rest = rest.trim_start_matches("git/").trim_start_matches("cgit/");
             return Some(repo_uri(&format!("https://{}/git/{}", host, rest)));
@@ -355,7 +371,10 @@ pub fn normalize_forge_url(url: &str) -> Option<String> {
         // sourceware.org/{project} (e.g., sourceware.org/glibc)
         let parts: Vec<&str> = path.splitn(3, '/').collect();
         if parts.len() >= 2 && !parts[1].contains('.') {
-            return Some(repo_uri(&format!("https://sourceware.org/git/{}", parts[1])));
+            return Some(repo_uri(&format!(
+                "https://sourceware.org/git/{}",
+                parts[1]
+            )));
         }
     }
 
@@ -373,7 +392,10 @@ pub fn normalize_forge_url(url: &str) -> Option<String> {
 pub fn fedora_distgit_uri(distro: &str, name: &str) -> String {
     match distro {
         "fedora" => repo_uri(&format!("https://src.fedoraproject.org/rpms/{}", name)),
-        "centos-stream" => repo_uri(&format!("https://gitlab.com/redhat/centos-stream/rpms/{}", name)),
+        "centos-stream" => repo_uri(&format!(
+            "https://gitlab.com/redhat/centos-stream/rpms/{}",
+            name
+        )),
         _ => repo_uri(&format!("https://src.fedoraproject.org/rpms/{}", name)),
     }
 }
@@ -440,7 +462,11 @@ pub fn forge_uri(host: &str) -> String {
 ///
 /// Example: ("gitlab", "17.1.0") → "https://packagegraph.github.io/d/forge-version/gitlab/17.1.0"
 pub fn forge_software_version_uri(software: &str, version: &str) -> String {
-    format!("{DATA}forge-version/{}/{}", encode(software), encode(version))
+    format!(
+        "{DATA}forge-version/{}/{}",
+        encode(software),
+        encode(version)
+    )
 }
 
 /// Build a vcs:ForgeVersionObservation URI.
@@ -487,7 +513,12 @@ pub fn ecosystem_uri(name: &str) -> String {
 /// The key should uniquely identify the issue (e.g., hash of detector + field + raw value).
 /// Example: "enrich-github/homepage/abc123" -> "https://packagegraph.github.io/d/dq/enrich-github/homepage/abc123"
 pub fn dq_issue_uri(detector: &str, field: &str, value_hash: &str) -> String {
-    format!("{DATA}dq/{}/{}/{}", encode(detector), encode(field), value_hash)
+    format!(
+        "{DATA}dq/{}/{}/{}",
+        encode(detector),
+        encode(field),
+        value_hash
+    )
 }
 
 /// Check if a release name is numeric (version number) vs a codename.
@@ -570,7 +601,7 @@ pub fn epss_assessment_uri(cve_id: &str, date: &str) -> String {
 /// Build a PackageRelationship URI from two identity URIs.
 /// Uses SHA-256 for deterministic, cross-release-stable hashing.
 pub fn package_relationship_uri(identity_a: &str, identity_b: &str) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let (first, second) = if identity_a < identity_b {
         (identity_a, identity_b)
     } else {
@@ -710,7 +741,10 @@ mod tests {
 
     #[test]
     fn test_arch_uri() {
-        assert_eq!(arch_uri("amd64"), "https://packagegraph.github.io/d/arch/amd64");
+        assert_eq!(
+            arch_uri("amd64"),
+            "https://packagegraph.github.io/d/arch/amd64"
+        );
     }
 
     #[test]
@@ -802,34 +836,58 @@ mod tests {
     #[test]
     fn test_spdx_license_uri() {
         assert_eq!(spdx_license_uri("MIT"), "https://spdx.org/licenses/MIT");
-        assert_eq!(spdx_license_uri("GPL-2.0-only"), "https://spdx.org/licenses/GPL-2.0-only");
-        assert_eq!(spdx_license_uri("Apache-2.0"), "https://spdx.org/licenses/Apache-2.0");
+        assert_eq!(
+            spdx_license_uri("GPL-2.0-only"),
+            "https://spdx.org/licenses/GPL-2.0-only"
+        );
+        assert_eq!(
+            spdx_license_uri("Apache-2.0"),
+            "https://spdx.org/licenses/Apache-2.0"
+        );
     }
 
     #[test]
     fn test_spdx_license_uri_compound_expression() {
         // Alpine packages use compound SPDX expressions with spaces
         let uri = spdx_license_uri("BSD-3-Clause OR GPL-2.0-or-later");
-        assert_eq!(uri, "https://spdx.org/licenses/BSD-3-Clause%20OR%20GPL-2.0-or-later");
+        assert_eq!(
+            uri,
+            "https://spdx.org/licenses/BSD-3-Clause%20OR%20GPL-2.0-or-later"
+        );
         assert!(!uri.contains(' '), "URI must not contain raw spaces");
     }
 
     #[test]
     fn test_cwe_uri() {
-        assert_eq!(cwe_uri("CWE-79"), "https://cwe.mitre.org/data/definitions/79");
+        assert_eq!(
+            cwe_uri("CWE-79"),
+            "https://cwe.mitre.org/data/definitions/79"
+        );
         assert_eq!(cwe_uri("79"), "https://cwe.mitre.org/data/definitions/79");
-        assert_eq!(cwe_uri("CWE-200"), "https://cwe.mitre.org/data/definitions/200");
+        assert_eq!(
+            cwe_uri("CWE-200"),
+            "https://cwe.mitre.org/data/definitions/200"
+        );
     }
 
     #[test]
     fn test_cve_entity_uri() {
-        assert_eq!(cve_entity_uri("CVE-2024-1234"), "https://packagegraph.github.io/d/cve/CVE-2024-1234");
+        assert_eq!(
+            cve_entity_uri("CVE-2024-1234"),
+            "https://packagegraph.github.io/d/cve/CVE-2024-1234"
+        );
     }
 
     #[test]
     fn test_ecosystem_uri() {
-        assert_eq!(ecosystem_uri("cargo"), "https://packagegraph.github.io/d/ecosystem/cargo");
-        assert_eq!(ecosystem_uri("pypi"), "https://packagegraph.github.io/d/ecosystem/pypi");
+        assert_eq!(
+            ecosystem_uri("cargo"),
+            "https://packagegraph.github.io/d/ecosystem/cargo"
+        );
+        assert_eq!(
+            ecosystem_uri("pypi"),
+            "https://packagegraph.github.io/d/ecosystem/pypi"
+        );
     }
 
     #[test]
@@ -846,7 +904,10 @@ mod tests {
         let pkg = "https://purl.org/packagegraph/ontology/core#";
         assert_eq!(dep_type_uri("build"), format!("{pkg}buildDependsOn"));
         assert_eq!(dep_type_uri("makedepends"), format!("{pkg}buildDependsOn"));
-        assert_eq!(dep_type_uri("build_depends"), format!("{pkg}buildDependsOn"));
+        assert_eq!(
+            dep_type_uri("build_depends"),
+            format!("{pkg}buildDependsOn")
+        );
         assert_eq!(dep_type_uri("host"), format!("{pkg}buildDependsOn"));
     }
 
@@ -883,19 +944,49 @@ mod tests {
     #[test]
     fn test_severity_concept_uri() {
         let sec = "https://purl.org/packagegraph/ontology/security#";
-        assert_eq!(severity_concept_uri("critical"), Some(format!("{sec}sev-critical")));
-        assert_eq!(severity_concept_uri("CRITICAL"), Some(format!("{sec}sev-critical")));
-        assert_eq!(severity_concept_uri("important"), Some(format!("{sec}sev-important")));
-        assert_eq!(severity_concept_uri("high"), Some(format!("{sec}sev-important")));
-        assert_eq!(severity_concept_uri("HIGH"), Some(format!("{sec}sev-important")));
-        assert_eq!(severity_concept_uri("moderate"), Some(format!("{sec}sev-moderate")));
-        assert_eq!(severity_concept_uri("medium"), Some(format!("{sec}sev-moderate")));
-        assert_eq!(severity_concept_uri("MEDIUM"), Some(format!("{sec}sev-moderate")));
+        assert_eq!(
+            severity_concept_uri("critical"),
+            Some(format!("{sec}sev-critical"))
+        );
+        assert_eq!(
+            severity_concept_uri("CRITICAL"),
+            Some(format!("{sec}sev-critical"))
+        );
+        assert_eq!(
+            severity_concept_uri("important"),
+            Some(format!("{sec}sev-important"))
+        );
+        assert_eq!(
+            severity_concept_uri("high"),
+            Some(format!("{sec}sev-important"))
+        );
+        assert_eq!(
+            severity_concept_uri("HIGH"),
+            Some(format!("{sec}sev-important"))
+        );
+        assert_eq!(
+            severity_concept_uri("moderate"),
+            Some(format!("{sec}sev-moderate"))
+        );
+        assert_eq!(
+            severity_concept_uri("medium"),
+            Some(format!("{sec}sev-moderate"))
+        );
+        assert_eq!(
+            severity_concept_uri("MEDIUM"),
+            Some(format!("{sec}sev-moderate"))
+        );
         assert_eq!(severity_concept_uri("low"), Some(format!("{sec}sev-low")));
         assert_eq!(severity_concept_uri("LOW"), Some(format!("{sec}sev-low")));
         assert_eq!(severity_concept_uri("none"), Some(format!("{sec}sev-none")));
-        assert_eq!(severity_concept_uri("urgent"), Some(format!("{sec}sev-critical")));
-        assert_eq!(severity_concept_uri("URGENT"), Some(format!("{sec}sev-critical")));
+        assert_eq!(
+            severity_concept_uri("urgent"),
+            Some(format!("{sec}sev-critical"))
+        );
+        assert_eq!(
+            severity_concept_uri("URGENT"),
+            Some(format!("{sec}sev-critical"))
+        );
         assert_eq!(severity_concept_uri("unimportant"), None);
         assert_eq!(severity_concept_uri("unknown"), None);
     }
@@ -903,17 +994,29 @@ mod tests {
     #[test]
     fn test_advisory_category_uri() {
         let sec = "https://purl.org/packagegraph/ontology/security#";
-        assert_eq!(advisory_category_uri("security"), format!("{sec}cat-security"));
+        assert_eq!(
+            advisory_category_uri("security"),
+            format!("{sec}cat-security")
+        );
         assert_eq!(advisory_category_uri("bugfix"), format!("{sec}cat-bugfix"));
-        assert_eq!(advisory_category_uri("enhancement"), format!("{sec}cat-enhancement"));
+        assert_eq!(
+            advisory_category_uri("enhancement"),
+            format!("{sec}cat-enhancement")
+        );
     }
 
     #[test]
     fn test_event_type_uri() {
         let sec = "https://purl.org/packagegraph/ontology/security#";
-        assert_eq!(event_type_uri("introduced"), format!("{sec}event-introduced"));
+        assert_eq!(
+            event_type_uri("introduced"),
+            format!("{sec}event-introduced")
+        );
         assert_eq!(event_type_uri("fixed"), format!("{sec}event-fixed"));
-        assert_eq!(event_type_uri("last_affected"), format!("{sec}event-last-affected"));
+        assert_eq!(
+            event_type_uri("last_affected"),
+            format!("{sec}event-last-affected")
+        );
     }
 
     #[test]
@@ -956,12 +1059,18 @@ mod tests {
 
     #[test]
     fn test_normalize_email_obfuscated_caps() {
-        assert_eq!(normalize_email("pnemade AT redhat DOT com"), "pnemade@redhat.com");
+        assert_eq!(
+            normalize_email("pnemade AT redhat DOT com"),
+            "pnemade@redhat.com"
+        );
     }
 
     #[test]
     fn test_normalize_email_obfuscated_lower() {
-        assert_eq!(normalize_email("bradbell at seanet dot com"), "bradbell@seanet.com");
+        assert_eq!(
+            normalize_email("bradbell at seanet dot com"),
+            "bradbell@seanet.com"
+        );
     }
 
     #[test]
@@ -976,13 +1085,19 @@ mod tests {
     #[test]
     fn test_person_uri_from_email_normal() {
         let uri = person_uri_from_email("user@example.com").unwrap();
-        assert_eq!(uri, "https://packagegraph.github.io/d/person/user-at-example-com");
+        assert_eq!(
+            uri,
+            "https://packagegraph.github.io/d/person/user-at-example-com"
+        );
     }
 
     #[test]
     fn test_person_uri_from_email_obfuscated() {
         let uri = person_uri_from_email("pnemade AT redhat DOT com").unwrap();
-        assert_eq!(uri, "https://packagegraph.github.io/d/person/pnemade-at-redhat-com");
+        assert_eq!(
+            uri,
+            "https://packagegraph.github.io/d/person/pnemade-at-redhat-com"
+        );
     }
 
     #[test]

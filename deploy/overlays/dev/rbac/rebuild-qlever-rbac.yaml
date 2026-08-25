@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rebuild-qlever
+  namespace: packagegraph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rebuild-qlever
+  namespace: packagegraph
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch", "watch"]
+    resourceNames: ["qlever"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rebuild-qlever
+  namespace: packagegraph
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rebuild-qlever
+subjects:
+  - kind: ServiceAccount
+    name: rebuild-qlever
+    namespace: packagegraph

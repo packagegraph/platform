@@ -13,7 +13,10 @@ pub fn normalize_debian_package(
 ) -> Option<PackageIr> {
     let name = fields.get("Package")?;
     let version = fields.get("Version")?;
-    let arch = fields.get("Architecture").map(|s| s.as_str()).unwrap_or(&scope.arch);
+    let arch = fields
+        .get("Architecture")
+        .map(|s| s.as_str())
+        .unwrap_or(&scope.arch);
 
     // Parse epoch from version string
     let (epoch, clean_version) = if let Some(idx) = version.find(':') {
@@ -72,27 +75,43 @@ pub fn normalize_debian_package(
 
     // Metadata
     let metadata = PackageMetadataIr {
-        summary: fields.get("Description").and_then(|d| d.lines().next().map(String::from)),
+        summary: fields
+            .get("Description")
+            .and_then(|d| d.lines().next().map(String::from)),
         description: fields.get("Description").cloned(),
         homepage: fields.get("Homepage").cloned(),
         license: None, // Debian doesn't have a license field in Packages
         checksum: fields.get("SHA256").cloned(),
-        size_bytes: fields.get("Installed-Size").and_then(|s| s.parse::<u64>().ok().map(|kb| kb * 1024)),
+        size_bytes: fields
+            .get("Installed-Size")
+            .and_then(|s| s.parse::<u64>().ok().map(|kb| kb * 1024)),
     };
 
     // Collector-specific
     let mut collector_specific = serde_json::Map::new();
     if let Some(suite) = fields.get("Suite") {
-        collector_specific.insert("suite".to_string(), serde_json::Value::String(suite.clone()));
+        collector_specific.insert(
+            "suite".to_string(),
+            serde_json::Value::String(suite.clone()),
+        );
     }
     if let Some(component) = scope.repo.as_ref() {
-        collector_specific.insert("component".to_string(), serde_json::Value::String(component.clone()));
+        collector_specific.insert(
+            "component".to_string(),
+            serde_json::Value::String(component.clone()),
+        );
     }
     if let Some(installed_size) = fields.get("Installed-Size") {
-        collector_specific.insert("installed_size_kb".to_string(), serde_json::Value::String(installed_size.clone()));
+        collector_specific.insert(
+            "installed_size_kb".to_string(),
+            serde_json::Value::String(installed_size.clone()),
+        );
     }
     if let Some(vcs_git) = fields.get("Vcs-Git") {
-        collector_specific.insert("vcs_git".to_string(), serde_json::Value::String(vcs_git.clone()));
+        collector_specific.insert(
+            "vcs_git".to_string(),
+            serde_json::Value::String(vcs_git.clone()),
+        );
     }
 
     let mut source_artifacts = BTreeMap::new();
@@ -180,12 +199,15 @@ pub fn normalize_debian_shard(
 }
 
 fn parse_maintainer(maint: &str) -> Vec<MaintainerIr> {
-    use super::maintainer::{parse_mailbox_list, is_email_iri_safe};
+    use super::maintainer::{is_email_iri_safe, parse_mailbox_list};
 
     let parsed = parse_mailbox_list(maint);
 
     if parsed.malformed_count > 0 {
-        eprintln!("WARNING: {} malformed maintainer entries in: {}", parsed.malformed_count, maint);
+        eprintln!(
+            "WARNING: {} malformed maintainer entries in: {}",
+            parsed.malformed_count, maint
+        );
     }
 
     let mut iri_unsafe_count = 0usize;
@@ -209,7 +231,10 @@ fn parse_maintainer(maint: &str) -> Vec<MaintainerIr> {
     }
 
     if iri_unsafe_count > 0 {
-        eprintln!("WARNING: {} IRI-unsafe email addresses skipped in: {}", iri_unsafe_count, maint);
+        eprintln!(
+            "WARNING: {} IRI-unsafe email addresses skipped in: {}",
+            iri_unsafe_count, maint
+        );
     }
 
     result
@@ -295,8 +320,7 @@ mod tests {
         let ir_path = tmp.path().join("test.jsonl.zst");
 
         let count =
-            normalize_debian_shard(packages_text, &sample_scope(), "sha256:abc", &ir_path)
-                .unwrap();
+            normalize_debian_shard(packages_text, &sample_scope(), "sha256:abc", &ir_path).unwrap();
         assert_eq!(count, 2);
 
         let reader = IrReader::new(&ir_path).unwrap();
@@ -311,7 +335,10 @@ mod tests {
 
     #[test]
     fn test_parse_debian_deps() {
-        let deps = parse_debian_deps("libc6 (>= 2.17), libpthread-stubs0-dev, zlib1g (>= 1:1.1.4)", "requires");
+        let deps = parse_debian_deps(
+            "libc6 (>= 2.17), libpthread-stubs0-dev, zlib1g (>= 1:1.1.4)",
+            "requires",
+        );
         assert_eq!(deps.len(), 3);
         assert_eq!(deps[0].name, "libc6");
         assert_eq!(deps[0].version_constraint.as_deref(), Some(">= 2.17"));
@@ -361,10 +388,7 @@ mod tests {
         let maintainers = parse_maintainer("\"Doe, Jane\" <jane@example.org>");
         assert_eq!(maintainers.len(), 1);
         assert_eq!(maintainers[0].name, "Doe, Jane");
-        assert_eq!(
-            maintainers[0].email.as_deref(),
-            Some("jane@example.org")
-        );
+        assert_eq!(maintainers[0].email.as_deref(), Some("jane@example.org"));
     }
 
     #[test]

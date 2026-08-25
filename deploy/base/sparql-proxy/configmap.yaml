@@ -1,0 +1,86 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sparql-proxy-config
+  namespace: packagegraph
+data:
+  nginx.conf: |
+    worker_processes 1;
+    error_log /dev/stderr warn;
+    pid /tmp/nginx.pid;
+
+    events {
+        worker_connections 64;
+    }
+
+    http {
+        limit_req_zone $binary_remote_addr zone=sparql:1m rate=2r/s;
+
+        client_body_temp_path /tmp/client_body;
+        proxy_temp_path /tmp/proxy;
+
+        log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                        '$status $body_bytes_sent';
+        access_log /dev/stdout main;
+
+        server {
+            listen 8443 ssl;
+            server_name zany.weir.do;
+
+            ssl_certificate /etc/nginx/tls/tls.crt;
+            ssl_certificate_key /etc/nginx/tls/tls.key;
+            ssl_protocols TLSv1.2 TLSv1.3;
+            ssl_ciphers HIGH:!aNULL:!MD5;
+            ssl_prefer_server_ciphers on;
+
+            auth_basic "PackageGraph SPARQL";
+            auth_basic_user_file /etc/nginx/auth/htpasswd;
+
+            client_max_body_size 1m;
+            proxy_read_timeout 60s;
+            proxy_connect_timeout 5s;
+            proxy_send_timeout 10s;
+
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto https;
+
+            add_header X-Content-Type-Options nosniff always;
+
+            location / {
+                return 403;
+            }
+
+            # SPARQL query — proxy to Fuseki (switch to QLever after full migration)
+            location /packagegraph/sparql {
+                limit_req zone=sparql burst=10 nodelay;
+                limit_except GET POST {
+                    deny all;
+                }
+                proxy_pass http://fuseki:3030;
+            }
+
+            location /packagegraph/query {
+                limit_req zone=sparql burst=10 nodelay;
+                limit_except GET POST {
+                    deny all;
+                }
+                proxy_pass http://fuseki:3030;
+            }
+
+            # Read-only graph store protocol
+            location /packagegraph/get {
+                limit_req zone=sparql burst=5 nodelay;
+                limit_except GET {
+                    deny all;
+                }
+                proxy_pass http://fuseki:3030;
+            }
+
+            # Block write endpoints
+            location /packagegraph/update { return 403; }
+            location /packagegraph/data { return 403; }
+            location /$ { return 403; }
+        }
+    }

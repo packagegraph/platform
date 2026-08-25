@@ -3,7 +3,7 @@
 //! This module is where the ontology contract is applied. All URI construction,
 //! type assignments, property choices, and inverse edge policy lives here.
 
-use crate::ir::{PackageIr, MaintainerIr};
+use crate::ir::{MaintainerIr, PackageIr};
 use crate::ntriples::NTriplesWriter;
 use crate::uris::*;
 use std::collections::HashSet;
@@ -30,17 +30,19 @@ impl Default for EmitPolicy {
 /// Emit RDF triples for a single PackageIr record.
 ///
 /// Returns the number of triples written.
-pub fn emit_rdf(
-    ir: &PackageIr,
-    writer: &mut NTriplesWriter,
-    policy: &EmitPolicy,
-) -> Result<usize> {
+pub fn emit_rdf(ir: &PackageIr, writer: &mut NTriplesWriter, policy: &EmitPolicy) -> Result<usize> {
     let scope = &ir.scope;
     let pkg = &ir.package;
     let mut triples = 0;
 
     let release_name = &scope.release;
-    let pkg_uri = package_uri(&scope.distro, release_name, &pkg.arch, &pkg.name, &pkg.full_version);
+    let pkg_uri = package_uri(
+        &scope.distro,
+        release_name,
+        &pkg.arch,
+        &pkg.name,
+        &pkg.full_version,
+    );
 
     // === Package type ===
     writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{PKG}BinaryPackage"))?;
@@ -105,7 +107,11 @@ pub fn emit_rdf(
             triples += 1;
             // Upstream repository from homepage (if forge URL)
             if let Some(upstream_uri) = normalize_forge_url(homepage) {
-                writer.write_triple(&identity_uri, &format!("{PKG}upstreamRepository"), &upstream_uri)?;
+                writer.write_triple(
+                    &identity_uri,
+                    &format!("{PKG}upstreamRepository"),
+                    &upstream_uri,
+                )?;
                 writer.write_triple(&upstream_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
                 triples += 2;
             }
@@ -124,7 +130,14 @@ pub fn emit_rdf(
 
     // === Dependencies ===
     for dep in &ir.dependencies {
-        triples += emit_dependency(writer, &pkg_uri, dep, &scope.distro, release_name, &pkg.arch)?;
+        triples += emit_dependency(
+            writer,
+            &pkg_uri,
+            dep,
+            &scope.distro,
+            release_name,
+            &pkg.arch,
+        )?;
     }
 
     Ok(triples)
@@ -211,7 +224,11 @@ fn emit_dependency(
     writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
     writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
     writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
-    writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyType"), &dep_type_uri(&dep.dep_type))?;
+    writer.write_bnode_subject(
+        &bnode,
+        &format!("{PKG}dependencyType"),
+        &dep_type_uri(&dep.dep_type),
+    )?;
     triples += 4;
 
     if let Some(ref constraint) = dep.version_constraint {
@@ -296,21 +313,58 @@ mod tests {
         assert!(count > 10, "Should emit at least 10 triples, got {}", count);
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Core assertions
-        assert!(content.contains("core#BinaryPackage"), "Should type as BinaryPackage");
-        assert!(content.contains("core#PackageIdentity"), "Should create PackageIdentity");
-        assert!(content.contains("core#isVersionOf"), "Should link isVersionOf");
-        assert!(content.contains("core#hasVersion"), "Should link hasVersion");
-        assert!(content.contains("core#Person"), "Should type maintainer as Person");
+        assert!(
+            content.contains("core#BinaryPackage"),
+            "Should type as BinaryPackage"
+        );
+        assert!(
+            content.contains("core#PackageIdentity"),
+            "Should create PackageIdentity"
+        );
+        assert!(
+            content.contains("core#isVersionOf"),
+            "Should link isVersionOf"
+        );
+        assert!(
+            content.contains("core#hasVersion"),
+            "Should link hasVersion"
+        );
+        assert!(
+            content.contains("core#Person"),
+            "Should type maintainer as Person"
+        );
         assert!(content.contains("foaf/0.1/name"), "Should emit foaf:name");
-        assert!(content.contains("core#maintainedBy"), "Should emit maintainedBy");
-        assert!(content.contains("core#SourcePackage"), "Should emit SourcePackage");
-        assert!(content.contains("core#builtFromSource"), "Should emit builtFromSource");
-        assert!(content.contains("core#hasDependency"), "Should emit dependency");
-        assert!(content.contains("core#directlyDependsOn"), "Should emit directlyDependsOn");
-        assert!(content.contains("core#partOfDistribution"), "Should emit partOfDistribution");
+        assert!(
+            content.contains("core#maintainedBy"),
+            "Should emit maintainedBy"
+        );
+        assert!(
+            content.contains("core#SourcePackage"),
+            "Should emit SourcePackage"
+        );
+        assert!(
+            content.contains("core#builtFromSource"),
+            "Should emit builtFromSource"
+        );
+        assert!(
+            content.contains("core#hasDependency"),
+            "Should emit dependency"
+        );
+        assert!(
+            content.contains("core#directlyDependsOn"),
+            "Should emit directlyDependsOn"
+        );
+        assert!(
+            content.contains("core#partOfDistribution"),
+            "Should emit partOfDistribution"
+        );
     }
 
     #[test]
@@ -324,13 +378,32 @@ mod tests {
         assert!(count >= 6, "Should emit at least 6 triples");
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("core#Distribution"), "Should type as Distribution");
-        assert!(content.contains("core#DistributionRelease"), "Should type as DistributionRelease");
-        assert!(content.contains("core#releaseVersion"), "43 is numeric → releaseVersion");
-        assert!(content.contains("core#partOfDistribution"), "Should link partOfDistribution");
-        assert!(content.contains("core#hasRelease"), "Should auto-emit hasRelease inverse");
+        assert!(
+            content.contains("core#Distribution"),
+            "Should type as Distribution"
+        );
+        assert!(
+            content.contains("core#DistributionRelease"),
+            "Should type as DistributionRelease"
+        );
+        assert!(
+            content.contains("core#releaseVersion"),
+            "43 is numeric → releaseVersion"
+        );
+        assert!(
+            content.contains("core#partOfDistribution"),
+            "Should link partOfDistribution"
+        );
+        assert!(
+            content.contains("core#hasRelease"),
+            "Should auto-emit hasRelease inverse"
+        );
         assert!(content.contains("\"Fedora\""), "Should have rdfs:label");
     }
 
@@ -346,13 +419,23 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Must type as Person, NOT Maintainer (SD-3)
         assert!(content.contains("core#Person"), "Must type as Person");
-        assert!(!content.contains("core#Maintainer"), "Must NOT type as Maintainer");
+        assert!(
+            !content.contains("core#Maintainer"),
+            "Must NOT type as Maintainer"
+        );
         assert!(content.contains("\"Fedora Project\""), "Should emit name");
-        assert!(content.contains("mailto:admin@fedoraproject.org"), "Should emit mbox");
+        assert!(
+            content.contains("mailto:admin@fedoraproject.org"),
+            "Should emit mbox"
+        );
     }
 
     #[test]
@@ -375,7 +458,11 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // The URI must use the /maintainer/name/ path from maintainer_name_uri()
         let expected_uri = maintainer_name_uri("Debian QA Group");
@@ -383,7 +470,8 @@ mod tests {
             content.contains(&expected_uri),
             "RDF emitter must use maintainer_name_uri() for name-only entries.\n\
              Expected URI: {}\nContent:\n{}",
-            expected_uri, content
+            expected_uri,
+            content
         );
         assert!(content.contains("core#Person"), "Must type as Person");
         assert!(content.contains("\"Debian QA Group\""), "Must emit name");

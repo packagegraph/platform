@@ -10,7 +10,7 @@
 //! check in `enrich()`.
 
 use crate::ntriples::NTriplesWriter;
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use std::fs::File;
 use std::io::Result;
@@ -18,25 +18,41 @@ use std::io::Result;
 pub struct RevdepsEnricher {
     sparql: SparqlClient,
     graph: Option<String>,
+    pub graph_uri: Option<String>,
 }
 
 impl RevdepsEnricher {
-    pub fn new(endpoint: &str, graph: Option<&str>) -> Self {
-        let sparql = SparqlClient::new(endpoint);
+    pub fn new(
+        endpoint: &str,
+        graph: Option<&str>,
+        auth: SparqlAuth,
+        backend: SparqlBackend,
+    ) -> Self {
+        let sparql = make_sparql_client(endpoint, &auth, backend);
         Self {
             sparql,
             graph: graph.map(|s| s.to_string()),
+            graph_uri: None,
         }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn enrich(&self, output_path: &str) -> Result<(usize, usize)> {
         self.check_ontology_property()?;
 
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         let counts = self.query_reverse_dep_counts()?;
-        eprintln!("Computed reverse dependency counts for {} identities", counts.len());
+        eprintln!(
+            "Computed reverse dependency counts for {} identities",
+            counts.len()
+        );
 
         let mut total_triples = 0usize;
         for (identity_uri, count) in &counts {
@@ -128,13 +144,18 @@ mod tests {
             .with_body(r#"{"results": {"bindings": []}}"#)
             .create();
 
-        let enricher = RevdepsEnricher::new(&server.url(), None);
+        let enricher = RevdepsEnricher::new(&server.url(), None, None, SparqlBackend::Fuseki);
         assert!(enricher.graph.is_none());
     }
 
     #[test]
     fn test_revdeps_with_graph_scope() {
-        let enricher = RevdepsEnricher::new("http://localhost:3030", Some("https://example.org/graph"));
+        let enricher = RevdepsEnricher::new(
+            "http://localhost:3030",
+            Some("https://example.org/graph"),
+            None,
+            SparqlBackend::Fuseki,
+        );
         assert_eq!(
             enricher.graph,
             Some("https://example.org/graph".to_string())

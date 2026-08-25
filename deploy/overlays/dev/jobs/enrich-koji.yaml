@@ -42,24 +42,31 @@ spec:
                     echo "Cache warmed: $(find "${CACHE_DIR}" -name '*.json' 2>/dev/null | wc -l) entries"
                   fi
 
+                  ENRICH_OK=0
                   pg-collect enrich-koji \
                     --endpoint "$FUSEKI_ENDPOINT" \
                     -o /tmp/enrichment/koji.nt \
                     --cache-dir "${CACHE_DIR}" \
                     --koji-hub https://koji.fedoraproject.org/kojihub \
-                    --distro fedora || true
+                    --distro fedora || ENRICH_OK=$?
 
                   if [ "${ENRICHER_CACHE_DISABLED:-0}" != "1" ]; then
                     echo "Syncing cache to Minio..."
                     mc mirror --overwrite "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
                   fi
 
-                  if [ -f /tmp/enrichment/koji.nt ]; then
-                    pg-collect drop \
-                      --graph "https://packagegraph.github.io/graph/enrichment/koji" \
-                      --endpoint "$FUSEKI_ENDPOINT" && \
-                    pg-collect load /tmp/enrichment/koji.nt \
-                      --graph "https://packagegraph.github.io/graph/enrichment/koji" \
-                      --endpoint "$FUSEKI_ENDPOINT"
+                  GRAPH_URI="https://packagegraph.github.io/graph/enrichment/koji"
+                  if [ "$ENRICH_OK" -ne 0 ]; then
+                    echo "WARNING: enrich-koji failed (exit $ENRICH_OK) — skipping load"
+                    rm -f /tmp/enrichment/koji.nt
+                  elif [ -f /tmp/enrichment/koji.nt ]; then
+                    if pg-collect drop --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT" && \
+                       pg-collect load /tmp/enrichment/koji.nt \
+                         --graph "$GRAPH_URI" --endpoint "$FUSEKI_ENDPOINT"; then
+                      /app/scripts/upload-nt.sh /tmp/enrichment/koji.nt "$GRAPH_URI"
+                    else
+                      echo "ERROR: Fuseki drop/load failed — skipping Minio upload"
+                      exit 1
+                    fi
                   fi
               resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}

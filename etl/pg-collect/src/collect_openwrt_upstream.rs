@@ -12,7 +12,10 @@ pub struct OpenwrtUpstreamCollector {
 
 impl OpenwrtUpstreamCollector {
     pub fn new(distro_name: String, release_name: String) -> Self {
-        Self { distro_name, release_name }
+        Self {
+            distro_name,
+            release_name,
+        }
     }
 
     pub fn collect(
@@ -33,30 +36,48 @@ impl OpenwrtUpstreamCollector {
             if let Some(meta) = parsed_meta.get(effective_name) {
                 if let Some(ref source_url) = meta.source_url {
                     // Check if we already created the UpstreamProject for this parent
-                    let upstream_uri = if let Some(existing_uri) = emitted_upstream.get(effective_name) {
+                    let upstream_uri = if let Some(existing_uri) =
+                        emitted_upstream.get(effective_name)
+                    {
                         // Reuse existing UpstreamProject URI
                         existing_uri.clone()
                     } else {
                         // Create new UpstreamProject entity
                         let upstream_uri = upstream_uri(&format!("openwrt/{}", effective_name));
 
-                        writer.write_triple(&upstream_uri, RDF_TYPE, &format!("{PKG}UpstreamProject"))?;
+                        writer.write_triple(
+                            &upstream_uri,
+                            RDF_TYPE,
+                            &format!("{PKG}UpstreamProject"),
+                        )?;
                         total_triples += 1;
 
                         // pkg:projectName (SHACL required)
-                        writer.write_literal(&upstream_uri, &format!("{PKG}projectName"), effective_name)?;
+                        writer.write_literal(
+                            &upstream_uri,
+                            &format!("{PKG}projectName"),
+                            effective_name,
+                        )?;
                         total_triples += 1;
 
                         // For git sources: link to VCS repository (reuses forge URI from Stage 1)
                         if meta.source_proto.as_deref() == Some("git") {
                             if let Some(extraction) = crate::forge::extract_forge_url(source_url) {
                                 let repo_uri = crate::uris::repo_uri(&extraction.repo_url);
-                                writer.write_triple(&upstream_uri, &format!("{PKG}projectRepository"), &repo_uri)?;
+                                writer.write_triple(
+                                    &upstream_uri,
+                                    &format!("{PKG}projectRepository"),
+                                    &repo_uri,
+                                )?;
                                 total_triples += 1;
                             }
                         } else {
                             // For archive sources: emit download URL as projectUrl
-                            writer.write_literal(&upstream_uri, &format!("{PKG}projectUrl"), source_url)?;
+                            writer.write_literal(
+                                &upstream_uri,
+                                &format!("{PKG}projectUrl"),
+                                source_url,
+                            )?;
                             total_triples += 1;
                         }
 
@@ -65,7 +86,11 @@ impl OpenwrtUpstreamCollector {
                     };
 
                     // Link THIS package (parent or sub-package) to the UpstreamProject
-                    writer.write_triple(source_pkg_uri, &format!("{PKG}hasUpstreamProject"), &upstream_uri)?;
+                    writer.write_triple(
+                        source_pkg_uri,
+                        &format!("{PKG}hasUpstreamProject"),
+                        &upstream_uri,
+                    )?;
                     total_triples += 1;
                 }
             }
@@ -95,41 +120,65 @@ mod tests {
         identity_map.insert("foo-utils".to_string(), foo_utils_uri.to_string());
 
         let mut parsed_meta = HashMap::new();
-        parsed_meta.insert("foo".to_string(), OpenWrtPackageMeta {
-            source_url: Some("https://github.com/example/foo.git".to_string()),
-            source_proto: Some("git".to_string()),
-            source_hash: Some("abc123".to_string()),
-        });
+        parsed_meta.insert(
+            "foo".to_string(),
+            OpenWrtPackageMeta {
+                source_url: Some("https://github.com/example/foo.git".to_string()),
+                source_proto: Some("git".to_string()),
+                source_hash: Some("abc123".to_string()),
+            },
+        );
 
         let mut parent_map = HashMap::new();
         parent_map.insert("foo-utils".to_string(), "foo".to_string());
 
         let collector = OpenwrtUpstreamCollector::new("openwrt".into(), "24.10".into());
-        let triples = collector.collect(&mut writer, &identity_map, &parsed_meta, &parent_map).unwrap();
+        let triples = collector
+            .collect(&mut writer, &identity_map, &parsed_meta, &parent_map)
+            .unwrap();
 
         assert!(triples > 0, "Should emit upstream triples");
 
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Should have UpstreamProject
-        assert!(content.contains("UpstreamProject"), "Should emit UpstreamProject type");
+        assert!(
+            content.contains("UpstreamProject"),
+            "Should emit UpstreamProject type"
+        );
 
         // Should have projectName (SHACL required)
         assert!(content.contains("projectName"), "Should emit projectName");
-        assert!(content.contains("\"foo\""), "Should use parent name for projectName");
+        assert!(
+            content.contains("\"foo\""),
+            "Should use parent name for projectName"
+        );
 
         // Should have hasUpstreamProject link
-        assert!(content.contains("hasUpstreamProject"), "Should link via hasUpstreamProject");
+        assert!(
+            content.contains("hasUpstreamProject"),
+            "Should link via hasUpstreamProject"
+        );
 
         // Should link to VCS repository
-        assert!(content.contains("projectRepository"), "Should link to projectRepository");
+        assert!(
+            content.contains("projectRepository"),
+            "Should link to projectRepository"
+        );
 
         // Both packages (parent and sub-package) should link to same UpstreamProject
         let upstream_count = content.matches("hasUpstreamProject").count();
-        assert_eq!(upstream_count, 2, "Both foo and foo-utils should link to same UpstreamProject");
+        assert_eq!(
+            upstream_count, 2,
+            "Both foo and foo-utils should link to same UpstreamProject"
+        );
     }
 
     #[test]
@@ -142,23 +191,35 @@ mod tests {
         identity_map.insert("openssl".to_string(), pkg_uri.to_string());
 
         let mut parsed_meta = HashMap::new();
-        parsed_meta.insert("openssl".to_string(), OpenWrtPackageMeta {
-            source_url: Some("https://www.openssl.org/source/openssl-1.0.tar.gz".to_string()),
-            source_proto: Some("default".to_string()),
-            source_hash: Some("def456".to_string()),
-        });
+        parsed_meta.insert(
+            "openssl".to_string(),
+            OpenWrtPackageMeta {
+                source_url: Some("https://www.openssl.org/source/openssl-1.0.tar.gz".to_string()),
+                source_proto: Some("default".to_string()),
+                source_hash: Some("def456".to_string()),
+            },
+        );
 
         let parent_map = HashMap::new();
 
         let collector = OpenwrtUpstreamCollector::new("openwrt".into(), "24.10".into());
-        collector.collect(&mut writer, &identity_map, &parsed_meta, &parent_map).unwrap();
+        collector
+            .collect(&mut writer, &identity_map, &parsed_meta, &parent_map)
+            .unwrap();
 
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // UpstreamProject URI should be distro-scoped (openwrt/openssl, not global openssl)
-        assert!(content.contains("/upstream/openwrt%2Fopenssl"), "UpstreamProject URI should be distro-scoped");
+        assert!(
+            content.contains("/upstream/openwrt%2Fopenssl"),
+            "UpstreamProject URI should be distro-scoped"
+        );
     }
 }

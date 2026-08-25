@@ -2,6 +2,45 @@
 
 All notable changes to the PackageGraph platform are documented in this file.
 
+## [Unreleased] - 2026-08-24 (ontology v0.12.0)
+
+### SPARQL infrastructure
+
+- **Dual-backend SPARQL (QLever + Fuseki)** — new `SparqlBackend` enum dispatches queries to Fuseki (Graph Store Protocol) or QLever (HTTP POST) transparently. All production `SparqlClient`s are constructed via a single `make_sparql_client` helper; QLever's read-only nature is enforced by a `guard_write()` check on every mutating path.
+- **SPARQL Basic Auth + TLS** — new `sparql-proxy` (nginx) terminates TLS and enforces Basic Auth in front of the backends; the external Route uses TLS passthrough to the proxy (ClusterIP-only, not node-exposed).
+- **Graph-scoped queries** — SPARQL queries wrap patterns in `GRAPH ?g {}` for QLever N-Quads compatibility.
+
+### N-Quads output mode
+
+- **`--graph` flag** — propagates a graph URI to all collectors and enrichers via `.with_graph()` builders; `NTriplesWriter` emits N-Quads when a graph URI is set, including `write_raw_line()` for pre-formatted triples (NVD).
+- Incremental GitHub enrichment always emits N-Triples for its graph-scoped GSP load, independent of the global `--graph` flag (the graph is designated by the GSP endpoint, not an N-Quads 4th term).
+
+### Minio write pipeline
+
+- **Per-file `.graph` sidecars** — `upload-nt.sh` writes the `.nt` first, then the `.graph` sidecar as a commit marker, so incomplete pairs are safely excluded from index rebuilds. Replaces the racy `graphs.json` manifest.
+- **`migrate-graph-sidecars.sh`** (new) — enumerates actual Minio objects and fails on unmapped files.
+
+### Enrichers
+
+- **Outage detection** — npm-provenance, GitHub, and Repology enrichers abort on 20 consecutive failures or a >50% error rate (404→`Ok(0)`, 5xx/network→`Err`), so an upstream outage produces a hard error rather than a near-empty "successful" result. The RHSA advisory enricher now returns an error on non-success API responses instead of silently truncating.
+- **Minio parity** — advisory, npm-provenance, koji, repology, and GitHub enrichers upload results to Minio, gated on a successful Fuseki load. GitHub enrichment exports its full accumulated graph via a SPARQL `CONSTRUCT` after incremental loads.
+
+### Deployment
+
+- **QLever** (new) — Deployment (`Recreate` strategy with an init-container index load using staging+swap and `.prev` recovery), PVC, Service, and out-of-band credentials Secret.
+- **`rebuild-qlever-index`** (new CronJob) — builds a QLever index from Minio N-Quads behind a completeness gate (≥10 graphs, ≤25% triple loss, previous-graph identity), ETag-based concurrent-write detection, and rollback on failed rollout. Promotion is idempotent: an unchanged content hash skips the archive/upload and the rollout restart.
+- **`rebuild-tdb2`** — offline TDB2 rebuild with staging+swap, `tdb2.tdbloader` abort-on-error, Lucene text index via a `jena.textindexer` init container, and rollback. Uploads the ontology to Minio early for QLever parity (independent of the QLever rebuild). Removed the unsafe `snapshot-tdb2` live-tar CronJob.
+- **Image pinning to v0.12.0** — all PackageGraph-owned images pinned via kustomize images transformers; the `qlever-rebuild` Containerfile pins `mc` and `kubectl` by sha256 and runs as a non-root user.
+- **RBAC** — least-privilege Roles for the rebuild jobs (`get`/`patch`/`watch` scoped to the named Deployment only).
+
+### CI/CD
+
+- **qlever-rebuild image** — built in `ci.yml` and built + published by `release.yml` (ontology tag required, no fallback).
+
+### CQ validation
+
+- Profiler now compares canonical result bindings between QLever and Fuseki, not just row counts, so aggregate queries with matching counts but different values are detected. CQ-SEC-04 marked stale pending re-profiling after the GRAPH-scoping fix.
+
 ## [Unreleased] - 2026-05-12 (ontology v0.10.0)
 
 ### Collectors
@@ -235,7 +274,7 @@ All notable changes to the PackageGraph platform are documented in this file.
 - **Fuseki memory** — Increased pod limit to 6Gi with JVM heap at `-Xmx2g`, leaving 4Gi for TDB2 memory-mapped file cache per [Jena guidance](https://github.com/apache/jena/discussions/2099).
 - **Fuseki query timeout** — Added `arq:queryTimeout "30000,120000"` (30s soft / 120s hard) to protect against runaway YASGUI queries.
 - **Fuseki GSP endpoint** — Enabled `fuseki:gsp-rw` at `/data` for Graph Store Protocol bulk uploads.
-- **TDB2 snapshot archival** — New `snapshot-tdb2` CronJob archives TDB2 to Minio after collection. Future Fuseki restarts restore from snapshot via init container instead of re-running collectors (~2 min restore vs ~40 min re-collect).
+- **TDB2 snapshot archival** — The `rebuild-tdb2` CronJob produces consistent offline TDB2 snapshots from source N-Triples via `tdb2.tdbloader` and archives them to Minio. Fuseki restarts restore from snapshot via init container (~2 min restore vs ~40 min re-collect). The previous `snapshot-tdb2` live-tar approach was removed because raw tar of active TDB2 files is not transactionally safe.
 - **Job TTL cleanup** — All CronJobs now set `ttlSecondsAfterFinished: 600` and `successfulJobsHistoryLimit: 1` / `failedJobsHistoryLimit: 1` to auto-clean completed pods and prevent disk exhaustion.
 - **Removed base `etl-collect` job** — Redundant with distro-specific CronJobs. Removed from base kustomization along with `etl-single-distro.yaml` patch.
 - **GitHub token secret** — Removed `secrets/github-token.yaml` from base kustomization to prevent `oc apply` overwriting the real token with the placeholder. Managed out-of-band via `oc create secret`.

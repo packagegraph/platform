@@ -12,14 +12,14 @@ use crate::cache::{FileCache, MinioConfig};
 use crate::enricher::{github_owner_repo, rate_limit, DEFAULT_RATE_LIMIT};
 use crate::forge;
 use crate::ntriples::NTriplesWriter;
-use crate::sparql::SparqlClient;
+use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
+use chrono::Utc;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Result;
-use chrono::Utc;
 use std::time::Duration;
 
 /// GraphQL API v4 response wrapper. rateLimit is inside `data` (GraphQL top-level field).
@@ -289,6 +289,7 @@ pub struct GitHubEnricher {
     cache: Option<FileCache>,
     token: Option<String>,
     github_api_base: String,
+    pub graph_uri: Option<String>,
 }
 
 impl GitHubEnricher {
@@ -297,14 +298,14 @@ impl GitHubEnricher {
         github_token: Option<String>,
         cache_dir: Option<&str>,
         minio: Option<MinioConfig>,
+        auth: SparqlAuth,
+        backend: SparqlBackend,
     ) -> Self {
-        let sparql = SparqlClient::new(endpoint);
+        let sparql = make_sparql_client(endpoint, &auth, backend);
         let client = crate::enricher::default_http_client();
 
-        let cache = cache_dir.map(|dir| {
-            FileCache::new(dir, "github", 24, minio)
-                .expect("Failed to create cache")
-        });
+        let cache = cache_dir
+            .map(|dir| FileCache::new(dir, "github", 24, minio).expect("Failed to create cache"));
 
         Self {
             sparql,
@@ -312,12 +313,19 @@ impl GitHubEnricher {
             cache,
             token: github_token,
             github_api_base: "https://api.github.com".to_string(),
+            graph_uri: None,
         }
+    }
+
+    /// Set the graph URI for N-Quads output.
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
     }
 
     pub fn enrich(&self, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         let homepages = self.sparql.query_github_homepages()?;
         eprintln!("Found {} packages with GitHub homepages", homepages.len());
@@ -336,26 +344,38 @@ impl GitHubEnricher {
 
             let repo_key = format!("{}/{}", owner, repo);
             if seen_repos.contains_key(&repo_key) {
+                if let Some(maint_uri) = maintainer_uri {
+                    let r_uri = repo_uri(&format!("https://github.com/{owner}/{repo}"));
+                    writer.write_triple(maint_uri, &format!("{PKG}contributesTo"), &r_uri)?;
+                    writer.write_triple(&r_uri, &format!("{PKG}hasContributor"), maint_uri)?;
+                    total_triples += 2;
+                }
                 continue;
             }
             seen_repos.insert(repo_key.clone(), true);
 
             total_repos += 1;
             if total_repos % 100 == 0 {
-                eprintln!("Progress: {} repos processed, {} triples emitted", total_repos, total_triples);
+                eprintln!(
+                    "Progress: {} repos processed, {} triples emitted",
+                    total_repos, total_triples
+                );
+            }
+
+            // Emit maintainer links unconditionally (repo URI is deterministic)
+            if let Some(maint_uri) = maintainer_uri {
+                let r_uri = repo_uri(&format!("https://github.com/{owner}/{repo}"));
+                writer.write_triple(maint_uri, &format!("{PKG}contributesTo"), &r_uri)?;
+                writer.write_triple(&r_uri, &format!("{PKG}hasContributor"), maint_uri)?;
+                total_triples += 2;
             }
 
             match self.process_repo(&mut writer, &owner, &repo, pkg_uri) {
                 Ok(triples) => {
                     total_triples += triples;
-
-                    // Emit contributesTo link from maintainer to repo
-                    if let Some(maint_uri) = maintainer_uri {
-                        let repo_uri = format!("{DATA}repo/github/{owner}/{repo}");
-                        writer.write_triple(maint_uri, &format!("{PKG}contributesTo"), &repo_uri)?;
-                        writer.write_triple(&repo_uri, &format!("{PKG}hasContributor"), maint_uri)?;
-                        total_triples += 2;
-                    }
+                    let url = format!("https://github.com/{owner}/{repo}");
+                    writer.write_literal(&repo_uri(&url), &format!("{VCS}repositoryURL"), &url)?;
+                    total_triples += 1;
                 }
                 Err(e) => eprintln!("  Error processing {}/{}: {}", owner, repo, e),
             }
@@ -374,16 +394,33 @@ impl GitHubEnricher {
     /// batch is durable immediately after load.
     ///
     /// Returns: (repos_processed, triples_emitted)
-    pub fn enrich_incremental(&self, output_path: &str, max_repos: usize, graph_uri: &str) -> Result<(usize, usize)> {
+    pub fn enrich_incremental(
+        &self,
+        output_path: &str,
+        max_repos: usize,
+        graph_uri: &str,
+    ) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
+        // This batch is loaded into Fuseki via a graph-scoped GSP POST (below),
+        // where the target graph is the endpoint URL — NOT an N-Quads 4th term.
+        // Always emit N-Triples here regardless of the global `--graph` flag: a
+        // quad posted as application/n-triples would be rejected or mangled by
+        // the GSP endpoint. The N-Quads/QLever copy of GitHub enrichment is
+        // produced separately by the CONSTRUCT export in the enrich-github job.
         let mut writer = NTriplesWriter::new(file);
 
         let candidates = self.sparql.query_github_candidates(graph_uri, max_repos)?;
-        eprintln!("Selected {} candidate entries (ranked by package coverage)", candidates.len());
+        eprintln!(
+            "Selected {} candidate entries (ranked by package coverage)",
+            candidates.len()
+        );
 
         let mut total_repos = 0;
         let mut total_triples = 0;
+        let mut total_errors = 0;
+        let mut consecutive_errors = 0;
         let mut seen_repos: HashMap<String, bool> = HashMap::new();
+        let mut deferred_urls: Vec<(String, String)> = Vec::new();
 
         for (homepage, maintainer_uri, _package_count) in &candidates {
             // Parse owner/repo using the existing helper (handles http, .git, subpaths)
@@ -392,8 +429,11 @@ impl GitHubEnricher {
                 None => {
                     eprintln!("  Skipping malformed URL: {}", homepage);
                     total_triples += self.emit_dq_issue(
-                        &mut writer, homepage, "malformed-github-url",
-                        "homepage", "error",
+                        &mut writer,
+                        homepage,
+                        "malformed-github-url",
+                        "homepage",
+                        "error",
                     )?;
                     continue;
                 }
@@ -405,9 +445,9 @@ impl GitHubEnricher {
             if seen_repos.contains_key(&repo_key) {
                 // Emit contributor link if this is a new maintainer for an already-processed repo
                 if let Some(maint_uri) = maintainer_uri {
-                    let repo_uri = format!("{DATA}repo/github/{owner}/{repo}");
-                    writer.write_triple(maint_uri, &format!("{PKG}contributesTo"), &repo_uri)?;
-                    writer.write_triple(&repo_uri, &format!("{PKG}hasContributor"), maint_uri)?;
+                    let r_uri = repo_uri(&format!("https://github.com/{owner}/{repo}"));
+                    writer.write_triple(maint_uri, &format!("{PKG}contributesTo"), &r_uri)?;
+                    writer.write_triple(&r_uri, &format!("{PKG}hasContributor"), maint_uri)?;
                     total_triples += 2;
                 }
                 continue;
@@ -416,35 +456,84 @@ impl GitHubEnricher {
 
             total_repos += 1;
             if total_repos % 100 == 0 {
-                eprintln!("Progress: {} repos processed, {} triples emitted", total_repos, total_triples);
+                eprintln!(
+                    "Progress: {} repos processed, {} triples emitted",
+                    total_repos, total_triples
+                );
             }
 
             match self.process_repo(&mut writer, &owner, &repo, "") {
                 Ok(triples) => {
                     total_triples += triples;
+                    consecutive_errors = 0;
+                    deferred_urls.push((
+                        repo_uri(&format!("https://github.com/{owner}/{repo}")),
+                        format!("https://github.com/{owner}/{repo}"),
+                    ));
 
                     // Emit contributor link from maintainer to repo
                     if let Some(maint_uri) = maintainer_uri {
-                        let repo_uri = format!("{DATA}repo/github/{owner}/{repo}");
-                        writer.write_triple(maint_uri, &format!("{PKG}contributesTo"), &repo_uri)?;
-                        writer.write_triple(&repo_uri, &format!("{PKG}hasContributor"), maint_uri)?;
+                        let r_uri = repo_uri(&format!("https://github.com/{owner}/{repo}"));
+                        writer.write_triple(maint_uri, &format!("{PKG}contributesTo"), &r_uri)?;
+                        writer.write_triple(&r_uri, &format!("{PKG}hasContributor"), maint_uri)?;
                         total_triples += 2;
                     }
                 }
                 Err(e) => {
                     eprintln!("  Error processing {}/{}: {}", owner, repo, e);
+                    total_errors += 1;
+                    consecutive_errors += 1;
                     total_triples += self.emit_dq_issue(
-                        &mut writer, homepage, "api-lookup-failed",
-                        "homepage", "warning",
+                        &mut writer,
+                        homepage,
+                        "api-lookup-failed",
+                        "homepage",
+                        "warning",
                     )?;
+                    if consecutive_errors >= 20 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "Aborting: {} consecutive GitHub API failures — API may be down (last: {})",
+                                consecutive_errors, e
+                            ),
+                        ));
+                    }
                 }
             }
 
             rate_limit(DEFAULT_RATE_LIMIT);
         }
 
+        if total_repos > 0 && total_errors as f64 / total_repos as f64 > 0.5 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "Aborting: error rate {}/{} ({:.0}%) exceeds 50% threshold",
+                    total_errors,
+                    total_repos,
+                    total_errors as f64 / total_repos as f64 * 100.0
+                ),
+            ));
+        }
+
+        // Emit deferred repositoryURL triples at end of file. GSP chunks are
+        // sent sequentially — if an earlier chunk fails, these are never committed,
+        // so repos remain candidates for the next run instead of being permanently
+        // excluded with incomplete data.
+        for (r_uri, url) in &deferred_urls {
+            writer.write_literal(r_uri, &format!("{VCS}repositoryURL"), url)?;
+        }
+        total_triples += deferred_urls.len();
+
         writer.flush()?;
-        eprintln!("Batch complete: {} repos, {} triples", total_repos, total_triples);
+        eprintln!(
+            "Batch complete: {} repos ({} errors), {} triples ({} deferred URLs)",
+            total_repos,
+            total_errors,
+            total_triples,
+            deferred_urls.len()
+        );
 
         // Load batch into graph via GSP POST
         eprintln!("Loading batch to graph: {}", graph_uri);
@@ -456,7 +545,10 @@ impl GitHubEnricher {
 
     /// Check if a cached value is a negative cache sentinel.
     fn is_negative_cache(value: &serde_json::Value) -> bool {
-        value.get("_negative_cache").and_then(|v| v.as_bool()).unwrap_or(false)
+        value
+            .get("_negative_cache")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 
     /// Create a negative cache sentinel value.
@@ -478,14 +570,22 @@ impl GitHubEnricher {
                 if let Some(rl) = &rate_limit {
                     // Periodic status (every repo that returns rate limit, caller logs every 100)
                     if rl.remaining % 500 == 0 || rl.remaining < 100 || rl.cost > 1 {
-                        eprintln!("  Rate limit: {}/{} pts remaining (cost {}/query, {} nodes)",
-                            rl.remaining, rl.limit, rl.cost, rl.node_count);
+                        eprintln!(
+                            "  Rate limit: {}/{} pts remaining (cost {}/query, {} nodes)",
+                            rl.remaining, rl.limit, rl.cost, rl.node_count
+                        );
                     }
                     if rl.cost > 1 {
-                        eprintln!("  WARNING: GraphQL cost {} > 1 for {}/{}", rl.cost, owner, repo_name);
+                        eprintln!(
+                            "  WARNING: GraphQL cost {} > 1 for {}/{}",
+                            rl.cost, owner, repo_name
+                        );
                     }
                     if rl.remaining < 100 {
-                        eprintln!("  CRITICAL: GraphQL rate limit low: {}/{} remaining", rl.remaining, rl.limit);
+                        eprintln!(
+                            "  CRITICAL: GraphQL rate limit low: {}/{} remaining",
+                            rl.remaining, rl.limit
+                        );
                     }
                 }
                 let mut triples = self.emit_from_graphql(writer, owner, repo_name, graphql_data)?;
@@ -497,7 +597,10 @@ impl GitHubEnricher {
                 return Ok(triples);
             }
             Err(e) => {
-                eprintln!("  GraphQL fetch failed for {}/{} ({}), falling back to REST", owner, repo_name, e);
+                eprintln!(
+                    "  GraphQL fetch failed for {}/{} ({}), falling back to REST",
+                    owner, repo_name, e
+                );
             }
         }
 
@@ -510,9 +613,29 @@ impl GitHubEnricher {
             Some(data) => {
                 // Check for negative cache hit
                 if Self::is_negative_cache(&data) {
-                    let error = data.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
-                    eprintln!("  Skipping {}/{}: cached failure ({})", owner, repo_name, error);
-                    return Ok(0);
+                    let error = data
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    if error.contains("404") {
+                        eprintln!("  Skipping {}/{}: cached 404 (permanent)", owner, repo_name);
+                        let r_uri =
+                            repo_uri(&format!("https://github.com/{}/{}", owner, repo_name));
+                        writer.write_triple(&r_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
+                        writer.write_literal(
+                            &r_uri,
+                            &format!("{VCS}repositoryStatus"),
+                            "not-found",
+                        )?;
+                        return Ok(2);
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "Cached transient failure for {}/{}: {}",
+                            owner, repo_name, error
+                        ),
+                    ));
                 }
                 data
             }
@@ -529,15 +652,20 @@ impl GitHubEnricher {
 
                         // Only mark as "not-found" for actual 404s
                         if e.contains("404") {
-                            let r_uri = repo_uri(&format!("https://github.com/{}/{}", owner, repo_name));
+                            let r_uri =
+                                repo_uri(&format!("https://github.com/{}/{}", owner, repo_name));
                             writer.write_triple(&r_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
-                            writer.write_literal(&r_uri, &format!("{VCS}repositoryStatus"), "not-found")?;
+                            writer.write_literal(
+                                &r_uri,
+                                &format!("{VCS}repositoryStatus"),
+                                "not-found",
+                            )?;
                             return Ok(2);
                         }
                         // For other errors (rate limit, 5xx, auth, network), propagate the error
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::Other,
-                            format!("GitHub API error for {}/{}: {}", owner, repo_name, e)
+                            format!("GitHub API error for {}/{}: {}", owner, repo_name, e),
                         ));
                     }
                 }
@@ -546,15 +674,16 @@ impl GitHubEnricher {
 
         let r_uri = repo_uri(&format!("https://github.com/{}/{}", owner, repo_name));
 
-        // Repository type and URL
+        // Repository type (repositoryURL emitted by caller for restart safety)
         writer.write_triple(&r_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
-        writer.write_literal(&r_uri, &format!("{VCS}repositoryURL"),
-            &format!("https://github.com/{}/{}", owner, repo_name))?;
-        triples += 2;
+        triples += 1;
 
         // Forge instance linkage (v0.8.0)
-        triples += forge::emit_forge_triples(writer, &r_uri,
-            &format!("https://github.com/{}/{}", owner, repo_name))?;
+        triples += forge::emit_forge_triples(
+            writer,
+            &r_uri,
+            &format!("https://github.com/{}/{}", owner, repo_name),
+        )?;
 
         // Metadata from repo object
         if let Some(desc) = repo_data.get("description").and_then(|v| v.as_str()) {
@@ -588,7 +717,11 @@ impl GitHubEnricher {
         }
 
         if let Some(is_archived) = repo_data.get("archived").and_then(|v| v.as_bool()) {
-            writer.write_literal(&r_uri, &format!("{VCS}isArchived"), &is_archived.to_string())?;
+            writer.write_literal(
+                &r_uri,
+                &format!("{VCS}isArchived"),
+                &is_archived.to_string(),
+            )?;
             triples += 1;
         }
 
@@ -623,9 +756,15 @@ impl GitHubEnricher {
         }
 
         // Language composition
-        let lang_url = format!("{}/repos/{}/{}/languages", self.github_api_base, owner, repo_name);
+        let lang_url = format!(
+            "{}/repos/{}/{}/languages",
+            self.github_api_base, owner, repo_name
+        );
         if let Some(lang_data) = self.cached_get(&lang_url).or_else(|| {
-            self.api_get(&lang_url).ok().map(|d| { self.cache_put(&lang_url, &d); d })
+            self.api_get(&lang_url).ok().map(|d| {
+                self.cache_put(&lang_url, &d);
+                d
+            })
         }) {
             if let Some(langs) = lang_data.as_object() {
                 let total_bytes: u64 = langs.values().filter_map(|v| v.as_u64()).sum();
@@ -637,7 +776,11 @@ impl GitHubEnricher {
                     }
                 }
                 if total_bytes > 0 {
-                    writer.write_integer(&r_uri, &format!("{MET}totalBytes"), total_bytes as i64)?;
+                    writer.write_integer(
+                        &r_uri,
+                        &format!("{MET}totalBytes"),
+                        total_bytes as i64,
+                    )?;
                     triples += 1;
                 }
             }
@@ -665,7 +808,9 @@ impl GitHubEnricher {
     }
 
     fn api_get(&self, url: &str) -> std::result::Result<serde_json::Value, String> {
-        let mut req = self.client.get(url)
+        let mut req = self
+            .client
+            .get(url)
             .header("Accept", "application/vnd.github+json");
 
         if let Some(ref token) = self.token {
@@ -738,15 +883,16 @@ impl GitHubEnricher {
         let r_uri = repo_uri(&format!("https://github.com/{}/{}", owner, repo_name));
         let mut triples = 0;
 
-        // Repository type and URL
+        // Repository type (repositoryURL emitted by caller for restart safety)
         writer.write_triple(&r_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
-        writer.write_literal(&r_uri, &format!("{VCS}repositoryURL"),
-            &format!("https://github.com/{}/{}", owner, repo_name))?;
-        triples += 2;
+        triples += 1;
 
         // Forge instance linkage (v0.8.0)
-        triples += forge::emit_forge_triples(writer, &r_uri,
-            &format!("https://github.com/{}/{}", owner, repo_name))?;
+        triples += forge::emit_forge_triples(
+            writer,
+            &r_uri,
+            &format!("https://github.com/{}/{}", owner, repo_name),
+        )?;
 
         // Metadata from GraphQL
         if let Some(desc) = graphql_data.description {
@@ -765,11 +911,20 @@ impl GitHubEnricher {
 
                 // HEAD commit signature (v0.8.0 att: module)
                 if let Some(ref sig) = target.signature {
-                    let commit_uri = format!("{DATA}commit/github/{}/{}/{}", owner, repo_name, &target.oid[..8]);
+                    let commit_uri = format!(
+                        "{DATA}commit/github/{}/{}/{}",
+                        owner,
+                        repo_name,
+                        &target.oid[..8]
+                    );
                     let sig_uri = format!("{commit_uri}/sig");
                     writer.write_triple(&commit_uri, &format!("{ATT}hasSignature"), &sig_uri)?;
                     writer.write_triple(&sig_uri, RDF_TYPE, &format!("{ATT}DigitalSignature"))?;
-                    let status = if sig.is_valid { "verified" } else { "unverified" };
+                    let status = if sig.is_valid {
+                        "verified"
+                    } else {
+                        "unverified"
+                    };
                     writer.write_literal(&sig_uri, &format!("{ATT}signatureStatus"), status)?;
                     triples += 3;
                 }
@@ -778,7 +933,11 @@ impl GitHubEnricher {
                 if let Some(user) = &target.author.user {
                     let person_uri = github_person_uri(&user.login);
                     writer.write_triple(&person_uri, RDF_TYPE, &format!("{FOAF}Person"))?;
-                    writer.write_literal(&person_uri, &format!("{FOAF}name"), &target.author.name)?;
+                    writer.write_literal(
+                        &person_uri,
+                        &format!("{FOAF}name"),
+                        &target.author.name,
+                    )?;
                     triples += 2;
 
                     // Email attestation with reified observation node
@@ -794,10 +953,27 @@ impl GitHubEnricher {
                             let mut hasher = std::collections::hash_map::DefaultHasher::new();
                             std::hash::Hash::hash(email, &mut hasher);
                             let email_hash = format!("{:x}", std::hash::Hasher::finish(&hasher));
-                            let obs_uri = format!("{DATA}observation/email/{}/{}/{}", user.login, &email_hash[..8], today);
-                            writer.write_triple(&person_uri, &format!("{PKG}hasEmailObservation"), &obs_uri)?;
-                            writer.write_triple(&obs_uri, RDF_TYPE, &format!("{PKG}EmailObservation"))?;
-                            writer.write_literal(&obs_uri, &format!("{PKG}observedEmail"), email)?;
+                            let obs_uri = format!(
+                                "{DATA}observation/email/{}/{}/{}",
+                                user.login,
+                                &email_hash[..8],
+                                today
+                            );
+                            writer.write_triple(
+                                &person_uri,
+                                &format!("{PKG}hasEmailObservation"),
+                                &obs_uri,
+                            )?;
+                            writer.write_triple(
+                                &obs_uri,
+                                RDF_TYPE,
+                                &format!("{PKG}EmailObservation"),
+                            )?;
+                            writer.write_literal(
+                                &obs_uri,
+                                &format!("{PKG}observedEmail"),
+                                email,
+                            )?;
                             writer.write_date(&obs_uri, &format!("{PKG}observedAt"), &today)?;
                             triples += 4;
                         }
@@ -817,17 +993,29 @@ impl GitHubEnricher {
         }
 
         if let Some(issues) = graphql_data.issues {
-            writer.write_integer(&r_uri, &format!("{VCS}openIssuesCount"), issues.total_count as i64)?;
+            writer.write_integer(
+                &r_uri,
+                &format!("{VCS}openIssuesCount"),
+                issues.total_count as i64,
+            )?;
             triples += 1;
         }
 
         if let Some(watchers) = graphql_data.watchers {
-            writer.write_integer(&r_uri, &format!("{VCS}subscriberCount"), watchers.total_count as i64)?;
+            writer.write_integer(
+                &r_uri,
+                &format!("{VCS}subscriberCount"),
+                watchers.total_count as i64,
+            )?;
             triples += 1;
         }
 
         if let Some(is_archived) = graphql_data.is_archived {
-            writer.write_literal(&r_uri, &format!("{VCS}isArchived"), &is_archived.to_string())?;
+            writer.write_literal(
+                &r_uri,
+                &format!("{VCS}isArchived"),
+                &is_archived.to_string(),
+            )?;
             triples += 1;
         }
 
@@ -867,7 +1055,11 @@ impl GitHubEnricher {
 
         // Open PRs
         if let Some(prs) = graphql_data.pull_requests {
-            writer.write_integer(&r_uri, &format!("{VCS}openPullRequestCount"), prs.total_count as i64)?;
+            writer.write_integer(
+                &r_uri,
+                &format!("{VCS}openPullRequestCount"),
+                prs.total_count as i64,
+            )?;
             triples += 1;
         }
 
@@ -901,7 +1093,10 @@ impl GitHubEnricher {
         // Releases (SCR-03 enablement)
         if let Some(releases) = graphql_data.releases {
             for release in releases.nodes {
-                let release_uri = format!("{DATA}release/github/{owner}/{repo_name}/{}", release.tag_name);
+                let release_uri = format!(
+                    "{DATA}release/github/{owner}/{repo_name}/{}",
+                    release.tag_name
+                );
                 writer.write_triple(&release_uri, RDF_TYPE, &format!("{VCS}Release"))?;
                 writer.write_literal(&release_uri, &format!("{VCS}tagName"), &release.tag_name)?;
                 writer.write_triple(&r_uri, &format!("{VCS}hasRelease"), &release_uri)?;
@@ -969,7 +1164,10 @@ impl GitHubEnricher {
 
             let person_uri = github_person_uri(&contributor.login);
             let account_uri = github_account_uri(&contributor.login);
-            let contribution_uri = format!("{DATA}contribution/github/{}/{}/{}", contributor.login, owner, repo_name);
+            let contribution_uri = format!(
+                "{DATA}contribution/github/{}/{}/{}",
+                contributor.login, owner, repo_name
+            );
 
             // Person entity
             writer.write_triple(&person_uri, RDF_TYPE, &format!("{FOAF}Person"))?;
@@ -979,16 +1177,27 @@ impl GitHubEnricher {
             // ContributorAccount entity
             writer.write_triple(&account_uri, RDF_TYPE, &format!("{PKG}ContributorAccount"))?;
             writer.write_literal(&account_uri, &format!("{PKG}accountPlatform"), "GitHub")?;
-            writer.write_literal(&account_uri, &format!("{PKG}accountUsername"), &contributor.login)?;
-            writer.write_literal(&account_uri, &format!("{PKG}accountUrl"),
-                &format!("https://github.com/{}", contributor.login))?;
+            writer.write_literal(
+                &account_uri,
+                &format!("{PKG}accountUsername"),
+                &contributor.login,
+            )?;
+            writer.write_literal(
+                &account_uri,
+                &format!("{PKG}accountUrl"),
+                &format!("https://github.com/{}", contributor.login),
+            )?;
             triples += 4;
 
             // Reified Contribution edge (repo-scoped commit count)
             writer.write_triple(&contribution_uri, RDF_TYPE, &format!("{PKG}Contribution"))?;
             writer.write_triple(&contribution_uri, &format!("{PKG}contributor"), &person_uri)?;
             writer.write_triple(&contribution_uri, &format!("{PKG}repository"), &r_uri)?;
-            writer.write_integer(&contribution_uri, &format!("{VCS}commitCount"), contributor.contributions as i64)?;
+            writer.write_integer(
+                &contribution_uri,
+                &format!("{VCS}commitCount"),
+                contributor.contributions as i64,
+            )?;
             triples += 4;
 
             // Convenience shortcuts
@@ -1003,21 +1212,30 @@ impl GitHubEnricher {
     /// Fetch repository data via GraphQL API v4.
     ///
     /// Returns (repository_data, rate_limit_info). Rate limit is None for cached responses.
-    fn fetch_repo_graphql(&self, owner: &str, repo: &str) -> std::result::Result<(GraphQlRepository, Option<GraphQlRateLimit>), String> {
+    fn fetch_repo_graphql(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> std::result::Result<(GraphQlRepository, Option<GraphQlRateLimit>), String> {
         let cache_key = format!("graphql:{}/{}", owner, repo);
 
         // Check cache first (no rate limit info for cached responses)
         if let Some(cached) = self.cached_get(&cache_key) {
             // Check for negative cache hit
             if Self::is_negative_cache(&cached) {
-                let error = cached.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let error = cached
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 return Err(format!("Cached failure: {}", error));
             }
 
             let response: GraphQlResponse = serde_json::from_value(cached)
                 .map_err(|e| format!("Cache deserialize error: {}", e))?;
 
-            let repo = response.data.repository
+            let repo = response
+                .data
+                .repository
                 .ok_or_else(|| "Repository not found (cached)".to_string())?;
             return Ok((repo, None));
         }
@@ -1034,7 +1252,9 @@ impl GitHubEnricher {
         });
 
         let graphql_url = format!("{}/graphql", self.github_api_base);
-        let mut req = self.client.post(&graphql_url)
+        let mut req = self
+            .client
+            .post(&graphql_url)
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
             .json(&graphql_body);
@@ -1049,7 +1269,8 @@ impl GitHubEnricher {
             return Err(format!("HTTP {}", response.status()));
         }
 
-        let graphql_resp: GraphQlResponse = response.json()
+        let graphql_resp: GraphQlResponse = response
+            .json()
             .map_err(|e| format!("JSON parse error: {}", e))?;
 
         // Check for GraphQL-level errors
@@ -1094,9 +1315,14 @@ impl GitHubEnricher {
             }
         }
 
-        let url = format!("{}/repos/{}/{}/contributors?per_page=30", self.github_api_base, owner, repo);
+        let url = format!(
+            "{}/repos/{}/{}/contributors?per_page=30",
+            self.github_api_base, owner, repo
+        );
 
-        let mut req = self.client.get(&url)
+        let mut req = self
+            .client
+            .get(&url)
             .header("Accept", "application/vnd.github+json");
 
         if let Some(ref token) = self.token {
@@ -1106,7 +1332,12 @@ impl GitHubEnricher {
         match req.send() {
             Ok(response) => {
                 if !response.status().is_success() {
-                    eprintln!("  Contributors fetch failed for {}/{}: HTTP {}", owner, repo, response.status());
+                    eprintln!(
+                        "  Contributors fetch failed for {}/{}: HTTP {}",
+                        owner,
+                        repo,
+                        response.status()
+                    );
                     return Vec::new();
                 }
 
@@ -1143,16 +1374,19 @@ mod tests {
         let mut server = mockito::Server::new();
 
         // Mock SPARQL endpoint (empty - we call process_repo directly)
-        let _sparql_mock = server.mock("POST", "/sparql")
+        let _sparql_mock = server
+            .mock("POST", "/sparql")
             .with_status(200)
             .with_body(r#"{"results": {"bindings": []}}"#)
             .create();
 
         // Mock GitHub repo API
-        let repo_mock = server.mock("GET", "/repos/test/repo")
+        let repo_mock = server
+            .mock("GET", "/repos/test/repo")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{
+            .with_body(
+                r#"{
                 "html_url": "https://github.com/test/repo",
                 "description": "A test repo",
                 "default_branch": "main",
@@ -1163,11 +1397,13 @@ mod tests {
                 "license": {"spdx_id": "MIT", "name": "MIT License"},
                 "archived": false,
                 "fork": false
-            }"#)
+            }"#,
+            )
             .create();
 
         // Mock languages API
-        let lang_mock = server.mock("GET", "/repos/test/repo/languages")
+        let lang_mock = server
+            .mock("GET", "/repos/test/repo/languages")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"Rust": 50000, "Python": 10000}"#)
@@ -1182,6 +1418,7 @@ mod tests {
             cache: None,
             token: None,
             github_api_base: server.url(),
+            graph_uri: None,
         };
 
         let temp_file = NamedTempFile::new().unwrap();
@@ -1196,23 +1433,43 @@ mod tests {
         let r_uri = repo_uri("https://github.com/test/repo");
 
         // Emit repo triples
-        writer.write_triple(&r_uri, RDF_TYPE, &format!("{VCS}Repository")).unwrap();
-        writer.write_literal(&r_uri, &format!("{VCS}repositoryURL"), "https://github.com/test/repo").unwrap();
+        writer
+            .write_triple(&r_uri, RDF_TYPE, &format!("{VCS}Repository"))
+            .unwrap();
+        writer
+            .write_literal(
+                &r_uri,
+                &format!("{VCS}repositoryURL"),
+                "https://github.com/test/repo",
+            )
+            .unwrap();
 
         if let Some(desc) = data.get("description").and_then(|v| v.as_str()) {
-            writer.write_literal(&r_uri, &format!("{VCS}repositoryDescription"), desc).unwrap();
+            writer
+                .write_literal(&r_uri, &format!("{VCS}repositoryDescription"), desc)
+                .unwrap();
         }
         if let Some(stars) = data.get("stargazers_count").and_then(|v| v.as_u64()) {
-            writer.write_integer(&r_uri, &format!("{VCS}stargazerCount"), stars as i64).unwrap();
+            writer
+                .write_integer(&r_uri, &format!("{VCS}stargazerCount"), stars as i64)
+                .unwrap();
         }
         if let Some(license) = data.get("license").and_then(|v| v.as_object()) {
             if let Some(spdx) = license.get("spdx_id").and_then(|v| v.as_str()) {
-                writer.write_literal(&r_uri, &format!("{PKG}licenseName"), spdx).unwrap();
+                writer
+                    .write_literal(&r_uri, &format!("{PKG}licenseName"), spdx)
+                    .unwrap();
                 // License entity with spdxId (v0.7.0)
                 let license_uri = crate::uris::spdx_license_uri(spdx);
-                writer.write_triple(&r_uri, &format!("{PKG}hasLicense"), &license_uri).unwrap();
-                writer.write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License")).unwrap();
-                writer.write_literal(&license_uri, &format!("{PKG}spdxId"), spdx).unwrap();
+                writer
+                    .write_triple(&r_uri, &format!("{PKG}hasLicense"), &license_uri)
+                    .unwrap();
+                writer
+                    .write_triple(&license_uri, RDF_TYPE, &format!("{PKG}License"))
+                    .unwrap();
+                writer
+                    .write_literal(&license_uri, &format!("{PKG}spdxId"), spdx)
+                    .unwrap();
             }
         }
 
@@ -1220,17 +1477,36 @@ mod tests {
         repo_mock.assert();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         // Verify VCS metadata
-        assert!(content.contains("vcs#Repository"), "Should have Repository type");
-        assert!(content.contains("vcs#repositoryURL"), "Should have repo URL");
-        assert!(content.contains("\"A test repo\""), "Should have description");
-        assert!(content.contains("vcs#stargazerCount"), "Should have star count");
+        assert!(
+            content.contains("vcs#Repository"),
+            "Should have Repository type"
+        );
+        assert!(
+            content.contains("vcs#repositoryURL"),
+            "Should have repo URL"
+        );
+        assert!(
+            content.contains("\"A test repo\""),
+            "Should have description"
+        );
+        assert!(
+            content.contains("vcs#stargazerCount"),
+            "Should have star count"
+        );
         assert!(content.contains("\"1000\""), "Should have 1000 stars");
         assert!(content.contains("licenseName"), "Should have license");
         assert!(content.contains("\"MIT\""), "Should have MIT license");
-        assert!(content.contains("core#spdxId"), "Should have spdxId on License entity");
+        assert!(
+            content.contains("core#spdxId"),
+            "Should have spdxId on License entity"
+        );
     }
 
     #[test]
@@ -1246,6 +1522,7 @@ mod tests {
             cache: None,
             token: None,
             github_api_base: server.url(),
+            graph_uri: None,
         };
 
         let temp_file = NamedTempFile::new().unwrap();
@@ -1253,15 +1530,29 @@ mod tests {
 
         // Simulate a 404 by writing not-found triples directly
         let r_uri = repo_uri("https://github.com/deleted/repo");
-        writer.write_triple(&r_uri, RDF_TYPE, &format!("{VCS}Repository")).unwrap();
-        writer.write_literal(&r_uri, &format!("{VCS}repositoryStatus"), "not-found").unwrap();
+        writer
+            .write_triple(&r_uri, RDF_TYPE, &format!("{VCS}Repository"))
+            .unwrap();
+        writer
+            .write_literal(&r_uri, &format!("{VCS}repositoryStatus"), "not-found")
+            .unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("vcs#Repository"), "Should still type as Repository");
-        assert!(content.contains("\"not-found\""), "Should flag as not-found");
+        assert!(
+            content.contains("vcs#Repository"),
+            "Should still type as Repository"
+        );
+        assert!(
+            content.contains("\"not-found\""),
+            "Should flag as not-found"
+        );
     }
 
     #[test]
@@ -1363,7 +1654,10 @@ mod tests {
         let releases = &repo.releases.as_ref().unwrap().nodes;
         assert_eq!(releases.len(), 2);
         assert_eq!(releases[0].tag_name, "v1.0.0");
-        assert_eq!(releases[0].published_at, Some("2023-01-01T00:00:00Z".to_string()));
+        assert_eq!(
+            releases[0].published_at,
+            Some("2023-01-01T00:00:00Z".to_string())
+        );
         assert_eq!(releases[0].is_prerelease, false);
 
         // HEAD commit
@@ -1391,9 +1685,15 @@ mod tests {
         }"#;
 
         let response: GraphQlResponse = serde_json::from_str(minimal_response).unwrap();
-        assert!(response.data.rate_limit.is_none(), "rateLimit should be None when not requested");
+        assert!(
+            response.data.rate_limit.is_none(),
+            "rateLimit should be None when not requested"
+        );
         let repo = response.data.repository.unwrap();
-        assert_eq!(repo.url, Some("https://github.com/minimal/repo".to_string()));
+        assert_eq!(
+            repo.url,
+            Some("https://github.com/minimal/repo".to_string())
+        );
         assert!(repo.description.is_none());
         assert!(repo.primary_language.is_none());
         assert!(repo.releases.is_none());
@@ -1452,7 +1752,10 @@ mod tests {
         assert_eq!(repo.watchers.as_ref().unwrap().total_count, 25);
         assert_eq!(repo.issues.as_ref().unwrap().total_count, 10);
         assert_eq!(repo.default_branch_ref.as_ref().unwrap().name, "main");
-        assert_eq!(repo.license_info.as_ref().unwrap().spdx_id, Some("MIT".to_string()));
+        assert_eq!(
+            repo.license_info.as_ref().unwrap().spdx_id,
+            Some("MIT".to_string())
+        );
 
         let topics = &repo.repository_topics.as_ref().unwrap().nodes;
         assert_eq!(topics.len(), 2);
@@ -1473,10 +1776,12 @@ mod tests {
         let mut server = mockito::Server::new();
 
         // Mock successful GraphQL response
-        let graphql_mock = server.mock("POST", "/graphql")
+        let graphql_mock = server
+            .mock("POST", "/graphql")
             .match_header("authorization", "Bearer test-token")
             .with_status(200)
-            .with_body(r#"{
+            .with_body(
+                r#"{
                 "data": {
                     "repository": {
                         "url": "https://github.com/test/repo",
@@ -1487,7 +1792,8 @@ mod tests {
                         }
                     }
                 }
-            }"#)
+            }"#,
+            )
             .create();
 
         let enricher = GitHubEnricher {
@@ -1499,6 +1805,7 @@ mod tests {
             cache: None,
             token: Some("test-token".to_string()),
             github_api_base: server.url(),
+            graph_uri: None,
         };
 
         // Should successfully fetch via GraphQL
@@ -1506,7 +1813,10 @@ mod tests {
         assert!(result.is_ok(), "GraphQL fetch should succeed");
 
         let (repo_data, _rate_limit) = result.unwrap();
-        assert_eq!(repo_data.url, Some("https://github.com/test/repo".to_string()));
+        assert_eq!(
+            repo_data.url,
+            Some("https://github.com/test/repo".to_string())
+        );
         assert_eq!(repo_data.stargazer_count, Some(1000));
 
         graphql_mock.assert();
@@ -1517,18 +1827,21 @@ mod tests {
         let mut server = mockito::Server::new();
 
         // Mock GraphQL failure (500 error)
-        let _graphql_mock = server.mock("POST", "/graphql")
+        let _graphql_mock = server
+            .mock("POST", "/graphql")
             .with_status(500)
             .with_body("Internal server error")
             .create();
 
         // Mock successful REST fallback
-        let rest_repo_mock = server.mock("GET", "/repos/test/repo")
+        let rest_repo_mock = server
+            .mock("GET", "/repos/test/repo")
             .with_status(200)
             .with_body(r#"{"html_url": "https://github.com/test/repo", "stargazers_count": 1000}"#)
             .create();
 
-        let rest_lang_mock = server.mock("GET", "/repos/test/repo/languages")
+        let rest_lang_mock = server
+            .mock("GET", "/repos/test/repo/languages")
             .with_status(200)
             .with_body(r#"{"Rust": 50000}"#)
             .create();
@@ -1542,6 +1855,7 @@ mod tests {
             cache: None,
             token: None,
             github_api_base: server.url(),
+            graph_uri: None,
         };
 
         let temp_file = NamedTempFile::new().unwrap();
@@ -1578,13 +1892,17 @@ mod tests {
             cache: Some(cache),
             token: Some("test-token".to_string()),
             github_api_base: server.url(),
+            graph_uri: None,
         };
 
         // First call - should hit GraphQL API
         let result1 = enricher.fetch_repo_graphql("test", "repo");
         assert!(result1.is_ok(), "First fetch should succeed");
         let (_, rl1) = result1.unwrap();
-        assert!(rl1.is_none() || rl1.is_some(), "Rate limit may or may not be present");
+        assert!(
+            rl1.is_none() || rl1.is_some(),
+            "Rate limit may or may not be present"
+        );
 
         // Second call - should use cache, NOT hit API again
         let result2 = enricher.fetch_repo_graphql("test", "repo");
@@ -1654,9 +1972,11 @@ mod tests {
             .create();
 
         // Mock REST responses (for fallback path)
-        let _rest_repo_mock = server.mock("GET", "/repos/test/repo")
+        let _rest_repo_mock = server
+            .mock("GET", "/repos/test/repo")
             .with_status(200)
-            .with_body(r#"{
+            .with_body(
+                r#"{
                 "html_url": "https://github.com/test/repo",
                 "description": "Test repository",
                 "default_branch": "main",
@@ -1669,10 +1989,12 @@ mod tests {
                 "topics": ["rust", "testing"],
                 "license": {"spdx_id": "MIT"},
                 "pushed_at": "2024-01-15T10:30:00Z"
-            }"#)
+            }"#,
+            )
             .create();
 
-        let _rest_lang_mock = server.mock("GET", "/repos/test/repo/languages")
+        let _rest_lang_mock = server
+            .mock("GET", "/repos/test/repo/languages")
             .with_status(200)
             .with_body(r#"{"Rust": 50000, "Python": 10000}"#)
             .create();
@@ -1686,50 +2008,135 @@ mod tests {
             cache: None,
             token: None,
             github_api_base: server.url(),
+            graph_uri: None,
         };
 
         // Process via GraphQL path
         let graphql_file = NamedTempFile::new().unwrap();
         let mut graphql_writer = NTriplesWriter::new(graphql_file.reopen().unwrap());
-        let graphql_triples = enricher.process_repo(&mut graphql_writer, "test", "repo", "").unwrap();
+        let graphql_triples = enricher
+            .process_repo(&mut graphql_writer, "test", "repo", "")
+            .unwrap();
         graphql_writer.flush().unwrap();
 
         let mut graphql_output = String::new();
-        graphql_file.reopen().unwrap().read_to_string(&mut graphql_output).unwrap();
+        graphql_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut graphql_output)
+            .unwrap();
 
         // Verify GraphQL output contains expected predicates
-        assert!(graphql_output.contains("vcs#Repository"), "GraphQL: Repository type");
-        assert!(graphql_output.contains("vcs#repositoryURL"), "GraphQL: repo URL");
-        assert!(graphql_output.contains("vcs#repositoryDescription"), "GraphQL: description");
-        assert!(graphql_output.contains("vcs#defaultBranch"), "GraphQL: default branch");
-        assert!(graphql_output.contains("vcs#stargazerCount"), "GraphQL: star count");
-        assert!(graphql_output.contains("vcs#forkCount"), "GraphQL: fork count");
-        assert!(graphql_output.contains("vcs#openIssuesCount"), "GraphQL: open issues");
-        assert!(graphql_output.contains("vcs#subscriberCount"), "GraphQL: watchers");
-        assert!(graphql_output.contains("vcs#isArchived"), "GraphQL: is archived");
+        assert!(
+            graphql_output.contains("vcs#Repository"),
+            "GraphQL: Repository type"
+        );
+        // repositoryURL is emitted by the caller (enrich/enrich_incremental), not process_repo
+        assert!(
+            graphql_output.contains("vcs#repositoryDescription"),
+            "GraphQL: description"
+        );
+        assert!(
+            graphql_output.contains("vcs#defaultBranch"),
+            "GraphQL: default branch"
+        );
+        assert!(
+            graphql_output.contains("vcs#stargazerCount"),
+            "GraphQL: star count"
+        );
+        assert!(
+            graphql_output.contains("vcs#forkCount"),
+            "GraphQL: fork count"
+        );
+        assert!(
+            graphql_output.contains("vcs#openIssuesCount"),
+            "GraphQL: open issues"
+        );
+        assert!(
+            graphql_output.contains("vcs#subscriberCount"),
+            "GraphQL: watchers"
+        );
+        assert!(
+            graphql_output.contains("vcs#isArchived"),
+            "GraphQL: is archived"
+        );
         assert!(graphql_output.contains("vcs#isFork"), "GraphQL: is fork");
         assert!(graphql_output.contains("vcs#topic"), "GraphQL: topics");
         // New Tier 1 predicates
-        assert!(graphql_output.contains("metrics#primaryLanguage"), "GraphQL: primary language");
-        assert!(graphql_output.contains("vcs#headCommitHash"), "GraphQL: HEAD commit");
-        assert!(graphql_output.contains("vcs#Release"), "GraphQL: Release entities");
-        assert!(graphql_output.contains("vcs#tagName"), "GraphQL: release tag name");
-        assert!(graphql_output.contains("vcs#repositoryCreatedAt"), "GraphQL: repo created");
-        assert!(graphql_output.contains("vcs#openPullRequestCount"), "GraphQL: open PRs");
-        assert!(graphql_output.contains("core#licenseName"), "GraphQL: license name");
-        assert!(graphql_output.contains("core#spdxId"), "GraphQL: spdxId on License entity");
-        assert!(graphql_output.contains("metrics#languageName"), "GraphQL: language name");
-        assert!(graphql_output.contains("metrics#languageBytes"), "GraphQL: language bytes");
-        assert!(graphql_output.contains("metrics#totalBytes"), "GraphQL: total bytes");
-        assert!(graphql_output.contains("core#lastCommitDate"), "GraphQL: last commit date");
-        assert!(graphql_output.contains("\"2024-01-15\""), "GraphQL: correct date format");
+        assert!(
+            graphql_output.contains("metrics#primaryLanguage"),
+            "GraphQL: primary language"
+        );
+        assert!(
+            graphql_output.contains("vcs#headCommitHash"),
+            "GraphQL: HEAD commit"
+        );
+        assert!(
+            graphql_output.contains("vcs#Release"),
+            "GraphQL: Release entities"
+        );
+        assert!(
+            graphql_output.contains("vcs#tagName"),
+            "GraphQL: release tag name"
+        );
+        assert!(
+            graphql_output.contains("vcs#repositoryCreatedAt"),
+            "GraphQL: repo created"
+        );
+        assert!(
+            graphql_output.contains("vcs#openPullRequestCount"),
+            "GraphQL: open PRs"
+        );
+        assert!(
+            graphql_output.contains("core#licenseName"),
+            "GraphQL: license name"
+        );
+        assert!(
+            graphql_output.contains("core#spdxId"),
+            "GraphQL: spdxId on License entity"
+        );
+        assert!(
+            graphql_output.contains("metrics#languageName"),
+            "GraphQL: language name"
+        );
+        assert!(
+            graphql_output.contains("metrics#languageBytes"),
+            "GraphQL: language bytes"
+        );
+        assert!(
+            graphql_output.contains("metrics#totalBytes"),
+            "GraphQL: total bytes"
+        );
+        assert!(
+            graphql_output.contains("core#lastCommitDate"),
+            "GraphQL: last commit date"
+        );
+        assert!(
+            graphql_output.contains("\"2024-01-15\""),
+            "GraphQL: correct date format"
+        );
 
         // Verify values
-        assert!(graphql_output.contains("\"1000\"^^<http://www.w3.org/2001/XMLSchema#integer>"), "GraphQL: 1000 stars");
-        assert!(graphql_output.contains("\"50\"^^<http://www.w3.org/2001/XMLSchema#integer>"), "GraphQL: 50 forks");
-        assert!(graphql_output.contains("\"50000\"^^<http://www.w3.org/2001/XMLSchema#integer>"), "GraphQL: Rust bytes");
-        assert!(graphql_output.contains("\"10000\"^^<http://www.w3.org/2001/XMLSchema#integer>"), "GraphQL: Python bytes");
-        assert!(graphql_output.contains("\"60000\"^^<http://www.w3.org/2001/XMLSchema#integer>"), "GraphQL: total bytes");
+        assert!(
+            graphql_output.contains("\"1000\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+            "GraphQL: 1000 stars"
+        );
+        assert!(
+            graphql_output.contains("\"50\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+            "GraphQL: 50 forks"
+        );
+        assert!(
+            graphql_output.contains("\"50000\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+            "GraphQL: Rust bytes"
+        );
+        assert!(
+            graphql_output.contains("\"10000\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+            "GraphQL: Python bytes"
+        );
+        assert!(
+            graphql_output.contains("\"60000\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+            "GraphQL: total bytes"
+        );
 
         assert!(graphql_triples > 10, "GraphQL should emit multiple triples");
     }
@@ -1764,7 +2171,8 @@ mod tests {
             .create();
 
         // Mock GSP POST (for graph load - match by path to avoid catching GraphQL)
-        let gsp_mock = server.mock("POST", mockito::Matcher::Regex(r"^/data\?".to_string()))
+        let gsp_mock = server
+            .mock("POST", mockito::Matcher::Regex(r"^/data\?".to_string()))
             .with_status(200)
             .create();
 
@@ -1777,14 +2185,17 @@ mod tests {
             cache: None,
             token: None,
             github_api_base: server.url(),
+            graph_uri: None,
         };
 
         let temp_file = NamedTempFile::new().unwrap();
-        let (repos, _triples) = enricher.enrich_incremental(
-            temp_file.path().to_str().unwrap(),
-            10, // max_repos
-            "http://example.org/enrichment/github"
-        ).unwrap();
+        let (repos, _triples) = enricher
+            .enrich_incremental(
+                temp_file.path().to_str().unwrap(),
+                10, // max_repos
+                "http://example.org/enrichment/github",
+            )
+            .unwrap();
 
         candidates_mock.assert();
         gsp_mock.assert();
@@ -1806,32 +2217,51 @@ mod tests {
             cache: None,
             token: None,
             github_api_base: server.url(),
+            graph_uri: None,
         };
 
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 
-        let triples = enricher.emit_dq_issue(
-            &mut writer,
-            "https://github.com/org-only",
-            "malformed-github-url",
-            "homepage",
-            "error",
-        ).unwrap();
+        let triples = enricher
+            .emit_dq_issue(
+                &mut writer,
+                "https://github.com/org-only",
+                "malformed-github-url",
+                "homepage",
+                "error",
+            )
+            .unwrap();
         writer.flush().unwrap();
 
         assert_eq!(triples, 7, "DQ issue should emit exactly 7 triples");
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("dq#DataQualityIssue"), "Should have DQ issue type");
+        assert!(
+            content.contains("dq#DataQualityIssue"),
+            "Should have DQ issue type"
+        );
         assert!(content.contains("dq#issueType"), "Should have issueType");
-        assert!(content.contains("\"malformed-github-url\""), "Should have issue type value");
+        assert!(
+            content.contains("\"malformed-github-url\""),
+            "Should have issue type value"
+        );
         assert!(content.contains("dq#rawValue"), "Should have rawValue");
-        assert!(content.contains("\"https://github.com/org-only\""), "Should have raw URL");
+        assert!(
+            content.contains("\"https://github.com/org-only\""),
+            "Should have raw URL"
+        );
         assert!(content.contains("dq#detectedBy"), "Should have detectedBy");
-        assert!(content.contains("\"enrich-github\""), "Should have detector name");
+        assert!(
+            content.contains("\"enrich-github\""),
+            "Should have detector name"
+        );
         assert!(content.contains("dq#severity"), "Should have severity");
         assert!(content.contains("\"error\""), "Should have severity value");
     }
@@ -1851,7 +2281,8 @@ mod tests {
         let mut server = mockito::Server::new();
 
         // GraphQL returns null repository (repo doesn't exist)
-        let graphql_mock = server.mock("POST", "/graphql")
+        let graphql_mock = server
+            .mock("POST", "/graphql")
             .with_status(200)
             .with_body(r#"{"data": {"repository": null}}"#)
             .expect(1) // Should only be called once
@@ -1869,17 +2300,24 @@ mod tests {
             cache: Some(cache),
             token: Some("test-token".to_string()),
             github_api_base: server.url(),
+            graph_uri: None,
         };
 
         // First call: should hit API and get not-found
         let result1 = enricher.fetch_repo_graphql("deleted", "repo");
         assert!(result1.is_err(), "First call should fail");
-        assert!(result1.unwrap_err().contains("not found"), "Error should mention not found");
+        assert!(
+            result1.unwrap_err().contains("not found"),
+            "Error should mention not found"
+        );
 
         // Second call: should use negative cache, NOT hit API
         let result2 = enricher.fetch_repo_graphql("deleted", "repo");
         assert!(result2.is_err(), "Second call should also fail");
-        assert!(result2.unwrap_err().contains("Cached failure"), "Should report cached failure");
+        assert!(
+            result2.unwrap_err().contains("Cached failure"),
+            "Should report cached failure"
+        );
 
         // Verify API was only called once
         graphql_mock.assert();
@@ -1908,6 +2346,7 @@ mod tests {
             cache: Some(cache),
             token: Some("test-token".to_string()),
             github_api_base: server.url(),
+            graph_uri: None,
         };
 
         // First call: hits API
@@ -1927,12 +2366,11 @@ mod tests {
         let mut server = mockito::Server::new();
 
         // Mock GraphQL failure (forces REST fallback)
-        let _graphql_mock = server.mock("POST", "/graphql")
-            .with_status(500)
-            .create();
+        let _graphql_mock = server.mock("POST", "/graphql").with_status(500).create();
 
         // REST returns 404 — only called once
-        let rest_mock = server.mock("GET", "/repos/deleted/repo")
+        let rest_mock = server
+            .mock("GET", "/repos/deleted/repo")
             .with_status(404)
             .expect(1)
             .create();
@@ -1949,6 +2387,7 @@ mod tests {
             cache: Some(cache),
             token: None,
             github_api_base: server.url(),
+            graph_uri: None,
         };
 
         let temp_file = NamedTempFile::new().unwrap();
@@ -1962,7 +2401,11 @@ mod tests {
         // Second call: negative cache hit, skips API entirely
         let result2 = enricher.process_repo(&mut writer, "deleted", "repo", "");
         assert!(result2.is_ok());
-        assert_eq!(result2.unwrap(), 0, "Should return 0 triples from negative cache");
+        assert_eq!(
+            result2.unwrap(),
+            2,
+            "Cached 404 should emit type + status triples"
+        );
 
         // REST API only called once
         rest_mock.assert();

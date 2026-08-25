@@ -30,6 +30,11 @@ jobs:
         id: version
         run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
+      - name: Sync ontology files for container build
+        run: |
+          git clone --depth 1 --branch ${{ steps.version.outputs.tag }} https://github.com/packagegraph/ontology.git /tmp/ontology
+          bash etl/scripts/sync-ontology.sh /tmp/ontology
+
       - name: Build and push ETL image
         uses: docker/build-push-action@v6
         with:
@@ -49,6 +54,16 @@ jobs:
           tags: |
             ghcr.io/packagegraph/fuseki:${{ steps.version.outputs.tag }}
             ghcr.io/packagegraph/fuseki:latest
+
+      - name: Build and push QLever rebuild image
+        uses: docker/build-push-action@v6
+        with:
+          context: etl
+          file: etl/Containerfile.qlever-rebuild
+          push: true
+          tags: |
+            ghcr.io/packagegraph/qlever-rebuild:${{ steps.version.outputs.tag }}
+            ghcr.io/packagegraph/qlever-rebuild:latest
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

@@ -1,4 +1,5 @@
 use crate::ntriples::NTriplesWriter;
+use crate::sparql::{SparqlAuth, SparqlBackend};
 use crate::uris::*;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -10,6 +11,7 @@ use std::time::Duration;
 pub struct NugetCollector {
     client: Client,
     registration_base: String,
+    pub graph_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,11 +101,23 @@ impl NugetCollector {
         Ok(Self {
             client,
             registration_base,
+            graph_uri: None,
         })
     }
 
-    pub fn collect_discover(&self, endpoint: &str, output_path: &str) -> Result<(usize, usize)> {
-        let names = crate::seed::discover_by_ecosystem(endpoint, "nuget")?;
+    pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
+        self.graph_uri = graph_uri;
+        self
+    }
+
+    pub fn collect_discover(
+        &self,
+        endpoint: &str,
+        auth: &SparqlAuth,
+        backend: SparqlBackend,
+        output_path: &str,
+    ) -> Result<(usize, usize)> {
+        let names = crate::seed::discover_by_ecosystem(endpoint, "nuget", auth, backend.clone())?;
         let seed_path = "/tmp/seed-nuget-discover.txt";
         std::fs::write(seed_path, names.join("\n"))?;
         self.collect(seed_path, output_path)
@@ -111,12 +125,15 @@ impl NugetCollector {
 
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new(file);
+        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
         self.emit_distribution_metadata(&mut writer)?;
 
         let package_names = read_nuget_seed_file(packages_file)?;
-        eprintln!("Loaded {} NuGet package IDs from seed file", package_names.len());
+        eprintln!(
+            "Loaded {} NuGet package IDs from seed file",
+            package_names.len()
+        );
 
         let mut total_packages = 0;
         let mut total_triples = 0;
@@ -164,7 +181,11 @@ impl NugetCollector {
         package_id: &str,
         base_delay_ms: &mut u64,
     ) -> std::result::Result<CatalogEntry, String> {
-        let url = format!("{}/{}/index.json", self.registration_base, package_id.to_lowercase());
+        let url = format!(
+            "{}/{}/index.json",
+            self.registration_base,
+            package_id.to_lowercase()
+        );
         let max_attempts = 5;
 
         for attempt in 0..max_attempts {
@@ -183,7 +204,8 @@ impl NugetCollector {
                     }
 
                     let text = response.text().map_err(|e| e.to_string())?;
-                    let reg: RegistrationIndex = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                    let reg: RegistrationIndex =
+                        serde_json::from_str(&text).map_err(|e| e.to_string())?;
 
                     // Get latest version (last item in last page)
                     if let Some(page) = reg.items.last() {
@@ -207,7 +229,11 @@ impl NugetCollector {
         Err(format!("Max retries exceeded for {}", package_id))
     }
 
-    fn emit_package_triples(&self, writer: &mut NTriplesWriter, entry: &CatalogEntry) -> Result<usize> {
+    fn emit_package_triples(
+        &self,
+        writer: &mut NTriplesWriter,
+        entry: &CatalogEntry,
+    ) -> Result<usize> {
         let pkg_uri = package_uri("nuget", "gallery", "any", &entry.id, &entry.version);
         let identity_uri = package_identity_uri("nuget", "gallery", "any", &entry.id);
         let mut triples = 0;
@@ -370,13 +396,18 @@ mod tests {
         let collector = NugetCollector {
             client: Client::new(),
             registration_base: "https://api.nuget.org/v3/registration5-gz-semver2".to_string(),
+            graph_uri: None,
         };
 
         let triples = collector.emit_package_triples(&mut writer, &entry).unwrap();
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("core#Package"));
         assert!(content.contains("nuget#NuGetPackage"));

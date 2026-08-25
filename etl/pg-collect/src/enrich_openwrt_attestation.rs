@@ -18,12 +18,20 @@ impl OpenwrtAttestationEnricher {
         minio_config: Option<MinioConfig>,
     ) -> std::io::Result<Self> {
         let cache = if let Some(dir) = cache_dir {
-            Some(FileCache::new(dir, "openwrt-attestation", 8760, minio_config)?)
+            Some(FileCache::new(
+                dir,
+                "openwrt-attestation",
+                8760,
+                minio_config,
+            )?)
         } else {
             None
         };
 
-        Ok(Self { github_token, cache })
+        Ok(Self {
+            github_token,
+            cache,
+        })
     }
 
     pub fn enrich(
@@ -34,7 +42,9 @@ impl OpenwrtAttestationEnricher {
         let mut total_triples = 0;
 
         eprintln!("GitHub Attestation Check: OpenWrt does not publish attestations yet (verified 2026-04-27).");
-        eprintln!("Enricher ready for when openwrt/openwrt adopts actions/attest-build-provenance.");
+        eprintln!(
+            "Enricher ready for when openwrt/openwrt adopts actions/attest-build-provenance."
+        );
 
         // Stub: when OpenWrt starts publishing attestations, iterate digest_map and call GitHub API
         // for (digest_key, binary_uri) in digest_map {
@@ -76,10 +86,16 @@ mod tests {
         let enricher = OpenwrtAttestationEnricher::new(None, None, None).unwrap();
 
         let mut digest_map = HashMap::new();
-        digest_map.insert("sha256:abc123".to_string(), "https://packagegraph.github.io/d/pkg/openwrt/24.10/mips_24kc/test/1.0".to_string());
+        digest_map.insert(
+            "sha256:abc123".to_string(),
+            "https://packagegraph.github.io/d/pkg/openwrt/24.10/mips_24kc/test/1.0".to_string(),
+        );
 
         let triples = enricher.enrich(&mut writer, &digest_map).unwrap();
 
-        assert_eq!(triples, 0, "Should return 0 triples until OpenWrt publishes attestations");
+        assert_eq!(
+            triples, 0,
+            "Should return 0 triples until OpenWrt publishes attestations"
+        );
     }
 }

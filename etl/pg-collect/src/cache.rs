@@ -50,7 +50,12 @@ impl FileCache {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to create HTTP client: {}", e)))?;
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Other,
+                    format!("Failed to create HTTP client: {}", e),
+                )
+            })?;
 
         Ok(Self {
             cache_dir: dir,
@@ -139,7 +144,8 @@ impl FileCache {
         let object_key = self.minio_key(key);
         let url = format!("{}/{}/{}", config.endpoint, config.bucket, object_key);
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .basic_auth(&config.access_key, Some(&config.secret_key))
             .send()
@@ -159,7 +165,8 @@ impl FileCache {
         let body = serde_json::to_vec(value)
             .map_err(|e| Error::new(ErrorKind::Other, format!("JSON serialize: {}", e)))?;
 
-        let response = self.client
+        let response = self
+            .client
             .put(&url)
             .basic_auth(&config.access_key, Some(&config.secret_key))
             .header("Content-Type", "application/json")
@@ -239,7 +246,10 @@ mod tests {
         let nested = tmp.path().join("deep").join("path");
         let cache = FileCache::new(nested.to_str().unwrap(), "myenricher", 24, None).unwrap();
 
-        assert!(nested.join("myenricher").exists(), "Should create cache subdirectory");
+        assert!(
+            nested.join("myenricher").exists(),
+            "Should create cache subdirectory"
+        );
 
         cache.put("test", &serde_json::json!({}));
         assert!(cache.get("test").is_some());
@@ -251,7 +261,8 @@ mod tests {
 
         // Create a mock Minio server
         let mut server = mockito::Server::new();
-        let mock = server.mock("GET", mockito::Matcher::Any)
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"from": "minio"}"#)
@@ -264,9 +275,8 @@ mod tests {
             secret_key: "minioadmin".to_string(),
         };
 
-        let cache = FileCache::new(
-            tmp.path().to_str().unwrap(), "test", 24, Some(minio_config)
-        ).unwrap();
+        let cache =
+            FileCache::new(tmp.path().to_str().unwrap(), "test", 24, Some(minio_config)).unwrap();
 
         let result = cache.get("remote-key");
         mock.assert();
@@ -275,6 +285,9 @@ mod tests {
 
         // Should now be cached locally
         let local = cache.get("remote-key");
-        assert!(local.is_some(), "Should be cached locally after Minio fetch");
+        assert!(
+            local.is_some(),
+            "Should be cached locally after Minio fetch"
+        );
     }
 }
