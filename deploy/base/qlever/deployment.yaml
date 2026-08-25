@@ -114,6 +114,16 @@ spec:
         - name: qlever
           image: docker.io/adfreiburg/qlever:commit-1075455fae
           command: ["/qlever/qlever-server"]
+          # SECURITY NOTE: this pinned qlever-server binary only accepts its admin
+          # token via the -a/--access-token argv flag — no env-var or token-file
+          # option exists in this image (the Qleverfile ACCESS_TOKEN setting is
+          # consumed by the Python `qlever` wrapper, which we do not run here;
+          # cf. qlever-control#259). The token is sourced from the qlever-credentials
+          # Secret (env below), but argv expansion re-exposes it in the process
+          # table (/proc/<pid>/cmdline). This residual exposure is accepted and
+          # bounded: reading it requires pods/exec in this namespace or node root,
+          # both already-privileged. Revisit if a future QLever release adds
+          # --access-token-file.
           args: ["-i", "/data/index/packagegraph", "-j", "4", "-p", "7001",
                  "-m", "4G", "-c", "1G", "-e", "500M", "-k", "200", "-s", "300s",
                  "-a", "$(QLEVER_ACCESS_TOKEN)"]

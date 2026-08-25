@@ -6,11 +6,14 @@ metadata:
   labels:
     app: sparql-proxy
 spec:
-  type: NodePort
+  # ClusterIP: the endpoint is reached exclusively through the passthrough Route
+  # (see fuseki/route.yaml → to: sparql-proxy, port: https). A NodePort would
+  # additionally expose the TLS+auth listener on every node IP with no added
+  # benefit, widening the attack surface.
+  type: ClusterIP
   selector:
     app: sparql-proxy
   ports:
     - port: 8443
       targetPort: 8443
-      nodePort: 30443
       name: https

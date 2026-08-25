@@ -186,6 +186,24 @@ spec:
                   CONTENT_HASH=$(find /tmp/index -type f | sort | xargs sha256sum | sha256sum | cut -c1-16)
                   echo "Content hash: $CONTENT_HASH"
 
+                  # Idempotency: if the freshly built index is byte-identical to what
+                  # is already promoted, skip archive/upload/promotion and the rollout
+                  # restart. QLever uses strategy: Recreate, so an unconditional nightly
+                  # restart tears down the only pod to reload an identical index for no
+                  # reason. Safe to skip the completeness gate here: an identical hash
+                  # means the index already matches the live, previously-vetted one.
+                  # Mirrors the rebuild-tdb2 early-exit. (An unchanged run leaves
+                  # last-success.json untouched, preserving the completeness baseline.)
+                  MC_RC=0; mc_cat_check "pgraph/${MINIO_BUCKET}/qlever-index/latest" || MC_RC=$?
+                  if [ "$MC_RC" -eq 2 ]; then
+                    echo "FATAL: Minio error reading latest pointer — aborting"
+                    exit 1
+                  elif [ "$MC_RC" -eq 0 ] && [ "$MC_RESULT" = "$CONTENT_HASH" ]; then
+                    echo "QLever index ${CONTENT_HASH} already promoted — no changes, skipping promotion and rollout"
+                    STATUS="unchanged"
+                    exit 0
+                  fi
+
                   echo "Archiving index..."
                   tar czf /tmp/index.tar.gz -C /tmp/index .
                   ARCHIVE_SIZE=$(du -h /tmp/index.tar.gz | cut -f1)

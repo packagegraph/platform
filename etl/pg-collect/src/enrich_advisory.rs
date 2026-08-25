@@ -89,8 +89,15 @@ impl AdvisoryEnricher {
                         })?;
 
                     if !resp.status().is_success() {
-                        eprintln!("RHSA API returned {}", resp.status());
-                        break;
+                        // Distinguish a genuine API/outage failure from legitimate
+                        // end-of-pagination. End-of-pagination is a 200 with an empty
+                        // array (handled below); a non-success status is an error and
+                        // must not be swallowed into a truncated "successful" result
+                        // that could feed a drop-and-replace load. Matches enrich_dsa.
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("RHSA API returned {}", resp.status()),
+                        ));
                     }
 
                     let data: serde_json::Value = resp.json().map_err(|e| {
