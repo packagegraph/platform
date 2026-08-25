@@ -401,7 +401,13 @@ impl GitHubEnricher {
         graph_uri: &str,
     ) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
+        // This batch is loaded into Fuseki via a graph-scoped GSP POST (below),
+        // where the target graph is the endpoint URL — NOT an N-Quads 4th term.
+        // Always emit N-Triples here regardless of the global `--graph` flag: a
+        // quad posted as application/n-triples would be rejected or mangled by
+        // the GSP endpoint. The N-Quads/QLever copy of GitHub enrichment is
+        // produced separately by the CONSTRUCT export in the enrich-github job.
+        let mut writer = NTriplesWriter::new(file);
 
         let candidates = self.sparql.query_github_candidates(graph_uri, max_repos)?;
         eprintln!(

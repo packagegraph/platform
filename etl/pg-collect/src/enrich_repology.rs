@@ -87,22 +87,58 @@ impl RepologyEnricher {
 
         let mut total_links = 0;
         let mut total_triples = 0;
+        let mut total_checked = 0;
+        let mut total_errors = 0;
+        let mut consecutive_errors = 0;
 
         for (idx, name) in unique_names.iter().enumerate() {
             if (idx + 1) % 100 == 0 {
                 eprintln!("Progress: {} / {} packages", idx + 1, unique_names.len());
             }
+            total_checked += 1;
 
+            // Note: query_repology maps 404 (package unknown to Repology, very
+            // common) to Ok(0), so only genuine 5xx/network failures count as
+            // errors. Abort on sustained failure so a Repology outage produces a
+            // hard error rather than a near-empty "successful" result — mirrors
+            // the npm-provenance and github enrichers.
             match self.query_repology(&mut writer, name) {
-                Ok(triples) if triples > 0 => {
-                    total_links += 1;
-                    total_triples += triples;
+                Ok(triples) => {
+                    if triples > 0 {
+                        total_links += 1;
+                        total_triples += triples;
+                    }
+                    consecutive_errors = 0;
                 }
-                Ok(_) => {}
-                Err(e) => eprintln!("  Error querying Repology for {}: {}", name, e),
+                Err(e) => {
+                    eprintln!("  Error querying Repology for {}: {}", name, e);
+                    total_errors += 1;
+                    consecutive_errors += 1;
+                    if consecutive_errors >= 20 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "Aborting: {} consecutive failures — Repology may be down (last: {})",
+                                consecutive_errors, e
+                            ),
+                        ));
+                    }
+                }
             }
 
             rate_limit(SLOW_RATE_LIMIT);
+        }
+
+        if total_checked > 0 && total_errors as f64 / total_checked as f64 > 0.5 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "Aborting: error rate {}/{} ({:.0}%) exceeds 50% threshold",
+                    total_errors,
+                    total_checked,
+                    total_errors as f64 / total_checked as f64 * 100.0
+                ),
+            ));
         }
 
         writer.flush()?;
