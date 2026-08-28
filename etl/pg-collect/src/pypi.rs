@@ -8,9 +8,37 @@ use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Result;
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
+
+/// Number of worker threads used to fetch PyPI packages in parallel.
+const FETCH_THREADS: usize = 8;
+
+/// Shared BFS state for parallel PyPI collection, guarded by a single mutex.
+///
+/// Every field that workers read or mutate lives here so a single lock
+/// serializes all shared access. The expensive part — the HTTP fetch — runs
+/// outside the lock, so workers only contend briefly to pop work and to
+/// commit triples/dependencies.
+struct CollectState {
+    queue: VecDeque<String>,
+    visited: HashSet<String>,
+    depth_map: HashMap<String, u32>,
+    writer: NTriplesWriter,
+    total_packages: usize,
+    total_triples: usize,
+    total_to_visit: usize,
+    /// Workers that have popped an item and may still enqueue dependencies.
+    /// The BFS is done only when the queue is empty AND this reaches zero.
+    active_workers: usize,
+    /// Set once the max_packages limit is hit, telling every worker to stop.
+    stop: bool,
+    /// First triple-writing error, if any — propagated after the pool drains.
+    write_error: Option<std::io::Error>,
+}
 
 /// PEP 503 name normalization: lowercase, replace runs of [-_. ] with a single hyphen.
 /// Also strips extras brackets (e.g. "aiohttp[speedups]" → "aiohttp").
@@ -101,8 +129,6 @@ impl PypiCollector {
     }
 
     pub fn collect(&self, packages_file: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
-        use std::collections::{HashSet, HashMap, VecDeque};
-
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new(file);
 
@@ -122,70 +148,178 @@ impl PypiCollector {
         eprintln!("Loaded {} seed packages", seeds.len());
         eprintln!("Spider config: max_depth={}, max_packages={}", max_depth, max_packages);
 
-        // BFS state
-        let mut queue: VecDeque<String> = seeds.into_iter().collect();
-        let mut visited: HashSet<String> = HashSet::new();
+        // BFS state, all guarded by a single mutex. Seeds start at depth 0.
+        let queue: VecDeque<String> = seeds.into_iter().collect();
         let mut depth_map: HashMap<String, u32> = HashMap::new();
-
-        // Seeds start at depth 0
         for name in queue.iter() {
             depth_map.insert(name.clone(), 0);
         }
+        let total_to_visit = queue.len();
 
-        let mut total_packages = 0;
-        let mut total_triples = 0;
-        let mut base_delay_ms = 200;
+        let state = Mutex::new(CollectState {
+            queue,
+            visited: HashSet::new(),
+            depth_map,
+            writer,
+            total_packages: 0,
+            total_triples: 0,
+            total_to_visit,
+            active_workers: 0,
+            stop: false,
+            write_error: None,
+        });
+        // Signalled whenever new work is enqueued or a worker goes idle, so
+        // blocked workers can re-check for work or termination.
+        let idle = Condvar::new();
 
-        while let Some(name) = queue.pop_front() {
-            if !visited.insert(name.clone()) {
-                continue; // Already processed
-            }
+        // Run FETCH_THREADS workers on a dedicated rayon pool. `broadcast`
+        // blocks until every worker returns, so the closure may borrow
+        // `state`, `idle`, `self`, and `cached_fetcher` off the stack.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(FETCH_THREADS)
+            .build()
+            .map_err(std::io::Error::other)?;
 
-            if visited.len() > max_packages {
-                eprintln!("Reached max_packages limit ({})", max_packages);
-                break;
-            }
+        pool.broadcast(|_ctx| {
+            self.fetch_worker(max_depth, max_packages, &cached_fetcher, &state, &idle);
+        });
 
-            let depth = *depth_map.get(&name).unwrap_or(&0);
+        let state = state.into_inner().unwrap();
+        if let Some(e) = state.write_error {
+            return Err(e);
+        }
+        let mut writer = state.writer;
 
-            if (visited.len()) % 50 == 0 {
-                eprintln!("Progress: {} packages (depth {})", visited.len(), depth);
-            }
+        eprintln!(
+            "Collected {} packages ({} total in graph)",
+            state.total_packages,
+            state.visited.len()
+        );
+        writer.flush()?;
+        Ok((state.total_packages, state.total_triples))
+    }
 
-            let outcome = self.fetch_package(&name, &mut base_delay_ms, &cached_fetcher);
+    /// One parallel fetch worker: pop a package under the lock, fetch it
+    /// outside the lock, then commit its triples and enqueue dependencies
+    /// under the lock. Returns when the BFS is exhausted or stopped.
+    fn fetch_worker(
+        &self,
+        max_depth: u32,
+        max_packages: usize,
+        cached_fetcher: &Option<CachedFetcher>,
+        state: &Mutex<CollectState>,
+        idle: &Condvar,
+    ) {
+        // Per-worker rate-limit backoff, kept off the shared state so the
+        // fetch/retry path needs no lock.
+        let mut base_delay_ms = 0u64;
+
+        loop {
+            // ── Acquire work (or exit) under the lock ──────────────────
+            let (name, depth) = {
+                let mut st = state.lock().unwrap();
+                let name = loop {
+                    if st.stop {
+                        return;
+                    }
+                    if let Some(name) = st.queue.pop_front() {
+                        break name;
+                    }
+                    // Queue empty: if no other worker might enqueue more,
+                    // we're done — wake the others so they exit too.
+                    if st.active_workers == 0 {
+                        idle.notify_all();
+                        return;
+                    }
+                    // Otherwise wait for work or the last worker to go idle.
+                    st = idle.wait(st).unwrap();
+                };
+
+                // Skip already-processed names without counting as work.
+                if !st.visited.insert(name.clone()) {
+                    continue;
+                }
+                if st.visited.len() > max_packages {
+                    eprintln!("Reached max_packages limit ({})", max_packages);
+                    st.stop = true;
+                    idle.notify_all();
+                    return;
+                }
+
+                st.active_workers += 1;
+
+                let depth = *st.depth_map.get(&name).unwrap_or(&0);
+                if st.visited.len() % 50 == 0 {
+                    eprintln!(
+                        "Progress: {}/{} packages (depth {})",
+                        st.visited.len(),
+                        st.total_to_visit,
+                        depth
+                    );
+                }
+                (name, depth)
+            };
+
+            // ── Fetch outside the lock (the expensive, parallel part) ──
+            let outcome = self.fetch_package(&name, &mut base_delay_ms, cached_fetcher);
             let needs_delay = should_delay(&outcome);
 
-            match outcome.result {
-                Ok(pkg) => {
-                    let (pkg_triples, dep_names) = self.emit_package_triples(&mut writer, &pkg)?;
-                    total_triples += pkg_triples;
-                    total_packages += 1;
+            // ── Commit results under the lock ──────────────────────────
+            {
+                let mut st = state.lock().unwrap();
+                match outcome.result {
+                    Ok(pkg) => {
+                        let st = &mut *st;
+                        match self.emit_package_triples(&mut st.writer, &pkg) {
+                            Ok((pkg_triples, dep_names)) => {
+                                st.total_triples += pkg_triples;
+                                st.total_packages += 1;
 
-                    // Enqueue dependencies if under max_depth
-                    if depth < max_depth {
-                        for raw_dep in dep_names {
-                            let dep_name = normalize_pypi_name(&raw_dep);
-                            if dep_name.is_empty() {
-                                continue;
+                                // Enqueue dependencies if under max_depth
+                                if depth < max_depth {
+                                    for raw_dep in dep_names {
+                                        let dep_name = normalize_pypi_name(&raw_dep);
+                                        if dep_name.is_empty() {
+                                            continue;
+                                        }
+                                        if !st.visited.contains(&dep_name)
+                                            && !st.depth_map.contains_key(&dep_name)
+                                        {
+                                            st.depth_map.insert(dep_name.clone(), depth + 1);
+                                            st.queue.push_back(dep_name);
+                                            st.total_to_visit += 1;
+                                            idle.notify_one();
+                                        }
+                                    }
+                                }
                             }
-                            if !visited.contains(&dep_name) && !depth_map.contains_key(&dep_name) {
-                                depth_map.insert(dep_name.clone(), depth + 1);
-                                queue.push_back(dep_name);
+                            Err(e) => {
+                                // Persist the first write error and stop the run.
+                                if st.write_error.is_none() {
+                                    st.write_error = Some(e);
+                                }
+                                st.stop = true;
+                                st.active_workers -= 1;
+                                idle.notify_all();
+                                return;
                             }
                         }
                     }
+                    Err(e) => eprintln!("  Error fetching {}: {}", name, e),
                 }
-                Err(e) => eprintln!("  Error fetching {}: {}", name, e),
+
+                st.active_workers -= 1;
+                // If we just went idle and the queue is empty, other blocked
+                // workers may now need to terminate.
+                if st.queue.is_empty() {
+                    idle.notify_all();
+                }
             }
 
             if needs_delay {
                 std::thread::sleep(Duration::from_millis(base_delay_ms));
             }
         }
-
-        eprintln!("Collected {} packages ({} total in graph)", total_packages, visited.len());
-        writer.flush()?;
-        Ok((total_packages, total_triples))
     }
 
     fn emit_distribution_metadata(&self, writer: &mut NTriplesWriter) -> Result<usize> {
