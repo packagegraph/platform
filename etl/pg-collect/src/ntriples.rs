@@ -28,6 +28,11 @@ pub struct NTriplesWriter {
     writer: BufWriter<File>,
     /// Count of triples skipped due to invalid IRI characters.
     pub skipped_invalid_iri: usize,
+    /// Set of already-emitted "definition" triples (rdf:type declarations and
+    /// name/label literals of shared entities), keyed by (subject, predicate,
+    /// object) so byte-identical duplicates are written only once per output file.
+    /// Only low-cardinality definition triples are routed here, so this stays small.
+    def_seen: std::collections::HashSet<String>,
 }
 
 impl NTriplesWriter {
@@ -36,7 +41,37 @@ impl NTriplesWriter {
         Self {
             writer: BufWriter::new(file),
             skipped_invalid_iri: 0,
+            def_seen: std::collections::HashSet::new(),
         }
+    }
+
+    /// Write a triple, but only if this exact (subject, predicate, object) has not
+    /// already been written to this file. Returns `true` if it was written, `false`
+    /// if it was a duplicate and skipped.
+    ///
+    /// Use for definition triples that are a pure function of a shared entity URI
+    /// (e.g. a Capability's rdf:type), which would otherwise be re-emitted once per
+    /// referencing occurrence. Do NOT use for high-cardinality edges — those are
+    /// distinct per subject and deduping them only wastes memory.
+    pub fn write_triple_once(&mut self, subject: &str, predicate: &str, object: &str) -> Result<bool> {
+        let key = format!("{subject}\u{1}{predicate}\u{1}{object}");
+        if !self.def_seen.insert(key) {
+            return Ok(false);
+        }
+        self.write_triple(subject, predicate, object)?;
+        Ok(true)
+    }
+
+    /// Literal counterpart to [`write_triple_once`]. Returns `true` if written,
+    /// `false` if it was a duplicate and skipped.
+    pub fn write_literal_once(&mut self, subject: &str, predicate: &str, value: &str) -> Result<bool> {
+        // The leading '"' distinguishes literal keys from URI-object keys.
+        let key = format!("{subject}\u{1}{predicate}\u{1}\"{value}");
+        if !self.def_seen.insert(key) {
+            return Ok(false);
+        }
+        self.write_literal(subject, predicate, value)?;
+        Ok(true)
     }
 
     /// Write a triple: `<subject> <predicate> <object> .\n`

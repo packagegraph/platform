@@ -1279,18 +1279,31 @@ impl RpmCollector {
                 &dep.name,
             );
 
-            writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-            writer.write_literal(&dep_uri, &format!("{PKG}packageName"), &dep.name)?;
+            // Definition triples for the provided identity are a pure function of
+            // dep_uri; emit them once per distinct identity rather than once per
+            // providing package (see write_triple_once).
+            if writer.write_triple_once(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))? {
+                triples += 1;
+            }
+            if writer.write_literal_once(&dep_uri, &format!("{PKG}packageName"), &dep.name)? {
+                triples += 1;
+            }
+            // Provides edges are per (package, capability) and are never deduplicated.
             writer.write_triple(pkg_uri, &format!("{PKG}directlyProvides"), &dep_uri)?;
             writer.write_triple(pkg_uri, &format!("{RPM}rpmProvides"), &dep_uri)?;
+            triples += 2;
 
-            // Also emit Capability entity for CQ-PM-03
+            // Also emit Capability entity for CQ-PM-03. Its definition is likewise a
+            // pure function of cap_uri and emitted once per distinct capability.
             let cap_uri = format!("{DATA}capability/{}", crate::uris::encode(&dep.name));
-            writer.write_triple(&cap_uri, RDF_TYPE, &format!("{PKG}Capability"))?;
-            writer.write_literal(&cap_uri, &format!("{PKG}capabilityName"), &dep.name)?;
+            if writer.write_triple_once(&cap_uri, RDF_TYPE, &format!("{PKG}Capability"))? {
+                triples += 1;
+            }
+            if writer.write_literal_once(&cap_uri, &format!("{PKG}capabilityName"), &dep.name)? {
+                triples += 1;
+            }
             writer.write_triple(pkg_uri, &format!("{PKG}providesCapability"), &cap_uri)?;
-
-            triples += 7;
+            triples += 1;
         }
 
         Ok(triples)
@@ -1883,5 +1896,78 @@ mod tests {
         assert!(!content.contains("/pkg/fedora/43/x86_64/other-pkg/"), "Should not emit unmatched package");
         assert!(content.contains("CVE-2025-1234"));
         assert!(triples > 0);
+    }
+
+    #[test]
+    fn shared_capability_definition_is_emitted_once() {
+        use tempfile::NamedTempFile;
+        use std::io::Read;
+
+        // Two distinct packages that both provide the SAME capability.
+        // The capability's definition triples (rdf:type + capabilityName) are a pure
+        // function of the capability URI, so they must be emitted exactly once even
+        // though the providesCapability edges (one per providing package) are not.
+        let make_pkg = |name: &str| {
+            let mut fields = HashMap::new();
+            fields.insert("name".to_string(), name.to_string());
+            fields.insert("arch".to_string(), "x86_64".to_string());
+            fields.insert("ver".to_string(), "1.0".to_string());
+            fields.insert("rel".to_string(), "1.el9".to_string());
+            RpmPackageData {
+                fields,
+                deps: vec![RpmDep {
+                    name: "libshared.so.1()(64bit)".to_string(),
+                    flags: None,
+                    epoch: None,
+                    ver: None,
+                    rel: None,
+                    dep_type: "provides".to_string(),
+                }],
+            }
+        };
+
+        let tmp = NamedTempFile::new().unwrap();
+        let file = tmp.reopen().unwrap();
+        let mut writer = NTriplesWriter::new(file);
+
+        let collector = RpmCollector {
+            client: Client::builder().timeout(Duration::from_secs(10)).build().unwrap(),
+            repo_url: "https://example.com".to_string(),
+            distro_name: "rhel".to_string(),
+            release_name: "9".to_string(),
+            repo_type: "release".to_string(),
+            source_cache: None,
+        };
+
+        let mut emitted_packages: HashSet<(String, String, String, String, String)> = HashSet::new();
+        collector
+            .emit_package_triples(&mut writer, &make_pkg("pkg-a"), None, &mut emitted_packages)
+            .unwrap();
+        collector
+            .emit_package_triples(&mut writer, &make_pkg("pkg-b"), None, &mut emitted_packages)
+            .unwrap();
+        writer.flush().unwrap();
+
+        let mut content = String::new();
+        tmp.reopen().unwrap().read_to_string(&mut content).unwrap();
+
+        // The capability definition (name literal) must appear exactly once.
+        let cap_name_lines = content
+            .matches("#capabilityName> \"libshared.so.1()(64bit)\"")
+            .count();
+        assert_eq!(
+            cap_name_lines, 1,
+            "capabilityName definition should be emitted once, got {}",
+            cap_name_lines
+        );
+
+        // But the providesCapability edge is per-package and must NOT be deduplicated:
+        // both pkg-a and pkg-b provide it, so exactly two edges.
+        let provides_edges = content.matches("#providesCapability>").count();
+        assert_eq!(
+            provides_edges, 2,
+            "providesCapability edges should be preserved per package, got {}",
+            provides_edges
+        );
     }
 }
