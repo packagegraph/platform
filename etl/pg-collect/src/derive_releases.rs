@@ -258,6 +258,8 @@ fn detect_ecosystem(graph_uri: &str) -> Ecosystem {
     if uri_lower.contains("fedora")
         || uri_lower.contains("rhel")
         || uri_lower.contains("centos")
+        || uri_lower.contains("almalinux")
+        || uri_lower.contains("rocky")
         || uri_lower.contains("opensuse")
     {
         Ecosystem::Rpm
@@ -334,6 +336,14 @@ mod tests {
         );
         assert_eq!(
             detect_ecosystem("https://packagegraph.github.io/graph/opensuse/tumbleweed"),
+            Ecosystem::Rpm
+        );
+        assert_eq!(
+            detect_ecosystem("https://packagegraph.github.io/graph/almalinux/9"),
+            Ecosystem::Rpm
+        );
+        assert_eq!(
+            detect_ecosystem("https://packagegraph.github.io/graph/rocky/9"),
             Ecosystem::Rpm
         );
         assert_eq!(

@@ -24,6 +24,8 @@ fn distro_display_name(distro_id: &str) -> &str {
         "fedora" => "Fedora",
         "rhel" => "Red Hat Enterprise Linux",
         "centos-stream" => "CentOS Stream",
+        "almalinux" => "AlmaLinux",
+        "rocky" => "Rocky Linux",
         "opensuse" => "openSUSE",
         "alpine" => "Alpine Linux",
         "gentoo" => "Gentoo",
@@ -1896,6 +1898,15 @@ mod tests {
         assert!(!content.contains("/pkg/fedora/43/x86_64/other-pkg/"), "Should not emit unmatched package");
         assert!(content.contains("CVE-2025-1234"));
         assert!(triples > 0);
+    }
+
+    #[test]
+    fn distro_display_names_cover_rhel_rebuilds() {
+        // The RHEL rebuilds must be distinguishable from RHEL (and each other)
+        // by a proper display name rather than falling through to the raw id.
+        assert_eq!(distro_display_name("almalinux"), "AlmaLinux");
+        assert_eq!(distro_display_name("rocky"), "Rocky Linux");
+        assert_eq!(distro_display_name("rhel"), "Red Hat Enterprise Linux");
     }
 
     #[test]
