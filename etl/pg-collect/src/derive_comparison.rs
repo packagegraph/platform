@@ -56,12 +56,14 @@ pub fn parse_pair(s: &str) -> Result<Pair> {
         if !(iri.starts_with("http://") || iri.starts_with("https://")) {
             return Err(err(format!("--pair IRIs must be absolute, got: {iri}")));
         }
-        if iri.chars().any(|c| {
-            matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`')
-                || c.is_ascii_whitespace()
-        }) {
+        // Defer to the shared IRI validator (used everywhere triples are written)
+        // instead of hand-rolling a second, independently-maintained character
+        // check: it covers the same injection characters and additionally
+        // rejects malformed/truncated percent-encoding, which a narrower local
+        // check would silently let through.
+        if crate::ntriples::has_invalid_iri_chars(iri) {
             return Err(err(format!(
-                "--pair IRIs must not contain <, >, \", {{, }}, |, \\, ^, backtick, or whitespace, got: {iri}"
+                "--pair IRIs must not contain <, >, \", {{, }}, |, \\, ^, backtick, whitespace, or malformed percent-encoding, got: {iri}"
             )));
         }
     }
@@ -297,7 +299,7 @@ pub(crate) fn build_report(
 /// -- not the old flat rebuildTrackingStatus/RebuildTrackingScheme, which no
 /// longer exist in the ontology, so gating on them would always fail closed
 /// (safe, but with a useless error message).
-pub(crate) const REBUILD_TERMS: [&str; 11] = [
+pub(crate) const REBUILD_TERMS: [&str; 17] = [
     "RebuildAssessment",
     "assessmentOf",
     "hasUpstreamCounterpart",
@@ -309,6 +311,15 @@ pub(crate) const REBUILD_TERMS: [&str; 11] = [
     "lineageConfirmed",
     "RebuildFidelityScheme",
     "RebuildDriftScheme",
+    // Also emitted on every assessment/snapshot -- gated so a partially-synced
+    // TBox (e.g. missing the DataSnapshot class) fails closed here rather than
+    // silently writing triples that reference undeclared vocabulary.
+    "DataSnapshot",
+    "assessmentMethod",
+    "assessmentConfidence",
+    "ambiguousCandidate",
+    "snapshotTimestamp",
+    "snapshotSource",
 ];
 
 /// Per-term existence probe. `SparqlClient::query` is built for SELECT bindings,
@@ -768,6 +779,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_pair_shares_ntriples_iri_validation_not_a_hand_rolled_duplicate() {
+        // parse_pair's own char check historically duplicated ntriples::has_invalid_iri_chars
+        // with a narrower ruleset that, unlike the shared validator, did not reject
+        // malformed/truncated percent-encoding. Two independently-maintained "is this
+        // IRI safe" validators can silently drift apart; this proves parse_pair now
+        // defers to the shared one instead of re-implementing the character set.
+        assert!(
+            parse_pair("https://x/graph/a%2=https://x/graph/rhel/9").is_err(),
+            "a truncated percent-encoding escape (%2 with no second hex digit) must be rejected"
+        );
+        assert!(
+            parse_pair("https://x/graph/a%zz=https://x/graph/rhel/9").is_err(),
+            "a percent-encoding escape with non-hex digits must be rejected"
+        );
+        // Sanity: valid percent-encoding still parses.
+        assert!(parse_pair("https://x/graph/a%20b=https://x/graph/rhel/9").is_ok());
+    }
+
+    #[test]
     fn atomic_swap_update_replaces_prod_from_staging() {
         let u = atomic_swap_update(
             "https://packagegraph.github.io/graph/derived/rhel-rebuilds",
@@ -788,6 +818,29 @@ mod tests {
         assert!(REBUILD_TERMS.contains(&"RebuildFidelityScheme"));
         assert!(REBUILD_TERMS.contains(&"RebuildDriftScheme"));
         assert!(!REBUILD_TERMS.contains(&"rebuildTrackingStatus")); // old term, gone
+    }
+
+    #[test]
+    fn ontology_gate_covers_every_term_emit_assessment_writes() {
+        // check_ontology_terms exists to fail closed BEFORE emitting data if the
+        // TBox isn't fully synced. A gate that only checks a subset of the terms
+        // this deriver actually emits would let a partially-synced ontology (e.g.
+        // missing the DataSnapshot class) pass the gate and write triples using
+        // undeclared vocabulary straight into prod. Every term emit_assessment
+        // and build_report's DataSnapshot minting write must be gated.
+        for term in [
+            "DataSnapshot",
+            "assessmentMethod",
+            "assessmentConfidence",
+            "ambiguousCandidate",
+            "snapshotTimestamp",
+            "snapshotSource",
+        ] {
+            assert!(
+                REBUILD_TERMS.contains(&term),
+                "REBUILD_TERMS is missing {term:?}, which is emitted on every assessment/snapshot"
+            );
+        }
     }
 
     #[test]

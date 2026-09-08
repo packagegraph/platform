@@ -1136,7 +1136,8 @@ enum Commands {
         load: bool,
     },
 
-    /// Derive rebuild lineage + tracking status vs RHEL into graph/derived/rhel-rebuilds
+    /// Assess rebuild presence/fidelity/drift vs RHEL into graph/derived/rhel-rebuilds
+    /// (never asserts rebuildOf lineage -- see RebuildAssessment in the ontology)
     DeriveRebuildComparison {
         /// Fuseki SPARQL endpoint URL
         #[arg(long, required = true)]
@@ -1144,7 +1145,10 @@ enum Commands {
         /// Output N-Triples file
         #[arg(short, long, required = true)]
         output: String,
-        /// Rebuild=RHEL graph pair (absolute IRIs), repeatable. Defaults to the four Alma/Rocky 9&10 pairs.
+        /// Rebuild=RHEL graph pair (absolute IRIs), repeatable. Order matters: the
+        /// left side is the downstream rebuild being assessed, the right side is
+        /// its RHEL upstream -- swapping them silently reverses which package is
+        /// treated as the baseline. Defaults to the four Alma/Rocky 9&10 pairs.
         #[arg(long = "pair")]
         pairs: Vec<String>,
         /// Minimum source builds per graph for the readiness floor
