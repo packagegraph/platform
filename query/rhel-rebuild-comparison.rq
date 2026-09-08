@@ -1,0 +1,114 @@
+# ============================================================================
+# Alma / Rocky / RHEL three-way comparison queries
+# ============================================================================
+# How faithfully do the RHEL rebuilds (AlmaLinux, Rocky Linux) track RHEL?
+#
+# Unit of comparison: the SOURCE package (SRPM), which is the canonical build
+# unit a rebuild reproduces. Each release lives in its own named graph:
+#   https://packagegraph.github.io/graph/{distro}/{release}
+#   distro ∈ {rhel, almalinux, rocky}   release ∈ {9, 10}
+#
+# Edit the three graph IRIs below to switch release (9 <-> 10).
+#
+# Key facts these queries exploit (see docs/reports for the write-up):
+#  - Alma/Rocky emit BYTE-IDENTICAL NVR strings to RHEL for rebuilt packages
+#    (e.g. openssl-3.5.5-6.el9_8), so exact (name, versionString) matching is a
+#    valid fidelity test.
+#  - The RHEL CDN carries the full cumulative z-stream history; the Alma/Rocky
+#    mirrors carry only current builds. Always compare in the
+#    rebuild -> RHEL direction ("does this rebuild build exist in RHEL?").
+#  - Modular AppStream packages (release 9) never match: RHEL uses
+#    `.module+el9…`, Alma uses `.module_el9…`, and module build-IDs are
+#    regenerated. Exclude them for a content-level fidelity number.
+# ============================================================================
+
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+
+# ----------------------------------------------------------------------------
+# Q1 — Coverage: of the rebuild's source-package NAMES, how many are shared with
+#      RHEL vs unique to the rebuild. (rhelOnly is the row count of Q4 below.)
+#      Edit the two hardcoded graph IRIs to switch distro/release.
+# ----------------------------------------------------------------------------
+SELECT (SUM(?in) AS ?namesInBoth) (SUM(1 - ?in) AS ?rebuildOnly)
+WHERE {
+  { SELECT DISTINCT ?name WHERE {
+      GRAPH <https://packagegraph.github.io/graph/almalinux/9> {
+        ?a a pkg:SourcePackage ; pkg:packageName ?name } } }
+  BIND(IF(EXISTS {
+    GRAPH <https://packagegraph.github.io/graph/rhel/9> {
+      ?b a pkg:SourcePackage ; pkg:packageName ?name } }, 1, 0) AS ?in)
+}
+
+# ----------------------------------------------------------------------------
+# Q2 — Version fidelity: of every (name, version) source build in the rebuild,
+#      how many exist byte-for-byte in RHEL's history? Excludes modular
+#      packages (whose dist-tag convention differs). Reports matched / total.
+# ----------------------------------------------------------------------------
+SELECT (COUNT(*) AS ?rebuildBuilds) (SUM(IF(?inRhel, 1, 0)) AS ?matchingRhel)
+WHERE {
+  BIND(<https://packagegraph.github.io/graph/almalinux/9> AS ?rebuild)
+  BIND(<https://packagegraph.github.io/graph/rhel/9>      AS ?rhel)
+
+  GRAPH ?rebuild {
+    ?s a pkg:SourcePackage ; pkg:packageName ?name ; pkg:hasVersion ?v .
+    ?v pkg:versionString ?ver .
+  }
+  FILTER(!CONTAINS(?ver, "module"))          # comment out to include modules
+  BIND(EXISTS {
+    GRAPH ?rhel {
+      ?s2 a pkg:SourcePackage ; pkg:packageName ?name ; pkg:hasVersion ?v2 .
+      ?v2 pkg:versionString ?ver .
+    }
+  } AS ?inRhel)
+}
+
+# ----------------------------------------------------------------------------
+# Q3 — Divergent builds: source (name, version) present in the rebuild but NOT
+#      in RHEL, for names RHEL also ships. The version suffix reveals the cause
+#      (.rocky/.alma vendor rebuild, .module_el9 modular convention, .0.N re-tag,
+#      or a z-stream timing skew).
+# ----------------------------------------------------------------------------
+SELECT ?name ?ver WHERE {
+  BIND(<https://packagegraph.github.io/graph/rocky/9> AS ?rebuild)
+  BIND(<https://packagegraph.github.io/graph/rhel/9>  AS ?rhel)
+
+  GRAPH ?rebuild {
+    ?s a pkg:SourcePackage ; pkg:packageName ?name ; pkg:hasVersion ?v .
+    ?v pkg:versionString ?ver .
+  }
+  FILTER EXISTS     { GRAPH ?rhel { ?c a pkg:SourcePackage ; pkg:packageName ?name } }
+  FILTER NOT EXISTS {
+    GRAPH ?rhel {
+      ?s2 a pkg:SourcePackage ; pkg:packageName ?name ; pkg:hasVersion ?v2 .
+      ?v2 pkg:versionString ?ver .
+    }
+  }
+}
+ORDER BY ?name ?ver
+
+# ----------------------------------------------------------------------------
+# Q4 — RHEL differentiation: source-package names RHEL ships that the rebuild
+#      does not. Surfaces RHEL-exclusive tooling (kpatch-patch-*, insights-*,
+#      command-line-assistant, go-toolset, kmod-redhat-*, ...).
+# ----------------------------------------------------------------------------
+SELECT DISTINCT ?name WHERE {
+  BIND(<https://packagegraph.github.io/graph/almalinux/9> AS ?rebuild)
+  BIND(<https://packagegraph.github.io/graph/rhel/9>      AS ?rhel)
+
+  GRAPH ?rhel { ?b a pkg:SourcePackage ; pkg:packageName ?name }
+  FILTER NOT EXISTS { GRAPH ?rebuild { ?a a pkg:SourcePackage ; pkg:packageName ?name } }
+}
+ORDER BY ?name
+
+# ----------------------------------------------------------------------------
+# Q5 — Rebuild-only names: what each rebuild adds on top of RHEL (branding plus
+#      distro-specific extras such as Rocky's efs-utils / yggdrasil).
+# ----------------------------------------------------------------------------
+SELECT DISTINCT ?name WHERE {
+  BIND(<https://packagegraph.github.io/graph/rocky/9> AS ?rebuild)
+  BIND(<https://packagegraph.github.io/graph/rhel/9>  AS ?rhel)
+
+  GRAPH ?rebuild { ?a a pkg:SourcePackage ; pkg:packageName ?name }
+  FILTER NOT EXISTS { GRAPH ?rhel { ?b a pkg:SourcePackage ; pkg:packageName ?name } }
+}
+ORDER BY ?name
