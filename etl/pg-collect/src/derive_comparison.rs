@@ -491,7 +491,7 @@ pub(crate) fn staging_checks(staging: &str, rhel_graphs: &[String]) -> Vec<Stagi
         format!("{prefix}SELECT (COUNT(DISTINCT ?b) AS ?c) WHERE {{ GRAPH <{staging}> {{ {{ ?a pkg:fidelityBaseline ?b }} UNION {{ ?a pkg:comparedAgainst ?b }} UNION {{ ?a pkg:ambiguousCandidate ?b }} }} FILTER NOT EXISTS {{ {graph_membership} }} }}"));
 
     push(&mut checks, "assessedAgainstSnapshot value missing rdf:type pkg:DataSnapshot",
-        format!("{prefix}SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE {{ GRAPH <{staging}> {{ ?a pkg:assessedAgainstSnapshot ?s }} FILTER NOT EXISTS {{ ?s a pkg:DataSnapshot }} }}"));
+        format!("{prefix}SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE {{ GRAPH <{staging}> {{ ?a pkg:assessedAgainstSnapshot ?s }} FILTER NOT EXISTS {{ GRAPH <{staging}> {{ ?s a pkg:DataSnapshot }} }} }}"));
     push(&mut checks, "assessedAgainstSnapshot value missing a non-empty rdfs:label",
         format!("PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n{prefix}SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE {{ GRAPH <{staging}> {{ ?a pkg:assessedAgainstSnapshot ?s }} FILTER NOT EXISTS {{ GRAPH <{staging}> {{ ?s rdfs:label ?l }} FILTER(STRLEN(REPLACE(STR(?l), \"^\\\\s+|\\\\s+$\", \"\")) > 0) }} }}"));
 
@@ -889,6 +889,33 @@ mod tests {
             label_check.query.contains("STRLEN") || label_check.query.contains("strlen"),
             "the rdfs:label check must filter on label length/content, not just presence; got: {}",
             label_check.query
+        );
+    }
+
+    #[test]
+    fn snapshot_type_check_scopes_not_exists_to_the_staging_graph() {
+        // Confirmed via live testing against a PLAIN (non-union) Fuseki dataset:
+        // `FILTER NOT EXISTS { ?s a pkg:DataSnapshot }`, unwrapped, searches the
+        // DEFAULT graph, not the enclosing GRAPH <staging> block -- it does NOT
+        // inherit the outer GRAPH scope the way one might assume. This project's
+        // deployed Fuseki config happens to set tdb2:unionDefaultGraph true, which
+        // incidentally masks the bug by unioning every named graph into the default
+        // graph -- but that is a deployment-specific accident, not a SPARQL
+        // guarantee, and validate_staging must be correct independent of it: a
+        // differently-configured (or default-configured) Fuseki would see this
+        // check flag EVERY valid DataSnapshot as missing, rejecting every run.
+        let checks = staging_checks("urn:staging", &["urn:rhel9".to_string()]);
+        let type_check = checks
+            .iter()
+            .find(|c| c.description.contains("pkg:DataSnapshot"))
+            .expect("a staging check must reference pkg:DataSnapshot");
+        assert!(
+            type_check.query.contains("GRAPH <urn:staging> { ?s a pkg:DataSnapshot }")
+                || type_check.query.matches("GRAPH <urn:staging>").count() >= 2,
+            "the pkg:DataSnapshot type check's FILTER NOT EXISTS must explicitly \
+             re-scope to GRAPH <staging>, not rely on outer-scope inheritance \
+             (which does not hold on a non-union dataset); got: {}",
+            type_check.query
         );
     }
 
