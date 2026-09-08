@@ -520,6 +520,60 @@ impl SparqlClient {
 
         self.update(&sparql)
     }
+
+    /// Query source-package builds in a named graph, joining the RPM epoch
+    /// (from any binary `builtFromSource` the source, defaulting to 0) and
+    /// splitting the source `versionString` ("VERSION-RELEASE") on the last '-'.
+    ///
+    /// Returns (name, node_uri, epoch, version, release) tuples.
+    pub fn query_source_builds(&self, graph: &str)
+        -> Result<Vec<(String, String, i64, String, String)>> {
+        let rows = self.query(&source_builds_query(graph))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let (name, src, ver) = match (r.get("name"), r.get("src"), r.get("ver")) {
+                (Some(n), Some(s), Some(v)) => (n.clone(), s.clone(), v.clone()),
+                _ => continue,
+            };
+            let epoch = r.get("epoch").and_then(|e| e.parse::<i64>().ok()).unwrap_or(0);
+            // split versionString "VERSION-RELEASE" on the last '-'
+            let (version, release) = match ver.rfind('-') {
+                Some(i) => (ver[..i].to_string(), ver[i + 1..].to_string()),
+                None => (ver.clone(), String::new()),
+            };
+            out.push((name, src, epoch, version, release));
+        }
+        Ok(out)
+    }
+
+    /// Resolve the single distribution IRI (`pkg:partOfDistribution`) for a named graph.
+    ///
+    /// Fails closed: errors if zero or more than one distinct distribution IRI is present.
+    pub fn resolve_distribution(&self, graph: &str) -> Result<String> {
+        let rows = self.query(&distribution_query(graph))?;
+        let dists: Vec<String> = rows.into_iter().filter_map(|r| r.get("d").cloned()).collect();
+        match dists.len() {
+            1 => Ok(dists.into_iter().next().unwrap()),
+            n => Err(Error::new(ErrorKind::InvalidData,
+                format!("graph {graph} resolved {n} distribution IRIs via pkg:partOfDistribution; expected exactly 1"))),
+        }
+    }
+}
+
+pub(crate) fn source_builds_query(graph: &str) -> String {
+    format!(r#"PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+SELECT ?name ?src (COALESCE(?ep, 0) AS ?epoch) ?ver WHERE {{
+  GRAPH <{graph}> {{
+    ?src a pkg:SourcePackage ; pkg:packageName ?name ; pkg:hasVersion ?v .
+    ?v pkg:versionString ?ver .
+    OPTIONAL {{ ?bin pkg:builtFromSource ?src ; pkg:hasVersion ?bv . ?bv pkg:epoch ?ep . }}
+  }}
+}}"#)
+}
+
+pub(crate) fn distribution_query(graph: &str) -> String {
+    format!(r#"PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+SELECT DISTINCT ?d WHERE {{ GRAPH <{graph}> {{ ?p pkg:partOfDistribution ?d }} }}"#)
 }
 
 /// Count non-empty, non-comment lines in an N-Triples file.
@@ -776,6 +830,31 @@ mod tests {
         assert!(result.is_err(), "Should propagate GSP failure as Err");
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("500") || err_msg.contains("GSP"), "Error should mention HTTP 500 or GSP");
+    }
+
+    #[test]
+    fn source_builds_query_joins_epoch_via_binary() {
+        let q = super::source_builds_query("https://packagegraph.github.io/graph/rhel/9");
+        assert!(q.contains("a pkg:SourcePackage"));
+        assert!(q.contains("pkg:packageName"));
+        assert!(q.contains("pkg:versionString"));
+        assert!(q.contains("pkg:builtFromSource"));   // epoch join through the binary
+        // epoch lives on the binary's VERSION node (pkg:epoch), NOT rpm:epoch on the
+        // binary itself — the latter is Fedora-IR-only and absent in RHEL/Alma/Rocky.
+        assert!(q.contains("pkg:hasVersion ?bv"));    // hop to the binary's version node
+        assert!(q.contains("?bv pkg:epoch ?ep"));     // epoch read from the version node
+        assert!(!q.contains("rpm:epoch"));            // must NOT rely on the Fedora shape
+        assert!(!q.contains("PREFIX rpm:"));          // unused prefix removed
+        assert!(q.contains("OPTIONAL"));              // epoch is optional, defaults 0
+        assert!(q.contains("COALESCE(?ep, 0) AS ?epoch")); // epoch-0 packages default 0
+        assert!(q.contains("GRAPH <https://packagegraph.github.io/graph/rhel/9>"));
+    }
+
+    #[test]
+    fn distribution_query_targets_partOfDistribution() {
+        let q = super::distribution_query("https://packagegraph.github.io/graph/rhel/9");
+        assert!(q.contains("pkg:partOfDistribution"));
+        assert!(q.contains("DISTINCT"));
     }
 
     #[test]

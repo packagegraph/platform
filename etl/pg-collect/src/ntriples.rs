@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufWriter, Write, Result};
+use std::io::{BufWriter, Error, ErrorKind, Write, Result};
 use crate::uris::{PKG, SEC, VCS};
 
 /// Look up the inverse predicate for a given forward predicate.
@@ -24,8 +24,13 @@ fn lookup_inverse(predicate: &str) -> Option<String> {
 /// Streaming N-Triples writer.
 ///
 /// Uses BufWriter for I/O buffering. Flush happens automatically on drop.
-pub struct NTriplesWriter {
-    writer: BufWriter<File>,
+///
+/// Generic over the underlying sink `W` (defaults to [`File`] so existing
+/// `NTriplesWriter` references keep working unchanged); an in-memory
+/// `NTriplesWriter<Vec<u8>>` is used by the deriver to render N-Triples to a
+/// `String` without touching the filesystem.
+pub struct NTriplesWriter<W: Write = File> {
+    writer: BufWriter<W>,
     /// Count of triples skipped due to invalid IRI characters.
     pub skipped_invalid_iri: usize,
     /// Set of already-emitted "definition" triples (rdf:type declarations and
@@ -35,11 +40,25 @@ pub struct NTriplesWriter {
     def_seen: std::collections::HashSet<String>,
 }
 
-impl NTriplesWriter {
-    /// Create a new N-Triples writer for the given file.
-    pub fn new(file: File) -> Self {
+impl NTriplesWriter<Vec<u8>> {
+    /// Flush and consume an in-memory writer, returning the buffered N-Triples
+    /// as a `String`. Used by the pure `build_report` orchestration so it can
+    /// return rendered triples without a filesystem sink.
+    pub fn into_string(mut self) -> Result<String> {
+        self.writer.flush()?;
+        let bytes = self
+            .writer
+            .into_inner()
+            .map_err(|e| e.into_error())?;
+        String::from_utf8(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))
+    }
+}
+
+impl<W: Write> NTriplesWriter<W> {
+    /// Create a new N-Triples writer over the given sink.
+    pub fn new(sink: W) -> Self {
         Self {
-            writer: BufWriter::new(file),
+            writer: BufWriter::new(sink),
             skipped_invalid_iri: 0,
             def_seen: std::collections::HashSet::new(),
         }
@@ -71,6 +90,20 @@ impl NTriplesWriter {
             return Ok(false);
         }
         self.write_literal(subject, predicate, value)?;
+        Ok(true)
+    }
+
+    /// `xsd:dateTime` counterpart to [`write_literal_once`]. Returns `true` if
+    /// written, `false` if it was a duplicate and skipped.
+    pub fn write_datetime_once(&mut self, subject: &str, predicate: &str, value: &str) -> Result<bool> {
+        // "dt:" distinguishes dateTime-literal keys from plain-literal and
+        // URI-object keys, so an identical string value written via a
+        // different write_*_once method never collides with this one.
+        let key = format!("{subject}\u{1}{predicate}\u{1}dt:{value}");
+        if !self.def_seen.insert(key) {
+            return Ok(false);
+        }
+        self.write_datetime(subject, predicate, value)?;
         Ok(true)
     }
 

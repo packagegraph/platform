@@ -1,0 +1,46 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: derive-rhel-rebuilds
+  namespace: packagegraph
+spec:
+  # Prerequisites before unsuspending: ontology PR #5 (v0.13.0, the reified
+  # RebuildAssessment model) merged and its TBox loaded, AND the Alma/Rocky/RHEL
+  # collect jobs exist in this overlay. The deriver's own gates fail closed if
+  # either is missing (check_ontology_terms / check_readiness), so a premature
+  # unsuspend degrades to a clean job failure, never bad data. Unsuspend (set
+  # suspend: false / remove) once BOTH are in place.
+  suspend: true
+  schedule: "0 13 * * 1"  # Weekly Monday 1pm (after RHEL/Alma/Rocky collectors)
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{name: ghcr-pull-secret}]
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: deriver
+              image: ghcr.io/packagegraph/etl:latest
+              imagePullPolicy: Always
+              securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+              envFrom: [{secretRef: {name: minio-credentials}}]
+              env:
+                - {name: HOME, value: /tmp}
+                - {name: FUSEKI_ENDPOINT, value: "http://fuseki.packagegraph.svc:3030/packagegraph"}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  pg-collect derive-rebuild-comparison \
+                    --endpoint "$FUSEKI_ENDPOINT" \
+                    --output /tmp/rhel-rebuilds.nt \
+                    --run-token "$(date +%s)-$HOSTNAME" \
+                    --load
+              resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 2Gi}}

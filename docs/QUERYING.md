@@ -350,6 +350,24 @@ SELECT ?pkg ?cve ?fixed_ver WHERE {
 ORDER BY ?pkg
 ```
 
+**Packages where AlmaLinux 9 lags RHEL 9 (potential security-update lag):**
+
+The `derive-rebuild-comparison` deriver writes reified `pkg:RebuildAssessment`
+nodes into the `.../graph/derived/rhel-rebuilds` named graph, one per assessed
+rebuild source package. Query it for rebuilds whose drift axis is flagged
+behind their upstream RHEL source via `pkg:rebuildDrift pkg:drift-behind`,
+joining back to the assessed package via `pkg:assessmentOf`:
+```sparql
+# Packages where AlmaLinux 9 lags RHEL 9 (potential security-update lag)
+PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+SELECT ?src WHERE {
+  GRAPH <https://packagegraph.github.io/graph/derived/rhel-rebuilds> {
+    ?assessment pkg:assessmentOf ?src ;
+                pkg:rebuildDrift pkg:drift-behind .
+  }
+}
+```
+
 ---
 
 ## Administration
