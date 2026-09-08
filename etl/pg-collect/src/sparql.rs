@@ -83,6 +83,43 @@ impl SparqlClient {
         Ok(())
     }
 
+    /// Send a SPARQL Update query string with a SINGLE attempt -- no retry.
+    ///
+    /// Required for non-idempotent compound updates (e.g. the derived-graph
+    /// atomic swap: `DROP <prod>; COPY <staging> TO <prod>; DROP <staging>`),
+    /// where a retry after a successful-but-unconfirmed first attempt would
+    /// re-apply a destructive `DROP` against state that is already correct:
+    /// the second attempt's `DROP <prod>` would erase the just-written data,
+    /// and its `COPY` would then find `<staging>` already gone (dropped by
+    /// attempt one), copying nothing -- silently leaving `<prod>` empty.
+    /// Callers that need resilience against transient failures for a
+    /// genuinely idempotent operation should use [`update`](Self::update)
+    /// instead (e.g. a bare `DROP SILENT` is safe to retry: dropping an
+    /// already-dropped graph is a no-op).
+    pub fn update_no_retry(&self, sparql: &str) -> Result<()> {
+        let url = format!("{}/update", self.endpoint);
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/sparql-update")
+            .body(sparql.to_string())
+            .send()
+            .map_err(|e| Error::new(ErrorKind::Other, format!("SPARQL update failed: {}", e)))?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "SPARQL update failed with status {}: {}",
+                    response.status(),
+                    response.text().unwrap_or_default()
+                ),
+            ))
+        }
+    }
+
     /// Drop a named graph from the triplestore.
     pub fn drop_graph(&self, graph_uri: &str) -> Result<()> {
         eprintln!("Dropping graph <{}>...", graph_uri);
@@ -892,5 +929,49 @@ mod tests {
         assert_eq!(forges[0].1, "https://gitlab.gnome.org");
         assert_eq!(forges[0].2, "https://purl.org/packagegraph/ontology/vcs#GitLab");
         assert_eq!(forges[1].2, "https://purl.org/packagegraph/ontology/vcs#Forgejo");
+    }
+
+    #[test]
+    fn update_no_retry_makes_exactly_one_attempt_and_fails_promptly() {
+        // update_no_retry exists for non-idempotent compound updates (the
+        // derived-graph atomic swap: DROP+COPY+DROP) where retrying after a
+        // successful-but-unconfirmed first attempt would re-apply a destructive
+        // DROP against already-correct state. Proves both properties: the mock
+        // is hit exactly once (no retry loop), and failure is immediate (no
+        // multi-second backoff sleep like `update`'s 5s/10s/20s schedule).
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/update")
+            .with_status(500)
+            .expect(1)
+            .create();
+
+        let client = SparqlClient::new(&server.url());
+        let start = std::time::Instant::now();
+        let result = client.update_no_retry("DROP SILENT GRAPH <urn:x>");
+
+        assert!(result.is_err(), "a 500 response must surface as an error");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "must fail promptly, not after a retry backoff sleep: took {:?}",
+            start.elapsed()
+        );
+        mock.assert();
+    }
+
+    #[test]
+    fn update_no_retry_succeeds_on_200() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/update")
+            .with_status(200)
+            .expect(1)
+            .create();
+
+        let client = SparqlClient::new(&server.url());
+        let result = client.update_no_retry("DROP SILENT GRAPH <urn:x>");
+
+        assert!(result.is_ok());
+        mock.assert();
     }
 }
