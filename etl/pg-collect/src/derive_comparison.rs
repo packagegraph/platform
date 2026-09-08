@@ -641,7 +641,10 @@ impl RebuildComparisonDeriver {
             self.sparql.drop_graph(&staging).ok();
             return Err(e);
         }
-        match self.sparql.update(&atomic_swap_update(prod_graph, &staging)) {
+        // The swap itself must NOT go through the retrying `update()`: DROP+COPY+DROP
+        // is not idempotent, and retrying after a successful-but-unconfirmed attempt
+        // would re-drop already-correct prod data (see `update_no_retry`'s doc).
+        match self.sparql.update_no_retry(&atomic_swap_update(prod_graph, &staging)) {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.sparql.drop_graph(&staging).ok();
