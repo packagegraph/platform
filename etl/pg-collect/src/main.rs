@@ -1136,6 +1136,28 @@ enum Commands {
         load: bool,
     },
 
+    /// Derive rebuild lineage + tracking status vs RHEL into graph/derived/rhel-rebuilds
+    DeriveRebuildComparison {
+        /// Fuseki SPARQL endpoint URL
+        #[arg(long, required = true)]
+        endpoint: String,
+        /// Output N-Triples file
+        #[arg(short, long, required = true)]
+        output: String,
+        /// Rebuild=RHEL graph pair (absolute IRIs), repeatable. Defaults to the four Alma/Rocky 9&10 pairs.
+        #[arg(long = "pair")]
+        pairs: Vec<String>,
+        /// Minimum source builds per graph for the readiness floor
+        #[arg(long, default_value_t = 500)]
+        min_sources: usize,
+        /// Unique token for the staging graph name (e.g. a timestamp/UUID from the caller)
+        #[arg(long, required = true)]
+        run_token: String,
+        /// Load output into graph/derived/rhel-rebuilds via atomic staged replace
+        #[arg(long)]
+        load: bool,
+    },
+
     /// Fetch upstream artifacts to source cache
     Fetch {
         /// Collector type (rpm, debian, alpine, arch)
@@ -2466,6 +2488,57 @@ fn main() {
                 }
 
                 Ok((report.derived, report.triples))
+            })()
+        }
+
+        Commands::DeriveRebuildComparison { endpoint, output, pairs, min_sources, run_token, load } => {
+            use pg_collect::derive_comparison::{parse_pair, LoadExpectations, Pair, RebuildComparisonDeriver};
+            eprintln!("=== PackageGraph RHEL Rebuild Assessment Deriver ===");
+
+            (|| -> std::io::Result<(usize, usize)> {
+                let base = "https://packagegraph.github.io/graph";
+                let pairs: Vec<Pair> = if pairs.is_empty() {
+                    ["almalinux/9=rhel/9", "almalinux/10=rhel/10", "rocky/9=rhel/9", "rocky/10=rhel/10"]
+                        .iter()
+                        .map(|p| { let (a, b) = p.split_once('=').unwrap();
+                            parse_pair(&format!("{base}/{a}={base}/{b}")).unwrap() })
+                        .collect()
+                } else {
+                    pairs.iter().map(|p| parse_pair(p)).collect::<std::io::Result<_>>()?
+                };
+                let deriver = RebuildComparisonDeriver::new(&endpoint);
+                deriver.check_ontology_terms()?;
+                deriver.check_readiness(&pairs, min_sources)?;
+
+                let assessed_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                let report = deriver.derive(&output, &pairs, &run_token, &assessed_at)?;
+
+                eprintln!("Pairs: {}  Assessments: {}  Triples: {}", report.pairs, report.assessments, report.triples);
+                eprintln!("  presence: true={} false={}", report.presence_true, report.presence_false);
+                for (concept, n) in &report.fidelity_counts { eprintln!("  fidelity {concept}: {n}"); }
+                for (concept, n) in &report.drift_counts { eprintln!("  drift {concept}: {n}"); }
+                eprintln!("  ambiguous: {}", report.ambiguous_count);
+
+                let prod = "https://packagegraph.github.io/graph/derived/rhel-rebuilds";
+                if load {
+                    let mut rhel_graphs: Vec<String> = pairs.iter().map(|p| p.rhel_graph.clone()).collect();
+                    rhel_graphs.sort();
+                    rhel_graphs.dedup();
+                    deriver.load_atomic(
+                        &output,
+                        prod,
+                        &run_token,
+                        LoadExpectations {
+                            assessments: report.assessments,
+                            distribution_count: report.distribution_count,
+                            subjects: &report.assessment_subjects,
+                            snapshots: &report.snapshot_subjects,
+                            rhel_graphs: &rhel_graphs,
+                        },
+                    )?;
+                    eprintln!("Loaded into {prod}");
+                }
+                Ok((report.pairs, report.triples))
             })()
         }
 

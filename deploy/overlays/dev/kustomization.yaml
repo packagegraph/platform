@@ -59,6 +59,7 @@ resources:
   - jobs/enrich-npm-provenance.yaml
   - jobs/enrich-koji.yaml
   - jobs/enrich-repology.yaml
+  - jobs/derive-rhel-rebuilds.yaml
   - jobs/validate-data.yaml
 
 patches:

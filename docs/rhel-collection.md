@@ -175,12 +175,11 @@ oc create secret generic rhel-entitlement -n packagegraph \
   --from-file=ca.pem=/etc/rhsm/ca/redhat-uep.pem
 ```
 
-## Tested Results
+## Output Scale
 
-| Release | Repos | Packages | Triples | Time |
-|---------|-------|----------|---------|------|
-| RHEL 9 | BaseOS | 13,532 | 2,016,799 | 27s |
-| RHEL 10 | BaseOS + AppStream | 13,221 | 2,033,435 | 17s |
+Per-graph RPM output is approximately 37M triples post-dedup. Exact figures vary
+by release, repo set, and enrichment; see issue #15 for the current measured
+breakdown rather than relying on point-in-time counts here.
 
 ## Troubleshooting
 

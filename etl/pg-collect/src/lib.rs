@@ -64,3 +64,7 @@ pub mod enrich_blast_radius;
 pub mod fetch_error;
 pub mod http_cache;
 pub mod cached_fetch;
+pub mod rpmver;
+pub mod rebuild_norm;
+pub mod rebuild_classify;
+pub mod derive_comparison;
