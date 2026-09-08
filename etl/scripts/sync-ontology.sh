@@ -96,7 +96,7 @@ if [[ -f "$MIRROR_DIR/shacl.ttl" ]] || [[ -f "$MIRROR_DIR/examples.ttl" ]]; then
     rm -f "$MIRROR_DIR/shacl.ttl" "$MIRROR_DIR/examples.ttl"
 fi
 
-# Verify exact allowlist (v0.12.0: 37 modules)
+# Verify exact allowlist (v0.13.0: 37 modules)
 EXPECTED_FILES="apk.ttl
 attestation.ttl
 bitbake.ttl
