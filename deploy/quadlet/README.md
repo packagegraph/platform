@@ -28,6 +28,33 @@ The scripts are bind-mounted into their containers read-only rather than
 baked into the `qlever-rebuild` image, so this set works against the image
 already built by `make build-qlever-rebuild` / CI with no rebuild required.
 
+## Dedicated data disk
+
+`qlever-data.volume` and `qlever-rebuild-scratch.volume` bind-mount a
+dedicated disk at `/var/lib/packagegraph` (via `Device=`/`Type=none`/
+`Options=bind`) rather than using default Podman-managed storage under `/`
+-- a full rebuild's scratch space alone can approach 80G (see the comment in
+`qlever-rebuild-scratch.volume`), which will not fit on a typical root
+filesystem. If your host has no such disk, delete those three lines from
+both `.volume` files to fall back to normal Podman storage.
+
+To provision the disk (adjust the device path for your host):
+
+```bash
+mkfs.xfs -L qlever-data /dev/sdb
+UUID=$(blkid -s UUID -o value /dev/sdb)
+echo "UUID=$UUID /var/lib/packagegraph xfs defaults 0 2" >> /etc/fstab
+mkdir -p /var/lib/packagegraph
+mount -a
+
+mkdir -p /var/lib/packagegraph/qlever-data /var/lib/packagegraph/qlever-rebuild-scratch
+
+# SELinux (skip if not enforcing): label the tree for container access,
+# persisted so it survives future relabels.
+semanage fcontext -a -t container_file_t "/var/lib/packagegraph(/.*)?"
+restorecon -Rv /var/lib/packagegraph
+```
+
 ## Install (system-wide; requires root)
 
 ```bash
@@ -66,6 +93,35 @@ Rootless deployment (`~/.config/containers/systemd/` + `systemctl --user`)
 works the same way, except `qlever-refresh-if-changed.sh`'s
 `systemctl restart` calls need `systemctl --user restart` instead — edit the
 script if you deploy rootless.
+
+## Using Scaleway Object Storage as MINIO_ENDPOINT
+
+`mc` (and the scripts here) always address objects as `alias/bucket/key` —
+path-style. Scaleway's per-bucket "Bucket Endpoint"
+(`https://<bucket>.s3.<region>.scw.cloud`, virtual-hosted-style, bucket
+baked into the hostname) does not work as `MINIO_ENDPOINT` here: combined
+with a path-style `bucket/key` reference, the bucket name ends up doubled
+(`<bucket>.s3.<region>.scw.cloud/<bucket>/key`), and every operation fails
+with a misleading `Object does not exist` / `Access Denied`. Use the
+regional "API Endpoint" instead (`https://s3.<region>.scw.cloud`, no bucket
+in the hostname) — `scw object bucket get <bucket>` prints both; take
+`APIEndpoint`, not `BucketEndpoint`.
+
+If provisioning a dedicated IAM application/API key for this host (as
+opposed to reusing an existing one), two things are easy to get wrong and
+both fail *silently permission-shaped* rather than obviously:
+- The policy rule needs `ObjectStorageBucketsRead` in addition to
+  `ObjectStorageObjectsRead`/`ObjectStorageObjectsWrite` — the Buckets/
+  Objects split mirrors AWS's `s3:ListBucket` vs `s3:GetObject` distinction,
+  and `mc ls`/`mc mirror`/`mc du` all need the former.
+- The API key's `default_project_id` must match the policy's scoped
+  project — Scaleway's S3 API resolves the acting project from the key
+  itself, not purely from the IAM policy's `project-ids`. A key created
+  without `default-project-id=<project>` explicitly set defaults to the
+  organization's default project, which silently doesn't match a policy
+  scoped to a different project, and every request comes back
+  `Insufficient permissions` even though `scw iam policy get` shows the
+  rule correctly attached.
 
 ## Deliberate differences from the Kubernetes version
 
