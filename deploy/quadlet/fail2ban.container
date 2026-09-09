@@ -1,0 +1,57 @@
+# fail2ban (crazymax/fail2ban image), watching sshd (via rsyslog's
+# /var/log/secure) and sparql-proxy (via its own file-based access log,
+# sparql-proxy-logs.volume) -- file polling, not journald: this image's
+# Alpine base lacks python3-systemd, so `backend = systemd` fails to
+# initialize at all (confirmed live). Bans into the SAME nftables sets
+# CrowdSec uses (see firewall/nftables.conf and fail2ban/nft-shared-ban.sh)
+# rather than fail2ban's default separate chain -- one shared ban list
+# regardless of which tool (if either, or both) is enabled.
+#
+# ALTERNATIVE to crowdsec.container, not a complement -- see
+# deploy/quadlet/README.md's "Traffic filtering and abuse detection"
+# section for when to pick which. Both write to the same enforcement
+# point, so running both is redundant, not additive.
+#
+# Needs --network host + NET_ADMIN/NET_RAW to run `nft` against the
+# host's real firewall (the whole point of this container).
+#
+# SecurityLabelDisable: /var/log/secure is var_log_t, and there is no
+# SELinux boolean that grants container read access to it without
+# relabeling the file itself -- which would risk breaking rsyslog's own
+# write access to a security-critical log (rsyslogd needs var_log_t to
+# write it). Scoped to this one already-privileged container (it already
+# has raw firewall control via NET_ADMIN/NET_RAW) rather than touching a
+# host log file other processes depend on.
+
+[Unit]
+Description=fail2ban (sshd + sparql-proxy jails, bans via shared nftables sets)
+After=nftables.service network-online.target
+Requires=nftables.service
+Wants=network-online.target
+
+[Container]
+ContainerName=fail2ban
+Image=docker.io/crazymax/fail2ban:latest
+AutoUpdate=registry
+Network=host
+Volume=fail2ban-data.volume:/data
+Volume=/etc/containers/systemd/fail2ban/jail.local:/data/jail.d/packagegraph.conf:ro
+Volume=/etc/containers/systemd/fail2ban/filter.d/sparql-proxy-abuse.conf:/data/filter.d/sparql-proxy-abuse.conf:ro
+Volume=/etc/containers/systemd/fail2ban/action.d/nftables-shared-set.conf:/data/action.d/nftables-shared-set.conf:ro
+Volume=/etc/containers/systemd/fail2ban/nft-shared-ban.sh:/etc/fail2ban/nft-shared-ban.sh:ro
+Volume=/var/log/secure:/var/log/secure:ro
+Volume=sparql-proxy-logs.volume:/var/log/sparql-proxy:ro
+Environment=F2B_LOG_TARGET=STDOUT
+Environment=TZ=UTC
+NoNewPrivileges=true
+DropCapability=ALL
+AddCapability=NET_ADMIN
+AddCapability=NET_RAW
+SecurityLabelDisable=true
+
+[Service]
+Restart=always
+TimeoutStartSec=60
+
+[Install]
+WantedBy=default.target
