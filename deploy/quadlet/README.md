@@ -6,10 +6,11 @@ as an alternative to the Kubernetes manifests in `deploy/base/qlever/` and
 `deploy/overlays/{dev,prod}/jobs/rebuild-qlever-index.yaml`. Each unit here
 maps to a Kubernetes equivalent — see the comment at the top of each file.
 
-This set does **not** include Fuseki, Minio, or sparql-proxy. Minio is
-assumed to already be reachable at `MINIO_ENDPOINT` (either the existing
-Kubernetes-deployed instance or a standalone one); this set only manages
-QLever.
+This set does **not** include Fuseki or Minio. Minio is assumed to already
+be reachable at `MINIO_ENDPOINT` (either the existing Kubernetes-deployed
+instance or a standalone one). It does include an optional public HTTPS
+reverse proxy (`sparql-proxy.container` and friends) in front of QLever --
+see "Public SPARQL reverse proxy" below.
 
 ## What's here
 
@@ -23,6 +24,10 @@ QLever.
 | `scripts/qlever-load-index.sh` | the initContainer's inline script |
 | `scripts/qlever-rebuild-index.sh` | the CronJob's inline script, minus the `kubectl rollout` steps |
 | `scripts/qlever-refresh-if-changed.sh` | the CronJob's `kubectl rollout restart/status` steps, reimplemented as a host-side systemd `ExecStartPost` |
+| `sparql-proxy.container` + `sparql-proxy/nginx.conf` | `deploy/base/sparql-proxy/{deployment,configmap}.yaml`, adapted: proxies to QLever instead of Fuseki, no basic auth, tuned for throughput instead of a conservative rate limit |
+| `sparql-proxy-certbot-renew.container` + `.timer` | no k8s equivalent (that deployment's TLS comes from cert-manager) |
+| `sparql-proxy-certs.volume`, `sparql-proxy-webroot.volume` | no k8s equivalent |
+| `scripts/sparql-proxy-reload-if-renewed.sh` | no k8s equivalent |
 
 The scripts are bind-mounted into their containers read-only rather than
 baked into the `qlever-rebuild` image, so this set works against the image
@@ -62,7 +67,9 @@ install -d /etc/containers/systemd/scripts
 install -m 644 deploy/quadlet/*.container deploy/quadlet/*.volume /etc/containers/systemd/
 install -m 755 deploy/quadlet/scripts/*.sh /etc/containers/systemd/scripts/
 install -m 600 deploy/quadlet/scripts/*.env /etc/containers/systemd/scripts/
-install -m 644 deploy/quadlet/qlever-rebuild-index.timer /etc/systemd/system/
+install -m 644 deploy/quadlet/qlever-rebuild-index.timer deploy/quadlet/sparql-proxy-certbot-renew.timer /etc/systemd/system/
+install -d /etc/containers/systemd/sparql-proxy
+install -m 644 deploy/quadlet/sparql-proxy/nginx.conf /etc/containers/systemd/sparql-proxy/
 
 # Real credentials -- do not leave the CHANGE_ME placeholders in place.
 ${EDITOR:-vi} /etc/containers/systemd/scripts/minio.env
@@ -122,6 +129,65 @@ both fail *silently permission-shaped* rather than obviously:
   scoped to a different project, and every request comes back
   `Insufficient permissions` even though `scw iam policy get` shows the
   rule correctly attached.
+
+## Public SPARQL reverse proxy (TLS, read-only)
+
+`sparql-proxy.container` puts an nginx reverse proxy on 80/443 in front of
+`qlever.container`'s loopback-only endpoint, with a real Let's Encrypt
+certificate. Unlike `deploy/base/sparql-proxy`'s Fuseki proxy, this one has
+**no authentication** -- it relies on QLever itself, not the proxy, for
+the read-only guarantee: QLever unconditionally rejects SPARQL Update
+without a valid `access-token` (verified: `HTTP 403` with none supplied),
+and the proxy never has or forwards that token. The one nginx-level rule
+(rejecting requests with an `access-token` query param) is defense in
+depth on top of that, not the actual guarantee -- it doesn't inspect POST
+bodies, so a client attempting Update via a POST body would still reach
+QLever and still get rejected there instead of at the proxy.
+
+Set `server_name`/`-d` in `sparql-proxy/nginx.conf` and the bootstrap
+command below to your own domain; DNS must already point at the host
+before requesting a certificate.
+
+### One-time certificate bootstrap
+
+Must happen **before** `sparql-proxy.service` first starts (needs port 80
+free for the ACME HTTP-01 standalone challenge; all *renewals* afterward
+use `--webroot` instead, served by nginx itself, so they don't need to
+stop it):
+
+```bash
+systemctl start sparql-proxy-certs-volume.service sparql-proxy-webroot-volume.service
+podman run --rm -p 80:80 \
+  -v sparql-proxy-certs:/etc/letsencrypt \
+  docker.io/certbot/certbot:latest \
+  certonly --standalone --non-interactive --agree-tos \
+  -m <your-email> \
+  -d <your-domain>
+
+# nginx-unprivileged (UID 101) can't read certbot's default 0700/0600
+# permissions -- see the gotcha below. Fix once for the bootstrap cert;
+# sparql-proxy-certbot-renew.container's --deploy-hook re-applies this on
+# every future renewal automatically.
+chmod 755 /var/lib/packagegraph/sparql-proxy-certs/live /var/lib/packagegraph/sparql-proxy-certs/archive
+chmod 644 /var/lib/packagegraph/sparql-proxy-certs/archive/<your-domain>/privkey1.pem
+
+systemctl start sparql-proxy.service
+systemctl enable --now sparql-proxy-certbot-renew.timer
+```
+
+### Gotcha: nginx-unprivileged can't read Let's Encrypt's default permissions
+
+Certbot creates `/etc/letsencrypt/{live,archive}` as `0700` root-only and
+the private key as `0600`, on both initial issuance and every renewal --
+deliberate isolation on a system where other users might exist. Since
+`sparql-proxy.container` deliberately runs as `nginx-unprivileged` (a
+fixed non-root UID, not the more common root-master/non-root-worker
+pattern used by the regular `nginx` image), it cannot read those files
+without loosening those permissions. Not a real weakening on this
+single-purpose host: nothing but root and containers explicitly granted
+this volume can reach these files regardless of the mode bits. This is
+why the renewal container's `--deploy-hook` does two things, not one --
+see the comment in `sparql-proxy-certbot-renew.container`.
 
 ## Deliberate differences from the Kubernetes version
 

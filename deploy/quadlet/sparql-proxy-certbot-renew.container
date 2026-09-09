@@ -1,0 +1,40 @@
+# Periodic Let's Encrypt renewal check (certbot only actually renews within
+# 30 days of expiry, so this is a cheap no-op most of the time). Scheduled
+# by sparql-proxy-certbot-renew.timer. For the one-time INITIAL certificate,
+# see the bootstrap command in deploy/quadlet/README.md -- this container
+# uses --webroot, which needs sparql-proxy.container already serving
+# /.well-known/acme-challenge/, so it cannot be the first-ever issuance.
+#
+# The deploy-hook only runs when a cert was actually renewed (not on a
+# no-op check). It does two things: (1) certbot resets the archive/live
+# directories to root-only 0700 and the private key to 0600 on every
+# renewal, which nginx-unprivileged's non-root worker (UID 101) can't
+# read -- so it re-applies the same loosened permissions used for the
+# initial bootstrap cert; (2) drops a marker file, since this hook runs
+# inside this container with no way to reach the nginx container
+# directly -- sparql-proxy-reload-if-renewed.sh (ExecStartPost, host-side)
+# checks for that marker and reloads nginx only when it's present.
+
+[Unit]
+Description=PackageGraph SPARQL proxy TLS certificate renewal check
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+ContainerName=sparql-proxy-certbot-renew
+Image=docker.io/certbot/certbot:latest
+AutoUpdate=registry
+Volume=sparql-proxy-certs.volume:/etc/letsencrypt
+Volume=sparql-proxy-webroot.volume:/var/www/acme-challenge
+Exec=renew --webroot -w /var/www/acme-challenge --quiet --deploy-hook "chmod 755 /etc/letsencrypt/live /etc/letsencrypt/archive && chmod 644 /etc/letsencrypt/archive/*/privkey*.pem && touch /etc/letsencrypt/.renewed-marker"
+NoNewPrivileges=true
+DropCapability=ALL
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+TimeoutStartSec=120
+ExecStartPost=/etc/containers/systemd/scripts/sparql-proxy-reload-if-renewed.sh
+
+[Install]
+WantedBy=default.target
