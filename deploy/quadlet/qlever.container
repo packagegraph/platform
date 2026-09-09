@@ -16,6 +16,12 @@ After=qlever-index-load.service
 [Container]
 ContainerName=qlever
 Image=docker.io/adfreiburg/qlever:commit-1075455fae
+# Must match qlever-index-load.container's User= -- see its comment. Pinned
+# to the "qlever" user's own UID (999) inside this image, rather than the
+# other way around, since this is the container that actually serves reads
+# against /data and writes qlever-server's own per-query metrics/resource
+# logs there.
+User=999
 Volume=qlever-data.volume:/data:Z
 EnvironmentFile=/etc/containers/systemd/scripts/qlever.env
 PublishPort=127.0.0.1:7001:7001
@@ -28,7 +34,14 @@ PublishPort=127.0.0.1:7001:7001
 # Accepted and bounded: reading it requires a shell inside this container or
 # host root, both already-privileged. Mirrors the identical tradeoff in
 # deploy/base/qlever/deployment.yaml.
-Exec=/bin/sh -c "exec /qlever/qlever-server -i /data/index/packagegraph -j 4 -p 7001 -m 4G -c 1G -e 500M -k 200 -s 300s -a \"$QLEVER_ACCESS_TOKEN\""
+# The image's own ENTRYPOINT (/qlever/docker-entrypoint.sh) expects one of its
+# own recognized invocation forms (interactive, `-c "qlever ..."`, etc.) and
+# just prints a usage banner and exits for anything else -- Exec= alone only
+# appends args to that entrypoint, it doesn't replace it (unlike Kubernetes'
+# `command:`, which does). Override it with Entrypoint= instead, matching
+# deploy/base/qlever/deployment.yaml's `command: ["/qlever/qlever-server"]`.
+Entrypoint=/bin/sh
+Exec=-c "exec /qlever/qlever-server -i /data/index/packagegraph -j 4 -p 7001 -m 4G -c 1G -e 500M -k 200 -s 300s -a \"$QLEVER_ACCESS_TOKEN\""
 Memory=6g
 PodmanArgs=--cpus=4
 NoNewPrivileges=true
