@@ -1,0 +1,18 @@
+# Let's Encrypt state (certs, account key, renewal config) -- shared between
+# the certbot bootstrap/renewal runs and sparql-proxy.container (which reads
+# the live cert read-only). Persists across container recreation; losing
+# this means re-issuing certs from scratch (rate-limited by Let's Encrypt).
+#
+# Backed by the dedicated data disk mounted at /var/lib/packagegraph (see
+# deploy/quadlet/README.md's "Dedicated data disk" section). If your host
+# has no such disk, delete the Device=/Type=/Options= lines to fall back to
+# normal Podman storage.
+
+[Volume]
+VolumeName=sparql-proxy-certs
+Device=/var/lib/packagegraph/sparql-proxy-certs
+Type=none
+Options=bind
+
+[Install]
+WantedBy=default.target

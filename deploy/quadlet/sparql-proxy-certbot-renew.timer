@@ -1,0 +1,17 @@
+# Schedules sparql-proxy-certbot-renew.service. Plain systemd timer, not a
+# quadlet unit -- Podman Quadlet has no .timer generator, so this is
+# installed as-is under /etc/systemd/system/ (see README.md). Twice-daily
+# matches certbot's own upstream-packaged renewal timer convention (it's a
+# no-op check unless a cert is within 30 days of expiry).
+
+[Unit]
+Description=Twice-daily schedule for sparql-proxy-certbot-renew.service
+
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+RandomizedDelaySec=3600
+Persistent=true
+Unit=sparql-proxy-certbot-renew.service
+
+[Install]
+WantedBy=timers.target
