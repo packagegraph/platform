@@ -14,6 +14,10 @@ Wants=network-online.target
 ContainerName=qlever-index-load
 Image=ghcr.io/packagegraph/qlever-rebuild:latest
 AutoUpdate=registry
+# Must match qlever.container's User= -- both read/write the same
+# qlever-data volume, and the qlever-rebuild image's own default user (1000)
+# doesn't match the qlever server image's default user ("qlever", 999).
+User=999
 Volume=qlever-data.volume:/data:Z
 Volume=/etc/containers/systemd/scripts/qlever-load-index.sh:/usr/local/bin/qlever-load-index.sh:ro
 EnvironmentFile=/etc/containers/systemd/scripts/minio.env
