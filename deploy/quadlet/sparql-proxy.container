@@ -1,0 +1,42 @@
+# Public HTTPS reverse proxy in front of the QLever SPARQL endpoint
+# (qlever.container, 127.0.0.1:7001). No authentication -- QLever itself
+# unconditionally rejects SPARQL Update without a valid access-token (this
+# proxy never has or forwards that token), so read-only is enforced by the
+# backend, not by this proxy. See sparql-proxy/nginx.conf for the tuning
+# (gzip, upstream keepalive, buffer sizes, rate limit) and the one nginx-level
+# defense-in-depth rule.
+#
+# TLS certs come from sparql-proxy-certs.volume, populated by the one-time
+# bootstrap (see deploy/quadlet/README.md) and kept current by
+# sparql-proxy-certbot-renew.timer.
+
+[Unit]
+Description=PackageGraph public SPARQL reverse proxy (QLever, read-only)
+Requires=qlever.service
+After=qlever.service
+
+[Container]
+ContainerName=sparql-proxy
+Image=docker.io/nginxinc/nginx-unprivileged:1.27.5-alpine
+AutoUpdate=registry
+Network=host
+Volume=/etc/containers/systemd/sparql-proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+Volume=sparql-proxy-certs.volume:/etc/letsencrypt:ro
+Volume=sparql-proxy-webroot.volume:/var/www/acme-challenge:ro
+NoNewPrivileges=true
+DropCapability=ALL
+# nginx-unprivileged runs as a non-root user; binding ports 80/443 (rather
+# than its default 8080/8443) needs this capability back even after
+# dropping everything else.
+AddCapability=NET_BIND_SERVICE
+HealthCmd=/bin/sh -c 'grep -q ":01BB " /proc/net/tcp || grep -q ":01BB " /proc/net/tcp6'
+HealthInterval=30s
+HealthStartPeriod=10s
+HealthRetries=5
+
+[Service]
+Restart=always
+TimeoutStartSec=60
+
+[Install]
+WantedBy=default.target

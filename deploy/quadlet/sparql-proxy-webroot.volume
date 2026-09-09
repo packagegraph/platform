@@ -1,0 +1,17 @@
+# Shared ACME HTTP-01 challenge directory: sparql-proxy-certbot-renew.container
+# writes challenge files here, sparql-proxy.container serves them over plain
+# HTTP at /.well-known/acme-challenge/. Tiny (a few KB of transient files).
+#
+# Backed by the dedicated data disk mounted at /var/lib/packagegraph (see
+# deploy/quadlet/README.md's "Dedicated data disk" section). If your host
+# has no such disk, delete the Device=/Type=/Options= lines to fall back to
+# normal Podman storage.
+
+[Volume]
+VolumeName=sparql-proxy-webroot
+Device=/var/lib/packagegraph/sparql-proxy-webroot
+Type=none
+Options=bind
+
+[Install]
+WantedBy=default.target
