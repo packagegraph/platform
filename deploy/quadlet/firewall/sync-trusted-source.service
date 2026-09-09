@@ -1,0 +1,17 @@
+# Native systemd service (NOT a quadlet/container -- needs CAP_NET_ADMIN
+# against the host's real nftables, same reasoning as nftables.service
+# itself, plus `podman exec` access to the fail2ban container). Runs
+# sync-trusted-source.sh once; scheduled by sync-trusted-source.timer.
+# Requires nftables.service (the trusted_ips set must already exist) and
+# trusted-ips.env to be installed first -- see README.md. fail2ban is
+# intentionally soft-required (After=, not Requires=): this script skips
+# the ignoreip half gracefully if fail2ban isn't running yet.
+
+[Unit]
+Description=Sync trusted nftables set and fail2ban ignoreip from dynamic-DNS hostnames
+After=nftables.service fail2ban.service
+Requires=nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/containers/systemd/firewall/sync-trusted-source.sh /etc/containers/systemd/scripts/trusted-ips.env

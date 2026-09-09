@@ -23,6 +23,7 @@ Network=host
 Volume=/etc/containers/systemd/sparql-proxy/nginx.conf:/etc/nginx/nginx.conf:ro
 Volume=sparql-proxy-certs.volume:/etc/letsencrypt:ro
 Volume=sparql-proxy-webroot.volume:/var/www/acme-challenge:ro
+Volume=sparql-proxy-logs.volume:/var/log/sparql-proxy
 NoNewPrivileges=true
 DropCapability=ALL
 # nginx-unprivileged runs as a non-root user; binding ports 80/443 (rather

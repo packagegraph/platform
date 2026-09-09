@@ -1,0 +1,17 @@
+# fail2ban's ban database (survives container restarts, so bans aren't
+# forgotten on a routine restart -- nftables itself stays authoritative
+# for actual enforcement via banned_ips/banned_ips6's element timeouts).
+#
+# Backed by the dedicated data disk mounted at /var/lib/packagegraph (see
+# deploy/quadlet/README.md's "Dedicated data disk" section). If your host
+# has no such disk, delete the Device=/Type=/Options= lines to fall back
+# to normal Podman storage.
+
+[Volume]
+VolumeName=fail2ban-data
+Device=/var/lib/packagegraph/fail2ban-data
+Type=none
+Options=bind
+
+[Install]
+WantedBy=default.target
