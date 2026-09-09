@@ -1,0 +1,52 @@
+# PackageGraph QLever SPARQL endpoint. Equivalent of the qlever Deployment +
+# Service in deploy/base/qlever/{deployment,service}.yaml.
+#
+# PublishPort binds to loopback only by default -- unlike the Kubernetes
+# Service (ClusterIP, reachable externally only through the TLS+basic-auth
+# sparql-proxy in deploy/base/sparql-proxy/), a bare `7001:7001` here would
+# bind all host interfaces with only the QLever access token for protection.
+# Put a TLS+auth reverse proxy in front (see deploy/base/sparql-proxy/configmap.yaml
+# for a model) before changing this to anything wider than 127.0.0.1.
+
+[Unit]
+Description=PackageGraph QLever SPARQL endpoint
+Requires=qlever-index-load.service
+After=qlever-index-load.service
+
+[Container]
+ContainerName=qlever
+Image=docker.io/adfreiburg/qlever:commit-1075455fae
+Volume=qlever-data.volume:/data:Z
+EnvironmentFile=/etc/containers/systemd/scripts/qlever.env
+PublishPort=127.0.0.1:7001:7001
+# SECURITY NOTE: this pinned qlever-server binary only accepts its admin token
+# via the -a/--access-token argv flag -- no env-var or token-file option
+# exists in this image (the Qleverfile ACCESS_TOKEN setting is consumed by the
+# Python `qlever` wrapper, which is not run here; cf. qlever-control#259). The
+# token is sourced from qlever.env (EnvironmentFile above), but argv expansion
+# re-exposes it in this container's own process table (/proc/<pid>/cmdline).
+# Accepted and bounded: reading it requires a shell inside this container or
+# host root, both already-privileged. Mirrors the identical tradeoff in
+# deploy/base/qlever/deployment.yaml.
+Exec=/bin/sh -c "exec /qlever/qlever-server -i /data/index/packagegraph -j 4 -p 7001 -m 4G -c 1G -e 500M -k 200 -s 300s -a \"$QLEVER_ACCESS_TOKEN\""
+Memory=6g
+PodmanArgs=--cpus=4
+NoNewPrivileges=true
+DropCapability=ALL
+# The k8s readinessProbe issues a real SPARQL query via kubelet's own httpGet
+# (no in-container binary needed). Podman's HealthCmd execs inside the
+# container instead, and curl/wget presence in the upstream QLever image is
+# unverified, so this checks port 7001 is listening via /proc/net/tcp (0x1B59
+# = 7001) rather than assuming a specific HTTP client exists. Swap in a
+# curl-based query check if you confirm one is present.
+HealthCmd=/bin/sh -c 'grep -q ":1B59 " /proc/net/tcp || grep -q ":1B59 " /proc/net/tcp6'
+HealthInterval=30s
+HealthStartPeriod=15s
+HealthRetries=5
+
+[Service]
+Restart=always
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

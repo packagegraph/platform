@@ -1,0 +1,36 @@
+# Nightly QLever index rebuild from the .nt/.graph corpus in Minio. Equivalent
+# of the rebuild-qlever-index CronJob in
+# deploy/overlays/{dev,prod}/jobs/rebuild-qlever-index.yaml. Scheduled by
+# qlever-rebuild-index.timer.
+#
+# On success (a new index was actually promoted), qlever-refresh-if-changed.sh
+# (ExecStartPost below) reloads qlever-index-load.service and bounces
+# qlever.service. See that script's header for what it does NOT do
+# (no automatic rollback on a failed reload).
+
+[Unit]
+Description=PackageGraph QLever nightly index rebuild
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+ContainerName=qlever-rebuild-index
+Image=ghcr.io/packagegraph/qlever-rebuild:latest
+AutoUpdate=registry
+Volume=qlever-rebuild-scratch.volume:/tmp:Z
+Volume=/etc/containers/systemd/scripts/qlever-rebuild-index.sh:/usr/local/bin/qlever-rebuild-index.sh:ro
+EnvironmentFile=/etc/containers/systemd/scripts/minio.env
+Exec=/usr/local/bin/qlever-rebuild-index.sh
+Memory=8g
+PodmanArgs=--cpus=4
+NoNewPrivileges=true
+DropCapability=ALL
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+TimeoutStartSec=7200
+ExecStartPost=/etc/containers/systemd/scripts/qlever-refresh-if-changed.sh
+
+[Install]
+WantedBy=default.target

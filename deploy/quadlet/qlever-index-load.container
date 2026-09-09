@@ -1,0 +1,32 @@
+# Pulls the latest built QLever index from Minio and atomically swaps it into
+# qlever-data before qlever.service starts. Equivalent of the `load-index`
+# initContainer in deploy/base/qlever/deployment.yaml.
+#
+# Also re-run on demand by qlever-refresh-if-changed.sh (via `systemctl
+# restart`) after qlever-rebuild-index.service promotes a new index.
+
+[Unit]
+Description=PackageGraph QLever index loader
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+ContainerName=qlever-index-load
+Image=ghcr.io/packagegraph/qlever-rebuild:latest
+AutoUpdate=registry
+Volume=qlever-data.volume:/data:Z
+Volume=/etc/containers/systemd/scripts/qlever-load-index.sh:/usr/local/bin/qlever-load-index.sh:ro
+EnvironmentFile=/etc/containers/systemd/scripts/minio.env
+Exec=/usr/local/bin/qlever-load-index.sh
+Memory=512m
+PodmanArgs=--cpus=1
+NoNewPrivileges=true
+DropCapability=ALL
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=600
+
+[Install]
+WantedBy=default.target

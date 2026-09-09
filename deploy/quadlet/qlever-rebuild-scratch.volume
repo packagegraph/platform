@@ -1,0 +1,12 @@
+# Scratch space for qlever-rebuild-index.service: downloaded .nt/.graph
+# corpus, the converted .nq file, and the freshly built index all land here
+# before being archived and uploaded. Equivalent of the emptyDir `tmp` volume
+# in deploy/overlays/{dev,prod}/jobs/rebuild-qlever-index.yaml (ephemeral-storage
+# requests: 20Gi, limits: 80Gi there) — size this host volume accordingly;
+# a full corpus + index build can approach that limit.
+
+[Volume]
+VolumeName=qlever-rebuild-scratch
+
+[Install]
+WantedBy=default.target
