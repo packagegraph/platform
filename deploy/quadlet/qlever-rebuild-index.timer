@@ -1,0 +1,16 @@
+# Schedules qlever-rebuild-index.service. Plain systemd timer, not a quadlet
+# unit -- Podman Quadlet has no .timer generator, so this is installed as-is
+# under /etc/systemd/system/ (see README.md). Matches the CronJob schedule
+# "30 3 * * *" in deploy/overlays/{dev,prod}/jobs/rebuild-qlever-index.yaml.
+
+[Unit]
+Description=Nightly schedule for qlever-rebuild-index.service
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=60
+Persistent=true
+Unit=qlever-rebuild-index.service
+
+[Install]
+WantedBy=timers.target

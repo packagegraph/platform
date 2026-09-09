@@ -1,0 +1,8 @@
+# Persistent QLever index storage. Equivalent of the qlever-data PVC in
+# deploy/base/qlever/pvc.yaml (20Gi there; size this host volume accordingly).
+
+[Volume]
+VolumeName=qlever-data
+
+[Install]
+WantedBy=default.target
