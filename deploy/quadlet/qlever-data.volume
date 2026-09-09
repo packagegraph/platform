@@ -1,8 +1,16 @@
 # Persistent QLever index storage. Equivalent of the qlever-data PVC in
 # deploy/base/qlever/pvc.yaml (20Gi there; size this host volume accordingly).
+#
+# Backed by a dedicated data disk mounted at /var/lib/packagegraph (see
+# README.md's "Dedicated data disk" section) rather than default
+# Podman-managed storage under /. If your host has no such disk, delete the
+# Device=/Type=/Options= lines below to fall back to normal Podman storage.
 
 [Volume]
 VolumeName=qlever-data
+Device=/var/lib/packagegraph/qlever-data
+Type=none
+Options=bind
 
 [Install]
 WantedBy=default.target
