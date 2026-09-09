@@ -1,0 +1,17 @@
+# Schedules sync-trusted-source.service. Every 5 minutes is cheap (a DNS
+# lookup, a small nftables set rebuild, and at most a couple of
+# fail2ban-client calls) and keeps the window where a DDNS change hasn't
+# propagated yet short -- during that window the source just falls back
+# to normal rate limits and normal ban eligibility, it isn't blocked or
+# banned outright.
+
+[Unit]
+Description=Periodic schedule for sync-trusted-source.service
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Unit=sync-trusted-source.service
+
+[Install]
+WantedBy=timers.target

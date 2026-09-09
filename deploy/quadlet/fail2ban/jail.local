@@ -1,0 +1,46 @@
+[DEFAULT]
+# File-based polling, not journald: the crazymax/fail2ban image (Alpine
+# base) doesn't ship python3-systemd, so `backend = systemd` fails to
+# initialize at all (confirmed live: "No module named 'systemd'"). File
+# polling is fail2ban's original, most battle-tested mode anyway.
+backend = auto
+banaction = nftables-shared-set
+
+# This is the ACTUAL whitelist -- it prevents a ban from being issued in
+# the first place. nftables.conf's trusted_ips set does NOT do this: it
+# sits below the banned_ips check in the input chain (an explicit ban
+# still wins), it has no visibility into nginx's own request-rate
+# limiting (application-layer, inside the proxy, invisible to nftables),
+# and it only ever existed to bypass the coarse connection-rate
+# pre-filter, not to make a source un-bannable. Loopback is always safe
+# to exempt; sync-trusted-source.sh additionally keeps a dynamic-DNS
+# admin source in sync here (via `fail2ban-client set <jail>
+# addignoreip`) for the same staleness reason trusted_ips needs syncing.
+#
+# Honest tradeoff: an ignoreip'd source can never be banned by ANY jail,
+# so genuine abuse from that exact address goes uncaught. Acceptable for
+# a known, narrowly-scoped admin source; do not add broad ranges here.
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+# RHEL's rsyslog mirrors journald to this standard path. fail2ban's stock
+# sshd filter's prefregex is intentionally generic about the process-name
+# token, so it matches this host's split sshd-session[PID]: log lines
+# without a custom filter.
+logpath = /var/log/secure
+maxretry = 5
+findtime = 10m
+bantime = 1h
+
+[sparql-proxy-abuse]
+enabled = true
+filter = sparql-proxy-abuse
+# sparql-proxy.container writes here in addition to stdout (see
+# sparql-proxy/nginx.conf) specifically so this file-polling jail can read
+# it -- podman's own journald capture of container stdout isn't reachable
+# without the systemd backend this image lacks.
+logpath = /var/log/sparql-proxy/access.log
+maxretry = 20
+findtime = 1m
+bantime = 1h
