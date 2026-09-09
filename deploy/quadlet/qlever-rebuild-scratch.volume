@@ -4,9 +4,17 @@
 # in deploy/overlays/{dev,prod}/jobs/rebuild-qlever-index.yaml (ephemeral-storage
 # requests: 20Gi, limits: 80Gi there) — size this host volume accordingly;
 # a full corpus + index build can approach that limit.
+#
+# Backed by a dedicated data disk mounted at /var/lib/packagegraph (see
+# README.md's "Dedicated data disk" section) rather than default
+# Podman-managed storage under /. If your host has no such disk, delete the
+# Device=/Type=/Options= lines below to fall back to normal Podman storage.
 
 [Volume]
 VolumeName=qlever-rebuild-scratch
+Device=/var/lib/packagegraph/qlever-rebuild-scratch
+Type=none
+Options=bind
 
 [Install]
 WantedBy=default.target
