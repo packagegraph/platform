@@ -199,10 +199,50 @@ Storing a hash rather than the bindings keeps run artifacts small and makes base
 | `RATE_LIMITED` | 503 from `limit_req` |
 | `CLIENT_TIMEOUT` | Local socket timeout at `timeout_s` |
 | `CONNECTION_ERROR` | TCP/TLS failure, connection reset, DNS failure |
+| `BANNED` | Connections failing at the TCP layer on both 443 and 22 after earlier success — an nftables ban (§5.4) |
 | `FINGERPRINT_MISMATCH` | 200 and well-formed, but the canonical hash differs from the manifest on a `deterministic: true` query |
 | `CARDINALITY_VIOLATION` | 200 and well-formed, but row count falls outside `expect` |
 
 `FINGERPRINT_MISMATCH` and `CARDINALITY_VIOLATION` are *correctness* outcomes layered on top of a successful request; a sample carries both a transport outcome and, where applicable, a correctness outcome, rather than collapsing them. Timing from a correctness-failing sample is retained but excluded from latency aggregates by default, since a query returning the wrong number of rows is not measuring the same work.
+
+`BANNED` is a tenth outcome, added because of §5.4: a connection that times out or is refused at the TCP layer *after* previous requests succeeded, on both 443 and 22, is the signature of an nftables ban rather than an ordinary connection failure. Distinguishing it from `CONNECTION_ERROR` matters because the remedy is completely different and time-critical.
+
+### 5.4 The enforcement path, and not banning yourself
+
+`deploy/quadlet/firewall/nftables.conf` and `deploy/quadlet/fail2ban/` add a packet-filter and abuse-detection layer in front of the proxy. The harness must model it, because the harness is the most likely thing to trip it.
+
+The `input` chain's rule order is decisive:
+
+```
+ip saddr @banned_ips drop          # bans win
+ct state established,related accept
+ip saddr @trusted_ips accept       # exemption from rate limits only
+tcp dport 22    ct state new limit rate 60/minute  burst 20
+tcp dport {80,443} ct state new limit rate 200/second burst 400
+```
+
+Three consequences:
+
+1. **`trusted_ips` does not protect against a ban.** The `banned_ips` drop precedes the trusted accept, and the config says so explicitly: "an explicit ban still wins". Adding the workstation to `TRUSTED_HOSTNAMES` exempts it from the coarse connection-rate pre-filter and nothing more.
+
+2. **A ban costs SSH too.** `banned_ips` drops *all* traffic from the source, port 22 included. So the failure mode is not "the load test stops" — it is "the load test stops and you cannot get in to fix it for an hour", with no `direct` tunnel, no telemetry, and no way to unban short of out-of-band console access. This is the single most consequential operational hazard in the harness.
+
+3. **The rate limits apply to new connections only.** `ct state established,related accept` precedes them, so a keepalive or HTTP/2-multiplexed client is unaffected by the 200/second ceiling; a client that disables connection reuse is not.
+
+The abuse jail is `[sparql-proxy-abuse]`: `maxretry = 20`, `findtime = 1m`, `bantime = 1h`, with `failregex` matching **any 4xx** in the proxy's access log. Note what this does and does not catch:
+
+- nginx's `limit_req` returns **503** by default, which is 5xx and therefore does *not* match. Rate-limiting alone will not ban the harness — a deliberate and correct separation.
+- A **400 from QLever on a malformed query does** match. So does the proxy's own `if ($arg_access_token) { return 403; }` defense-in-depth rule. Twenty of either within one minute is a one-hour ban.
+
+The adversarial corpus (§4.5) deliberately produces errors, and any harness bug that sends a token through the public endpoint produces 403s in a tight loop. Both are 20-requests-from-a-ban. The harness therefore:
+
+- **Tracks its own 4xx rate client-side against the jail's own thresholds** and hard-stops the run at 15 4xx responses within any rolling 60-second window, well under `maxretry = 20`. This is a circuit breaker in the client, not a request to the operator to be careful.
+- **Refuses to send `access-token` on a `public` target at all**, at the client layer, so the 403 rule is unreachable by construction rather than by discipline.
+- **Runs adversarial queries against `direct` only** unless `--allow-adversarial-public` is passed, since `direct` bypasses both nginx and the jail that reads its log.
+- **Uses one multiplexed SSH connection** (`ControlMaster` / `ControlPersist`) for telemetry and the `direct` tunnel. `ice-cold` restarts the service before every repetition (§6); reconnecting per restart would open hundreds of new connections against a `60/minute` limit. Multiplexing keeps it at one, which the `established` rule then exempts entirely.
+- **Records ban state in the run manifest.** Before and after each pass, `nft list set inet filter banned_ips` over SSH; if the client IP appears, the run is marked `banned: true` and aborts rather than reporting a wall of connection errors as if they were latency.
+
+Adding the workstation to `TRUSTED_HOSTNAMES` in `deploy/quadlet/scripts/trusted-ips.env` is still worthwhile — it removes the connection-rate pre-filter as a confounding variable — but it is explicitly **not** the mitigation for any of the above, and the spec should not be read as suggesting it is.
 
 ## 6. Cache levels
 
@@ -243,6 +283,8 @@ Harness git revision and dirty status; `sha256` of `corpus/manifest.json`; the f
 | Host facts | `uname -a`, `lscpu`, `free -m`, `xfs_info` on the data disk | aarch64, RHEL 10.2, xfs on `/dev/sdb`. |
 | Unit state | `systemctl show` for `qlever`, `qlever-index-load`, `sparql-proxy` | Detects a run started against a partially-restarted stack. |
 | Concurrent activity | `systemctl is-active qlever-rebuild-index.service` | A rebuild is allotted `Memory=8g` and `--cpus=4` on a host whose server has 4. Any run overlapping one is contaminated and must be marked, not silently averaged in. |
+| Ban state | `nft list set inet filter banned_ips` | §5.4. Checked before and after every pass; the client IP appearing aborts the run. |
+| Enforcement config | `sha256` of the live `nftables.conf` and `jail.local`, plus `fail2ban-client status` | The 4xx thresholds and rate limits are now part of what determines observed latency and error rates, so a change to them must show up in a run diff exactly as a change to `-j` or `-c` would. |
 
 The rebuild-overlap check runs both before and after the measured pass; a run that overlapped a rebuild is flagged `contaminated: true` and `pgperf compare` refuses to use it as a baseline.
 
@@ -359,4 +401,6 @@ Steps 1–3 alone produce a usable per-query cost ranking on real hardware, whic
 - **QLever's cache-clear admin endpoint is assumed, not confirmed.** If the pinned build does not expose one, `cache-cold` collapses into `ice-cold` and the middle level is dropped. This does not affect §9's gate, which runs `warm`.
 - **Determinism sampling can be wrong** (§4.4). Accepted, with an explicit triage path, because the alternative — gating nothing on results — forfeits the only correctness signal available.
 - **`public` measurements include internet path variance.** Runs from a workstation over the public internet carry RTT and jitter that have nothing to do with the server. This is why `direct` exists and why baselines are per-target; it also means `public` p99 should not be read as a server property.
-- **Nothing here measures the endpoint under concurrency**, which is where the `rate=50r/s`, 60s-versus-300s, and 4-thread interactions actually bite. That is the entire point of spec 2, and no capacity claim should be made from this spec's output alone.
+- **The client-side circuit breaker is a mitigation, not a guarantee** (§5.4). It counts the 4xx responses *it* causes; it cannot see 4xx from anything else sharing the workstation's egress IP, and behind NAT or a shared office address the jail's counter is fed by traffic the harness never sent. A run from a shared address can therefore be banned despite the breaker behaving correctly. Running from an address the harness controls exclusively is the only real answer, and the first `public` run should be treated as a probe with console access available.
+- **The enforcement layer is new and still moving.** `nftables.conf`, `jail.local`, and the fail2ban units were untracked and being actively edited while this spec was written — `jail.local` changed from a journald backend to file polling against `/var/log/sparql-proxy/access.log` mid-design. §5.4's analysis rests on the jail's *thresholds* (`maxretry = 20`, `findtime = 1m`, any-4xx `failregex`), which held across that change, but the implementation plan must re-read these files rather than trusting this spec's transcription of them.
+- **Nothing here measures the endpoint under concurrency**, which is where the `rate=50r/s`, 60s-versus-300s, 4-thread, and now fail2ban interactions actually bite. That is the entire point of spec 2, and no capacity claim should be made from this spec's output alone. Spec 2 inherits §5.4 as a hard constraint: a load generator that trips a one-hour ban on itself mid-ramp produces no data and locks the operator out of the host it was testing.
