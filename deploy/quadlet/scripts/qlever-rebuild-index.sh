@@ -79,9 +79,49 @@ mc ls -r --json "pgraph/${MINIO_BUCKET}/nt-output/" | \
   jq -r 'select(.status == "success") | select(.key | test("\\.json$") | not) | "\(.key) \(.etag)"' | \
   sort > /tmp/etag-before.txt
 
-echo "Downloading all .nt and .graph files..."
-mc mirror --exclude '*.json' \
-  "pgraph/${MINIO_BUCKET}/nt-output/" /tmp/nt-output/ --overwrite
+# Early-exit skip: this same listing is a cheap, complete fingerprint of
+# nt-output/'s current contents. QLever's indexer isn't incremental --
+# every rebuild pays the full download+convert+build cost regardless of
+# how much actually changed, which is wasted work entirely on any night
+# where no collector uploaded anything new. Compare against the listing
+# hash saved after the last run that got this far (below); an identical
+# corpus means an identical index would result, so skip before doing any
+# of that work rather than after (the existing content-hash check further
+# down still catches the case where the corpus *did* change but happens to
+# produce a byte-identical index).
+CORPUS_LISTING_HASH=$(sha256sum /tmp/etag-before.txt | cut -d' ' -f1)
+MC_RC=0; mc_cat_check "pgraph/${MINIO_BUCKET}/qlever-index/latest" || MC_RC=$?
+if [ "$MC_RC" -eq 0 ]; then
+  PREV_LISTING_HASH=""
+  MC_RC2=0; mc_cat_check "pgraph/${MINIO_BUCKET}/qlever-index/last-corpus-listing-hash.txt" || MC_RC2=$?
+  [ "$MC_RC2" -eq 0 ] && PREV_LISTING_HASH="$MC_RESULT"
+  if [ "$PREV_LISTING_HASH" = "$CORPUS_LISTING_HASH" ]; then
+    echo "nt-output/ unchanged since the last completed run — skipping download/build entirely"
+    STATUS="unchanged"
+    exit 0
+  fi
+fi
+
+echo "Downloading all .nt/.nt.gz and .graph files..."
+# --overwrite is required, not optional. /tmp is the persistent
+# qlever-rebuild-scratch.volume (not tmpfs), so anything downloaded once
+# stays cached across runs -- that part of the original reasoning was
+# right. But without --overwrite, `mc mirror` treats ANY existing
+# destination file that doesn't exactly match (by size/mtime) as a
+# conflict and SKIPS it with a warning rather than updating it -- it does
+# NOT sync changed files, only skip-if-same or download-if-new. Confirmed
+# 2026-09-10: after fixing and re-uploading several graphs (cve-nvd,
+# ubuntu-noble, centos-stream-10) mid-incident, this step logged
+# "Overwrite not allowed for ... Use --overwrite to override this
+# behavior" for every one of them and silently kept indexing the stale,
+# broken bytes already sitting in the volume -- the exact same "Parse
+# error at byte position 11860648860" recurred twice in a row because the
+# fixed uploads never actually made it into /tmp/nt-output. With
+# --overwrite, a file that already matches by size+mtime is still skipped
+# (no needless re-transfer of genuinely-unchanged graphs); only an actual
+# mismatch now gets synced instead of silently ignored.
+mc mirror --overwrite --exclude '*.json' \
+  "pgraph/${MINIO_BUCKET}/nt-output/" /tmp/nt-output/
 
 # Verify no files changed during download (ETags catch same-size replacements)
 mc ls -r --json "pgraph/${MINIO_BUCKET}/nt-output/" | \
@@ -93,6 +133,14 @@ if ! diff -q /tmp/etag-before.txt /tmp/etag-after.txt >/dev/null 2>&1; then
   exit 1
 fi
 rm -f /tmp/etag-before.txt /tmp/etag-after.txt
+
+# Record this corpus state now that it's confirmed stable, so the next run's
+# early-exit check (above) can skip if nothing changes before then. Recorded
+# regardless of whether this run ends up promoting -- a crash before this
+# point (script error, indexer failure, etc.) simply leaves the previous
+# marker in place, so the next run correctly does NOT skip and retries the
+# full pipeline instead of getting stuck skipping forever.
+echo "$CORPUS_LISTING_HASH" | mc pipe "pgraph/${MINIO_BUCKET}/qlever-index/last-corpus-listing-hash.txt"
 
 GRAPH_FILES=$(find /tmp/nt-output -name '*.graph' | wc -l | tr -d ' ')
 echo "$GRAPH_FILES graphs discovered"
@@ -115,12 +163,17 @@ echo "Converting to N-Quads..."
 : > /tmp/packagegraph.nq
 : > /tmp/graph-uris.txt
 
-# Validate complete pairs — every .graph must have its .nt
+# Validate complete pairs — every .graph must have its .nt/.nt.gz. The
+# sidecar filename always embeds the real extension of its pair (whatever
+# upload-nt.sh wrote at upload time), so this works unchanged for both
+# older uncompressed .nt uploads and current .nt.gz ones -- no format
+# migration needed, the two coexist until each graph's own collector
+# naturally re-uploads it in the new format.
 INCOMPLETE=0
 for graph_file in /tmp/nt-output/*.graph; do
     nt_file="${graph_file%.graph}"
     if [ ! -f "$nt_file" ]; then
-        echo "ERROR: orphan sidecar $(basename "$graph_file") — .nt missing (concurrent upload in progress?)"
+        echo "ERROR: orphan sidecar $(basename "$graph_file") — .nt/.nt.gz missing (concurrent upload in progress?)"
         INCOMPLETE=$((INCOMPLETE + 1))
     fi
 done
@@ -137,11 +190,16 @@ for graph_file in /tmp/nt-output/*.graph; do
     nt_size=$(du -h "$nt_file" | cut -f1)
     echo "  $filename ($nt_size) → <$graph_uri>"
     echo "$graph_uri" >> /tmp/graph-uris.txt
-    sed "s| \.$| <${graph_uri}> .|" "$nt_file" >> /tmp/packagegraph.nq
-    rm -f "$nt_file" "$graph_file"
+    case "$nt_file" in
+        *.gz) gunzip -c "$nt_file" | sed "s| \.$| <${graph_uri}> .|" >> /tmp/packagegraph.nq ;;
+        *)    sed "s| \.$| <${graph_uri}> .|" "$nt_file" >> /tmp/packagegraph.nq ;;
+    esac
     GRAPH_COUNT=$((GRAPH_COUNT + 1))
 done
-rm -rf /tmp/nt-output
+# Deliberately not deleting /tmp/nt-output or its contents: it lives on
+# qlever-rebuild-scratch.volume (a real disk, not tmpfs -- see its own
+# comment), and keeping it around is what lets next run's mc mirror above
+# skip re-downloading every graph that hasn't changed since tonight.
 
 NQ_SIZE=$(du -sh /tmp/packagegraph.nq | cut -f1)
 TRIPLE_COUNT=$(wc -l < /tmp/packagegraph.nq)
