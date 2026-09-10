@@ -24,11 +24,6 @@ jobs:
       tags: |
         ${{ github.ref_name }}
         latest
-      # Historical behaviour, preserved deliberately: the ontology repo is
-      # cloned at the *platform* tag, so a platform release requires an
-      # identically named ontology tag to exist. ci.yml pins v0.13.0
-      # instead. Reconciling the two is a separate change.
-      ontology_ref: ${{ github.ref_name }}
 
   github-release:
     needs: publish
