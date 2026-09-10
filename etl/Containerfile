@@ -24,9 +24,14 @@ ENV JENA_HOME=/opt/jena
 ENV PATH="${JENA_HOME}/bin:${PATH}"
 
 # Install mc (Minio client) and kubectl (for rollout restart)
-RUN curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc \
+# Multi-arch: TARGETARCH is populated automatically by podman/buildah and
+# Docker buildx to the arch being built for ("amd64"/"arm64"), matching
+# both Minio's and Kubernetes' own release path segments directly -- see
+# etl/Containerfile.qlever-rebuild for the identical fix applied there.
+ARG TARGETARCH
+RUN curl -fsSL https://dl.min.io/client/mc/release/linux-${TARGETARCH}/mc -o /usr/local/bin/mc \
     && chmod +x /usr/local/bin/mc \
-    && curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl \
+    && curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${TARGETARCH}/kubectl" -o /usr/local/bin/kubectl \
     && chmod +x /usr/local/bin/kubectl
 
 # Copy pg-collect binary from Rust builder
