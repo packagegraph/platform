@@ -1054,8 +1054,15 @@ enum Commands {
         mode: String,
 
         /// Target graph URI for API mode (INSERT DATA destination)
+        // Deliberately not named `--graph`: that collides with the global
+        // `--graph` (N-Quads output) arg by name, and clap resolves both
+        // from the same matched value -- this arg's default_value silently
+        // leaked into the global one for every EnrichNvd invocation,
+        // including plain feed-mode runs that never passed `--graph` at
+        // all, causing feed-mode output to be written as pre-tagged
+        // N-Quads. Confirmed empirically 2026-09-10 via a debug eprintln.
         #[arg(long, default_value = "https://packagegraph.github.io/graph/cve/nvd")]
-        graph: String,
+        insert_graph: String,
 
         /// NVD API key for higher rate limits (optional, also via NVD_API_KEY env var)
         #[arg(long, env = "NVD_API_KEY")]
@@ -2931,7 +2938,7 @@ fn main() {
             endpoint,
             output,
             mode,
-            graph,
+            insert_graph,
             nvd_api_key,
             cache_dir,
         } => {
@@ -2967,7 +2974,7 @@ fn main() {
                         enricher.enrich(&output_path)
                     }
                     "api" => {
-                        eprintln!("Graph: {}", graph);
+                        eprintln!("Graph: {}", insert_graph);
                         if nvd_api_key.is_some() {
                             eprintln!("API Key: [provided]");
                         } else {
@@ -2983,7 +2990,7 @@ fn main() {
                             make_backend(),
                         )?
                         .with_graph(graph_uri.clone());
-                        enricher.enrich_api(&graph)
+                        enricher.enrich_api(&insert_graph)
                     }
                     _ => Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
