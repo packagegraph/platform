@@ -1,0 +1,21 @@
+# Schedules pg-collect@fedora-44-full.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=fedora-44-full, script: scripts/collectors/fedora-44-full.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+# Cadence: stable point release, same weekly tier as fedora-43-full and
+# debian-trixie-full. Scheduled Sunday (the other -full jobs run
+# Fri/Fri-Mon-Wed/Sat) to avoid piling multiple hours-long full collections
+# onto the same night.
+[Unit]
+Description=Schedule for pg-collect@fedora-44-full.service
+
+[Timer]
+OnCalendar=Sun *-*-* 02:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@fedora-44-full.service
+
+[Install]
+WantedBy=timers.target
