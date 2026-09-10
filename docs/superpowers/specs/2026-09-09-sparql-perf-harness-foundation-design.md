@@ -110,7 +110,8 @@ Queries move from string fields inside `spike/cq-queries.json` to individual `.r
       "class": "aggregate",
       "features": ["GROUP BY", "inverse-path", "FILTER NOT EXISTS"],
       "expect": { "min_rows": 1, "max_rows": 10000 },
-      "fingerprint": "sha256:…",
+      "max_row_drift_pct": 25,
+      "fingerprint": { "index_hash": "a1b2c3d4e5f60718", "sha256": "…" },
       "deterministic": true,
       "timeout_s": 300,
       "weight": 3,
@@ -124,14 +125,15 @@ Queries move from string fields inside `spike/cq-queries.json` to individual `.r
 |---|---|
 | `class` | One of `lookup`, `join`, `aggregate`, `path`, `graph`, `text`, `adversarial`. Drives per-class percentile reporting — a blended p95 across 65 queries hides the handful that are unusable. |
 | `features` | SPARQL constructs present, derived mechanically at manifest-generation time. Diagnostic, not gating. |
-| `expect.min_rows` / `max_rows` | Cardinality bounds. A query dropping to 0 rows is the signature of a partial index promotion and must be caught even where the fingerprint is not gated. |
-| `fingerprint` | `sha256` over the canonicalized bindings (§5.2). `null` when `deterministic` is false. |
-| `deterministic` | Measured, not asserted. See §4.4. |
+| `expect.min_rows` / `max_rows` | Absolute cardinality bounds. A query that should never return zero returning zero is the signature of a partial index promotion, and must be caught even where results themselves cannot be compared (§4.5). |
+| `max_row_drift_pct` | Relative cardinality tolerance across a promotion (§4.5). `null` opts a legitimately fast-moving query out. |
+| `fingerprint` | `sha256` over the canonicalized bindings (§5.2), **paired with the `index_hash` it was captured against** — a fingerprint is evidence about one index, not about the data (§4.4). `null` when `deterministic` is false. |
+| `deterministic` | Measured, not asserted. See §4.6. |
 | `timeout_s` | Per-query client timeout. Defaults to 300 to match `qlever-server -s 300s`; `public` runs additionally see nginx's 60s ceiling, which is recorded as a distinct outcome rather than a timeout (§5.3). |
 | `weight` | Relative frequency in a mixed load profile. **Unused by this spec**; present so spec 2's k6 workload consumes this same file rather than inventing a parallel corpus. |
 | `enabled` | Allows retiring a query without deleting it and losing its history. |
 
-The corpus at authoring time is heavy on inverse paths (42 of 65), `ORDER BY` (39), `DISTINCT` (24), `COUNT` (22), and `GROUP BY` (19), and light on property paths (3), named-graph scoping (3), and `UNION` (2). It contains no `SERVICE`, consistent with federation not being part of the service. The adversarial set (§4.5) exists to cover what the CQs do not.
+The corpus at authoring time is heavy on inverse paths (42 of 65), `ORDER BY` (39), `DISTINCT` (24), `COUNT` (22), and `GROUP BY` (19), and light on property paths (3), named-graph scoping (3), and `UNION` (2). It contains no `SERVICE`, consistent with federation not being part of the service. The adversarial set (§4.7) exists to cover what the CQs do not.
 
 ### 4.3 Migration and the existing consumers
 
@@ -140,18 +142,47 @@ The corpus at authoring time is heavy on inverse paths (42 of 65), `ORDER BY` (3
 - `spike/` is spike material that already served its purpose (`SPIKE-RESULTS.md`, recommendation GO, migration complete). `spike/profile-cqs.py` and `spike/cq-profile-results.json` are superseded by `perf/` and are **deleted** as part of this change; their behavior is subsumed by `pgperf profile`, and their amd64 results are actively misleading as a baseline (§1).
 - `etl/scripts/cq-validate.py` targets Fuseki for data-quality validation on a different cadence and is **left untouched**. `spike/cq-queries.json` remains in place as its input. The `perf/corpus/cq/*.rq` files are generated from it once by `pgperf manifest --import spike/cq-queries.json`, after which `perf/corpus/` is the source of truth for performance work. The two corpora are permitted to drift; a divergence check is explicitly not built, because the queries serve different purposes and forcing them to stay identical would couple two independent lifecycles.
 
-### 4.4 Determinism is measured
+### 4.4 What a fingerprint can and cannot gate
 
-Gating on result fingerprints only works if the fingerprints are stable. 39 of the 65 CQs use `ORDER BY` and 28 use `LIMIT`. Where the sort key has ties, `ORDER BY … LIMIT n` returns a genuinely different *set* between runs — not merely a different order, which canonicalization would absorb. Gating those queries produces a flapping gate, and a flapping gate is an ignored gate.
+A fingerprint is evidence about **one index**. It is not evidence about the *data*, and conflating the two produces a gate that fires on every successful rebuild.
 
-`pgperf manifest` therefore executes each query three times in immediate succession and compares fingerprints:
+`qlever-rebuild-index.sh` promotes if and only if the index content hash differs from `latest`; identical content sets `STATUS="unchanged"` and exits without promoting (lines 181–183). So a promotion, by construction, means the data changed — new packages, new CVEs, refreshed enrichment. Deterministic queries over changed data return different results, correctly. A gate comparing a post-promotion fingerprint against a pre-promotion baseline would therefore reject essentially every real promotion, which is worse than no gate: it trains the operator to ignore it.
 
-- All three identical → `deterministic: true`, fingerprint recorded, gated on results.
-- Any difference → `deterministic: false`, `fingerprint: null`, a `nondeterminism_note` recorded. The query is still timed and still cardinality-checked; it never gates on results.
+Fingerprints are consequently scoped to the index they were captured against. Every fingerprint is stored with the `index_hash` it came from, and `pgperf compare` selects its mode from whether the two runs share one:
 
-Three runs is a heuristic, not a proof — a query with a rare tie may pass and later flap. `pgperf compare` therefore treats a first-ever fingerprint mismatch on a `deterministic: true` query as a finding to triage, and `pgperf manifest --recheck <id>` demotes it to non-deterministic if that is what triage concludes. The failure mode is a false positive requiring human judgment, which is the correct direction for a safety gate.
+| Mode | Condition | Result gating |
+|---|---|---|
+| `same-index` | baseline and run share `index_hash` | Full. Fingerprint mismatch is exit 2. |
+| `cross-index` | `index_hash` differs — a real promotion | Fingerprints are not compared. §4.6 applies instead. |
 
-### 4.5 Adversarial set
+`same-index` is not a degenerate case; it is how you gate everything that is *not* a data change. A QLever version bump, a change to `-j`/`-m`/`-c`/`-k`, a kernel or filesystem change, a host migration, or latent non-determinism all reproduce against a fixed index, and against a fixed index a fingerprint mismatch is unambiguous evidence of a correctness regression. Any change to the serving stack should be validated this way *before* it meets a new index.
+
+`cross-index` is the nightly-promotion case and is the one that needs §4.6.
+
+### 4.5 Gating a data-changing promotion
+
+Across a promotion, the question is not "are the results identical" but "does every query still answer, and does it answer with a plausible amount of data". Three checks, none of which require an authoritative reference dataset:
+
+1. **Still answers.** The query returns a non-error result. A query that newly errors or times out is a regression regardless of what the data did (§9.3).
+2. **Absolute bounds.** Row count within the manifest's `expect.min_rows`/`max_rows` (§4.2). These are wide, hand-set sanity rails — a query that should never return zero returning zero is caught here even when the exact set legitimately changed.
+3. **Relative drift.** Row count change against the baseline within a per-query tolerance, `max_row_drift_pct`, defaulting to 25%. This mirrors the promotion pipeline's existing `MAX_LOSS_PCT=25` but per query rather than over the whole corpus — and that is the point. The global triple-count gate cannot see a rebuild where the total is healthy because one collector grew while another silently produced nothing; a per-query drift check over 65 queries spanning package management, licensing, security, provenance, and five ecosystems can. This is the single highest-value thing this gate adds over what already exists.
+
+Queries whose result size legitimately moves fast (recent-CVE windows, "packages updated in the last 30 days") set a wider `max_row_drift_pct` or `null` to opt out. Setting it per query rather than globally is what keeps the tolerance tight where it can be tight.
+
+Row *count* rather than row *content* is deliberate: content comparison across a data change requires knowing what the data should have become, which is the ETL pipeline's job and not something this harness can independently establish.
+
+### 4.6 Determinism is measured
+
+Independent of §4.4's scoping, a fingerprint is only usable if it is stable *within* a fixed index. 39 of the 65 CQs use `ORDER BY` and 28 use `LIMIT`. Where the sort key has ties, `ORDER BY … LIMIT n` returns a genuinely different *set* between executions — not merely a different order, which canonicalization would absorb. Gating those queries produces a flapping gate, and a flapping gate is an ignored gate.
+
+`pgperf manifest` therefore executes each query three times in immediate succession against one index and compares fingerprints:
+
+- All three identical → `deterministic: true`, fingerprint recorded with its `index_hash`, eligible for `same-index` result gating.
+- Any difference → `deterministic: false`, `fingerprint: null`, a `nondeterminism_note` recorded. The query is still timed and still subject to §4.5's checks; it never gates on results.
+
+Three executions is a heuristic, not a proof — a query with a rare tie may pass and later flap. In `same-index` mode `pgperf compare` treats a first-ever fingerprint mismatch as a finding to triage, and `pgperf manifest --recheck <id>` demotes it to non-deterministic if that is what triage concludes. The failure mode is a false positive requiring human judgment, which is the correct direction for a safety gate.
+
+### 4.7 Adversarial set
 
 Authored in this spec because the manifest schema and container must accommodate it, but **exercised by spec 2**. It covers what a public unauthenticated endpoint will eventually receive and what the CQ corpus does not:
 
@@ -171,10 +202,14 @@ Each carries `class: "adversarial"` and `deterministic: false`. Selection is by 
 
 | Mode | Endpoint | Path exercised |
 |---|---|---|
-| `public` | `https://packagegraph.di.riseproject.dev` | TLS 1.2/1.3, HTTP/2, gzip over `application/sparql-results+json`, `limit_req rate=50r/s burst=100 nodelay`, `proxy_read_timeout 60s`, `proxy_buffering on` with 8×16k buffers, upstream keepalive 32 |
+| `public` | `https://packagegraph.di.riseproject.dev` | TLS 1.2/1.3 over **HTTP/1.1** (see below), gzip over `application/sparql-results+json`, `limit_req rate=50r/s burst=100 nodelay`, `proxy_read_timeout 60s`, `proxy_buffering on` with 8×16k buffers, upstream keepalive 32 |
 | `direct` | `127.0.0.1:7001` via SSH local-forward to the host | `qlever-server` alone |
 
 Both are first-class and every run records which was used. The difference between them is itself a measurement: proxy and TLS overhead, gzip cost against response size, and the 60s cliff. Mixing them in one baseline is a category error, so `pgperf compare` refuses to compare runs with different `target` values.
+
+**The profiler speaks HTTP/1.1, and production speaks HTTP/2.** `nginx.conf` sets `http2 on` for the 443 listener, but the stdlib decision in §3 fixes the client at HTTP/1.1 — `http.client.HTTPConnection._http_vsn_str` is `HTTP/1.1` and there is no HTTP/2 implementation in the standard library. This is accepted rather than fixed: adding an HTTP/2 client means adding a third-party dependency and abandoning the stdlib-only constraint, for a difference that is small and *constant* in the serial, one-request-in-flight regime this spec measures. HTTP/2's advantages — multiplexing, header compression across concurrent streams — are properties of concurrency, which this spec explicitly does not exercise.
+
+Two consequences must be recorded rather than forgotten. `public` runs slightly overstate per-request overhead versus a real HTTP/2 client, so the `public`-minus-`direct` delta is an upper bound on proxy cost. And spec 2's k6 *does* negotiate HTTP/2, so its numbers are not directly comparable to this spec's `public` baselines. The protocol version is written into the run manifest for exactly this reason, and `compare` treats it as part of comparability.
 
 `cache-cold` (§6) requires the QLever access token, which the proxy rejects by design (`if ($arg_access_token) { return 403; }`), so that cache level implies `direct`.
 
@@ -196,7 +231,7 @@ Storing a hash rather than the bindings keeps run artifacts small and makes base
 | `SPARQL_ERROR` | HTTP 200 with an `exception` key, or a 4xx carrying a QLever error body |
 | `HTTP_ERROR` | Any other unexpected status from QLever itself |
 | `PROXY_TIMEOUT` | 504 from nginx — QLever is still executing; the run notes the orphan |
-| `RATE_LIMITED` | 503 from `limit_req` |
+| `RATE_LIMITED` | 503 **carrying a rate-limit provenance marker**. Without one, a 503 is `HTTP_ERROR` — see below. |
 | `CLIENT_TIMEOUT` | Local socket timeout at `timeout_s` |
 | `CONNECTION_ERROR` | TCP/TLS failure, connection reset, DNS failure |
 | `BANNED` | Connections failing at the TCP layer on both 443 and 22 after earlier success — an nftables ban (§5.4) |
@@ -206,6 +241,15 @@ Storing a hash rather than the bindings keeps run artifacts small and makes base
 `FINGERPRINT_MISMATCH` and `CARDINALITY_VIOLATION` are *correctness* outcomes layered on top of a successful request; a sample carries both a transport outcome and, where applicable, a correctness outcome, rather than collapsing them. Timing from a correctness-failing sample is retained but excluded from latency aggregates by default, since a query returning the wrong number of rows is not measuring the same work.
 
 `BANNED` is a tenth outcome (§5.4): connections failing at the TCP layer on both 443 and 22 after earlier success is the signature of an nftables ban rather than an ordinary connection failure. It is separated from `CONNECTION_ERROR` so a banned run is discarded as a measurement rather than contributing a wall of fast failures to the latency distribution.
+
+**A bare 503 is not attributable.** nginx returns 503 for `limit_req`, but also when every server in an upstream block is marked unavailable — and the current `sparql-proxy/nginx.conf` sets no `limit_req_status` and adds no header distinguishing the two. Both are plausible during exactly the saturation conditions where telling them apart matters most: one means "the proxy shed my load", the other means "QLever is down". Classifying every 503 as `RATE_LIMITED` would let a genuine backend outage be silently discarded as an enforcement artifact.
+
+So the client classifies 503 as `RATE_LIMITED` only when a provenance marker is present, and as `HTTP_ERROR` otherwise, with the ambiguity recorded on the sample. Making the marker exist is a one-line proxy change, offered here as a recommendation rather than assumed as a dependency, since `nginx.conf` belongs to the team maintaining the enforcement layer:
+
+- **Preferred:** keep `limit_req_status 503` and attach a marker — `limit_req_status 503; error_page 503 = @ratelimited; location @ratelimited { add_header X-PG-RateLimit 1 always; return 503; }`. Unambiguous, and stays 5xx.
+- **Not recommended without discussion:** `limit_req_status 429`. Semantically the better code, but 429 matches `fail2ban/filter.d/sparql-proxy-abuse.conf`'s `failregex = ^<HOST> -.*"(GET|POST) \S+ HTTP/\d\.\d" 4\d\d`, so rate-limited clients would begin accruing toward a ban. That may even be desirable for real abusers, but it is a change in enforcement behavior and should be a deliberate decision, not a side effect of improving harness observability.
+
+Until a marker exists, saturation findings involving 503s carry an explicit caveat rather than a rate-limit attribution.
 
 ### 5.4 The enforcement path as a measurement confounder
 
@@ -226,7 +270,7 @@ A run that silently averages 503s, dropped SYNs, and real query latency into one
 - **The run manifest records ban state** before and after each pass (`nft list set inet filter banned_ips`). If the client IP appears, the run is marked `banned: true` and discarded as a measurement — the point is not to avoid the ban but to avoid publishing a p99 computed from dropped packets.
 - **One multiplexed SSH connection** (`ControlMaster` / `ControlPersist`) serves telemetry and the `direct` tunnel. This is correct regardless of rate limits: `ice-cold` restarts the service before every repetition (§6), and reconnecting each time would add connection-setup cost to a measurement about query latency.
 
-Adversarial queries (§4.5) default to `direct`, which bypasses nginx and the jail entirely — again for measurement cleanliness, since the point of those queries is to observe QLever's behavior under a hostile query, not nginx's behavior under a 4xx burst.
+Adversarial queries (§4.7) default to `direct`, which bypasses nginx and the jail entirely — again for measurement cleanliness, since the point of those queries is to observe QLever's behavior under a hostile query, not nginx's behavior under a 4xx burst.
 
 ## 6. Cache levels
 
@@ -234,11 +278,15 @@ Adversarial queries (§4.5) default to `direct`, which bypasses nginx and the ja
 
 | Level | Action before the measured pass | Clears | Requires |
 |---|---|---|---|
-| `warm` | A full warming pass over the corpus, discarded | nothing | — |
-| `cache-cold` | QLever's cache-clear admin endpoint, before *every* repetition | query cache | access token, therefore `direct` |
-| `ice-cold` | `systemctl restart qlever.service` and `echo 3 > /proc/sys/vm/drop_caches` over SSH, before *every* repetition | query cache, process state, page cache | root SSH |
+| `warm` | One warming pass over the corpus, discarded, before the measured pass begins | nothing | — |
+| `cache-cold` | QLever's cache-clear admin endpoint, before **each individual query execution** | query cache | access token, therefore `direct` |
+| `ice-cold` | `systemctl restart qlever.service`, then `sync && echo 3 > /proc/sys/vm/drop_caches` over SSH, before **each individual query execution** | query cache, process state, page cache | root SSH |
 
-The granularity matters and differs by level. `warm` measures steady state, so the cache is primed once and every repetition benefits. `cache-cold` and `ice-cold` measure a first-execution cost, so the clearing action repeats before each repetition — clearing once and then running five repetitions would produce one cold sample and four warm ones averaged together, which is the exact confusion these levels exist to prevent. This makes `ice-cold` expensive: each repetition pays a service restart plus the readiness wait, so its default repetition count is 3 rather than 5, and the profiler reports the total wall time of the pass so the cost is visible.
+**Scheduling unit.** The clearing action for `cache-cold` and `ice-cold` runs before *every individual query sample* — that is, the loop is `for query: for repetition: clear; execute`, not `clear; for query: for repetition: execute`. Clearing once per pass would yield one cold sample and N−1 warm ones averaged together, which is the exact confusion these levels exist to prevent. `warm` is the opposite by design: the cache is primed once by the discarded pass and every subsequent sample benefits, because steady state is what it measures.
+
+`sync` before `drop_caches` is not optional. `drop_caches` frees only *clean* pages; without a preceding `sync`, dirty pages stay resident and the "cold" condition is neither achieved nor reproducible between runs.
+
+This makes `ice-cold` expensive — every sample pays a service restart plus a readiness wait — so its default repetition count is 3 rather than 5, and the profiler reports the pass's total wall time so the cost is visible up front.
 
 `warm` explicitly *performs* the warming pass rather than discarding early samples, and the discarded pass is recorded in the run artifacts. Quietly dropping the first N samples is the standard way benchmarks become unreproducible.
 
@@ -286,11 +334,25 @@ Three time sources per sample, all retained:
 
 1. **Wall time**, `time.monotonic()` around the request: connection setup, TLS, queuing, planning, execution, serialization, gzip, and transfer.
 2. **`meta.query-time-ms`** from QLever's own JSON response: execution as the engine accounts for it.
-3. **`QueryEventLog`**, harvested from `/data` after the run and joined by query: QLever's own per-query event stream.
+3. **`QueryEventLog`**, harvested from `/data` after the run: QLever's own per-query event stream. **Run-level evidence by default** — see §8.2.1 for why per-sample attribution is conditional.
 
 The gap between (1) and (2) is where proxy, serialization, and transfer costs live, and separating them is what distinguishes "the engine got slower" from "the response got bigger" or "nginx started buffering to disk". Response size in bytes is recorded alongside, both compressed and uncompressed on `public` runs, because `gzip_comp_level 5` over large JSON is real CPU on a 4-core box.
 
-The `QueryEventLog` join is best-effort: if the log is unreadable or the format is not what this spec assumes, the run records `qlever_events: {"available": false, "reason": …}` and continues on sources (1) and (2). The implementation plan must verify the log's actual on-disk format against the pinned image before relying on it.
+#### 8.2.1 Joining the event log is conditional, not assumed
+
+"Joined by query" is not a specification. With 5 repetitions of an identical query string, query text is not a key, and nothing in this spec has yet established that the log carries one. Promising per-sample attribution on an unverified schema would produce confidently mis-attributed server-side timings — worse than having none, because they would look authoritative.
+
+Attribution is therefore staged, and the stage in force is recorded on the run:
+
+| Stage | Condition | What is claimed |
+|---|---|---|
+| `per-sample` | The log exposes a stable per-query correlation key that the client can also observe or derive | Each sample joined to its event. Full attribution. |
+| `ordinal` | No correlation key, but events are ordered and countable per query text | Events matched to samples by (query, execution ordinal) within the run window. Valid only for a serial profiler — which this is — and explicitly void for spec 2. |
+| `run-level` | Neither holds, or the schema is unrecognized | Events retained as unjoined run evidence. No per-sample claim. |
+
+The implementation plan must read the log's actual on-disk format in `docker.io/adfreiburg/qlever:commit-1075455fae` and record which stage applies before any code depends on it. `run-level` is the default until that verification happens, and the degradation path is unchanged: an unreadable or unrecognized log records `qlever_events: {"available": false, "reason": …}` and the run continues on sources (1) and (2).
+
+Both `per-sample` and `ordinal` need a clock-skew policy, since the log is written on the host and the samples are timed on the workstation. At run start and again at run end the profiler records the offset between the host's clock and its own (`ssh <host> date +%s.%N` against a local reading, halving the round-trip), stores both offsets and the drift between them in the run manifest, and widens the join window by the observed drift. If drift exceeds the window, attribution downgrades to `run-level` for that run rather than producing joins that cannot be trusted.
 
 ### 8.3 Host telemetry
 
@@ -313,14 +375,37 @@ Written to `output/perf/<run-id>/`, where `<run-id>` is `<target>-<cache-level>-
 |---|---|
 | `manifest.json` | §7, client and server |
 | `samples.json` | Every individual sample: query id, repetition, wall ms, engine ms, rows, bytes, transport outcome, correctness outcome |
-| `summary.json` | Per-query, per-class, and overall aggregates. The comparison input. |
+| `summary.json` | An `identity` block plus per-query, per-class, and overall aggregates. The comparison input, and self-contained (below). |
 | `telemetry.json` | §8.3 time series |
 | `qlever-events.jsonl` | Harvested `QueryEventLog`, when available |
 | `summary.md` | Human-readable digest, in the shape of `docs/reports/` writeups |
 
+`summary.json` embeds an `identity` block so it stands alone as a comparison operand. `manifest.json` remains the exhaustive record; `identity` is the subset `compare` needs, copied in at write time:
+
+```json
+{
+  "identity": {
+    "run_id": "public-warm-20260909T142211Z",
+    "target": "public",
+    "cache_level": "warm",
+    "repetitions": 5,
+    "corpus_hash": "sha256:…",
+    "index_hash": "a1b2c3d4e5f60718",
+    "index_size_bytes": 41203847612,
+    "qlever_image": "docker.io/adfreiburg/qlever:commit-1075455fae",
+    "qlever_exec": "/qlever/qlever-server -i … -j 4 -m 4G -c 1G -e 500M -k 200 -s 300s",
+    "contaminated": false,
+    "contamination_reasons": []
+  },
+  "queries": { }, "classes": { }, "overall": { }
+}
+```
+
+Duplicating these fields is deliberate. A committed baseline is one file in git with no sibling run directory, so any field `compare` needs must live inside it — and pinning `index_hash`, `qlever_image`, and `qlever_exec` into the baseline is what lets a diff say *what changed* rather than only *that something did*.
+
 ### 9.2 Baselines
 
-Committed under `perf/baselines/<target>-<date>.json` — the `summary.json` of a run designated as reference, one per target mode. Committing them makes "what did this look like before" answerable from a clone, which the `output/` directory does not provide.
+Committed under `perf/baselines/<target>-<date>.json` — the `summary.json` of a run designated as reference, one per target mode. Committing them makes "what did this look like before" answerable from a clone, which the `output/` directory does not provide. Because `identity` travels with the file, a baseline remains interpretable years later without the run that produced it.
 
 ### 9.3 `pgperf compare`
 
@@ -328,18 +413,25 @@ Committed under `perf/baselines/<target>-<date>.json` — the `summary.json` of 
 pgperf compare perf/baselines/public-2026-09-09.json output/perf/<run-id>/summary.json
 ```
 
-Refuses to compare across different `target` or `cache_level` values, or against a `contaminated` run. Reports, and gates on:
+Both operands are `summary.json` files and each is self-contained (§9.1): the `identity` block carries everything the comparison needs, so `compare` never has to reach into a sibling `manifest.json` or a run directory that a committed baseline does not have.
 
-| Condition | Exit | Rationale |
-|---|---|---|
-| `FINGERPRINT_MISMATCH` on any `deterministic: true` query | 2 | Correctness. The highest-severity signal available and the one the existing volumetric promotion gates cannot produce. |
-| `CARDINALITY_VIOLATION` on any query | 2 | Catches partial index promotion even where results are not gated. |
-| New `SPARQL_ERROR` or `CLIENT_TIMEOUT` on a query that previously succeeded | 2 | A query that stopped working. |
-| Per-query p95 regression beyond threshold (default 25%) | 1 | Suppressed when the baseline's coefficient of variation exceeds 0.3, so noisy queries do not generate standing false alarms. |
-| Per-class p95 regression beyond threshold (default 15%) | 1 | Class aggregates are steadier than individual queries and catch broad regressions individual thresholds would miss. |
-| Index size growth beyond threshold (default 20%) | 1 | Directly relevant on a 512G disk holding both the index and rebuild scratch. |
+`compare` first establishes comparability, refusing to proceed if `target`, `cache_level`, or `corpus_hash` differ, or if either side is `contaminated`. It then selects `same-index` or `cross-index` mode by comparing `index_hash` (§4.4), and reports and gates on:
 
-Exit 2 is correctness, exit 1 is performance, exit 0 is clean. Separating them lets an operator wire correctness into a promotion gate immediately while treating latency as advisory until enough baselines exist to trust the thresholds.
+| Condition | Mode | Exit | Rationale |
+|---|---|---|---|
+| `FINGERPRINT_MISMATCH` on any `deterministic: true` query | `same-index` only | 2 | Correctness against a fixed index — unambiguous evidence of a serving-stack regression. Not evaluated across a promotion, where changed results are expected (§4.4). |
+| `CARDINALITY_VIOLATION` — row count outside `expect` | both | 2 | Absolute sanity rails. |
+| Row-count drift beyond `max_row_drift_pct` | `cross-index` | 2 | The per-query analogue of the pipeline's global `MAX_LOSS_PCT` (§4.5); catches one collector silently emptying while the corpus total stays healthy. |
+| Query newly returns `SPARQL_ERROR`, `HTTP_ERROR`, `PROXY_TIMEOUT`, or `CLIENT_TIMEOUT` after previously succeeding | both | 2 | A query that stopped answering. `PROXY_TIMEOUT` is included deliberately: it means the query crossed nginx's 60s ceiling, which is a user-visible failure whatever QLever is still doing behind it. |
+| Query newly returns `CONNECTION_ERROR` | both | 2 or contaminated | Routed by evidence, not assumption. If the run manifest's server-side unit state shows `qlever.service` restarted or changed `ActiveEnterTimestamp` mid-run, this is a crash and exits 2. Otherwise it is treated as client-side or network noise and marks the run contaminated. |
+| Any `RATE_LIMITED` or `BANNED` sample | both | contaminated | Enforcement-layer artifacts, not properties of the server (§5.4). These never gate; they invalidate. |
+| Per-query p95 regression beyond threshold (default 25%) | both | 1 | Suppressed when the baseline's coefficient of variation exceeds 0.3, so noisy queries do not generate standing false alarms. |
+| Per-class p95 regression beyond threshold (default 15%) | both | 1 | Class aggregates are steadier than individual queries and catch broad regressions individual thresholds would miss. |
+| Index size growth beyond threshold (default 20%) | both | 1 | Directly relevant on a 512G disk holding both the index and rebuild scratch. |
+
+Exit 2 is correctness, exit 1 is performance, exit 0 is clean, and a contaminated verdict is exit 3 — distinct from all three, because "this run cannot be trusted" is not "this run passed" and must never be read as one. Separating them lets an operator wire correctness into a promotion gate immediately while treating latency as advisory until enough baselines exist to trust the thresholds.
+
+The general rule behind the table: **every outcome that is not `OK` is a gate failure unless it is attributable to the enforcement layer or to the client.** New non-answer outcomes are enumerated explicitly rather than defaulted, so adding a tenth outcome to §5.3 forces a decision here rather than silently landing in the pass bucket.
 
 ### 9.4 Relationship to the promotion pipeline
 
@@ -352,11 +444,14 @@ Note also that `qlever-rebuild-index.timer` is **not currently enabled** on the 
 The harness is measurement code, so its own tests are about correctness of classification and aggregation, not about performance:
 
 - `canonicalize_bindings` and hashing: order independence for permuted bindings, and inequality across differing `datatype`, `xml:lang`, and `type` — the distinctions §5.2 exists to preserve.
-- Outcome classification: table-driven over synthetic responses covering every row of §5.3, in particular that a 503 from `limit_req` classifies as `RATE_LIMITED` and a 504 from nginx as `PROXY_TIMEOUT`, since collapsing either into a generic error is the specific failure this taxonomy prevents.
+- Outcome classification: table-driven over synthetic responses covering every row of §5.3. Specifically: a 504 classifies as `PROXY_TIMEOUT`; a 503 **with** a rate-limit marker as `RATE_LIMITED`; a 503 **without** one as `HTTP_ERROR` with the ambiguity flagged. That last case is the regression test for the attribution bug in §5.3 — a bare 503 must never be silently absorbed as an enforcement artifact.
+- **Gate mode selection** (§4.4): identical `index_hash` selects `same-index` and evaluates fingerprints; differing `index_hash` selects `cross-index` and does not. A fixture where results changed across a promotion must exit 0, since that is the false-positive this design exists to prevent.
+- **Row-drift gating** (§4.5): drift inside `max_row_drift_pct` passes; outside it exits 2; `max_row_drift_pct: null` opts out entirely. Include a fixture where the corpus-wide triple count is healthy but one query collapses, since catching that is the gate's main value over the existing volumetric checks.
 - Percentile and coefficient-of-variation computation against known inputs.
-- Manifest validation: unknown `class`, missing `file`, `deterministic: true` with a null `fingerprint`, and `min_rows > max_rows` are all rejected at load.
-- `compare` gating: fixture pairs producing each exit code, including the coefficient-of-variation suppression and the refusal to compare mismatched targets or a contaminated baseline.
-- Degradation paths: SSH unavailable, `QueryEventLog` absent or malformed, telemetry sampler failing mid-run. Each must produce a complete run with an `available: false` marker rather than a crash or, worse, a silently incomplete manifest.
+- Manifest validation: unknown `class`, missing `file`, `deterministic: true` with a null `fingerprint`, a `fingerprint` lacking its `index_hash`, and `min_rows > max_rows` are all rejected at load.
+- `compare` gating: fixture pairs producing each of exit 0/1/2/3, including coefficient-of-variation suppression, the `CONNECTION_ERROR` routing that depends on server-side unit state, and refusal on mismatched `target`, `cache_level`, or `corpus_hash`.
+- **Self-containment** (§9.1): `compare` must run against two `summary.json` files with no run directory and no `manifest.json` present — the committed-baseline case. A test that passes only because a sibling file happened to exist would hide exactly the defect this schema change fixes.
+- Degradation paths: SSH unavailable, `QueryEventLog` absent or malformed, telemetry sampler failing mid-run, and clock drift exceeding the join window (§8.2.1). Each must produce a complete run with an `available: false` marker or a downgraded attribution stage, rather than a crash or, worse, a silently incomplete manifest.
 
 Tests run against fixtures with no live endpoint. Whether these run in CI is deferred: `.github/workflows/ci.yml` has no Python job today, and adding one is a small but real new convention. The tests are written to be CI-ready regardless.
 
@@ -383,7 +478,10 @@ Steps 1–3 alone produce a usable per-query cost ranking on real hardware, whic
 
 - **`QueryEventLog` format is unverified.** Its existence is established by the `User=999` fix in `docs/QLEVER-HOST-OPERATIONS.md`, but its schema in `adfreiburg/qlever:commit-1075455fae` has not been read. Step 5 must confirm it before the join is relied on; §8.2's degradation path exists so this cannot block the rest.
 - **QLever's cache-clear admin endpoint is assumed, not confirmed.** If the pinned build does not expose one, `cache-cold` collapses into `ice-cold` and the middle level is dropped. This does not affect §9's gate, which runs `warm`.
-- **Determinism sampling can be wrong** (§4.4). Accepted, with an explicit triage path, because the alternative — gating nothing on results — forfeits the only correctness signal available.
+- **Determinism sampling can be wrong** (§4.6). Accepted, with an explicit triage path, because the alternative — gating nothing on results — forfeits the only correctness signal available.
+- **`max_row_drift_pct` defaults are guesses** (§4.5). 25% is borrowed from the pipeline's `MAX_LOSS_PCT` and has no empirical basis per query. The first several promotions should be run with the gate advisory, its findings triaged, and the per-query tolerances tuned from observed drift before it blocks anything. A drift gate calibrated from one run's data is a gate calibrated from noise.
+- **`cross-index` mode cannot detect a wrong-but-plausible result.** If a rebuild changes results *incorrectly* while keeping row counts within tolerance, nothing here catches it. Establishing that would require an authoritative reference for what the data should have become, which belongs to the ETL pipeline, not to a performance harness. The honest scope of this gate is "still answers, plausibly sized, no slower" — not "correct".
+- **Server-side attribution may never reach `per-sample`** (§8.2.1). If the pinned image's `QueryEventLog` carries no correlation key, the profiler falls back to ordinal matching, which is sound only because this spec is strictly serial. Spec 2 gets no such fallback and will need a real key or no per-query server-side timing at all.
 - **`public` measurements include internet path variance.** Runs from a workstation over the public internet carry RTT and jitter that have nothing to do with the server. This is why `direct` exists and why baselines are per-target; it also means `public` p99 should not be read as a server property.
 - **The enforcement layer is new and still moving.** `nftables.conf`, `jail.local`, and the fail2ban units were untracked and being actively edited while this spec was written — `jail.local` changed from a journald backend to file polling against `/var/log/sparql-proxy/access.log` mid-design, and the team owns further changes. §5.4 rests on the jail's *thresholds* and on which layer produces which response code, both of which held across that change, but the implementation plan must re-read these files rather than trusting this spec's transcription. Since the run manifest hashes the live config (§7.2), drift shows up in run diffs rather than silently invalidating baselines.
 - **Nothing here measures the endpoint under concurrency**, which is where the `rate=50r/s`, 60s-versus-300s, and 4-thread interactions actually bite. That is the entire point of spec 2, and no capacity claim should be made from this spec's output alone. Spec 2 inherits §5.4's distinction between enforcement responses and real latency as a correctness requirement for its own reporting — a saturation curve built partly on 503s and dropped SYNs describes the wrong system.
