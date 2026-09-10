@@ -1,5 +1,5 @@
 .PHONY: build-etl build-qlever-rebuild build-fuseki push-etl push-qlever-rebuild push-fuseki deploy-dev deploy-prod \
-       scale-readers port-forward
+       scale-readers port-forward perf-test
 
 REGISTRY ?= ghcr.io/packagegraph
 ETL_IMAGE = $(REGISTRY)/etl
@@ -53,3 +53,8 @@ refresh-readers:
 port-forward:
 	@echo "Forwarding Fuseki to localhost:3030 — press Ctrl+C to stop"
 	oc port-forward svc/fuseki 3030:3030 -n packagegraph
+
+# --- Performance harness (perf/) ---
+# Stdlib-only Python; no venv, no dependency install. See perf/README.md.
+perf-test:
+	cd perf && python3 -m unittest discover -s tests -t . -v
