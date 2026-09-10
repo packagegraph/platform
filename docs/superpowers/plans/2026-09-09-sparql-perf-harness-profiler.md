@@ -218,7 +218,7 @@ def summarize(values):
 cd perf && python3 -m unittest discover -s tests -t . -v
 ```
 
-Expected: `OK` — 10 tests.
+Expected: `OK` — 9 new tests pass; 9 total, 0 failures.
 
 - [ ] **Step 6: Add the Make target**
 
@@ -238,7 +238,7 @@ perf-test:
 make perf-test
 ```
 
-Expected: `OK` — 10 tests.
+Expected: `OK` — 9 new tests pass; 9 total, 0 failures.
 
 - [ ] **Step 8: Commit**
 
@@ -420,7 +420,7 @@ def fingerprint(bindings):
 make perf-test
 ```
 
-Expected: `OK` — 21 tests.
+Expected: `OK` — 11 new tests pass; 20 total, 0 failures.
 
 - [ ] **Step 5: Commit**
 
@@ -677,7 +677,7 @@ def check_cardinality(rows, expect):
 make perf-test
 ```
 
-Expected: `OK` — 42 tests.
+Expected: `OK` — 19 new tests pass; 39 total, 0 failures.
 
 - [ ] **Step 5: Commit**
 
@@ -1025,7 +1025,7 @@ def manifest_hash(manifest_path):
 make perf-test
 ```
 
-Expected: `OK` — 60 tests.
+Expected: `OK` — 17 new tests pass; 56 total, 0 failures.
 
 - [ ] **Step 5: Commit**
 
@@ -1379,7 +1379,7 @@ class Client:
 make perf-test
 ```
 
-Expected: `OK` — 78 tests.
+Expected: `OK` — 16 new tests pass; 72 total, 0 failures.
 
 - [ ] **Step 5: Commit**
 
@@ -1608,7 +1608,7 @@ class Ssh:
 make perf-test
 ```
 
-Expected: `OK` — 90 tests.
+Expected: `OK` — 11 new tests pass; 83 total, 0 failures.
 
 - [ ] **Step 5: Commit**
 
@@ -1872,9 +1872,21 @@ class CacheController:
         self._restart_and_drop_caches()
 
     def _clear_query_cache(self):
-        # Requires the access token, which the proxy rejects -- so this
-        # level implies a direct target (spec 6).
-        self.client.execute("", timeout_s=30)
+        # QLever's cache-clear admin endpoint is UNCONFIRMED for the pinned
+        # image (spec 13). Fail loudly rather than silently no-op: a
+        # cache-cold pass that never actually cleared anything would report
+        # warm numbers under a cold label, which is worse than not running.
+        #
+        # To implement: verify the endpoint against
+        # docker.io/adfreiburg/qlever:commit-1075455fae, then issue it here
+        # with the access token (hence direct-only). If no such endpoint
+        # exists, spec 13's fallback applies -- drop this level and keep
+        # warm and ice-cold.
+        raise NotImplementedError(
+            "cache-cold is not implemented: QLever's cache-clear endpoint is "
+            "unverified for the pinned image (spec section 13). Use --cache-level "
+            "warm or ice-cold."
+        )
 
     def _restart_and_drop_caches(self):
         self.conn.run("systemctl restart qlever.service", timeout=180)
@@ -1974,7 +1986,7 @@ def aggregate(samples):
 make perf-test
 ```
 
-Expected: `OK` — 103 tests.
+Expected: `OK` — 11 new tests pass; 94 total, 0 failures.
 
 - [ ] **Step 5: Commit**
 
@@ -2331,7 +2343,7 @@ def build(source_json, out_dir, client, index_hash, attempts=ATTEMPTS):
 make perf-test
 ```
 
-Expected: `OK` — 119 tests.
+Expected: `OK` — 15 new tests pass; 109 total, 0 failures.
 
 - [ ] **Step 5: Sanity-check the classifier against the real corpus**
 
@@ -2648,7 +2660,7 @@ if __name__ == "__main__":
 make perf-test
 ```
 
-Expected: `OK` — 126 tests.
+Expected: `OK` — 7 new tests pass; 116 total, 0 failures.
 
 - [ ] **Step 5: Write the Containerfile**
 
@@ -2848,4 +2860,4 @@ git commit -m "chore(perf): remove spike profiler superseded by pgperf"
 
 **Type consistency.** `Client.execute` returns the ten-key sample dict from Task 5; `profile.run` adds `query_id`, `class`, `repetition` and nothing else. `outcomes.check_cardinality` is called only from `client.execute`. `corpus.load` attaches `sparql` and `path`, which `profile.run` and `manifestgen.build` both read. `stats.summarize`'s key set is consumed by `profile._summarize_bucket` under the `wall_ms` key. `ssh.Ssh.run` is called from `profile.CacheController` only. `corpus.DEFAULT_TIMEOUT_S` and `corpus.SCHEMA_VERSION` are referenced by `manifestgen`; both are defined in Task 4, which precedes it.
 
-**One gap found and left as a gap:** `CacheController._clear_query_cache` calls `self.client.execute("")` as a placeholder for QLever's cache-clear admin endpoint, whose existence and URL spec §13 lists as unconfirmed. Task 7's tests use a fake controller and never exercise it. The first person to run `--cache-level cache-cold` must verify the endpoint against the pinned image and fix that one method; if the endpoint does not exist, spec §13's stated fallback applies — drop `cache-cold` and keep `warm` and `ice-cold`. This is called out here rather than papered over with an invented URL.
+**One gap found and left as a gap:** `CacheController._clear_query_cache` raises `NotImplementedError`, because QLever's cache-clear admin endpoint is listed as unconfirmed in spec §13 and this plan will not invent a URL for it. It fails loudly rather than no-opping: a `cache-cold` pass that never cleared anything would report warm numbers under a cold label, which is worse than refusing to run. `--cache-level cache-cold` therefore errors until someone verifies the endpoint against `docker.io/adfreiburg/qlever:commit-1075455fae` and implements that one method. If no such endpoint exists, spec §13's fallback applies — drop the level and keep `warm` and `ice-cold`. `warm` (which §9.3's gate uses) and `ice-cold` are both fully functional in this plan.
