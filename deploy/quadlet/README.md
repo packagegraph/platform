@@ -28,6 +28,9 @@ see "Public SPARQL reverse proxy" below.
 | `sparql-proxy-certbot-renew.container` + `.timer` | no k8s equivalent (that deployment's TLS comes from cert-manager) |
 | `sparql-proxy-certs.volume`, `sparql-proxy-webroot.volume` | no k8s equivalent |
 | `scripts/sparql-proxy-reload-if-renewed.sh` | no k8s equivalent |
+| `firewall/nftables.conf` | no k8s equivalent (network policy would be the analogue) |
+| `firewall/sync-trusted-source.sh` + `.service` + `.timer` | no k8s equivalent |
+| `fail2ban/` (jail.local, filter.d/, action.d/, nft-shared-ban.sh) | no k8s equivalent -- native package install, not a quadlet unit; see "Traffic filtering and abuse detection" |
 
 The scripts are bind-mounted into their containers read-only rather than
 baked into the `qlever-rebuild` image, so this set works against the image
@@ -188,6 +191,75 @@ single-purpose host: nothing but root and containers explicitly granted
 this volume can reach these files regardless of the mode bits. This is
 why the renewal container's `--deploy-hook` does two things, not one --
 see the comment in `sparql-proxy-certbot-renew.container`.
+
+## Traffic filtering and abuse detection
+
+`firewall/nftables.conf` is a baseline packet filter (default-deny INPUT,
+allow 22/80/443, coarse new-connection rate limits) loaded by the host's
+native `nftables.service` -- without it, nothing filters inbound traffic
+at all (Podman's own nftables rules are pure NAT/isolation plumbing,
+`policy accept` throughout). Install:
+
+```bash
+install -m 644 deploy/quadlet/firewall/nftables.conf /etc/sysconfig/nftables.conf
+systemctl enable --now nftables.service
+```
+
+**fail2ban is a native package install, not a container.** It started as
+`crazymax/fail2ban` (containerized) and was deliberately moved off that
+image: any containerized process hits the same SELinux confinement
+crossing a container-native image doesn't fix -- reading a pre-existing,
+security-sensitive host file (`/var/log/secure`, labeled `var_log_t`
+for rsyslog's own write access) under a foreign SELinux label requires
+either relabeling the file (risks breaking rsyslog itself) or disabling
+SELinux confinement for that container. Neither is a fair price when a
+package install has neither problem: `fail2ban-selinux` ships the proper
+policy, `fail2ban-systemd` provides real journald support, and both
+install for free from EPEL.
+
+```bash
+dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
+dnf install -y fail2ban fail2ban-systemd fail2ban-selinux
+
+install -d /etc/fail2ban/filter.d /etc/fail2ban/action.d
+install -m 644 deploy/quadlet/fail2ban/jail.local /etc/fail2ban/jail.d/packagegraph.conf
+install -m 644 deploy/quadlet/fail2ban/filter.d/sparql-proxy-abuse.conf /etc/fail2ban/filter.d/
+install -m 644 deploy/quadlet/fail2ban/action.d/nftables-shared-set.conf /etc/fail2ban/action.d/
+install -m 755 deploy/quadlet/fail2ban/nft-shared-ban.sh /etc/fail2ban/
+restorecon -Rv /etc/fail2ban/
+
+systemctl enable --now fail2ban.service
+```
+
+fail2ban watches `sshd` (journald, `_SYSTEMD_UNIT=sshd.service`) and
+`sparql-proxy` (journald, `_SYSTEMD_UNIT=sparql-proxy.service` --
+`sparql-proxy.container`'s stdout, captured there by Podman's default
+log driver) and bans into the *same* `banned_ips`/`banned_ips6` nftables
+sets `firewall/nftables.conf` defines, via a custom action
+(`fail2ban/action.d/nftables-shared-set.conf` + `nft-shared-ban.sh`)
+rather than fail2ban's own default chain -- so `nft list set inet filter
+banned_ips` shows every ban regardless of what issued it, and a future
+CrowdSec-based alternative (not yet built; would write to the same sets)
+stays a straight swap rather than a parallel, conflicting system.
+
+**`trusted_ips` (in `nftables.conf`) is not a ban whitelist.** It only
+bypasses the connection-rate pre-filter, and it's checked *after*
+`banned_ips` in the input chain -- an explicit ban still wins, and it has
+no visibility into nginx's own application-layer rate limiting either.
+The actual ban-prevention mechanism is fail2ban's `ignoreip`
+(`jail.local`'s `[DEFAULT]` section) -- `firewall/sync-trusted-source.sh`
+keeps *both* in sync from the same `TRUSTED_HOSTNAMES` (hostnames and/or
+raw IPs) so a dynamic-DNS-tracked admin source doesn't go stale in
+either place, using `fail2ban-client set <jail> addignoreip/delignoreip`
+since `ignoreip` has no bulk-replace the way an nftables set flush does.
+An `ignoreip`'d source can never be banned by *any* jail -- narrow it to
+known admin sources, never a broad range.
+
+Install `sync-trusted-source.sh` + `.service` + `.timer` the same way as
+`qlever-refresh-if-changed.sh` (see the main Install section above), and
+fill in real values in `scripts/trusted-ips.env` (quoting matters -- it's
+`source`d as shell, so an unquoted multi-word value parses as a second
+command).
 
 ## Deliberate differences from the Kubernetes version
 

@@ -1,9 +1,9 @@
 [DEFAULT]
-# File-based polling, not journald: the crazymax/fail2ban image (Alpine
-# base) doesn't ship python3-systemd, so `backend = systemd` fails to
-# initialize at all (confirmed live: "No module named 'systemd'"). File
-# polling is fail2ban's original, most battle-tested mode anyway.
-backend = auto
+# Native fail2ban (EPEL: fail2ban, fail2ban-systemd, fail2ban-selinux),
+# NOT containerized -- see README.md's "Traffic filtering and abuse
+# detection" section for why. journald backend works correctly here
+# because fail2ban-systemd provides the real python3-systemd binding.
+backend = systemd
 banaction = nftables-shared-set
 
 # This is the ACTUAL whitelist -- it prevents a ban from being issued in
@@ -24,11 +24,10 @@ ignoreip = 127.0.0.1/8 ::1
 
 [sshd]
 enabled = true
-# RHEL's rsyslog mirrors journald to this standard path. fail2ban's stock
-# sshd filter's prefregex is intentionally generic about the process-name
-# token, so it matches this host's split sshd-session[PID]: log lines
-# without a custom filter.
-logpath = /var/log/secure
+# fail2ban's stock sshd filter's prefregex is intentionally generic about
+# the process-name token, so it matches this host's split
+# sshd-session[PID]: log lines without a custom filter -- verified live.
+journalmatch = _SYSTEMD_UNIT=sshd.service
 maxretry = 5
 findtime = 10m
 bantime = 1h
@@ -36,11 +35,10 @@ bantime = 1h
 [sparql-proxy-abuse]
 enabled = true
 filter = sparql-proxy-abuse
-# sparql-proxy.container writes here in addition to stdout (see
-# sparql-proxy/nginx.conf) specifically so this file-polling jail can read
-# it -- podman's own journald capture of container stdout isn't reachable
-# without the systemd backend this image lacks.
-logpath = /var/log/sparql-proxy/access.log
+# sparql-proxy.container logs to stdout, captured by podman's default
+# journald log driver under this unit -- verified live via
+# `journalctl -u sparql-proxy.service`.
+journalmatch = _SYSTEMD_UNIT=sparql-proxy.service
 maxretry = 20
 findtime = 1m
 bantime = 1h
