@@ -28,7 +28,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Sync ontology files for container build
         run: |
-          git clone --depth 1 --branch v0.13.0 https://github.com/packagegraph/ontology.git /tmp/ontology
+          set -euo pipefail
+          # Single source of truth -- see etl/ONTOLOGY_VERSION. Validation
+          # here must use the same pin the published images use, or a PR can
+          # go green against an ontology version that never ships.
+          ref="$(sed -e 's/#.*//' -e 's/[[:space:]]//g' etl/ONTOLOGY_VERSION | grep -m1 . || true)"
+          if [ -z "${ref}" ]; then
+            echo "etl/ONTOLOGY_VERSION contains no version value" >&2
+            exit 1
+          fi
+          echo "ontology ref: ${ref}"
+          git clone --depth 1 --branch "${ref}" https://github.com/packagegraph/ontology.git /tmp/ontology
           bash etl/scripts/sync-ontology.sh /tmp/ontology
       - uses: docker/setup-buildx-action@v3
       - name: Build ETL image
@@ -86,4 +96,3 @@ jobs:
       tags: |
         devel-latest
         main-${{ github.sha }}
-      ontology_ref: v0.13.0

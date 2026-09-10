@@ -28,10 +28,6 @@ on:
         description: Newline-separated tag names (not full refs) to point at the manifest list
         type: string
         required: true
-      ontology_ref:
-        description: Git ref of packagegraph/ontology to build the etl image against
-        type: string
-        required: true
 
 permissions:
   contents: read
@@ -71,7 +67,18 @@ jobs:
       - name: Sync ontology files for container build
         if: matrix.image.ontology
         run: |
-          git clone --depth 1 --branch ${{ inputs.ontology_ref }} \
+          set -euo pipefail
+          # etl/ONTOLOGY_VERSION is the single source of truth, deliberately
+          # in-repo rather than an Actions variable: the pin is reviewable in
+          # a PR, bisectable, and pinned by the release tag itself, and it is
+          # coupled to sync-ontology.sh's module allowlist.
+          ref="$(sed -e 's/#.*//' -e 's/[[:space:]]//g' etl/ONTOLOGY_VERSION | grep -m1 . || true)"
+          if [ -z "${ref}" ]; then
+            echo "etl/ONTOLOGY_VERSION contains no version value" >&2
+            exit 1
+          fi
+          echo "ontology ref: ${ref}"
+          git clone --depth 1 --branch "${ref}" \
             https://github.com/packagegraph/ontology.git /tmp/ontology
           bash etl/scripts/sync-ontology.sh /tmp/ontology
 
