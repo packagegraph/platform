@@ -78,7 +78,7 @@ struct SnapChannelInfo {
 
 impl SnapCollector {
     pub fn new(distro_name: String, release_name: String) -> Self {
-        let client = Client::builder()
+        let client = crate::enricher::http_client_builder()
             .timeout(Duration::from_secs(60))
             .build()
             .expect("Failed to create HTTP client");

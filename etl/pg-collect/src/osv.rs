@@ -17,7 +17,7 @@ pub struct OsvCollector {
 
 impl OsvCollector {
     pub fn new() -> Self {
-        let client = Client::builder()
+        let client = crate::enricher::http_client_builder()
             .timeout(Duration::from_secs(300))
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()

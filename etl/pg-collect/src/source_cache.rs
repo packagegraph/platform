@@ -74,7 +74,7 @@ impl SourceCache {
         let dir = Path::new(cache_dir).join(collector_name);
         fs::create_dir_all(&dir)?;
 
-        let client = Client::builder()
+        let client = crate::enricher::http_client_builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;

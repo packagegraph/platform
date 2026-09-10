@@ -42,7 +42,7 @@ struct NixMeta {
 
 impl NixCollector {
     pub fn new(distro_name: String, release_name: String, channel_url: String) -> Self {
-        let client = Client::builder()
+        let client = crate::enricher::http_client_builder()
             .timeout(Duration::from_secs(300))
             .build()
             .expect("Failed to create HTTP client");

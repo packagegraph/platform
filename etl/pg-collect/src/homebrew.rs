@@ -57,7 +57,7 @@ pub struct Cask {
 
 impl HomebrewCollector {
     pub fn new(api_base: String, distro_name: String, release_name: String) -> Self {
-        let client = Client::builder()
+        let client = crate::enricher::http_client_builder()
             .timeout(Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()

@@ -77,11 +77,7 @@ struct NugetDependency {
 
 impl NugetCollector {
     pub fn new_from_service_index(service_index_url: &str) -> std::result::Result<Self, String> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .map_err(|e| e.to_string())?;
+        let client = crate::enricher::default_http_client();
 
         let response = client
             .get(service_index_url)

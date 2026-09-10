@@ -94,7 +94,7 @@ impl RpmCollector {
         release_name: String,
         repo_type_override: Option<String>,
     ) -> Self {
-        let client = Client::builder()
+        let client = crate::enricher::http_client_builder()
             .timeout(Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()
@@ -169,7 +169,7 @@ impl RpmCollector {
         let ca_cert =
             reqwest::Certificate::from_pem(&ca_pem).expect("Failed to parse CA certificate");
 
-        let client = Client::builder()
+        let client = crate::enricher::http_client_builder()
             .timeout(Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::limited(5))
             .identity(identity)

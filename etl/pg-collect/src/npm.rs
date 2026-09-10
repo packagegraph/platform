@@ -46,11 +46,7 @@ struct NpmDist {
 
 impl NpmCollector {
     pub fn new(registry_url: String) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .expect("Failed to create HTTP client");
+        let client = crate::enricher::default_http_client();
 
         Self {
             client,
