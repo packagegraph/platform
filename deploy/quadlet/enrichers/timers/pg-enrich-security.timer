@@ -1,0 +1,18 @@
+# Schedules pg-enrich@security.service (deploy/quadlet/enrichers/pg-enrich@.container,
+# instantiated with %i=security, script: scripts/enrichers/security.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+# Cadence: per-package OSV lookups across 11 ecosystems is an expensive weekly pass already.
+[Unit]
+Description=Schedule for pg-enrich@security.service
+
+[Timer]
+OnCalendar=Mon *-*-* 12:30:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-enrich@security.service
+
+[Install]
+WantedBy=timers.target

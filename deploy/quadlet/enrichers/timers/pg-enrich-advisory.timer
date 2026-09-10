@@ -1,0 +1,18 @@
+# Schedules pg-enrich@advisory.service (deploy/quadlet/enrichers/pg-enrich@.container,
+# instantiated with %i=advisory, script: scripts/enrichers/advisory.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+# Cadence: RHSA/DSA advisories publish frequently; matches the collectors' 3x/week security tier.
+[Unit]
+Description=Schedule for pg-enrich@advisory.service
+
+[Timer]
+OnCalendar=Mon,Wed,Fri *-*-* 09:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-enrich@advisory.service
+
+[Install]
+WantedBy=timers.target

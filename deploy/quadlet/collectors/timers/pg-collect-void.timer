@@ -1,0 +1,18 @@
+# Schedules pg-collect@void.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=void, script: scripts/collectors/void.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@void.service
+
+# Cadence: void-packages is a rolling-release source tree.
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@void.service
+
+[Install]
+WantedBy=timers.target

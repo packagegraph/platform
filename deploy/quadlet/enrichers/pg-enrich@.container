@@ -1,0 +1,49 @@
+# Templated enrichment unit -- same shape as ../collectors/pg-collect@.container,
+# one instance per enricher, scheduled independently by the matching
+# timers/pg-enrich-<name>.timer. Ported from deploy/overlays/{dev,prod}/jobs/
+# enrich-*.yaml, minus the direct-to-Fuseki drop+load round trip those jobs
+# do (no writable Fuseki on this host -- see collectors/pg-collect@.container's
+# header for the same reasoning): every enricher here just enriches and
+# uploads a .nt/.graph pair to Minio's nt-output/ prefix, picked up by
+# qlever-rebuild-index.timer on its own nightly schedule.
+#
+# %i is the enricher name (matches the .sh filename under scripts/enrichers/).
+#
+# Discovery queries (what needs enriching) go against the local QLever
+# instance the same way collectors' discovery-mode queries do -- see that
+# file's comment for why FUSEKI_ENDPOINT/SPARQL_BACKEND/QLEVER_ACCESS_TOKEN
+# are set the way they are.
+
+[Unit]
+Description=PackageGraph enricher: %i
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/packagegraph/etl:latest
+AutoUpdate=registry
+Network=host
+EnvironmentFile=/etc/containers/systemd/scripts/minio.env
+EnvironmentFile=/etc/containers/systemd/scripts/qlever.env
+Environment=HOME=/tmp
+Environment=SPARQL_BACKEND=qlever
+Environment=FUSEKI_ENDPOINT=http://127.0.0.1:7001
+Volume=/etc/containers/systemd/scripts/enrichers/%i.sh:/usr/local/bin/enrich.sh:ro
+Entrypoint=/bin/sh
+Exec=/usr/local/bin/enrich.sh
+NoNewPrivileges=true
+DropCapability=ALL
+Memory=4g
+PodmanArgs=--cpus=2
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+# Raised 2h -> 8h 2026-09-10: koji and security both got SIGKILL'd at the
+# old 2h ceiling mid-run (koji ~19,700 packages in, security ~11,400 in,
+# both still steadily progressing, not hung) -- shared across all
+# enrichers, but only matters for the slow ones since fast ones just
+# finish early regardless. Does NOT fix repology: at its observed rate
+# (~100 pkgs / 1.7min against 314,416 total) it needs ~90h, far beyond any
+# reasonable timeout here -- see repology.sh's cache-sync comment.
+TimeoutStartSec=28800

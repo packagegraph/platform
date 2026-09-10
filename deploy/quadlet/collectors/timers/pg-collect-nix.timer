@@ -1,0 +1,18 @@
+# Schedules pg-collect@nix.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=nix, script: scripts/collectors/nix.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@nix.service
+
+# Cadence: nixpkgs (unstable channel) merges continuously, many commits a day.
+[Timer]
+OnCalendar=*-*-* 14:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@nix.service
+
+[Install]
+WantedBy=timers.target

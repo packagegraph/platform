@@ -1,0 +1,40 @@
+#!/bin/sh
+# Collector: centos-stream-9-full
+# Ported from deploy/overlays/dev/jobs/collect-centos-stream-9-full.yaml.
+set -eu
+GRAPH_URI="https://packagegraph.github.io/graph/centos-stream/9"
+
+mkdir -p /tmp/collection
+CACHE_DIR=/tmp/cache/centos-stream-9-full
+MINIO_CACHE="pgraph/${MINIO_BUCKET}/collector-cache/centos-stream-9-full"
+mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
+
+echo "Syncing cache from Minio..."
+mc mirror --overwrite "${MINIO_CACHE}/" "${CACHE_DIR}/" 2>/dev/null || true
+echo "Cache warmed: $(find "${CACHE_DIR}" -type f 2>/dev/null | wc -l) entries"
+
+# Periodically flush the cache back to Minio while the (long-running,
+# network-bound) collect runs, so a timeout kill doesn't discard hours
+# of freshly-cached fetches -- see fedora-43-full.sh's 2026-09-10
+# timeout incident for why this matters.
+( while sleep 300; do
+    mc mirror --overwrite "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
+  done ) &
+CACHE_SYNC_PID=$!
+trap 'kill "${CACHE_SYNC_PID}" 2>/dev/null || true' EXIT
+
+pg-collect rpm-full \
+  --url https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/ \
+  --url https://mirror.stream.centos.org/9-stream/BaseOS/aarch64/os/ \
+  --distro centos-stream --release 9 \
+  --with-spec --with-maintainers \
+  --cache-dir "${CACHE_DIR}" \
+  -o /tmp/collection/centos-stream-9.nt
+
+/app/scripts/upload-nt.sh /tmp/collection/centos-stream-9.nt "$GRAPH_URI"
+
+echo "Syncing cache to Minio..."
+mc mirror --overwrite "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
+
+echo "Collection complete"
+

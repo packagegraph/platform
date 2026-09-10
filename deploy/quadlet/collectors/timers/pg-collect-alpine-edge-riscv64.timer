@@ -1,0 +1,18 @@
+# Schedules pg-collect@alpine-edge-riscv64.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=alpine-edge-riscv64, script: scripts/collectors/alpine-edge-riscv64.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@alpine-edge-riscv64.service
+
+# Cadence: Alpine's edge branch is the rolling/unstable branch by design.
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@alpine-edge-riscv64.service
+
+[Install]
+WantedBy=timers.target

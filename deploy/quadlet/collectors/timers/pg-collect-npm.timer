@@ -1,0 +1,18 @@
+# Schedules pg-collect@npm.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=npm, script: scripts/collectors/npm.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@npm.service
+
+# Cadence: npm has an extremely high daily publish volume.
+[Timer]
+OnCalendar=*-*-* 02:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@npm.service
+
+[Install]
+WantedBy=timers.target

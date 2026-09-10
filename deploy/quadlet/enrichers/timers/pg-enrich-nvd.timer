@@ -1,0 +1,18 @@
+# Schedules pg-enrich@nvd.service (deploy/quadlet/enrichers/pg-enrich@.container,
+# instantiated with %i=nvd, script: scripts/enrichers/nvd.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+# Cadence: the NVD Modified/Recent feeds update multiple times a day; feed mode's META-based cache makes daily cheap.
+[Unit]
+Description=Schedule for pg-enrich@nvd.service
+
+[Timer]
+OnCalendar=*-*-* 20:30:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-enrich@nvd.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,18 @@
+# Schedules pg-collect@cargo.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=cargo, script: scripts/collectors/cargo.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@cargo.service
+
+# Cadence: crates.io has a high daily publish volume.
+[Timer]
+OnCalendar=*-*-* 06:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@cargo.service
+
+[Install]
+WantedBy=timers.target

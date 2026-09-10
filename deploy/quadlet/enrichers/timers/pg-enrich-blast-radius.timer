@@ -1,0 +1,27 @@
+# Schedules pg-enrich@blast-radius.service (deploy/quadlet/enrichers/pg-enrich@.container,
+# instantiated with %i=blast-radius, script: scripts/enrichers/blast-radius.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+# Cadence: was blocked on the ontology never being loaded into QLever until
+# 2026-09-10; now unblocked. This enricher reads met:reverseDependencyCount
+# via a live SPARQL query against QLever, not directly from Minio -- so it
+# only sees what enrich-revdeps materialized *after* the next
+# qlever-rebuild-index.timer run (nightly, 03:30 UTC) has indexed it.
+# Confirmed live 2026-09-10: running this 30 min after enrich-revdeps on
+# the same day (both Monday) produced only 36 bytes of output, because
+# Monday's revdeps upload wasn't queryable until the following rebuild.
+# Scheduled Tuesday, comfortably after the Tuesday 03:30 rebuild that picks
+# up Monday's enrich-revdeps run (13:30) -- NOT the same day.
+[Unit]
+Description=Schedule for pg-enrich@blast-radius.service
+
+[Timer]
+OnCalendar=Tue *-*-* 09:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-enrich@blast-radius.service
+
+[Install]
+WantedBy=timers.target
