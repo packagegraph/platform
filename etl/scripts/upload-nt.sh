@@ -8,8 +8,8 @@ set -euo pipefail
 # Example:
 #   upload-nt.sh /tmp/packages.nt "https://packagegraph.github.io/graph/debian/trixie"
 #
-# Uploads to: pgraph/${MINIO_BUCKET}/nt-output/debian-trixie.nt
-# Creates: pgraph/${MINIO_BUCKET}/nt-output/debian-trixie.nt.graph (sidecar)
+# Uploads to: pgraph/${MINIO_BUCKET}/nt-output/debian-trixie.nt.gz
+# Creates: pgraph/${MINIO_BUCKET}/nt-output/debian-trixie.nt.gz.graph (sidecar)
 
 if [ $# -ne 2 ]; then
     echo "Usage: upload-nt.sh <local-file.nt> <graph-uri>" >&2
@@ -29,7 +29,11 @@ fi
 # https://packagegraph.github.io/graph/security/osv → security-osv
 # https://packagegraph.github.io/ontology            → ontology
 GRAPH_SLUG=$(echo "$GRAPH_URI" | sed 's|https://packagegraph.github.io/graph/||; s|https://packagegraph.github.io/||' | tr '/' '-')
-MINIO_FILENAME="${GRAPH_SLUG}.nt"
+# gzip, not xz: N-Triples text compresses well under either, but gzip
+# decompresses several times faster, which matters more here than the last
+# few percent of ratio -- qlever-rebuild-index.sh decompresses every graph
+# on every nightly rebuild.
+MINIO_FILENAME="${GRAPH_SLUG}.nt.gz"
 
 echo "=== Uploading N-Triples to Minio ==="
 echo "Local: $LOCAL_FILE"
@@ -39,13 +43,18 @@ echo "Minio: nt-output/$MINIO_FILENAME"
 # Configure mc alias (idempotent)
 mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 >/dev/null 2>&1
 
-# Upload .nt file first — orphan .nt without sidecar is safely excluded by
-# rebuilds (they iterate .graph files). The .graph sidecar acts as a commit
-# marker: only written after the .nt upload succeeds.
-mc cp "$LOCAL_FILE" "pgraph/${MINIO_BUCKET}/nt-output/${MINIO_FILENAME}"
+COMPRESSED_FILE="${LOCAL_FILE}.gz"
+gzip -c "$LOCAL_FILE" > "$COMPRESSED_FILE"
 
-# Create .graph sidecar (commit marker) — signals this .nt is ready for rebuild
+# Upload .nt.gz file first — orphan .nt.gz without sidecar is safely excluded
+# by rebuilds (they iterate .graph files). The .graph sidecar acts as a
+# commit marker: only written after the .nt.gz upload succeeds.
+mc cp "$COMPRESSED_FILE" "pgraph/${MINIO_BUCKET}/nt-output/${MINIO_FILENAME}"
+
+# Create .graph sidecar (commit marker) — signals this .nt.gz is ready for rebuild
 SIDECAR_PATH="pgraph/${MINIO_BUCKET}/nt-output/${MINIO_FILENAME}.graph"
 echo -n "$GRAPH_URI" | mc pipe "$SIDECAR_PATH"
+
+rm -f "$COMPRESSED_FILE"
 
 echo "✓ Uploaded $MINIO_FILENAME + .graph sidecar"
