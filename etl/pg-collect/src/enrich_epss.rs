@@ -101,7 +101,7 @@ impl EpssEnricher {
     fn query_cve_entities(&self) -> Result<HashMap<String, String>> {
         let query = r#"
             SELECT DISTINCT ?vuln ?cveId WHERE {
-              { GRAPH ?g { ?vuln <SEC_PLACEHOLDER>cveId ?cveId } }
+              { GRAPH ?g { ?vuln <SEC_PLACEHOLDERcveId> ?cveId } }
             }
         "#
         .replace("SEC_PLACEHOLDER", SEC);
