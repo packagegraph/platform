@@ -1,0 +1,18 @@
+# Schedules pg-collect@alma-9-full.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=alma-9-full, script: scripts/collectors/alma-9-full.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@alma-9-full.service
+
+# Cadence: stable RHEL rebuild, weekly is plenty. Staggered off centos-stream-9-full's Mon/Wed/Fri 02:00 slot.
+[Timer]
+OnCalendar=Mon *-*-* 04:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@alma-9-full.service
+
+[Install]
+WantedBy=timers.target
