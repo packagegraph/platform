@@ -51,12 +51,25 @@ pub const DEFAULT_RATE_LIMIT: Duration = Duration::from_millis(200);
 /// Rate limit for rate-sensitive APIs like Repology (1s between calls).
 pub const SLOW_RATE_LIMIT: Duration = Duration::from_secs(1);
 
+/// User-Agent sent by every pg-collect HTTP client. Some mirror CDNs
+/// (e.g. mirror.stream.centos.org's CloudFront front-end) return 403 for
+/// requests with no User-Agent header at all -- confirmed by comparing
+/// `curl` (sends one by default, gets 200) against `curl -H "User-Agent:"`
+/// (gets 403) against the same URL.
+pub const USER_AGENT: &str = "pg-collect/1.0 (PackageGraph; https://packagegraph.github.io)";
+
+/// Base builder every pg-collect HTTP client starts from, so the
+/// User-Agent can never be forgotten by a new collector -- callers add
+/// whatever timeout/redirect/identity options they need before `.build()`.
+pub fn http_client_builder() -> reqwest::blocking::ClientBuilder {
+    Client::builder().user_agent(USER_AGENT)
+}
+
 /// Shared HTTP client with consistent User-Agent, timeout, and redirect policy.
 pub fn default_http_client() -> Client {
-    Client::builder()
+    http_client_builder()
         .timeout(std::time::Duration::from_secs(60))
         .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent("pg-collect/1.0 (PackageGraph; https://packagegraph.github.io)")
         .build()
         .expect("Failed to create HTTP client")
 }

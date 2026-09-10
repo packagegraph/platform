@@ -43,7 +43,7 @@ use std::collections::HashMap;
 
 impl FreebsdCollector {
     pub fn new(distro_name: String, mirror: String, release: String, arch: String) -> Self {
-        let client = Client::builder()
+        let client = crate::enricher::http_client_builder()
             .timeout(Duration::from_secs(300))
             .build()
             .expect("Failed to create HTTP client");

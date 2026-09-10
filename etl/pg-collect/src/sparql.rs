@@ -45,7 +45,7 @@ impl SparqlClient {
     /// Create a new SPARQL client with the given endpoint URL.
     /// Example: `SparqlClient::new("http://localhost:3030/packagegraph")`
     pub fn new(endpoint: &str) -> Self {
-        let client = Client::builder()
+        let client = crate::enricher::http_client_builder()
             .timeout(Duration::from_secs(600))
             .build()
             .expect("Failed to create HTTP client");
