@@ -22,8 +22,12 @@ Wants=network-online.target
 
 [Container]
 ContainerName=sparql-proxy-certbot-renew
-Image=docker.io/certbot/certbot:latest
-AutoUpdate=registry
+# Pinned, and deliberately no AutoUpdate=registry. This container mounts
+# the Let's Encrypt store read-write and runs unattended on a timer, so
+# tracking an upstream floating tag meant an arbitrary new certbot could
+# start touching our private keys with no review. Renewals still run on
+# schedule; only the image is frozen. Bump this deliberately.
+Image=docker.io/certbot/certbot:v5.8.0
 Volume=sparql-proxy-certs.volume:/etc/letsencrypt
 Volume=sparql-proxy-webroot.volume:/var/www/acme-challenge
 Exec=renew --webroot -w /var/www/acme-challenge --quiet --deploy-hook "chmod 755 /etc/letsencrypt/live /etc/letsencrypt/archive && chmod 644 /etc/letsencrypt/archive/*/privkey*.pem && touch /etc/letsencrypt/.renewed-marker"

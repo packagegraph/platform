@@ -97,13 +97,46 @@ first one, then start `qlever.service`.
 
 `qlever-refresh-if-changed.sh` runs on the host (not in a container) and
 needs `podman`, `jq`, and `curl` installed there — everything else runs
-inside the `ghcr.io/packagegraph/qlever-rebuild:latest` image, which already
+inside the `ghcr.io/packagegraph/qlever-rebuild` image, which already
 bundles `mc`, `jq`, and the `qlever-index` tool.
 
 Rootless deployment (`~/.config/containers/systemd/` + `systemctl --user`)
 works the same way, except `qlever-refresh-if-changed.sh`'s
 `systemctl restart` calls need `systemctl --user restart` instead — edit the
 script if you deploy rootless.
+
+## Image tags and auto-update
+
+`.github/workflows/images.yml` builds every image for `linux/amd64` and
+`linux/arm64` — each on a runner of its own architecture, then assembled
+into a manifest list — and two callers decide what tag the result gets:
+
+| Trigger | Tags published | Moves production? |
+|---|---|---|
+| Merge to `main` (`ci.yml`) | `devel-latest`, `main-<sha>` | no |
+| `v*` tag (`release.yml`) | `<tag>`, `latest` | yes |
+
+`devel-latest` floats; `main-<sha>` is immutable and exists to roll back
+to. `latest` moves only when someone cuts a release, so a merge to `main`
+can never reach production on its own.
+
+**This host currently tracks `devel-latest`**, because no `v*` tag has ever
+been cut and `latest` therefore points at a hand-assembled image. Once
+`v0.1.0` exists, flip the `Image=` lines in `qlever-index-load.container`,
+`qlever-rebuild-index.container`, `collectors/pg-collect@.container`, and
+`enrichers/pg-enrich@.container` back to `:latest` so production stops
+following `main`.
+
+`AutoUpdate=registry` belongs only on units whose tag is meant to move.
+Units pinned to an exact upstream version — `qlever.container`,
+`sparql-proxy.container`, `sparql-proxy-certbot-renew.container` — do not
+carry it: on a pinned tag the line is a no-op that reads as protection.
+`sparql-proxy-certbot-renew.container` is the one worth being deliberate
+about, since it mounts the Let's Encrypt store read-write and runs
+unattended; bump its certbot pin by hand.
+
+Pull-request CI still builds amd64-only and pushes nothing, so the arm64
+build cost is only paid once a change reaches `main`.
 
 ## Using Scaleway Object Storage as MINIO_ENDPOINT
 
@@ -447,12 +480,15 @@ this?", versus just buying more wall-clock headroom. Deployed directly to
 `/etc/containers/systemd/scripts/collectors/` (no image rebuild needed --
 these are bind-mounted, not baked in) and `fedora-43-full` re-triggered.
 
-**Building a multi-arch `etl` image manually.** `.github/workflows/release.yml`
-only builds single-arch (`ubuntu-latest`, no `platforms:`/QEMU setup) and
-only triggers on `v*` tags -- it was not used for this fix, since pushing a
-tag would have overwritten this host's existing multi-arch manifest with an
-amd64-only one (this host is aarch64). Instead, build each arch where it
-matches natively and assemble a manifest by hand:
+**Building a multi-arch `etl` image manually.** *Superseded — CI does this
+now; see "Image tags and auto-update" above. Kept for the record, and as
+the fallback if Actions is unavailable.* At the time,
+`.github/workflows/release.yml` only built single-arch (`ubuntu-latest`, no
+`platforms:`/QEMU setup) and only triggered on `v*` tags -- it was not used
+for this fix, since pushing a tag would have overwritten this host's
+existing multi-arch manifest with an amd64-only one (this host is aarch64).
+Instead, build each arch where it matches natively and assemble a manifest
+by hand:
 ```bash
 # amd64, on an x86_64 dev machine:
 cd etl && podman build --platform linux/amd64 -t ghcr.io/packagegraph/etl:amd64-tmp -f Containerfile .
@@ -469,9 +505,11 @@ podman manifest push ghcr.io/packagegraph/etl:latest docker://ghcr.io/packagegra
 ```
 Then `podman pull ghcr.io/packagegraph/etl:latest` on the host (or wait for
 `io.containers.autoupdate=registry`'s own poll). Giving `release.yml` real
-multi-arch support (QEMU + `platforms: linux/amd64,linux/arm64`) would make
-this manual dance unnecessary going forward -- not done here, out of scope
-for a same-day bug fix.
+multi-arch support would make this manual dance unnecessary going forward --
+not done here, out of scope for a same-day bug fix. **Done since**, in
+`.github/workflows/images.yml`, using native per-arch runners rather than
+QEMU: the etl image compiles `pg-collect`, and emulated Rust made the QEMU
+route far slower than building each arch on a runner that matches it.
 
 **Don't `podman rmi -f` the host's `latest` tag to clear a "name already in
 use" conflict when re-assembling the manifest.** Doing this on

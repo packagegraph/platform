@@ -33,7 +33,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=ghcr.io/packagegraph/etl:latest
+# devel-latest, not latest: it floats on every merge to main, which is what
+# this host should track until a v* release is cut. See
+# "Image tags and auto-update" in ../README.md.
+Image=ghcr.io/packagegraph/etl:devel-latest
 AutoUpdate=registry
 Network=host
 EnvironmentFile=/etc/containers/systemd/scripts/minio.env
