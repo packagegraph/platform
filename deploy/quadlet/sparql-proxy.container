@@ -1,10 +1,14 @@
 # Public HTTPS reverse proxy in front of the QLever SPARQL endpoint
-# (qlever.container, 127.0.0.1:7001). No authentication -- QLever itself
-# unconditionally rejects SPARQL Update without a valid access-token (this
-# proxy never has or forwards that token), so read-only is enforced by the
-# backend, not by this proxy. See sparql-proxy/nginx.conf for the tuning
-# (gzip, upstream keepalive, buffer sizes, rate limit) and the one nginx-level
-# defense-in-depth rule.
+# (qlever.container, 127.0.0.1:7001). No authentication -- QLever DOES
+# support SPARQL 1.1 Update and the Graph Store Protocol (confirmed live,
+# 2026-09-10: a scoped INSERT DATA/DELETE WHERE round-trip against our
+# pinned commit-1075455fae succeeded, flagged only as "experimental" by
+# QLever itself), gated behind the admin access-token set via -a on
+# qlever.container's Exec=. This proxy never has or forwards that token, so
+# read-only is enforced by the backend rejecting any update request that
+# arrives without one, not by QLever lacking Update support. See
+# sparql-proxy/nginx.conf for the tuning (gzip, upstream keepalive, buffer
+# sizes, rate limit) and the one nginx-level defense-in-depth rule.
 #
 # TLS certs come from sparql-proxy-certs.volume, populated by the one-time
 # bootstrap (see deploy/quadlet/README.md) and kept current by
