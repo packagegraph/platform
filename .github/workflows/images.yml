@@ -1,0 +1,163 @@
+name: Images
+
+# Reusable multi-arch container image build. Callers pass an explicit tag
+# list rather than having one derived here, because the caller is what
+# decides a tag's meaning:
+#
+#   ci.yml       merge to main  -> devel-latest, main-<sha>
+#   release.yml  v* tag         -> <tag>, latest
+#
+# `devel-latest` floats and is what the deployed host tracks today;
+# `latest` is production and moves only on a cut release. See
+# deploy/quadlet/README.md ("Image tags and auto-update").
+#
+# Each architecture builds on a runner of its own architecture rather than
+# under QEMU. The etl image compiles pg-collect, and emulated Rust turns a
+# few minutes into tens of them; native arm64 runners are free for public
+# repositories. The per-arch jobs therefore push by digest with no tag at
+# all, and `merge` assembles those digests into one manifest list per tag.
+# Tagging in the per-arch jobs instead would let whichever arch finished
+# last clobber the other's tag -- the amd64-overwrites-aarch64 failure that
+# forced the manual manifest assembly documented in
+# deploy/quadlet/README.md.
+
+on:
+  workflow_call:
+    inputs:
+      tags:
+        description: Newline-separated tag names (not full refs) to point at the manifest list
+        type: string
+        required: true
+      ontology_ref:
+        description: Git ref of packagegraph/ontology to build the etl image against
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: packagegraph
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          # `ontology` marks the images whose Containerfile COPYs
+          # ontology/ -- only etl does, so only etl pays for the clone.
+          - name: etl
+            context: etl
+            file: etl/Containerfile
+            ontology: true
+          - name: fuseki
+            context: fuseki
+            file: fuseki/Containerfile
+            ontology: false
+          - name: qlever-rebuild
+            context: etl
+            file: etl/Containerfile.qlever-rebuild
+            ontology: false
+        platform:
+          - { id: linux/amd64, runner: ubuntu-latest, slug: amd64 }
+          - { id: linux/arm64, runner: ubuntu-24.04-arm, slug: arm64 }
+    runs-on: ${{ matrix.platform.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync ontology files for container build
+        if: matrix.image.ontology
+        run: |
+          git clone --depth 1 --branch ${{ inputs.ontology_ref }} \
+            https://github.com/packagegraph/ontology.git /tmp/ontology
+          bash etl/scripts/sync-ontology.sh /tmp/ontology
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.file }}
+          platforms: ${{ matrix.platform.id }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.OWNER }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Record digest
+        run: |
+          mkdir -p /tmp/digests
+          echo "${{ steps.build.outputs.digest }}" > "/tmp/digests/${{ matrix.platform.slug }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.image.name }}-${{ matrix.platform.slug }}
+          path: /tmp/digests/*
+          retention-days: 1
+          if-no-files-found: error
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [etl, fuseki, qlever-rebuild]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-${{ matrix.image }}-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assemble and push the manifest list
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ matrix.image }}
+          TAGS: ${{ inputs.tags }}
+        run: |
+          set -euo pipefail
+          # nullglob so a missing digest directory reports the arch-count
+          # error below rather than `cat: '/tmp/digests/*': No such file`.
+          shopt -s nullglob
+
+          sources=()
+          for f in /tmp/digests/*; do
+            sources+=("${IMAGE}@$(cat "$f")")
+          done
+          # Refuse to publish a partial manifest. `fail-fast: false` above
+          # means one arch can fail while the other succeeds, and a
+          # single-arch manifest pushed to devel-latest/latest is exactly
+          # the failure this workflow exists to prevent.
+          if [ "${#sources[@]}" -ne 2 ]; then
+            echo "expected 2 architecture digests, got ${#sources[@]}: ${sources[*]-none}" >&2
+            exit 1
+          fi
+
+          args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            args+=(--tag "${IMAGE}:${tag}")
+          done <<< "$TAGS"
+          if [ "${#args[@]}" -eq 0 ]; then
+            echo "inputs.tags contained no usable tag names" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create "${args[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "${IMAGE}:$(printf '%s' "$TAGS" | sed -n '/./{p;q}')"
