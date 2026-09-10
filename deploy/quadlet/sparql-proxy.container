@@ -21,8 +21,10 @@ After=qlever.service
 
 [Container]
 ContainerName=sparql-proxy
+# Pinned to an exact upstream version, so no AutoUpdate=registry: the tag
+# never moves, which made the line a no-op that read as protection. Bump
+# this deliberately.
 Image=docker.io/nginxinc/nginx-unprivileged:1.27.5-alpine
-AutoUpdate=registry
 Network=host
 Volume=/etc/containers/systemd/sparql-proxy/nginx.conf:/etc/nginx/nginx.conf:ro
 Volume=sparql-proxy-certs.volume:/etc/letsencrypt:ro

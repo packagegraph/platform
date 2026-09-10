@@ -20,7 +20,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=ghcr.io/packagegraph/etl:latest
+# devel-latest, not latest -- see collectors/pg-collect@.container and
+# "Image tags and auto-update" in ../README.md.
+Image=ghcr.io/packagegraph/etl:devel-latest
 AutoUpdate=registry
 Network=host
 EnvironmentFile=/etc/containers/systemd/scripts/minio.env

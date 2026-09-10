@@ -15,7 +15,9 @@ Wants=network-online.target
 
 [Container]
 ContainerName=qlever-rebuild-index
-Image=ghcr.io/packagegraph/qlever-rebuild:latest
+# devel-latest, not latest -- see qlever-index-load.container and
+# "Image tags and auto-update" in README.md.
+Image=ghcr.io/packagegraph/qlever-rebuild:devel-latest
 AutoUpdate=registry
 Volume=qlever-rebuild-scratch.volume:/tmp:Z
 Volume=/etc/containers/systemd/scripts/qlever-rebuild-index.sh:/usr/local/bin/qlever-rebuild-index.sh:ro
