@@ -22,7 +22,14 @@ Volume=/etc/containers/systemd/scripts/qlever-rebuild-index.sh:/usr/local/bin/ql
 EnvironmentFile=/etc/containers/systemd/scripts/minio.env
 Exec=/usr/local/bin/qlever-rebuild-index.sh
 Memory=8g
-PodmanArgs=--cpus=4
+# 8 of the host's 12 cores (Neoverse-N1) -- qlever.service itself idles
+# around 0.5% CPU under normal query load, so this leaves comfortable
+# headroom for it plus whatever collectors happen to be running
+# concurrently. Measured: the previous --cpus=4 limit was ~73% saturated
+# (2.9 of 4 cores) during the index-build phase with RAM barely touched
+# (81MB of an 8g limit) -- CPU-bound, not memory-bound, so raising the CPU
+# ceiling is the lever that should actually shrink wall-clock time.
+PodmanArgs=--cpus=8
 NoNewPrivileges=true
 DropCapability=ALL
 
