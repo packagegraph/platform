@@ -1318,10 +1318,10 @@ impl RpmCollector {
                         &format!("{PKG}versionConstraintValue"),
                         &constraint_val,
                     )?;
-                    writer.write_bnode_subject(
+                    writer.write_bnode_to_bnode(
                         &dep_bnode,
                         &format!("{PKG}hasVersionConstraint"),
-                        &format!("_{constraint_bnode}"),
+                        &constraint_bnode,
                     )?;
                     triples += 4;
                 }
