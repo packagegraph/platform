@@ -815,7 +815,10 @@ pub fn detect_ecosystem_by_name(
             });
         }
         if lower.contains("crates.io") || lower.contains("static.crates.io") {
-            let pkg = strip_ecosystem_prefix(package_name, &["rust-", "librust-"]);
+            let pkg = normalize_librust_crate_name(&strip_ecosystem_prefix(
+                package_name,
+                &["rust-", "librust-"],
+            ));
             return Some(EcosystemDetection {
                 ecosystem: "cargo",
                 package_name: Some(pkg),
@@ -916,7 +919,7 @@ pub fn detect_ecosystem_by_name(
         let without_suffix = without_lib.strip_suffix("-dev").unwrap_or(without_lib);
         return Some(EcosystemDetection {
             ecosystem: "cargo",
-            package_name: Some(without_suffix.to_string()),
+            package_name: Some(normalize_librust_crate_name(without_suffix)),
             detection_method: "name-prefix",
         });
     }
@@ -1001,6 +1004,22 @@ fn strip_ecosystem_prefix(source_name: &str, prefixes: &[&str]) -> String {
         }
     }
     source_name.to_string()
+}
+
+/// Strip a `-dev` suffix and a `+<feature>` suffix from a Debian Rust
+/// package name fragment, leaving only the real crates.io crate name.
+/// Debian packages each enabled-feature combination of a crate as its own
+/// binary package, named `librust-<crate>+<feature>-dev`; the crate name
+/// is only the part before the first `+` -- a feature name can itself
+/// contain `+` (e.g. "c++14"), so this splits on the first occurrence
+/// only, never the crate name.
+fn normalize_librust_crate_name(name: &str) -> String {
+    let without_suffix = name.strip_suffix("-dev").unwrap_or(name);
+    without_suffix
+        .split_once('+')
+        .map(|(crate_name, _feature)| crate_name)
+        .unwrap_or(without_suffix)
+        .to_string()
 }
 
 /// Parse a BuildRequires line into individual package names.
@@ -1185,6 +1204,40 @@ BuildRequires:  perl(Test::More)
         let detection = detect_ecosystem_by_name("librust-serde-dev", None).unwrap();
         assert_eq!(detection.ecosystem, "cargo");
         assert_eq!(detection.package_name, Some("serde".to_string()));
+    }
+
+    #[test]
+    fn test_detect_ecosystem_by_name_debian_rust_feature_variant() {
+        // Debian packages each enabled-feature combination of a crate as
+        // its own binary package: librust-<crate>+<feature>-dev. The
+        // upstream crate name must not include the +feature suffix.
+        let detection =
+            detect_ecosystem_by_name("librust-adler+compiler-builtins-dev", None).unwrap();
+        assert_eq!(detection.ecosystem, "cargo");
+        assert_eq!(detection.package_name, Some("adler".to_string()));
+    }
+
+    #[test]
+    fn test_detect_ecosystem_by_name_debian_rust_feature_variant_with_plus_in_feature() {
+        // A feature name can itself contain '+' (e.g. a C++ standard
+        // version like "c++14") -- must split on the first '+' only.
+        let detection =
+            detect_ecosystem_by_name("librust-cxxbridge-flags+c++14-dev", None).unwrap();
+        assert_eq!(detection.ecosystem, "cargo");
+        assert_eq!(detection.package_name, Some("cxxbridge-flags".to_string()));
+    }
+
+    #[test]
+    fn test_detect_ecosystem_by_name_debian_rust_feature_variant_via_homepage() {
+        // The homepage-domain strategy (checked first, higher confidence)
+        // has the same +feature suffix to strip.
+        let detection = detect_ecosystem_by_name(
+            "librust-adler+compiler-builtins-dev",
+            Some("https://crates.io/crates/adler"),
+        )
+        .unwrap();
+        assert_eq!(detection.ecosystem, "cargo");
+        assert_eq!(detection.package_name, Some("adler".to_string()));
     }
 
     #[test]
