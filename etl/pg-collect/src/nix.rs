@@ -36,7 +36,10 @@ struct NixMeta {
     description: Option<String>,
     homepage: Option<serde_json::Value>,
     license: Option<serde_json::Value>,
-    platforms: Option<Vec<String>>,
+    // meta.platforms intentionally not modeled: unused downstream, and
+    // nixpkgs emits it as either plain strings ("x86_64-linux") or
+    // structured {cpu,kernel} objects depending on the derivation, which
+    // broke a strict Vec<String> deserialization in production 2026-09-10.
     broken: Option<bool>,
 }
 
@@ -256,6 +259,18 @@ mod tests {
     }
 
     #[test]
+    fn test_nix_package_deserialization_structured_platforms() {
+        // Real shape seen in production 2026-09-10 for fs-uae-3.1.66:
+        // meta.platforms as a list of {cpu,kernel} objects instead of
+        // plain "system"-string entries. Must not fail deserialization.
+        let json = r#"{"pname":"fs-uae","version":"3.1.66","meta":{"description":"An Amiga emulator","platforms":[{"cpu":{"family":"x86"},"kernel":{"_type":"kernel","name":"linux"}}],"broken":false}}"#;
+
+        let pkg: NixPackage = serde_json::from_str(json).unwrap();
+        assert_eq!(pkg.pname, Some("fs-uae".to_string()));
+        assert_eq!(pkg.metadata.as_ref().unwrap().broken, Some(false));
+    }
+
+    #[test]
     fn test_emit_nix_package() {
         use std::io::{Read, Write};
         use tempfile::NamedTempFile;
@@ -277,7 +292,6 @@ mod tests {
                     "https://www.gnu.org/software/hello/".to_string(),
                 )),
                 license: None,
-                platforms: None,
                 broken: Some(false),
             }),
         };
