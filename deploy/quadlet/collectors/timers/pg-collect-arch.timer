@@ -1,0 +1,18 @@
+# Schedules pg-collect@arch.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=arch, script: scripts/collectors/arch.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@arch.service
+
+# Cadence: Arch core/extra/multilib is a rolling release; packages update multiple times a day.
+[Timer]
+OnCalendar=*-*-* 05:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@arch.service
+
+[Install]
+WantedBy=timers.target

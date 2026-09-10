@@ -1,0 +1,18 @@
+# Schedules pg-enrich@taxonomy.service (deploy/quadlet/enrichers/pg-enrich@.container,
+# instantiated with %i=taxonomy, script: scripts/enrichers/taxonomy.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+# Cadence: package classification is slow-changing; weekly is more than sufficient.
+[Unit]
+Description=Schedule for pg-enrich@taxonomy.service
+
+[Timer]
+OnCalendar=Mon *-*-* 12:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-enrich@taxonomy.service
+
+[Install]
+WantedBy=timers.target

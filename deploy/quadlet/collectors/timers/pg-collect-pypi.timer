@@ -1,0 +1,18 @@
+# Schedules pg-collect@pypi.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=pypi, script: scripts/collectors/pypi.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@pypi.service
+
+# Cadence: PyPI has an extremely high daily publish volume.
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@pypi.service
+
+[Install]
+WantedBy=timers.target

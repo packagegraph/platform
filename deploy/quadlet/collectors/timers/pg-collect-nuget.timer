@@ -1,0 +1,18 @@
+# Schedules pg-collect@nuget.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=nuget, script: scripts/collectors/nuget.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@nuget.service
+
+# Cadence: NuGet has a high daily publish volume.
+[Timer]
+OnCalendar=*-*-* 11:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@nuget.service
+
+[Install]
+WantedBy=timers.target

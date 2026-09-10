@@ -1,0 +1,68 @@
+# Templated collector unit -- one instance per package ecosystem/distro,
+# scheduled independently by the matching timers/pg-collect-<name>.timer.
+# Equivalent of the collect-<name> CronJobs in
+# deploy/overlays/{dev,prod}/jobs/collect-*.yaml, minus the direct-to-Fuseki
+# load step: this host has no writable Fuseki (only QLever, which is
+# read-only -- see sparql-proxy.container's comment), so every collector
+# here only collects and uploads .nt/.graph pairs to Minio's nt-output/
+# prefix. qlever-rebuild-index.timer picks those up on its own nightly
+# schedule and promotes them into the live QLever index -- see
+# [[qlever-tdb2-decoupling]] in the README's cross-reference, or just
+# qlever-rebuild-index.sh directly.
+#
+# %i is the collector name (matches the .sh filename under scripts/collectors/
+# and the GRAPH_URI/logic baked into that script -- this unit file has no
+# per-collector knowledge at all, it only runs whatever script %i names).
+#
+# SPARQL_BACKEND=qlever + FUSEKI_ENDPOINT pointed at the loopback QLever
+# instance (below) lets discovery-mode collectors (npm, pypi, maven, ...)
+# query already-collected data without a Fuseki instance: pg-collect's
+# discovery queries are plain SPARQL 1.1 SELECT, confirmed QLever-compatible.
+# The env var is still named FUSEKI_ENDPOINT (not renamed to SPARQL_ENDPOINT)
+# so the collector scripts below stay copy-paste identical to the
+# Kubernetes jobs they were ported from.
+#
+# Network=host is required to reach qlever.container's PublishPort
+# (127.0.0.1:7001, loopback-only by design -- see qlever.container's
+# comment) from inside this container; Podman's default bridge/pasta
+# networking has its own loopback and can't see the host's.
+
+[Unit]
+Description=PackageGraph collector: %i
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/packagegraph/etl:latest
+AutoUpdate=registry
+Network=host
+EnvironmentFile=/etc/containers/systemd/scripts/minio.env
+EnvironmentFile=/etc/containers/systemd/scripts/qlever.env
+Environment=HOME=/tmp
+Environment=SPARQL_BACKEND=qlever
+Environment=FUSEKI_ENDPOINT=http://127.0.0.1:7001
+Volume=/etc/containers/systemd/scripts/collectors/%i.sh:/usr/local/bin/collect.sh:ro
+Entrypoint=/bin/sh
+Exec=/usr/local/bin/collect.sh
+NoNewPrivileges=true
+DropCapability=ALL
+# Ceiling generous enough for the slowest job (fedora-43-full's Koji+spec
+# enrichment pass) rather than tuned per collector -- one shared template
+# file, one shared timeout. Raised from 5h to 8h on 2026-09-10 after
+# fedora-43-full hit the 5h ceiling at 99.6% complete (23,900/23,999 spec
+# files) and lost the entire run -- a oneshot service with no incremental
+# upload (upload-nt.sh only runs after full completion) means a timeout
+# discards everything, not just the tail. Compounding cause found and
+# fixed the same day: cache.rs's Minio-backed Koji cache was silently
+# failing 100% of its reads/writes (wrong auth scheme for Scaleway's S3
+# API), so every run re-fetched every Koji build from scratch with no
+# cross-run caching benefit -- fixed same day in etl/pg-collect/src/cache.rs
+# (AWS SigV4 signing instead of HTTP Basic Auth). 8h leaves headroom even
+# before confirming how much the cache fix actually shortens a warm-cache run.
+Memory=4g
+PodmanArgs=--cpus=2
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+TimeoutStartSec=28800

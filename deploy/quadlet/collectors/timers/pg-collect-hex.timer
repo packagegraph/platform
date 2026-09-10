@@ -1,0 +1,18 @@
+# Schedules pg-collect@hex.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=hex, script: scripts/collectors/hex.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@hex.service
+
+# Cadence: hex.pm (Erlang/Elixir) is smaller and slower-moving than npm/pypi-scale registries.
+[Timer]
+OnCalendar=Mon,Wed,Fri *-*-* 10:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@hex.service
+
+[Install]
+WantedBy=timers.target

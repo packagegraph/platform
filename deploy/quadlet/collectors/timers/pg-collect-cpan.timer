@@ -1,0 +1,17 @@
+# Schedules pg-collect@cpan.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=cpan, script: scripts/collectors/cpan.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@cpan.service
+
+[Timer]
+OnCalendar=Tue *-*-* 07:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@cpan.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,18 @@
+# Schedules pg-collect@osv.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=osv, script: scripts/collectors/osv.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@osv.service
+
+# Cadence: OSV ingests vendor advisories continuously across all 12 tracked ecosystems.
+[Timer]
+OnCalendar=*-*-* 09:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@osv.service
+
+[Install]
+WantedBy=timers.target

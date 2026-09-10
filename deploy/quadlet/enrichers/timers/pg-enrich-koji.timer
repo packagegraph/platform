@@ -1,0 +1,18 @@
+# Schedules pg-enrich@koji.service (deploy/quadlet/enrichers/pg-enrich@.container,
+# instantiated with %i=koji, script: scripts/enrichers/koji.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+# Cadence: matches the Kubernetes original's weekly cadence, timed after the Fedora/CentOS collectors.
+[Unit]
+Description=Schedule for pg-enrich@koji.service
+
+[Timer]
+OnCalendar=Mon *-*-* 11:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-enrich@koji.service
+
+[Install]
+WantedBy=timers.target

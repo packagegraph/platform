@@ -1,0 +1,26 @@
+# Schedules pg-enrich@revdeps.service (deploy/quadlet/enrichers/pg-enrich@.container,
+# instantiated with %i=revdeps, script: scripts/enrichers/revdeps.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+# Cadence: was blocked on the ontology never being loaded into QLever (see
+# docs/QLEVER-HOST-OPERATIONS.md and deploy/quadlet/README.md) until
+# 2026-09-10; now unblocked. A single SPARQL aggregate over
+# pkg:directlyDependsOn is cheap, but weekly matches the other
+# instance-data-dependent enrichers' cadence -- reverse-dependency counts
+# don't need to be fresher than the dependency graph itself, which updates
+# on the collectors' own weekly-or-slower cadence for most ecosystems.
+# Scheduled before enrich-blast-radius, which reads
+# met:reverseDependencyCount that this enricher materializes.
+[Unit]
+Description=Schedule for pg-enrich@revdeps.service
+
+[Timer]
+OnCalendar=Mon *-*-* 13:30:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-enrich@revdeps.service
+
+[Install]
+WantedBy=timers.target

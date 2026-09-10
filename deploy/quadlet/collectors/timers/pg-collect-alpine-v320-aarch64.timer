@@ -1,0 +1,17 @@
+# Schedules pg-collect@alpine-v320-aarch64.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=alpine-v320-aarch64, script: scripts/collectors/alpine-v320-aarch64.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@alpine-v320-aarch64.service
+
+[Timer]
+OnCalendar=Mon *-*-* 02:30:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@alpine-v320-aarch64.service
+
+[Install]
+WantedBy=timers.target

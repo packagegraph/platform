@@ -1,0 +1,18 @@
+# Schedules pg-collect@homebrew.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=homebrew, script: scripts/collectors/homebrew.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@homebrew.service
+
+# Cadence: homebrew-core sees frequent formula bumps across its large catalog.
+[Timer]
+OnCalendar=Mon,Wed,Fri *-*-* 15:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@homebrew.service
+
+[Install]
+WantedBy=timers.target

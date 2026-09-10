@@ -1,0 +1,18 @@
+# Schedules pg-collect@conda.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=conda, script: scripts/collectors/conda.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@conda.service
+
+# Cadence: conda-forge's feedstocks update frequently across a large catalog.
+[Timer]
+OnCalendar=Mon,Wed,Fri *-*-* 16:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@conda.service
+
+[Install]
+WantedBy=timers.target

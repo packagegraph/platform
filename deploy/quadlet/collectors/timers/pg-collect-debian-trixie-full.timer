@@ -1,0 +1,17 @@
+# Schedules pg-collect@debian-trixie-full.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=debian-trixie-full, script: scripts/collectors/debian-trixie-full.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@debian-trixie-full.service
+
+[Timer]
+OnCalendar=Sat *-*-* 02:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@debian-trixie-full.service
+
+[Install]
+WantedBy=timers.target

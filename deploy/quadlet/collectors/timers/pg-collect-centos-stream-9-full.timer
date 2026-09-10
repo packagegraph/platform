@@ -1,0 +1,18 @@
+# Schedules pg-collect@centos-stream-9-full.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=centos-stream-9-full, script: scripts/collectors/centos-stream-9-full.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@centos-stream-9-full.service
+
+# Cadence: CentOS Stream is a rolling preview of RHEL -- faster-moving than a stable point release, slower than Fedora rawhide.
+[Timer]
+OnCalendar=Mon,Wed,Fri *-*-* 02:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@centos-stream-9-full.service
+
+[Install]
+WantedBy=timers.target

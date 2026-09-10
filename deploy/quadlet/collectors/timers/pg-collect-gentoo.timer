@@ -1,0 +1,18 @@
+# Schedules pg-collect@gentoo.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=gentoo, script: scripts/collectors/gentoo.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@gentoo.service
+
+# Cadence: the Portage tree updates continuously, many ebuilds a day.
+[Timer]
+OnCalendar=*-*-* 02:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@gentoo.service
+
+[Install]
+WantedBy=timers.target

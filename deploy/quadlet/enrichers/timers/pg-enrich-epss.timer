@@ -1,0 +1,18 @@
+# Schedules pg-enrich@epss.service (deploy/quadlet/enrichers/pg-enrich@.container,
+# instantiated with %i=epss, script: scripts/enrichers/epss.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+# Cadence: EPSS scores are republished daily by FIRST.org.
+[Unit]
+Description=Schedule for pg-enrich@epss.service
+
+[Timer]
+OnCalendar=*-*-* 20:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-enrich@epss.service
+
+[Install]
+WantedBy=timers.target

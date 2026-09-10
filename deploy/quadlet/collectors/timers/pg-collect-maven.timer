@@ -1,0 +1,18 @@
+# Schedules pg-collect@maven.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=maven, script: scripts/collectors/maven.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@maven.service
+
+# Cadence: Maven Central is one of the largest, highest-volume registries tracked.
+[Timer]
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@maven.service
+
+[Install]
+WantedBy=timers.target

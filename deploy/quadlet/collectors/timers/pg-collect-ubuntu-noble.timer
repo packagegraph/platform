@@ -1,0 +1,17 @@
+# Schedules pg-collect@ubuntu-noble.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=ubuntu-noble, script: scripts/collectors/ubuntu-noble.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@ubuntu-noble.service
+
+[Timer]
+OnCalendar=Mon *-*-* 08:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@ubuntu-noble.service
+
+[Install]
+WantedBy=timers.target

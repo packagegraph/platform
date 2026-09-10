@@ -1,0 +1,18 @@
+# Schedules pg-collect@archarm-aarch64.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=archarm-aarch64, script: scripts/collectors/archarm-aarch64.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@archarm-aarch64.service
+
+# Cadence: ArchLinuxARM mirrors Arch's rolling cadence.
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@archarm-aarch64.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,18 @@
+# Schedules pg-collect@hackage.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=hackage, script: scripts/collectors/hackage.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@hackage.service
+
+# Cadence: Hackage (Haskell) publishes at a moderate, sub-daily-signal pace.
+[Timer]
+OnCalendar=Mon,Wed,Fri *-*-* 09:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@hackage.service
+
+[Install]
+WantedBy=timers.target
