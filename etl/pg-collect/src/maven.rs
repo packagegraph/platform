@@ -24,6 +24,15 @@ pub struct MavenCollector {
     pub max_packages: usize,
     pub delay_ms: u64,
     pub graph_uri: Option<String>,
+    // Circuit breaker: once the search API fails at the transport level
+    // (DNS/TLS/connection/timeout) once in this run, skip straight to the
+    // maven-metadata.xml fallback for every subsequent lookup instead of
+    // re-paying the full retry+timeout cost per package. Observed in
+    // production 2026-09-10: a single hung search request can cost up to
+    // the client's 60s timeout, and a 2000+ package run repeating that
+    // per package is not tolerable. `Cell`, not `AtomicBool`: maven.rs's
+    // traversal is sequential, no threads.
+    search_unavailable: std::cell::Cell<bool>,
 }
 
 /// Check whether a URL points to Maven Central over HTTPS.
@@ -131,6 +140,7 @@ impl MavenCollector {
             max_packages: 5_000,
             delay_ms: 500,
             graph_uri: None,
+            search_unavailable: std::cell::Cell::new(false),
         }
     }
 
@@ -248,9 +258,47 @@ impl MavenCollector {
         Ok((pom, any_network_hit))
     }
 
+    /// Fetch latest version from the Maven search API, falling back to
+    /// `maven-metadata.xml` (read directly from the repository, the same
+    /// mechanism every real Maven/Gradle build uses to resolve "latest")
+    /// when the search API is unreachable at the transport level.
+    ///
+    /// Observed in production 2026-09-10: `search.maven.org` (a Solr
+    /// index meant for human search, not programmatic resolution) went
+    /// unreachable for several hours while `repo1.maven.org` (the actual
+    /// artifact CDN, used by every build tool) stayed healthy throughout
+    /// -- confirmed live via direct `curl` before writing this fallback.
+    /// Only transport-level failures (DNS/TLS/connection reset/timeout)
+    /// trigger the fallback; a legitimate 404 (`FetchError::NotFound`)
+    /// means the coordinate doesn't exist and metadata.xml would 404 too,
+    /// so there's no reason to double the request.
+    fn get_latest_version(
+        &self,
+        group_id: &str,
+        artifact_id: &str,
+        base_delay_ms: &mut u64,
+    ) -> std::result::Result<(String, bool), (FetchError, bool)> {
+        if self.search_unavailable.get() {
+            return self.get_latest_version_via_metadata(group_id, artifact_id, base_delay_ms);
+        }
+
+        let result = self.get_latest_version_via_search(group_id, artifact_id, base_delay_ms);
+        if let Err((FetchError::Transport { url, .. }, hit)) = &result {
+            eprintln!(
+                "  Search API unreachable ({url}) for {}:{}, falling back to maven-metadata.xml \
+                 (and skipping the search API for the rest of this run)",
+                group_id, artifact_id
+            );
+            self.search_unavailable.set(true);
+            let fallback = self.get_latest_version_via_metadata(group_id, artifact_id, base_delay_ms);
+            return fallback.map(|(version, fallback_hit)| (version, *hit || fallback_hit));
+        }
+        result
+    }
+
     /// Fetch latest version from the Maven search API.
     /// Returns `Ok((version_string, was_network_hit))` or `Err((FetchError, was_network_hit))`.
-    fn get_latest_version(
+    fn get_latest_version_via_search(
         &self,
         group_id: &str,
         artifact_id: &str,
@@ -304,6 +352,51 @@ impl MavenCollector {
         // Semantic check: empty docs → negative-cache as 404 with 6h TTL.
         // Empty latestVersion → InvalidResponse, NOT cached.
         self.parse_search_version_with_cache(group_id, artifact_id, &url, &bytes, was_hit)
+    }
+
+    /// Fallback path for `get_latest_version`: read `maven-metadata.xml`
+    /// directly from the repository instead of querying the Solr search
+    /// API. Not wired into the HTTP cache -- this only runs when the
+    /// search API is already down, so there's no steady-state cost to
+    /// justify the extra cache-plumbing complexity, and once a version is
+    /// resolved the POM fetch step still benefits from its own cache.
+    fn get_latest_version_via_metadata(
+        &self,
+        group_id: &str,
+        artifact_id: &str,
+        base_delay_ms: &mut u64,
+    ) -> std::result::Result<(String, bool), (FetchError, bool)> {
+        let url = self.build_metadata_url(group_id, artifact_id);
+        let (bytes, was_hit) = self
+            .direct_fetch_with_retry(&url, base_delay_ms, 3)
+            .map_err(|e| (e, true))?;
+        let text = std::str::from_utf8(&bytes).map_err(|e| {
+            (
+                FetchError::Parse {
+                    url: url.clone(),
+                    detail: e.to_string(),
+                },
+                was_hit,
+            )
+        })?;
+        match parse_metadata_version(text) {
+            Some(version) => Ok((version, was_hit)),
+            None => Err((
+                FetchError::InvalidResponse {
+                    url,
+                    detail: "maven-metadata.xml has no <release> or <latest>".into(),
+                },
+                was_hit,
+            )),
+        }
+    }
+
+    fn build_metadata_url(&self, group_id: &str, artifact_id: &str) -> String {
+        let group_path = group_id.replace('.', "/");
+        format!(
+            "{}/{}/{}/maven-metadata.xml",
+            self.repo_base, group_path, artifact_id
+        )
     }
 
     /// Direct search fetch without cache (shared by no-cache path and cache-init fallback).
@@ -1342,6 +1435,52 @@ fn dep_identity(pkg_uri: &str, ordinal: usize, dep: &PomDependency) -> String {
 /// - Plugin and profile dependencies are ignored.
 ///
 /// Also parses `<properties>`, `<parent>`, `<type>`, `<classifier>`, and `<exclusions>`.
+/// Extract the latest version from a `maven-metadata.xml` document:
+/// `<metadata><versioning><release>X</release><latest>Y</latest></versioning></metadata>`.
+/// Prefers `<release>` (excludes snapshots/pre-releases per Maven's own
+/// convention) and falls back to `<latest>` if `<release>` is absent or
+/// empty.
+fn parse_metadata_version(xml: &str) -> Option<String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut path_stack: Vec<String> = Vec::new();
+    let mut current_text = String::new();
+    let mut release: Option<String> = None;
+    let mut latest: Option<String> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                path_stack.push(String::from_utf8_lossy(e.name().as_ref()).to_string());
+                current_text.clear();
+            }
+            Ok(Event::Text(e)) => {
+                current_text.push_str(&e.unescape().unwrap_or_default());
+            }
+            Ok(Event::End(_)) => {
+                let path = path_stack.join("/");
+                if path == "metadata/versioning/release" {
+                    release = Some(current_text.trim().to_string());
+                } else if path == "metadata/versioning/latest" {
+                    latest = Some(current_text.trim().to_string());
+                }
+                path_stack.pop();
+                current_text.clear();
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    release
+        .filter(|s| !s.is_empty())
+        .or_else(|| latest.filter(|s| !s.is_empty()))
+}
+
 fn parse_pom(
     xml: &str,
     group_id: &str,
@@ -2247,6 +2386,7 @@ mod tests {
             max_packages: 5_000,
             delay_ms: 0,
             graph_uri: None,
+            search_unavailable: std::cell::Cell::new(false),
         };
 
         let mut delay = 1u64;
@@ -2292,6 +2432,7 @@ mod tests {
             max_packages: 5_000,
             delay_ms: 0,
             graph_uri: None,
+            search_unavailable: std::cell::Cell::new(false),
         };
 
         let mut delay = 1u64;
@@ -2341,6 +2482,7 @@ mod tests {
             max_packages: 5_000,
             delay_ms: 0,
             graph_uri: None,
+            search_unavailable: std::cell::Cell::new(false),
         };
 
         let mut delay = 1u64;
@@ -2890,6 +3032,7 @@ mod tests {
             max_packages: 5_000,
             delay_ms: 0,
             graph_uri: None,
+            search_unavailable: std::cell::Cell::new(false),
         };
 
         let mut delay = 1u64;
@@ -3043,6 +3186,7 @@ mod tests {
             max_packages: 5_000,
             delay_ms: 0,
             graph_uri: None,
+            search_unavailable: std::cell::Cell::new(false),
         };
 
         let mut delay = 1u64;
@@ -5611,5 +5755,159 @@ mod tests {
         assert_eq!(collector.max_roots, 50);
         assert_eq!(collector.max_packages, 100);
         assert_eq!(collector.delay_ms, 10);
+    }
+
+    // ── maven-metadata.xml fallback (search API outage) ──────────────
+
+    #[test]
+    fn test_parse_metadata_version_prefers_release() {
+        let xml = r#"<?xml version="1.0"?>
+<metadata>
+  <groupId>org.example</groupId>
+  <artifactId>lib</artifactId>
+  <versioning>
+    <latest>2.0-SNAPSHOT</latest>
+    <release>1.5.0</release>
+    <versions><version>1.5.0</version></versions>
+  </versioning>
+</metadata>"#;
+        assert_eq!(parse_metadata_version(xml), Some("1.5.0".to_string()));
+    }
+
+    #[test]
+    fn test_parse_metadata_version_falls_back_to_latest_when_no_release() {
+        let xml = r#"<?xml version="1.0"?>
+<metadata>
+  <versioning>
+    <latest>2.0-SNAPSHOT</latest>
+  </versioning>
+</metadata>"#;
+        assert_eq!(
+            parse_metadata_version(xml),
+            Some("2.0-SNAPSHOT".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_metadata_version_empty_release_falls_back_to_latest() {
+        let xml = r#"<?xml version="1.0"?>
+<metadata>
+  <versioning>
+    <release></release>
+    <latest>2.0-SNAPSHOT</latest>
+  </versioning>
+</metadata>"#;
+        assert_eq!(
+            parse_metadata_version(xml),
+            Some("2.0-SNAPSHOT".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_metadata_version_missing_both_returns_none() {
+        let xml = r#"<?xml version="1.0"?><metadata><versioning></versioning></metadata>"#;
+        assert_eq!(parse_metadata_version(xml), None);
+    }
+
+    #[test]
+    fn test_get_latest_version_falls_back_to_metadata_on_search_transport_error() {
+        let mut server = mockito::Server::new();
+        let metadata_mock = server
+            .mock("GET", "/maven2/org/ex/lib/maven-metadata.xml")
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?><metadata><versioning><release>3.2.1</release></versioning></metadata>"#,
+            )
+            .expect(1)
+            .create();
+
+        let collector = MavenCollector {
+            client: crate::enricher::default_http_client(),
+            // Port 1: nothing listens there, so this fails fast with a
+            // real transport-level connection error rather than a slow
+            // timeout, exercising the same FetchError::Transport path
+            // search.maven.org's outage produced in production.
+            search_base: "http://127.0.0.1:1".to_string(),
+            repo_base: format!("{}/maven2", server.url()),
+            http_cache: None,
+            refresh: false,
+            max_depth: 3,
+            max_roots: 10_000,
+            max_packages: 5_000,
+            delay_ms: 0,
+            graph_uri: None,
+            search_unavailable: std::cell::Cell::new(false),
+        };
+
+        let mut delay = 1u64;
+        let result = collector.get_latest_version("org.ex", "lib", &mut delay);
+        assert_eq!(result.unwrap().0, "3.2.1");
+        metadata_mock.assert();
+    }
+
+    #[test]
+    fn test_search_circuit_breaker_skips_search_after_first_transport_failure() {
+        // Once the search API has failed once in a run, subsequent lookups
+        // must skip straight to metadata.xml rather than re-paying the
+        // full retry+timeout cost per package.
+        let mut server = mockito::Server::new();
+        let metadata_mock = server
+            .mock("GET", mockito::Matcher::Regex(r"maven-metadata\.xml$".into()))
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?><metadata><versioning><release>1.0.0</release></versioning></metadata>"#,
+            )
+            .expect(2)
+            .create();
+
+        let collector = MavenCollector {
+            client: crate::enricher::default_http_client(),
+            search_base: "http://127.0.0.1:1".to_string(),
+            repo_base: format!("{}/maven2", server.url()),
+            http_cache: None,
+            refresh: false,
+            max_depth: 3,
+            max_roots: 10_000,
+            max_packages: 5_000,
+            delay_ms: 0,
+            graph_uri: None,
+            search_unavailable: std::cell::Cell::new(false),
+        };
+
+        let mut delay = 1u64;
+        let r1 = collector.get_latest_version("org.ex", "one", &mut delay);
+        assert_eq!(r1.unwrap().0, "1.0.0");
+        assert!(collector.search_unavailable.get());
+
+        // Second call: search_base is still unreachable, but if the
+        // breaker didn't trip this would hang retrying against it before
+        // falling back. Bound the whole call in a thread with a short
+        // timeout so a regression fails the test instead of hanging it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repo_base = collector.repo_base.clone();
+        std::thread::spawn(move || {
+            let collector2 = MavenCollector {
+                client: crate::enricher::default_http_client(),
+                search_base: "http://127.0.0.1:1".to_string(),
+                repo_base,
+                http_cache: None,
+                refresh: false,
+                max_depth: 3,
+                max_roots: 10_000,
+                max_packages: 5_000,
+                delay_ms: 0,
+                graph_uri: None,
+                search_unavailable: std::cell::Cell::new(true), // pre-tripped
+            };
+            let mut delay2 = 1u64;
+            let r2 = collector2.get_latest_version("org.ex", "two", &mut delay2);
+            tx.send(r2.map(|(v, _)| v)).unwrap();
+        });
+        let r2 = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pre-tripped breaker must not hit the search API at all");
+        assert_eq!(r2.unwrap(), "1.0.0");
+
+        metadata_mock.assert();
     }
 }
