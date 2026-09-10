@@ -64,3 +64,26 @@ jobs:
           file: etl/Containerfile.qlever-rebuild
           push: false
           tags: ghcr.io/packagegraph/qlever-rebuild:ci
+
+  # Merges to main publish the floating `devel-latest` tag -- which is what
+  # the deployed host's AutoUpdate=registry units track -- plus an immutable
+  # `main-<sha>` to roll back to. Production `latest` is deliberately NOT
+  # published here; it moves only on a cut release, via release.yml.
+  #
+  # The jobs above stay amd64-only and push nothing, so pull-request latency
+  # is unchanged: the arm64 build only runs once a change is on main.
+  #
+  # The `github.ref` guard also keeps this from firing when release.yml
+  # calls this workflow, where the ref is a tag rather than refs/heads/main.
+  publish-devel:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test-rust, build-etl, build-fuseki, build-qlever-rebuild]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/images.yml
+    with:
+      tags: |
+        devel-latest
+        main-${{ github.sha }}
+      ontology_ref: v0.13.0
