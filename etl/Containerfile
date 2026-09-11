@@ -26,11 +26,24 @@ ENV PATH="${JENA_HOME}/bin:${PATH}"
 # Install mc (Minio client) and kubectl (for rollout restart)
 # Multi-arch: TARGETARCH is populated automatically by podman/buildah and
 # Docker buildx to the arch being built for ("amd64"/"arm64"), matching
-# both Minio's and Kubernetes' own release path segments directly -- see
-# etl/Containerfile.qlever-rebuild for the identical fix applied there.
+# both Minio's GitHub release asset naming (mc.linux-$TARGETARCH) and
+# Kubernetes' own release path segment directly.
+#
+# mc is pinned and downloaded from GitHub Releases rather than dl.min.io --
+# confirmed live 2026-09-11: MinIO has retired dl.min.io's raw binary
+# distribution entirely (both pinned-version and unversioned "latest" URLs
+# return HTTP 410 Gone now), and the minio/mc Docker Hub image now requires
+# authentication even for anonymous pulls. See
+# etl/Containerfile.qlever-rebuild for the identical fix and full
+# rationale. This also pins a version for the first time -- this file
+# previously downloaded whatever "latest" happened to be.
 ARG TARGETARCH
-RUN curl -fsSL https://dl.min.io/client/mc/release/linux-${TARGETARCH}/mc -o /usr/local/bin/mc \
+ARG MC_VERSION=RELEASE.2025-04-08T15-39-49Z
+RUN curl -fsSL "https://github.com/minio/mc/releases/download/${MC_VERSION}/mc.linux-${TARGETARCH}.${MC_VERSION}" -o /usr/local/bin/mc \
+    && curl -fsSL "https://github.com/minio/mc/releases/download/${MC_VERSION}/mc.linux-${TARGETARCH}.${MC_VERSION}.sha256sum" -o /tmp/mc.sha256sum \
+    && echo "$(awk '{print $1}' /tmp/mc.sha256sum)  /usr/local/bin/mc" | sha256sum -c - \
     && chmod +x /usr/local/bin/mc \
+    && rm /tmp/mc.sha256sum \
     && curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${TARGETARCH}/kubectl" -o /usr/local/bin/kubectl \
     && chmod +x /usr/local/bin/kubectl
 

@@ -3,6 +3,17 @@ FROM docker.io/eclipse-temurin:21-jre-alpine
 ARG JENA_VERSION=5.3.0
 ARG FUSEKI_HOME=/fuseki
 
+# mc (Minio client) — pinned version with sha256 verification, downloaded
+# from GitHub Releases rather than dl.min.io. Confirmed live 2026-09-11:
+# MinIO has retired dl.min.io's raw binary distribution entirely (both
+# pinned-version and unversioned "latest" URLs return HTTP 410 Gone now),
+# and the minio/mc Docker Hub image now requires authentication even for
+# anonymous pulls. See etl/Containerfile.qlever-rebuild for the identical
+# fix and full rationale. This also fixes this file's pre-existing
+# amd64-only hardcoding (it never used TARGETARCH).
+ARG TARGETARCH
+ARG MC_VERSION=RELEASE.2025-04-08T15-39-49Z
+
 RUN apk add --no-cache bash curl unzip \
     && curl -fsSL "https://archive.apache.org/dist/jena/binaries/apache-jena-fuseki-${JENA_VERSION}.tar.gz" \
        | tar -xz -C /opt \
@@ -11,8 +22,11 @@ RUN apk add --no-cache bash curl unzip \
     && mkdir -p "${FUSEKI_HOME}/webapp" \
     && unzip -qo /tmp/fuseki.war -d "${FUSEKI_HOME}/webapp" -x 'WEB-INF/lib/*' 'WEB-INF/classes/*' 'META-INF/*' 'DEPENDENCIES' \
     && rm /tmp/fuseki.war \
-    && curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc \
+    && curl -fsSL "https://github.com/minio/mc/releases/download/${MC_VERSION}/mc.linux-${TARGETARCH}.${MC_VERSION}" -o /usr/local/bin/mc \
+    && curl -fsSL "https://github.com/minio/mc/releases/download/${MC_VERSION}/mc.linux-${TARGETARCH}.${MC_VERSION}.sha256sum" -o /tmp/mc.sha256sum \
+    && echo "$(awk '{print $1}' /tmp/mc.sha256sum)  /usr/local/bin/mc" | sha256sum -c - \
     && chmod +x /usr/local/bin/mc \
+    && rm /tmp/mc.sha256sum \
     && addgroup -S fuseki && adduser -S -G fuseki fuseki \
     && chown -R fuseki:fuseki "${FUSEKI_HOME}" \
     && apk del curl unzip
