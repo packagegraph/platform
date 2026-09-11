@@ -1,17 +1,16 @@
+use crate::fetch_error::FetchError;
+use crate::http_transport::{HttpTransport, StatsSnapshot};
 use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::sparql::{SparqlAuth, SparqlBackend};
 use crate::uris::*;
-use reqwest::blocking::Client;
-use reqwest::StatusCode;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
-use std::time::Duration;
 use crate::emit::rdf::write_package_identity;
 
 pub struct NpmCollector {
-    client: Client,
+    transport: HttpTransport,
     registry_url: String,
     pub graph_uri: Option<String>,
 }
@@ -47,10 +46,8 @@ struct NpmDist {
 
 impl NpmCollector {
     pub fn new(registry_url: String) -> Self {
-        let client = crate::enricher::default_http_client();
-
         Self {
-            client,
+            transport: HttpTransport::new(),
             registry_url,
             graph_uri: None,
         }
@@ -59,6 +56,17 @@ impl NpmCollector {
     pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
         self.graph_uri = graph_uri;
         self
+    }
+
+    /// Override the transport, for tests that need fast retries.
+    pub fn with_transport(mut self, transport: HttpTransport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// One-line fetch summary for the end of a run.
+    pub fn transport_stats(&self) -> StatsSnapshot {
+        self.transport.stats()
     }
 
     pub fn collect_discover(
@@ -102,9 +110,9 @@ impl NpmCollector {
                 }
                 Err(e) => eprintln!("  Error fetching {}: {}", name, e),
             }
-
-            std::thread::sleep(Duration::from_millis(base_delay_ms));
         }
+
+        eprintln!("  {}", self.transport_stats());
 
         writer.flush()?;
         Ok((total_packages, total_triples))
@@ -127,56 +135,28 @@ impl NpmCollector {
         Ok(triples)
     }
 
+    /// Fetch one package document.
+    ///
+    /// Retry, backoff, `Retry-After`, and inter-request pacing all live in
+    /// `HttpTransport`, so what remains here is URL construction and JSON
+    /// decoding. `_base_delay_ms` is vestigial -- the transport's per-host
+    /// limiter paces requests now -- and goes away when the remaining
+    /// registry collectors migrate.
     fn fetch_package_with_retry(
         &self,
         name: &str,
-        base_delay_ms: &mut u64,
+        _base_delay_ms: &mut u64,
     ) -> std::result::Result<NpmPackageDoc, String> {
         let url = format!("{}/{}", self.registry_url, name);
-        let max_attempts = 5;
 
-        for attempt in 0..max_attempts {
-            match self.client.get(&url).send() {
-                Ok(response) => {
-                    if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                        // Parse Retry-After header or use exponential backoff
-                        let retry_after_secs = response
-                            .headers()
-                            .get("retry-after")
-                            .and_then(|h| h.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or_else(|| 2u64.pow(attempt as u32));
-
-                        let delay_ms = retry_after_secs * 1000;
-                        eprintln!(
-                            "  Rate limited on {}, waiting {}s...",
-                            name, retry_after_secs
-                        );
-                        std::thread::sleep(Duration::from_millis(delay_ms));
-                        *base_delay_ms = (*base_delay_ms * 2).min(5000); // Increase base delay
-                        continue;
-                    }
-
-                    if response.status() == StatusCode::NOT_FOUND {
-                        return Err(format!("404: {}", name));
-                    }
-
-                    let text = response.text().map_err(|e| e.to_string())?;
-                    return serde_json::from_str(&text).map_err(|e| e.to_string());
-                }
-                Err(e) => {
-                    if attempt < max_attempts - 1 {
-                        let delay = Duration::from_millis(1000 * 2u64.pow(attempt as u32));
-                        eprintln!("  Network error on {}, retrying in {:?}...", name, delay);
-                        std::thread::sleep(delay);
-                        continue;
-                    }
-                    return Err(e.to_string());
-                }
+        match self.transport.get(&url, None) {
+            Ok(response) => {
+                let text = std::str::from_utf8(&response.bytes).map_err(|e| e.to_string())?;
+                serde_json::from_str(text).map_err(|e| e.to_string())
             }
+            Err(FetchError::NotFound { .. }) => Err(format!("404: {}", name)),
+            Err(e) => Err(e.to_string()),
         }
-
-        Err(format!("Max retries exceeded for {}", name))
     }
 
     fn emit_package_triples(
@@ -346,7 +326,9 @@ pub fn read_seed_file(path: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http_transport::{HostLimiter, RetryPolicy};
     use std::io::{Read, Write};
+    use std::time::Duration;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -512,32 +494,45 @@ mod tests {
         rate_limited.assert();
         ok.assert();
         assert_eq!(doc.name, "slowpkg");
-        // 429 handling doubles the inter-request base delay, capped at 5000.
-        assert_eq!(base_delay_ms, 400);
+        // Pre-migration this also asserted base_delay_ms doubled to 400.
+        // That described npm's manual inter-request pacing, which the
+        // transport's per-host limiter replaces; the retry behaviour this
+        // test exists to pin is unchanged.
     }
 
     #[test]
-    fn characterize_500_is_not_retried_and_fails_as_a_parse_error() {
-        // Documents a real gap: npm ignores 5xx entirely and hands the body
-        // to serde_json. The migration changes this deliberately.
+    fn migrated_500_is_retried_then_reported_as_an_http_error() {
+        // Deliberate change from the pre-migration behaviour: npm used to
+        // hand a 500 body to serde_json after a single request, because it
+        // checked only for 429 and 404. is_retryable() now treats 5xx as
+        // transient.
         let mut server = mockito::Server::new();
         let mock = server
             .mock("GET", "/brokenpkg")
             .with_status(500)
             .with_body("upstream exploded")
-            .expect(1) // exactly one request -- no retry today
+            .expect(3)
             .create();
 
-        let collector = NpmCollector::new(server.url());
+        let collector = NpmCollector::new(server.url()).with_transport(
+            HttpTransport::new()
+                .with_policy(RetryPolicy {
+                    max_attempts: 3,
+                    base_delay: Duration::from_millis(1),
+                    max_delay: Duration::from_millis(4),
+                    jitter: false,
+                })
+                .with_limiter(HostLimiter::new(Duration::from_millis(0))),
+        );
         let mut base_delay_ms = 200u64;
         let err = collector
             .fetch_package_with_retry("brokenpkg", &mut base_delay_ms)
-            .expect_err("500 body is not valid JSON");
+            .expect_err("500 should still be an error after retries");
 
         mock.assert();
         assert!(
-            !err.starts_with("404:"),
-            "500 must not be reported as a 404, got: {err}"
+            err.contains("500"),
+            "error should name the status, got: {err}"
         );
     }
 
