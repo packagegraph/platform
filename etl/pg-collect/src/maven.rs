@@ -958,18 +958,20 @@ impl MavenCollector {
         }
 
         if let Some(scm_url) = &pom.scm_url {
-            if let Some(repo_uri) = crate::uris::normalize_forge_url(scm_url) {
+            if let Some(canonical_url) = crate::uris::normalize_forge_url_canonical(scm_url) {
+                let upstream_repo_iri = crate::uris::repo_uri(&canonical_url);
                 writer.write_triple(
                     &identity_uri,
                     &format!("{PKG}upstreamRepository"),
-                    &repo_uri,
+                    &upstream_repo_iri,
                 )?;
-                writer.write_triple(&repo_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
+                writer.write_triple(&upstream_repo_iri, RDF_TYPE, &format!("{VCS}Repository"))?;
                 triples += 2;
+                triples += crate::forge::emit_upstream_project(writer, &canonical_url)?;
 
                 if let Some(conn) = &pom.scm_connection {
                     let clone_url = conn.strip_prefix("scm:git:").unwrap_or(conn);
-                    writer.write_literal(&repo_uri, &format!("{VCS}cloneUrl"), clone_url)?;
+                    writer.write_literal(&upstream_repo_iri, &format!("{VCS}cloneUrl"), clone_url)?;
                     triples += 1;
                 }
             }
@@ -6286,5 +6288,41 @@ mod tests {
         );
         search_mock.assert();
         metadata_mock.assert();
+    }
+
+    #[test]
+    fn test_maven_upstream_repo_links_to_hub() {
+        use std::io::Read;
+        use tempfile::NamedTempFile;
+
+        let collector = MavenCollector::new(
+            "https://search.maven.org".to_string(),
+            "https://repo1.maven.org/maven2".to_string(),
+        );
+        let pom = PomMetadata {
+            group_id: "com.example".to_string(),
+            artifact_id: "example-lib".to_string(),
+            version: "1.0.0".to_string(),
+            scm_url: Some("https://github.com/owner/repo".to_string()),
+            ..Default::default() // PomMetadata derives Default (maven.rs:78)
+        };
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+        collector.emit_package_metadata(&mut writer, &pom).unwrap();
+        writer.flush().unwrap();
+
+        let mut content = String::new();
+        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+
+        assert!(content.contains("upstreamRepository"));
+        assert!(content.contains(&format!("{VCS}Repository")));
+        assert!(content.contains("UpstreamProject"));
+        assert!(content.contains("\"owner/repo\""));
+        // hasUpstreamProject is rdfs:domain :SourcePackage; identity_uri here
+        // is a PackageIdentity, so this predicate must never appear on it.
+        // The hub is discoverable via upstreamRepository/projectRepository
+        // joining through the shared repo URI instead.
+        assert!(!content.contains("hasUpstreamProject"));
     }
 }

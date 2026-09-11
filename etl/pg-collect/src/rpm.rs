@@ -880,14 +880,16 @@ impl RpmCollector {
 
         // Upstream repository (from Homepage/URL if it matches a forge)
         if let Some(url) = fields.get("url") {
-            if let Some(upstream_uri) = normalize_forge_url(url) {
+            if let Some(canonical_url) = normalize_forge_url_canonical(url) {
+                let upstream_repo_iri = repo_uri(&canonical_url);
                 writer.write_triple(
                     &identity_uri,
                     &format!("{PKG}upstreamRepository"),
-                    &upstream_uri,
+                    &upstream_repo_iri,
                 )?;
-                writer.write_triple(&upstream_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
+                writer.write_triple(&upstream_repo_iri, RDF_TYPE, &format!("{VCS}Repository"))?;
                 triples += 2;
+                triples += crate::forge::emit_upstream_project(writer, &canonical_url)?;
             }
         }
 
@@ -2170,5 +2172,54 @@ mod tests {
             "providesCapability edges should be preserved per package, got {}",
             provides_edges
         );
+    }
+
+    #[test]
+    fn test_rpm_upstream_repo_links_to_hub() {
+        use std::io::Read;
+        use tempfile::NamedTempFile;
+
+        let collector = RpmCollector::new(
+            "https://example.com/repo".to_string(),
+            "testdistro".to_string(),
+            "1".to_string(),
+        );
+
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), "example-pkg".to_string());
+        fields.insert("arch".to_string(), "x86_64".to_string());
+        fields.insert("ver".to_string(), "1.0".to_string());
+        fields.insert("rel".to_string(), "1".to_string());
+        fields.insert("url".to_string(), "https://github.com/owner/repo".to_string());
+
+        let pkg_data = RpmPackageData {
+            fields,
+            deps: Vec::new(),
+        };
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+        let mut emitted_packages = HashSet::new();
+
+        collector
+            .emit_package_triples(&mut writer, &pkg_data, None, &mut emitted_packages)
+            .unwrap();
+        writer.flush().unwrap();
+
+        let mut content = String::new();
+        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+
+        assert!(content.contains("upstreamRepository"), "existing triple must still be emitted");
+        assert!(content.contains(&format!("{VCS}Repository")), "existing repo typing must be preserved");
+        assert!(content.contains("UpstreamProject"), "new hub triple");
+        assert!(
+            content.contains("\"owner/repo\""),
+            "projectName should be derived from the repo URL"
+        );
+        // hasUpstreamProject is rdfs:domain :SourcePackage; identity_uri here
+        // is a PackageIdentity, so this predicate must never appear on it.
+        // The hub is discoverable via upstreamRepository/projectRepository
+        // joining through the shared repo URI instead.
+        assert!(!content.contains("hasUpstreamProject"));
     }
 }

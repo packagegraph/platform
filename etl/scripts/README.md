@@ -21,8 +21,10 @@ Output: 37 `.ttl` files in `etl/ontology/`.
 Uploads an N-Triples file to Minio and registers it in the graph manifest.
 
 ```bash
-bash etl/scripts/upload-nt.sh /tmp/packages.nt "https://packagegraph.github.io/graph/debian/trixie"
+bash etl/scripts/upload-nt.sh /tmp/packages.nt "https://packagegraph.github.io/graph/debian/trixie" "http://deb.debian.org/debian"
 ```
+
+The third `source-url` argument is optional: omit it for collectors with no single canonical upstream source (registry/API-based collectors, or multi-mirror collectors with several equally-canonical source URLs).
 
 ## Collecting RHEL Data
 

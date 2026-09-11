@@ -12,4 +12,4 @@ tar -xzf /tmp/gentoo.tar.gz -C /tmp/gentoo-repo --strip-components=1
 rm /tmp/gentoo.tar.gz
 
 pg-collect gentoo --repo-path /tmp/gentoo-repo --output /tmp/gentoo.nt
-/app/scripts/upload-nt.sh /tmp/gentoo.nt "$GRAPH_URI"
+/app/scripts/upload-nt.sh /tmp/gentoo.nt "$GRAPH_URI" "https://github.com/gentoo/gentoo/archive/refs/heads/master.tar.gz"

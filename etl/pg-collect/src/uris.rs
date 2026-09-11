@@ -232,6 +232,21 @@ pub fn upstream_uri(name: &str) -> String {
     format!("{DATA}upstream/{}", encode(name))
 }
 
+/// Derive a human-readable UpstreamProject name from its canonical repo
+/// URL -- the owner/repo slug, e.g. "FasterXML/jackson-databind". Used as
+/// pkg:projectName, which UpstreamProject requires (OWL cardinality 1 on
+/// :projectName, core.ttl:1319).
+pub fn project_name_from_repo_url(repo_url: &str) -> String {
+    let path = repo_url
+        .strip_prefix("https://")
+        .or_else(|| repo_url.strip_prefix("http://"))
+        .unwrap_or(repo_url);
+    path.splitn(2, '/')
+        .nth(1)
+        .unwrap_or(path)
+        .to_string()
+}
+
 /// Build a Vulnerability URI from CVE ID.
 pub fn cve_uri(cve_id: &str) -> String {
     format!("{DATA}cve/{}", encode(cve_id))
@@ -255,137 +270,20 @@ pub fn repo_uri(url: &str) -> String {
     format!("{DATA}repo/{}", encode(&cleaned))
 }
 
+/// Match a URL against known forge patterns and return its canonical form
+/// (e.g. "https://github.com/owner/repo") -- the plain URL, not a
+/// PackageGraph node IRI. Delegates to forge::extract_forge_url so this
+/// and every forge.rs-routed collector share exactly one matcher -- see
+/// round-two finding 3 in the design spec for why two independently
+/// maintained copies drifted (a GitLab nested-group truncation bug).
+pub fn normalize_forge_url_canonical(url: &str) -> Option<String> {
+    crate::forge::normalize_repo_url(url)
+}
+
 /// Try to normalize a URL into a canonical forge repository URI.
 /// Returns Some(repo_uri) if the URL matches a known forge pattern, None otherwise.
-///
-/// Recognized forges:
-///   github.com, gitlab.com, codeberg.org, pagure.io,
-///   src.fedoraproject.org, salsa.debian.org,
-///   git.savannah.gnu.org, savannah.gnu.org, savannah.nongnu.org,
-///   sourceware.org, git.kernel.org
 pub fn normalize_forge_url(url: &str) -> Option<String> {
-    let url = url.trim();
-    if url.is_empty() {
-        return None;
-    }
-
-    // Strip protocol
-    let path = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-
-    // Strip trailing slashes, .git suffix, and common subpaths
-    let path = path.trim_end_matches('/').trim_end_matches(".git");
-
-    // GitHub: github.com/{owner}/{repo}[/tree/...][/wiki][/issues]
-    if path.starts_with("github.com/") {
-        let parts: Vec<&str> = path.splitn(4, '/').collect();
-        if parts.len() >= 3 && !parts[1].is_empty() && !parts[2].is_empty() {
-            return Some(repo_uri(&format!(
-                "https://github.com/{}/{}",
-                parts[1], parts[2]
-            )));
-        }
-    }
-
-    // GitLab (any instance): gitlab.com, gitlab.freedesktop.org, etc.
-    if path.contains("gitlab.") || path.starts_with("gitlab/") {
-        let parts: Vec<&str> = path.splitn(4, '/').collect();
-        if parts.len() >= 3 {
-            let host = parts[0];
-            return Some(repo_uri(&format!(
-                "https://{}/{}/{}",
-                host, parts[1], parts[2]
-            )));
-        }
-    }
-
-    // Codeberg: codeberg.org/{owner}/{repo}
-    if path.starts_with("codeberg.org/") {
-        let parts: Vec<&str> = path.splitn(4, '/').collect();
-        if parts.len() >= 3 {
-            return Some(repo_uri(&format!(
-                "https://codeberg.org/{}/{}",
-                parts[1], parts[2]
-            )));
-        }
-    }
-
-    // Salsa (Debian): salsa.debian.org/{team}/{repo}
-    if path.starts_with("salsa.debian.org/") {
-        let parts: Vec<&str> = path.splitn(4, '/').collect();
-        if parts.len() >= 3 {
-            return Some(repo_uri(&format!(
-                "https://salsa.debian.org/{}/{}",
-                parts[1], parts[2]
-            )));
-        }
-    }
-
-    // Pagure (Fedora): pagure.io/{repo}
-    if path.starts_with("pagure.io/") {
-        let parts: Vec<&str> = path.splitn(3, '/').collect();
-        if parts.len() >= 2 {
-            return Some(repo_uri(&format!("https://pagure.io/{}", parts[1])));
-        }
-    }
-
-    // Fedora dist-git: src.fedoraproject.org/rpms/{name}
-    if path.starts_with("src.fedoraproject.org/") {
-        let parts: Vec<&str> = path.splitn(4, '/').collect();
-        if parts.len() >= 3 {
-            return Some(repo_uri(&format!(
-                "https://src.fedoraproject.org/{}/{}",
-                parts[1], parts[2]
-            )));
-        }
-    }
-
-    // Savannah (GNU): git.savannah.gnu.org/git/{project} or savannah.gnu.org/projects/{project}
-    if path.starts_with("git.savannah.gnu.org/") || path.starts_with("git.savannah.nongnu.org/") {
-        // git.savannah.gnu.org/git/bash.git → savannah.gnu.org/git/bash
-        let host = if path.contains("nongnu") {
-            "savannah.nongnu.org"
-        } else {
-            "savannah.gnu.org"
-        };
-        if let Some(rest) = path.split_once('/').map(|(_, r)| r) {
-            let rest = rest.trim_start_matches("git/").trim_start_matches("cgit/");
-            return Some(repo_uri(&format!("https://{}/git/{}", host, rest)));
-        }
-    }
-    if path.starts_with("savannah.gnu.org/") || path.starts_with("savannah.nongnu.org/") {
-        let parts: Vec<&str> = path.splitn(4, '/').collect();
-        if parts.len() >= 3 {
-            let project = parts[2];
-            return Some(repo_uri(&format!("https://{}/git/{}", parts[0], project)));
-        }
-    }
-
-    // Sourceware: sourceware.org/git/{project}
-    if path.starts_with("sourceware.org/") {
-        if let Some(project) = path.strip_prefix("sourceware.org/git/") {
-            return Some(repo_uri(&format!("https://sourceware.org/git/{}", project)));
-        }
-        // sourceware.org/{project} (e.g., sourceware.org/glibc)
-        let parts: Vec<&str> = path.splitn(3, '/').collect();
-        if parts.len() >= 2 && !parts[1].contains('.') {
-            return Some(repo_uri(&format!(
-                "https://sourceware.org/git/{}",
-                parts[1]
-            )));
-        }
-    }
-
-    // kernel.org: git.kernel.org/pub/scm/{path}/{repo}
-    if path.starts_with("git.kernel.org/") {
-        // Normalize to: git.kernel.org/{everything after pub/scm/}
-        let cleaned = path.replace("/pub/scm/", "/");
-        return Some(repo_uri(&format!("https://{}", cleaned)));
-    }
-
-    None
+    normalize_forge_url_canonical(url).map(|canonical| repo_uri(&canonical))
 }
 
 /// Derive a Fedora/CentOS dist-git packaging repository URI from package name.
@@ -787,6 +685,128 @@ mod tests {
         assert_eq!(
             uri,
             "https://packagegraph.github.io/d/repo/github.com%2Fpackagegraph%2Fontology"
+        );
+    }
+
+    #[test]
+    fn test_normalize_forge_url_canonical_gitlab_nested_group() {
+        // Round-two finding 3: uris.rs's old hand-rolled GitLab matcher
+        // truncated nested groups to two segments. Delegating to
+        // forge::extract_forge_url must preserve the full path.
+        assert_eq!(
+            normalize_forge_url_canonical("https://gitlab.com/group/subgroup/project"),
+            Some("https://gitlab.com/group/subgroup/project".to_string())
+        );
+        assert_eq!(
+            normalize_forge_url_canonical("https://gitlab.freedesktop.org/mesa/mesa"),
+            Some("https://gitlab.freedesktop.org/mesa/mesa".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_forge_url_canonical_strips_fragment_and_query() {
+        assert_eq!(
+            normalize_forge_url_canonical("https://github.com/owner/repo#readme"),
+            Some("https://github.com/owner/repo".to_string())
+        );
+        assert_eq!(
+            normalize_forge_url_canonical("https://github.com/owner/repo?tab=readme"),
+            Some("https://github.com/owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_forge_url_canonical_strips_git_suffix() {
+        assert_eq!(
+            normalize_forge_url_canonical("https://codeberg.org/owner/repo.git"),
+            Some("https://codeberg.org/owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_forge_url_canonical_forge_specific_paths() {
+        assert_eq!(
+            normalize_forge_url_canonical("https://salsa.debian.org/team/repo"),
+            Some("https://salsa.debian.org/team/repo".to_string())
+        );
+        assert_eq!(
+            normalize_forge_url_canonical("https://pagure.io/some-repo"),
+            Some("https://pagure.io/some-repo".to_string())
+        );
+        assert_eq!(
+            normalize_forge_url_canonical(
+                "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+            ),
+            Some("https://git.kernel.org/linux/kernel/git/torvalds/linux".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_forge_url_canonical_bitbucket() {
+        // Confirms uris.rs inherits Task 1's Bitbucket recognition through
+        // delegation, with no separate uris.rs-side patch needed.
+        assert_eq!(
+            normalize_forge_url_canonical("https://bitbucket.org/owner/repo"),
+            Some("https://bitbucket.org/owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_forge_url_canonical_self_hosted_gitlab() {
+        // Generic self-hosted GitLab host-prefix rule (final-review fix A):
+        // gitlab.kitware.com is not in the curated GITLAB_HOSTS list but
+        // still resolves, restoring coverage the retired loose substring
+        // matcher used to provide for instances like this.
+        assert_eq!(
+            normalize_forge_url_canonical("https://gitlab.kitware.com/cmake/cmake"),
+            Some("https://gitlab.kitware.com/cmake/cmake".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_forge_url_canonical_loose_gitlab_substring_no_longer_matches() {
+        // Intentional narrowing (round two, finding 3): the old uris.rs matcher
+        // matched any URL containing "gitlab." as a substring anywhere, not
+        // just a real GitLab host -- a false-positive risk. forge.rs's finite
+        // GITLAB_HOSTS list does not have this problem. If this test starts
+        // failing, something reintroduced the loose match.
+        assert_eq!(
+            normalize_forge_url_canonical("https://blog.example.com/tags/gitlab.html"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_normalize_forge_url_still_wraps_with_repo_uri() {
+        // normalize_forge_url's existing public contract: same recognized
+        // input, but wrapped as a repo_uri() PackageGraph node IRI.
+        assert_eq!(
+            normalize_forge_url("https://github.com/owner/repo"),
+            Some(repo_uri("https://github.com/owner/repo"))
+        );
+    }
+
+    #[test]
+    fn test_project_name_from_repo_url_github() {
+        assert_eq!(
+            project_name_from_repo_url("https://github.com/FasterXML/jackson-databind"),
+            "FasterXML/jackson-databind"
+        );
+    }
+
+    #[test]
+    fn test_project_name_from_repo_url_gitlab_nested() {
+        assert_eq!(
+            project_name_from_repo_url("https://gitlab.com/group/subgroup/project"),
+            "group/subgroup/project"
+        );
+    }
+
+    #[test]
+    fn test_project_name_from_repo_url_bitbucket() {
+        assert_eq!(
+            project_name_from_repo_url("https://bitbucket.org/owner/repo"),
+            "owner/repo"
         );
     }
 

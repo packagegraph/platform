@@ -139,4 +139,67 @@ mod tests {
             "Should emit VCS repo"
         );
     }
+
+    #[test]
+    fn test_emit_debian_extras_vcs_git_nested_salsa_path_with_branch_info() {
+        // Final-review fix D: emit/debian_ext.rs's normalize_forge_url(vcs_url)
+        // call was never reviewed against the forge-matcher fixes elsewhere in
+        // this branch. `vcs_git.split_whitespace().next()` strips the trailing
+        // `-b <branch>` before normalizing -- confirm the resulting
+        // pkg:packagingRepository triple points at the correctly-normalized
+        // repo URL (not truncated, not dropped).
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+
+        let ir = PackageIr {
+            ir_schema: 1,
+            scope: ScopeIr {
+                collector: "debian".to_string(),
+                distro: "debian".to_string(),
+                release: "trixie".to_string(),
+                repo: Some("main".to_string()),
+                arch: "amd64".to_string(),
+            },
+            source_artifacts: BTreeMap::new(),
+            package: PackageInfo {
+                kind: "binary".to_string(),
+                name: "pkg-name".to_string(),
+                epoch: 0,
+                version: "1.0-1".to_string(),
+                release: None,
+                full_version: "1.0-1".to_string(),
+                arch: "amd64".to_string(),
+            },
+            source_package: None,
+            maintainers: vec![],
+            dependencies: vec![],
+            metadata: None,
+            collector_specific: Some(serde_json::json!({
+                "vcs_git": "https://salsa.debian.org/go-team/pkg-name -b debian/master"
+            })),
+        };
+
+        let count = emit_debian_extras(&ir, &mut writer).unwrap();
+        writer.flush().unwrap();
+
+        assert!(count >= 2, "Should emit packagingRepository + repo type");
+
+        let mut content = String::new();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+
+        let expected_repo_uri = repo_uri("https://salsa.debian.org/go-team/pkg-name");
+        assert!(
+            content.contains(&expected_repo_uri),
+            "packagingRepository object should be the correctly-normalized \
+             (not truncated, not dropped) salsa repo URI: {expected_repo_uri}\ngot:\n{content}"
+        );
+        assert!(
+            content.contains("packagingRepository"),
+            "Should emit VCS repo predicate"
+        );
+    }
 }

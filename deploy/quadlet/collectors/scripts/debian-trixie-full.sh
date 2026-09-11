@@ -32,7 +32,7 @@ pg-collect deb-full \
   --cache-dir "${CACHE_DIR}" \
   -o /tmp/collection/debian-trixie.nt
 
-/app/scripts/upload-nt.sh /tmp/collection/debian-trixie.nt "$GRAPH_URI"
+/app/scripts/upload-nt.sh /tmp/collection/debian-trixie.nt "$GRAPH_URI" "http://deb.debian.org/debian"
 
 echo "Syncing cache to Minio..."
 mc mirror --overwrite "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
