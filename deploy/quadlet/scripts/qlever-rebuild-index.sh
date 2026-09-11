@@ -182,20 +182,59 @@ if [ "$INCOMPLETE" -gt 0 ]; then
   exit 1
 fi
 
-GRAPH_COUNT=0
-for graph_file in /tmp/nt-output/*.graph; do
-    nt_file="${graph_file%.graph}"
+# Per-graph gunzip+sed is independent work (no shared state, output order
+# doesn't matter -- qlever-index sorts everything internally regardless of
+# input quad order), so it runs in parallel across all available cores
+# instead of one graph at a time. Confirmed live 2026-09-11: this loop was
+# the actual bottleneck, not CPU contention from other containers --
+# `podman stats` showed qlever-rebuild-index using only ~1.4 of its 8
+# allotted cores during this exact phase, with 10+ host cores sitting idle.
+# Each graph converts into its own fragment under /tmp/nq-parts/, then all
+# fragments concatenate into packagegraph.nq once every job finishes.
+NQ_PARTS=/tmp/nq-parts
+rm -rf "$NQ_PARTS"
+mkdir -p "$NQ_PARTS"
+
+convert_one_graph() {
+    # Each invocation is a fresh `bash -c` process (spawned by xargs) that
+    # does not inherit the outer script's `set -euo pipefail` -- without
+    # this, a failed gunzip feeding a still-successful sed would silently
+    # write truncated data into this graph's fragment instead of failing.
+    set -euo pipefail
+    local graph_file="$1"
+    local nt_file="${graph_file%.graph}"
+    local filename
     filename=$(basename "$nt_file")
-    graph_uri=$(cat "$graph_file" | tr -d '\n')
+    local graph_uri
+    graph_uri=$(tr -d '\n' < "$graph_file")
+    local nt_size
     nt_size=$(du -h "$nt_file" | cut -f1)
     echo "  $filename ($nt_size) → <$graph_uri>"
-    echo "$graph_uri" >> /tmp/graph-uris.txt
+    echo "$graph_uri" > "$NQ_PARTS/${filename}.uri"
     case "$nt_file" in
-        *.gz) gunzip -c "$nt_file" | sed "s| \.$| <${graph_uri}> .|" >> /tmp/packagegraph.nq ;;
-        *)    sed "s| \.$| <${graph_uri}> .|" "$nt_file" >> /tmp/packagegraph.nq ;;
+        *.gz) gunzip -c "$nt_file" | sed "s| \.$| <${graph_uri}> .|" > "$NQ_PARTS/${filename}.nq" ;;
+        *)    sed "s| \.$| <${graph_uri}> .|" "$nt_file" > "$NQ_PARTS/${filename}.nq" ;;
     esac
-    GRAPH_COUNT=$((GRAPH_COUNT + 1))
-done
+}
+export -f convert_one_graph
+export NQ_PARTS
+
+find /tmp/nt-output -name '*.graph' -print0 | \
+    xargs -0 -P "$(nproc)" -I{} bash -c 'convert_one_graph "$@"' _ {}
+
+# xargs runs every job regardless of earlier failures, so a mid-batch error
+# doesn't fail fast the way the old serial loop did -- verify the expected
+# fragment count landed before trusting the concatenation below.
+GRAPH_COUNT=$(find /tmp/nt-output -name '*.graph' | wc -l | tr -d ' ')
+FRAGMENT_COUNT=$(find "$NQ_PARTS" -name '*.nq' | wc -l | tr -d ' ')
+if [ "$FRAGMENT_COUNT" -ne "$GRAPH_COUNT" ]; then
+  echo "ERROR: expected $GRAPH_COUNT converted fragments, found $FRAGMENT_COUNT -- a parallel conversion job failed"
+  exit 1
+fi
+
+cat "$NQ_PARTS"/*.nq > /tmp/packagegraph.nq
+cat "$NQ_PARTS"/*.uri > /tmp/graph-uris.txt
+rm -rf "$NQ_PARTS"
 # Deliberately not deleting /tmp/nt-output or its contents: it lives on
 # qlever-rebuild-scratch.volume (a real disk, not tmpfs -- see its own
 # comment), and keeping it around is what lets next run's mc mirror above
@@ -217,9 +256,18 @@ SETTINGS
 
 echo "Building QLever index..."
 mkdir -p /tmp/index
+# -m (stxxl-memory) was never set before, so the index build used QLever's
+# small built-in default for its external sort -- confirmed live
+# 2026-09-10 that the whole build peaked at 81MB of this container's 8g
+# limit, meaning the sort phase never got to use memory that's already
+# reserved for it. 4G leaves comfortable headroom under the 8g cap for
+# parsing buffers and everything else running in parallel above; qlever-index
+# writes a resource-usage TSV next to the index by default (see --help),
+# so a future rebuild's actual RSS is easy to check before tuning this
+# further.
 time qlever-index -i /tmp/index/packagegraph \
     -s /tmp/settings.json \
-    -F nq -f /tmp/packagegraph.nq -p true
+    -F nq -f /tmp/packagegraph.nq -p true -m 4G
 
 INDEX_SIZE=$(du -sh /tmp/index | cut -f1)
 echo "Index size: $INDEX_SIZE"
