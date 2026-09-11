@@ -30,6 +30,12 @@ EnvironmentFile=/etc/containers/systemd/scripts/qlever.env
 Environment=HOME=/tmp
 Environment=SPARQL_BACKEND=qlever
 Environment=FUSEKI_ENDPOINT=http://127.0.0.1:7001
+# Scratch space (cache + pre-upload output) on the dedicated data disk,
+# not the container's overlay writable layer -- see
+# pg-collect-scratch.volume's comment. Shared with pg-collect@.container's
+# instances; safe because each script namespaces its own paths under
+# /tmp/cache/<name> and /tmp/collection/<name>.nt.
+Volume=pg-collect-scratch.volume:/tmp:Z
 Volume=/etc/containers/systemd/scripts/collectors/%i.sh:/usr/local/bin/collect.sh:ro
 # RHEL entitlement cert/key + Red Hat CA (TLS client-cert auth -- see
 # rhel-9-full.sh/rhel-10-full.sh and docs/rhel-collection.md).
