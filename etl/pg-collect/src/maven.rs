@@ -68,6 +68,67 @@ struct SearchDoc {
     latest_version: String,
 }
 
+/// A root coordinate to collect, with an optionally pinned version.
+///
+/// `version: None` means "resolve the newest version at collection time"
+/// (via the search API, falling back to `maven-metadata.xml`).
+/// `version: Some(v)` pins the exact version and skips version resolution
+/// altogether -- no search or metadata request is issued for that root.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MavenSeed {
+    pub group_id: String,
+    pub artifact_id: String,
+    pub version: Option<String>,
+}
+
+impl MavenSeed {
+    /// A seed whose version is resolved at collection time.
+    pub fn unpinned(group_id: impl Into<String>, artifact_id: impl Into<String>) -> Self {
+        Self {
+            group_id: group_id.into(),
+            artifact_id: artifact_id.into(),
+            version: None,
+        }
+    }
+
+    /// A seed pinned to an exact version.
+    pub fn pinned(
+        group_id: impl Into<String>,
+        artifact_id: impl Into<String>,
+        version: impl Into<String>,
+    ) -> Self {
+        Self {
+            group_id: group_id.into(),
+            artifact_id: artifact_id.into(),
+            version: Some(version.into()),
+        }
+    }
+
+    /// Parse `groupId:artifactId` or `groupId:artifactId:version`.
+    ///
+    /// Returns `None` for lines without at least a non-empty group and
+    /// artifact. An empty or whitespace-only version field is treated as
+    /// unpinned rather than as a version literally named "".
+    pub fn parse(s: &str) -> Option<Self> {
+        let mut parts = s.splitn(3, ':');
+        let group_id = parts.next()?.trim();
+        let artifact_id = parts.next()?.trim();
+        if group_id.is_empty() || artifact_id.is_empty() {
+            return None;
+        }
+        let version = parts
+            .next()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        Some(Self {
+            group_id: group_id.to_string(),
+            artifact_id: artifact_id.to_string(),
+            version,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ParentCoordinate {
     pub(crate) group_id: String,
@@ -176,17 +237,16 @@ impl MavenCollector {
         let raw_names = crate::seed::discover_by_ecosystem(endpoint, "maven", auth, backend)?;
         let raw_count = raw_names.len();
         let mut seen = HashSet::new();
-        let seeds: Vec<(String, String)> = raw_names
+        // Discovery surveys which coordinates exist in the graph, so roots
+        // stay unpinned (resolve-latest) and collapse to one seed per
+        // groupId:artifactId even when the discovered name carries a version.
+        let seeds: Vec<MavenSeed> = raw_names
             .into_iter()
             .filter_map(|n| {
-                let parts: Vec<&str> = n.splitn(3, ':').collect();
-                if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                    let key = (parts[0].to_string(), parts[1].to_string());
-                    if seen.insert(key.clone()) {
-                        Some(key)
-                    } else {
-                        None
-                    }
+                let parsed = MavenSeed::parse(&n)?;
+                let key = MavenSeed::unpinned(&parsed.group_id, &parsed.artifact_id);
+                if seen.insert(key.clone()) {
+                    Some(key)
                 } else {
                     None
                 }
@@ -268,10 +328,17 @@ impl MavenCollector {
     /// unreachable for several hours while `repo1.maven.org` (the actual
     /// artifact CDN, used by every build tool) stayed healthy throughout
     /// -- confirmed live via direct `curl` before writing this fallback.
-    /// Only transport-level failures (DNS/TLS/connection reset/timeout)
-    /// trigger the fallback; a legitimate 404 (`FetchError::NotFound`)
-    /// means the coordinate doesn't exist and metadata.xml would 404 too,
-    /// so there's no reason to double the request.
+    /// Any *transient* search failure triggers the fallback, as defined by
+    /// `FetchError::is_retryable()`: transport errors (DNS/TLS/reset/timeout)
+    /// plus HTTP 429 and 5xx. Rate limiting matters as much as an outage here
+    /// -- `search.maven.org` throttles the legacy `solrsearch` endpoint hard,
+    /// and without the 429 case each package re-paid the full 3-attempt retry
+    /// cost for the entire run. Reusing `is_retryable()` keeps "transient
+    /// upstream failure" defined in exactly one place.
+    ///
+    /// A legitimate 404 (`FetchError::NotFound`) means the coordinate doesn't
+    /// exist and metadata.xml would 404 too, so there's no reason to double
+    /// the request -- nor to disable search for every later package.
     fn get_latest_version(
         &self,
         group_id: &str,
@@ -283,15 +350,18 @@ impl MavenCollector {
         }
 
         let result = self.get_latest_version_via_search(group_id, artifact_id, base_delay_ms);
-        if let Err((FetchError::Transport { url, .. }, hit)) = &result {
-            eprintln!(
-                "  Search API unreachable ({url}) for {}:{}, falling back to maven-metadata.xml \
-                 (and skipping the search API for the rest of this run)",
-                group_id, artifact_id
-            );
-            self.search_unavailable.set(true);
-            let fallback = self.get_latest_version_via_metadata(group_id, artifact_id, base_delay_ms);
-            return fallback.map(|(version, fallback_hit)| (version, *hit || fallback_hit));
+        if let Err((e, hit)) = &result {
+            if e.is_retryable() {
+                eprintln!(
+                    "  Search API unusable ({e}) for {}:{}, falling back to maven-metadata.xml \
+                     (and skipping the search API for the rest of this run)",
+                    group_id, artifact_id
+                );
+                self.search_unavailable.set(true);
+                let fallback =
+                    self.get_latest_version_via_metadata(group_id, artifact_id, base_delay_ms);
+                return fallback.map(|(version, fallback_hit)| (version, *hit || fallback_hit));
+            }
         }
         result
     }
@@ -1046,7 +1116,7 @@ impl MavenCollector {
     /// are non-optional, and have concrete (non-SNAPSHOT, non-range) versions.
     pub fn collect_recursive(
         &self,
-        seeds: Vec<(String, String)>,
+        seeds: Vec<MavenSeed>,
         output_path: &str,
     ) -> Result<(usize, usize)> {
         // Finding 4: empty seed → truly empty output
@@ -1069,6 +1139,7 @@ impl MavenCollector {
             roots_provided: seeds.len(),
             roots_unique: 0,
             roots_resolved: 0,
+            roots_pinned: 0,
             root_resolution_failures: 0,
             fetched_ok: 0,
             fetch_errors: HashMap::new(),
@@ -1082,11 +1153,16 @@ impl MavenCollector {
             skipped_roots: 0,
         };
 
-        // Deduplicate roots preserving order
+        // Deduplicate roots preserving order.
+        //
+        // The key includes the pinned version, so `g:a:1.0` and `g:a:2.0` are
+        // two distinct roots rather than one. Keying on `(group, artifact)`
+        // alone would silently collapse every pinned version of a coordinate
+        // down to whichever one happened to be listed first.
         let mut seen_roots = HashSet::new();
         let unique_seeds: Vec<_> = seeds
             .into_iter()
-            .filter(|c| seen_roots.insert((c.0.clone(), c.1.clone())))
+            .filter(|s| seen_roots.insert(s.clone()))
             .collect();
         state.roots_unique = unique_seeds.len();
         eprintln!(
@@ -1097,7 +1173,8 @@ impl MavenCollector {
         let mut base_delay_ms = self.delay_ms;
 
         // Root resolution phase
-        for (idx, (group, artifact)) in unique_seeds.iter().enumerate() {
+        for (idx, seed) in unique_seeds.iter().enumerate() {
+            let (group, artifact) = (&seed.group_id, &seed.artifact_id);
             if idx >= self.max_roots {
                 state.skipped_roots += unique_seeds.len() - idx;
                 break;
@@ -1107,6 +1184,24 @@ impl MavenCollector {
                 state.skipped_limit += unique_seeds.len() - idx;
                 break;
             }
+
+            // A pinned seed already carries its version, so there is nothing
+            // to resolve -- skip the network round-trip entirely.
+            if let Some(version) = &seed.version {
+                state.roots_resolved += 1;
+                state.roots_pinned += 1;
+                try_enqueue(
+                    &mut state,
+                    group,
+                    artifact,
+                    version,
+                    0,
+                    self.max_depth,
+                    self.max_packages,
+                );
+                continue;
+            }
+
             match self.get_latest_version(group, artifact, &mut base_delay_ms) {
                 Ok((version, was_hit)) => {
                     state.roots_resolved += 1;
@@ -1251,6 +1346,7 @@ impl MavenCollector {
         eprintln!("Roots provided:       {}", state.roots_provided);
         eprintln!("Roots unique:         {}", state.roots_unique);
         eprintln!("Roots resolved:       {}", state.roots_resolved);
+        eprintln!("Roots pinned:         {}", state.roots_pinned);
         eprintln!("Root failures:        {}", state.root_resolution_failures);
         eprintln!("Scheduled:            {}", state.scheduled.len());
         eprintln!("Fetched OK:           {}", state.fetched_ok);
@@ -1297,6 +1393,7 @@ struct TraversalState {
     roots_provided: usize,
     roots_unique: usize,
     roots_resolved: usize,
+    roots_pinned: usize,
     root_resolution_failures: usize,
     fetched_ok: usize,
     fetch_errors: HashMap<String, usize>,
@@ -2098,8 +2195,17 @@ fn validate_search_json(body: &[u8]) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// Read Maven coordinates from seed file (one "groupId:artifactId" per line).
-pub fn read_maven_seed_file(path: &str) -> Result<Vec<(String, String)>> {
+/// Read Maven coordinates from a seed file, one per line.
+///
+/// Accepts both `groupId:artifactId` (version resolved at collection time)
+/// and `groupId:artifactId:version` (pinned to that exact version).
+///
+/// Pinning matters when the seed list describes software that actually ships
+/// -- an SBOM, a product manifest -- rather than a set of names to survey.
+/// `latest` is a moving target and routinely differs by whole major versions
+/// from what a given release pinned, so resolving it would build a graph of
+/// *different* software than the one being asked about.
+pub fn read_maven_seed_file(path: &str) -> Result<Vec<MavenSeed>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut coords = Vec::new();
@@ -2112,8 +2218,8 @@ pub fn read_maven_seed_file(path: &str) -> Result<Vec<(String, String)>> {
             continue;
         }
 
-        if let Some((group_id, artifact_id)) = trimmed.split_once(':') {
-            coords.push((group_id.to_string(), artifact_id.to_string()));
+        if let Some(seed) = MavenSeed::parse(trimmed) {
+            coords.push(seed);
         }
     }
 
@@ -2141,16 +2247,10 @@ mod tests {
 
         let coords = read_maven_seed_file(temp.path().to_str().unwrap()).unwrap();
         assert_eq!(coords.len(), 2);
-        assert_eq!(
-            coords[0],
-            ("com.google.guava".to_string(), "guava".to_string())
-        );
+        assert_eq!(coords[0], MavenSeed::unpinned("com.google.guava", "guava"));
         assert_eq!(
             coords[1],
-            (
-                "org.apache.commons".to_string(),
-                "commons-lang3".to_string()
-            )
+            MavenSeed::unpinned("org.apache.commons", "commons-lang3")
         );
     }
 
@@ -4924,6 +5024,7 @@ mod tests {
             roots_provided: 0,
             roots_unique: 0,
             roots_resolved: 0,
+            roots_pinned: 0,
             root_resolution_failures: 0,
             fetched_ok: 0,
             fetch_errors: HashMap::new(),
@@ -4951,6 +5052,7 @@ mod tests {
             roots_provided: 0,
             roots_unique: 0,
             roots_resolved: 0,
+            roots_pinned: 0,
             root_resolution_failures: 0,
             fetched_ok: 0,
             fetch_errors: HashMap::new(),
@@ -4977,6 +5079,7 @@ mod tests {
             roots_provided: 0,
             roots_unique: 0,
             roots_resolved: 0,
+            roots_pinned: 0,
             root_resolution_failures: 0,
             fetched_ok: 0,
             fetch_errors: HashMap::new(),
@@ -5005,6 +5108,7 @@ mod tests {
             roots_provided: 0,
             roots_unique: 0,
             roots_resolved: 0,
+            roots_pinned: 0,
             root_resolution_failures: 0,
             fetched_ok: 0,
             fetch_errors: HashMap::new(),
@@ -5032,6 +5136,7 @@ mod tests {
             roots_provided: 0,
             roots_unique: 0,
             roots_resolved: 0,
+            roots_pinned: 0,
             root_resolution_failures: 0,
             fetched_ok: 0,
             fetch_errors: HashMap::new(),
@@ -5059,6 +5164,7 @@ mod tests {
             roots_provided: 0,
             roots_unique: 0,
             roots_resolved: 0,
+            roots_pinned: 0,
             root_resolution_failures: 0,
             fetched_ok: 0,
             fetch_errors: HashMap::new(),
@@ -5149,7 +5255,7 @@ mod tests {
         collector.max_depth = 1;
         collector.delay_ms = 0;
 
-        let seeds = vec![("org.a".into(), "art-a".into())];
+        let seeds = vec![MavenSeed::unpinned("org.a", "art-a")];
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
         assert!(
@@ -5200,7 +5306,7 @@ mod tests {
         collector.max_depth = 5;
         collector.delay_ms = 0;
 
-        let seeds = vec![("org.a".into(), "art-a".into())];
+        let seeds = vec![MavenSeed::unpinned("org.a", "art-a")];
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
         assert!(result.is_ok());
@@ -5249,7 +5355,7 @@ mod tests {
         collector.max_depth = 3;
         collector.delay_ms = 0;
 
-        let seeds = vec![("org.a".into(), "art-a".into())];
+        let seeds = vec![MavenSeed::unpinned("org.a", "art-a")];
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
         assert!(result.is_ok());
@@ -5290,7 +5396,7 @@ mod tests {
         collector.max_depth = 3;
         collector.delay_ms = 0;
 
-        let seeds = vec![("org.a".into(), "art-a".into())];
+        let seeds = vec![MavenSeed::unpinned("org.a", "art-a")];
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
         assert!(result.is_ok());
@@ -5327,7 +5433,7 @@ mod tests {
         collector.max_depth = 3;
         collector.delay_ms = 0;
 
-        let seeds = vec![("org.a".into(), "art-a".into())];
+        let seeds = vec![MavenSeed::unpinned("org.a", "art-a")];
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
         assert!(result.is_ok());
@@ -5363,9 +5469,9 @@ mod tests {
         collector.delay_ms = 0;
 
         let seeds = vec![
-            ("org.a".into(), "art-a".into()),
-            ("org.a".into(), "art-a".into()),
-            ("org.a".into(), "art-a".into()),
+            MavenSeed::unpinned("org.a", "art-a"),
+            MavenSeed::unpinned("org.a", "art-a"),
+            MavenSeed::unpinned("org.a", "art-a"),
         ];
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
@@ -5389,8 +5495,8 @@ mod tests {
         collector.delay_ms = 0;
 
         let seeds = vec![
-            ("org.missing".into(), "lib1".into()),
-            ("org.missing".into(), "lib2".into()),
+            MavenSeed::unpinned("org.missing", "lib1"),
+            MavenSeed::unpinned("org.missing", "lib2"),
         ];
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
@@ -5457,9 +5563,9 @@ mod tests {
         collector.delay_ms = 0;
 
         let seeds = vec![
-            ("org.a".into(), "a1".into()),
-            ("org.a".into(), "a2".into()),
-            ("org.a".into(), "a3".into()),
+            MavenSeed::unpinned("org.a", "a1"),
+            MavenSeed::unpinned("org.a", "a2"),
+            MavenSeed::unpinned("org.a", "a3"),
         ];
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
@@ -5496,7 +5602,7 @@ mod tests {
         collector.delay_ms = 0;
 
         let seeds: Vec<_> = (0..10)
-            .map(|i| ("org.a".into(), format!("a{}", i)))
+            .map(|i| MavenSeed::unpinned("org.a", format!("a{}", i)))
             .collect();
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
@@ -5538,7 +5644,7 @@ mod tests {
         collector.max_depth = 3;
         collector.delay_ms = 0;
 
-        let seeds = vec![("org.a".into(), "art-a".into())];
+        let seeds = vec![MavenSeed::unpinned("org.a", "art-a")];
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
         assert!(result.is_ok());
@@ -5591,7 +5697,7 @@ mod tests {
         collector.max_depth = 3;
         collector.delay_ms = 0;
 
-        let seeds = vec![("org.a".into(), "art-a".into())];
+        let seeds = vec![MavenSeed::unpinned("org.a", "art-a")];
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
         assert!(result.is_ok());
@@ -5636,7 +5742,7 @@ mod tests {
         collector.max_depth = 0;
         collector.delay_ms = 0;
 
-        let seeds = vec![("org.a".into(), "art-a".into())];
+        let seeds = vec![MavenSeed::unpinned("org.a", "art-a")];
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
         assert!(result.is_ok());
@@ -5682,7 +5788,7 @@ mod tests {
         collector.max_depth = 0;
         collector.delay_ms = 0;
 
-        let seeds = vec![("org.a".into(), "art-a".into())];
+        let seeds = vec![MavenSeed::unpinned("org.a", "art-a")];
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
         assert!(result.is_ok());
@@ -5727,7 +5833,7 @@ mod tests {
         collector.max_depth = 0;
         collector.delay_ms = 0;
 
-        let seeds = vec![("org.a".into(), "art-a".into())];
+        let seeds = vec![MavenSeed::unpinned("org.a", "art-a")];
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
         assert!(result.is_ok());
@@ -5908,6 +6014,277 @@ mod tests {
             .expect("pre-tripped breaker must not hit the search API at all");
         assert_eq!(r2.unwrap(), "1.0.0");
 
+        metadata_mock.assert();
+    }
+
+    /// A rate-limited search API must fail over to metadata.xml just like an
+    /// unreachable one. Before this, only `FetchError::Transport` tripped the
+    /// breaker, so a 429 re-paid the full 3-attempt retry cost on every single
+    /// package for the whole run.
+    #[test]
+    fn test_search_circuit_breaker_trips_on_rate_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut server = mockito::Server::new();
+
+        let search_mock = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch".into()))
+            .with_status(429)
+            // Keep the test fast: the cached path honours retry-after.
+            .with_header("retry-after", "0")
+            // The retry budget is an implementation detail; assert only that
+            // search was genuinely attempted before the breaker gave up on it.
+            .expect_at_least(1)
+            .create();
+        let metadata_mock = server
+            .mock("GET", "/maven2/org/ex/lib/maven-metadata.xml")
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?><metadata><versioning><release>7.7.7</release></versioning></metadata>"#,
+            )
+            .expect(1)
+            .create();
+
+        let collector = MavenCollector {
+            client: crate::enricher::default_http_client(),
+            search_base: server.url(),
+            repo_base: format!("{}/maven2", server.url()),
+            http_cache: Some(HttpCache::new(tmp.path().to_str().unwrap(), "maven").unwrap()),
+            refresh: false,
+            max_depth: 3,
+            max_roots: 10_000,
+            max_packages: 5_000,
+            delay_ms: 0,
+            graph_uri: None,
+            search_unavailable: std::cell::Cell::new(false),
+        };
+
+        let mut delay = 1u64;
+        let result = collector.get_latest_version("org.ex", "lib", &mut delay);
+        assert_eq!(
+            result
+                .expect("429 from search must fall back to metadata.xml")
+                .0,
+            "7.7.7"
+        );
+        assert!(
+            collector.search_unavailable.get(),
+            "a rate-limited search API must trip the breaker for the rest of the run"
+        );
+        search_mock.assert();
+        metadata_mock.assert();
+    }
+
+    #[test]
+    fn test_read_maven_seed_file_parses_pinned_version() {
+        let mut temp = NamedTempFile::new().unwrap();
+        writeln!(temp, "org.ex:lib:1.2.3").unwrap();
+        temp.flush().unwrap();
+
+        let coords = read_maven_seed_file(temp.path().to_str().unwrap()).unwrap();
+        assert_eq!(coords, vec![MavenSeed::pinned("org.ex", "lib", "1.2.3")]);
+    }
+
+    /// Red Hat rebuilds carry versions like `2.13.4.redhat-00001` -- dots,
+    /// digits and a hyphenated suffix. The third field must be taken whole.
+    #[test]
+    fn test_read_maven_seed_file_parses_vendor_suffixed_version() {
+        let mut temp = NamedTempFile::new().unwrap();
+        writeln!(temp, "com.fasterxml:jackson-databind:2.13.4.redhat-00001").unwrap();
+        temp.flush().unwrap();
+
+        let coords = read_maven_seed_file(temp.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            coords,
+            vec![MavenSeed::pinned(
+                "com.fasterxml",
+                "jackson-databind",
+                "2.13.4.redhat-00001"
+            )]
+        );
+    }
+
+    /// The whole point of pinning: one coordinate at several versions is
+    /// several roots. Deduplicating on `(group, artifact)` would collapse
+    /// these into one and silently drop the rest.
+    #[test]
+    fn test_read_maven_seed_file_keeps_distinct_versions_of_same_coordinate() {
+        let mut temp = NamedTempFile::new().unwrap();
+        writeln!(temp, "org.ex:lib:1.0").unwrap();
+        writeln!(temp, "org.ex:lib:2.0").unwrap();
+        writeln!(temp, "org.ex:lib:1.0").unwrap();
+        temp.flush().unwrap();
+
+        let coords = read_maven_seed_file(temp.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            coords,
+            vec![
+                MavenSeed::pinned("org.ex", "lib", "1.0"),
+                MavenSeed::pinned("org.ex", "lib", "2.0"),
+            ],
+            "distinct versions are distinct roots; exact duplicates still collapse"
+        );
+    }
+
+    #[test]
+    fn test_read_maven_seed_file_empty_version_field_is_unpinned() {
+        let mut temp = NamedTempFile::new().unwrap();
+        writeln!(temp, "org.ex:lib:").unwrap();
+        temp.flush().unwrap();
+
+        let coords = read_maven_seed_file(temp.path().to_str().unwrap()).unwrap();
+        assert_eq!(coords, vec![MavenSeed::unpinned("org.ex", "lib")]);
+    }
+
+    /// A pinned root already knows its version, so collection must go
+    /// straight to the POM -- no search call, no metadata.xml call.
+    #[test]
+    fn test_pinned_seed_skips_version_resolution() {
+        let mut server = mockito::Server::new();
+
+        let search_mock = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch".into()))
+            .with_status(200)
+            .with_body(make_search_json("9.9.9"))
+            .expect(0)
+            .create();
+        let metadata_mock = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"maven-metadata\.xml$".into()),
+            )
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?><metadata><versioning><release>9.9.9</release></versioning></metadata>"#,
+            )
+            .expect(0)
+            .create();
+        // The pinned version, NOT the "latest" the resolvers would report.
+        let pom_mock = server
+            .mock("GET", "/maven2/org/a/art-a/1.0/art-a-1.0.pom")
+            .with_status(200)
+            .with_body(make_pom_xml("org.a", "art-a", "1.0", &[]))
+            .expect(1)
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 0;
+        collector.delay_ms = 0;
+
+        let seeds = vec![MavenSeed::pinned("org.a", "art-a", "1.0")];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+        assert!(
+            result.is_ok(),
+            "collect_recursive failed: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().0, 1);
+
+        search_mock.assert();
+        metadata_mock.assert();
+        pom_mock.assert();
+    }
+
+    /// A 5xx from the search API must fail over as well.
+    ///
+    /// The breaker delegates to `FetchError::is_retryable()` rather than
+    /// listing statuses itself, which keeps "transient upstream failure"
+    /// defined once. The cost of that reuse is that a future change to
+    /// `is_retryable()` silently changes breaker behaviour, so the intended
+    /// set is pinned here explicitly: 429 and transport have their own
+    /// tests, this covers 5xx, and `..._does_not_trip_on_not_found` pins the
+    /// negative case. Together they fail loudly if that set ever shifts.
+    #[test]
+    fn test_search_circuit_breaker_trips_on_server_error() {
+        let mut server = mockito::Server::new();
+
+        let search_mock = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch".into()))
+            .with_status(503)
+            .expect_at_least(1)
+            .create();
+        let metadata_mock = server
+            .mock("GET", "/maven2/org/ex/lib/maven-metadata.xml")
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?><metadata><versioning><release>5.0.3</release></versioning></metadata>"#,
+            )
+            .expect(1)
+            .create();
+
+        let collector = MavenCollector {
+            client: crate::enricher::default_http_client(),
+            search_base: server.url(),
+            repo_base: format!("{}/maven2", server.url()),
+            http_cache: None,
+            refresh: false,
+            max_depth: 3,
+            max_roots: 10_000,
+            max_packages: 5_000,
+            delay_ms: 0,
+            graph_uri: None,
+            search_unavailable: std::cell::Cell::new(false),
+        };
+
+        let mut delay = 1u64;
+        let result = collector.get_latest_version("org.ex", "lib", &mut delay);
+        assert_eq!(
+            result
+                .expect("5xx from search must fall back to metadata.xml")
+                .0,
+            "5.0.3"
+        );
+        assert!(
+            collector.search_unavailable.get(),
+            "a 5xx search API must trip the breaker for the rest of the run"
+        );
+        search_mock.assert();
+        metadata_mock.assert();
+    }
+
+    /// The breaker must stay armed only for transient failures. A 404 means
+    /// the coordinate genuinely does not exist -- metadata.xml would 404 too,
+    /// so falling back would double the request count for no benefit and
+    /// would wrongly disable search for every later package in the run.
+    #[test]
+    fn test_search_circuit_breaker_does_not_trip_on_not_found() {
+        let mut server = mockito::Server::new();
+
+        let search_mock = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch".into()))
+            .with_status(404)
+            .create();
+        let metadata_mock = server
+            .mock("GET", "/maven2/org/ex/ghost/maven-metadata.xml")
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?><metadata><versioning><release>9.9.9</release></versioning></metadata>"#,
+            )
+            .expect(0)
+            .create();
+
+        let collector = MavenCollector {
+            client: crate::enricher::default_http_client(),
+            search_base: server.url(),
+            repo_base: format!("{}/maven2", server.url()),
+            http_cache: None,
+            refresh: false,
+            max_depth: 3,
+            max_roots: 10_000,
+            max_packages: 5_000,
+            delay_ms: 0,
+            graph_uri: None,
+            search_unavailable: std::cell::Cell::new(false),
+        };
+
+        let mut delay = 1u64;
+        let result = collector.get_latest_version("org.ex", "ghost", &mut delay);
+        assert!(result.is_err(), "a 404 coordinate must stay an error");
+        assert!(
+            !collector.search_unavailable.get(),
+            "a 404 is not a search outage and must not disable search"
+        );
+        search_mock.assert();
         metadata_mock.assert();
     }
 }
