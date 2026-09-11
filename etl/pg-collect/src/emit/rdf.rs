@@ -350,6 +350,29 @@ mod tests {
             .read_to_string(&mut content)
             .unwrap();
 
+        // The reported count must match what was actually written. Operators
+        // read this number off the "N packages, M triples" log line, so a
+        // hand-maintained `triples += N` that drifts from the writes around it
+        // is silently wrong. Centralizing the identity block into
+        // write_package_identity broke exactly this: the helper self-reports
+        // its 3 triples while the caller's trailing `triples += N` still
+        // counted the 2 writes the helper had absorbed, over-reporting by 2
+        // per package at all 37 call sites.
+        //
+        // Output lines are not the tally: write_triple auto-emits inverse
+        // statements that no caller counts, and silently drops triples with
+        // invalid IRI characters. Both are accounted for here, so this
+        // compares logical writes against a logical tally.
+        assert_eq!(
+            count + writer.skipped_invalid_iri,
+            content.lines().count() - writer.auto_inverses,
+            "reported tally ({count}) must match logical writes \
+             ({} lines - {} auto-inverses, {} skipped)",
+            content.lines().count(),
+            writer.auto_inverses,
+            writer.skipped_invalid_iri
+        );
+
         // Core assertions
         assert!(
             content.contains("core#BinaryPackage"),

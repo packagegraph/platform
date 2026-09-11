@@ -336,7 +336,7 @@ impl OpenWrtCollector {
         // identityName + rdfs:label, not packageName: see
         // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
-        triples += 3;
+        triples += 1;
 
         // Version resource (separate node with versionString)
         let ver_uri = version_uri(&self.distro_name, &self.release_name, &pkg.name, version);

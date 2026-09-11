@@ -180,7 +180,7 @@ impl OpkgIndexCollector {
         // identityName + rdfs:label, not packageName: see
         // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
-        triples += 3;
+        triples += 1;
 
         // Source linkage via builtFromSource (if in identity_map)
         if let Some(source_uri) = identity_map.get(name) {

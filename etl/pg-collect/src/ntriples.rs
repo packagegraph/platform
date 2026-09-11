@@ -36,6 +36,15 @@ pub struct NTriplesWriter<W: Write = File> {
     writer: BufWriter<W>,
     /// Count of triples skipped due to invalid IRI characters.
     pub skipped_invalid_iri: usize,
+    /// Count of inverse statements auto-emitted by [`Self::write_triple`].
+    ///
+    /// Collectors maintain their own `triples += N` tallies by hand and report
+    /// them to the operator, but output lines exceed logical write calls by
+    /// exactly this many, so the two are not directly comparable. Exposing it
+    /// lets a test check a caller's tally against the output it produced --
+    /// which is how the 2026-09-11 over-count at 37 identity call sites would
+    /// have been caught when it was introduced.
+    pub auto_inverses: usize,
     /// Set of already-emitted "definition" triples (rdf:type declarations and
     /// name/label literals of shared entities), keyed by (subject, predicate,
     /// object) so byte-identical duplicates are written only once per output file.
@@ -65,6 +74,7 @@ impl<W: Write> NTriplesWriter<W> {
         Self {
             writer: BufWriter::new(sink),
             skipped_invalid_iri: 0,
+            auto_inverses: 0,
             def_seen: std::collections::HashSet::new(),
             line_suffix: " .".to_string(),
         }
@@ -150,6 +160,7 @@ impl<W: Write> NTriplesWriter<W> {
                 "<{object}> <{inverse_pred}> <{subject}>{}",
                 self.line_suffix
             )?;
+            self.auto_inverses += 1;
         }
 
         Ok(())
@@ -294,6 +305,7 @@ impl NTriplesWriter<File> {
         Self {
             writer: BufWriter::new(file),
             skipped_invalid_iri: 0,
+            auto_inverses: 0,
             def_seen: std::collections::HashSet::new(),
             line_suffix: format!(" <{}> .", graph_uri),
         }
