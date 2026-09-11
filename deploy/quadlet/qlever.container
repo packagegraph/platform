@@ -41,9 +41,35 @@ PublishPort=127.0.0.1:7001:7001
 # `command:`, which does). Override it with Entrypoint= instead, matching
 # deploy/base/qlever/deployment.yaml's `command: ["/qlever/qlever-server"]`.
 Entrypoint=/bin/sh
-Exec=-c "exec /qlever/qlever-server -i /data/index/packagegraph -j 4 -p 7001 -m 4G -c 1G -e 500M -k 200 -s 300s -a \"$QLEVER_ACCESS_TOKEN\""
-Memory=6g
-PodmanArgs=--cpus=4
+# Resource sizing, measured on this host (46G RAM, 12 Neoverse-N1 cores, 3.0G
+# index). The previous settings (-m 4G -c 1G -e 500M, Memory=6g, --cpus=4)
+# were binding on both axes: systemd logged a "6G memory peak" against the 6g
+# ceiling, and an ordinary corpus-wide aggregate over one class failed with
+# "Tried to allocate 250 kB, but only 114.5 kB were available". Analytical
+# queries over ~200M triples are a normal workload for this endpoint.
+#
+#   -m 24G  query-processing budget (was 4G). QLever enforces this itself by
+#           refusing allocations, so it self-limits well below the cgroup
+#           ceiling -- the ceiling is a backstop, not the operative limit.
+#   -c 4G   result cache (was 1G), -e 2G per-entry ceiling (was 500M). Raising
+#           -e matters independently: a large aggregate whose result exceeded
+#           500M was not cacheable at all, so every repeat paid full cost.
+#   -j 8    worker threads (was 4), and --cpus=8 to match. Memory only lets a
+#           big query *finish*; thread count is what changes its wall-clock.
+#           4 of 12 cores while the server idles ~0.5% under query load was
+#           leaving two thirds of the box unused. Matches the --cpus=8 the
+#           rebuild unit already uses; the two contend only at 03:30, when
+#           query load is nil.
+#   Memory=32g cgroup ceiling, covering -m + -c + the 3G index's page cache
+#           plus process overhead. Index pages are file-backed and
+#           reclaimable, so a generous ceiling keeps more of it resident.
+#
+# Headroom: collector/enricher units cap at 4g each and run ~1.2G in practice;
+# observed whole-host usage was 6G of 46G. These are ceilings, not
+# reservations, so 32g here does not deny the collectors anything.
+Exec=-c "exec /qlever/qlever-server -i /data/index/packagegraph -j 8 -p 7001 -m 24G -c 4G -e 2G -k 200 -s 300s -a \"$QLEVER_ACCESS_TOKEN\""
+Memory=32g
+PodmanArgs=--cpus=8
 NoNewPrivileges=true
 DropCapability=ALL
 # The k8s readinessProbe issues a real SPARQL query via kubelet's own httpGet
