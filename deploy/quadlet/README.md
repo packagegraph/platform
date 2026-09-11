@@ -123,9 +123,9 @@ can never reach production on its own.
 **This host currently tracks `devel-latest`**, because no `v*` tag has ever
 been cut and `latest` therefore points at a hand-assembled image. Once
 `v0.1.0` exists, flip the `Image=` lines in `qlever-index-load.container`,
-`qlever-rebuild-index.container`, `collectors/pg-collect@.container`, and
-`enrichers/pg-enrich@.container` back to `:latest` so production stops
-following `main`.
+`qlever-rebuild-index.container`, `collectors/pg-collect@.container`,
+`collectors/pg-collect-rhel@.container`, and `enrichers/pg-enrich@.container`
+back to `:latest` so production stops following `main`.
 
 `AutoUpdate=registry` belongs only on units whose tag is meant to move.
 Units pinned to an exact upstream version — `qlever.container`,
@@ -402,18 +402,30 @@ client-cert flags (`--sslclientcert`/`--sslclientkey`/`--sslcacert`,
 mirroring the pre-existing `Rpm` subcommand's own flags of the same
 name): the scripts glob `/etc/pki/entitlement/[0-9]*.pem` for the cert
 (its filename embeds a serial number that rotates on renewal) and point
-`--sslcacert` at `/etc/rhsm/ca/redhat-uep.pem`. Both paths are bind-mounted
-read-only into `pg-collect@.container` unconditionally -- harmless for
-every other collector, but this does couple the shared template to these
-two host paths existing. Weekly cadence, Fri/Sat 04:00 UTC (continuing the
-alma/rocky stagger). See `docs/rhel-collection.md` for the TLS setup and
+`--sslcacert` at `/etc/rhsm/ca/redhat-uep.pem`. Weekly cadence, Fri/Sat
+04:00 UTC (continuing the alma/rocky stagger). See
+`docs/rhel-collection.md` for the TLS setup and
 `docs/superpowers/specs/2026-09-10-rhel-collection-rhsa-correlation-design.md`
 for how RHSA advisories get correlated against packages collected here.
+
+These two use their own template, `pg-collect-rhel@.container`, instead of
+the shared `pg-collect@.container` every other collector uses. First
+production run (2026-09-11) failed immediately: the entitlement/CA
+bind mounts hit SELinux denials inside the container (`/etc/pki/entitlement`
+and `/etc/rhsm/ca` carry `cert_t`/`rhsmcertd_config_t`, not a type
+container processes can read, and Quadlet's plain `Volume=` doesn't
+auto-relabel). `pg-collect-rhel@.container` adds
+`PodmanArgs=--security-opt label=disable` to work around this --
+relabeling the real files with `:z`/`:Z` was ruled out since that
+permanently changes their SELinux context and could break `rhsmcertd`'s
+own access to them. Scoped to a separate template (rather than added to
+the shared one) so this SELinux-confinement relaxation only applies to
+these two collectors, not all 40+.
 
 Install:
 
 ```bash
-install -m 644 deploy/quadlet/collectors/pg-collect@.container /etc/containers/systemd/
+install -m 644 deploy/quadlet/collectors/pg-collect@.container deploy/quadlet/collectors/pg-collect-rhel@.container /etc/containers/systemd/
 install -d /etc/containers/systemd/scripts/collectors
 install -m 755 deploy/quadlet/collectors/scripts/*.sh /etc/containers/systemd/scripts/collectors/
 install -m 644 deploy/quadlet/collectors/timers/*.timer /etc/systemd/system/

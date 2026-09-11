@@ -1,0 +1,49 @@
+# Dedicated template for the two RHEL collectors (rhel-9-full, rhel-10-full)
+# only -- split out from pg-collect@.container on 2026-09-11 after the
+# shared template's first real production run of rhel-9-full/rhel-10-full
+# failed: `Volume=...:ro` bind mounts of /etc/pki/entitlement and
+# /etc/rhsm/ca hit SELinux denials inside the container (those paths carry
+# cert_t/rhsmcertd_config_t, not a type container processes are allowed to
+# read), and Quadlet's plain Volume= doesn't auto-relabel. The fix here is
+# `--security-opt label=disable`, scoped to only these two collectors
+# rather than the shared template every other collector uses -- relabeling
+# the real host files instead (:z/:Z) was ruled out because that would
+# permanently change their SELinux context and could break rhsmcertd's own
+# access to its own certs.
+#
+# Otherwise identical to pg-collect@.container -- see that file's header
+# comment for the shared design rationale (Network=host, FUSEKI_ENDPOINT
+# naming, timeout sizing, etc.). Keep the two in sync for anything that
+# isn't RHEL-specific.
+
+[Unit]
+Description=PackageGraph collector: %i
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/packagegraph/etl:devel-latest
+AutoUpdate=registry
+Network=host
+EnvironmentFile=/etc/containers/systemd/scripts/minio.env
+EnvironmentFile=/etc/containers/systemd/scripts/qlever.env
+Environment=HOME=/tmp
+Environment=SPARQL_BACKEND=qlever
+Environment=FUSEKI_ENDPOINT=http://127.0.0.1:7001
+Volume=/etc/containers/systemd/scripts/collectors/%i.sh:/usr/local/bin/collect.sh:ro
+# RHEL entitlement cert/key + Red Hat CA (TLS client-cert auth -- see
+# rhel-9-full.sh/rhel-10-full.sh and docs/rhel-collection.md).
+Volume=/etc/pki/entitlement:/etc/pki/entitlement:ro
+Volume=/etc/rhsm/ca:/etc/rhsm/ca:ro
+PodmanArgs=--security-opt label=disable
+Entrypoint=/bin/sh
+Exec=/usr/local/bin/collect.sh
+NoNewPrivileges=true
+DropCapability=ALL
+Memory=4g
+PodmanArgs=--cpus=2
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+TimeoutStartSec=28800
