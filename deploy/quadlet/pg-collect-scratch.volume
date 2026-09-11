@@ -1,0 +1,25 @@
+# Scratch space for pg-collect@.container and pg-collect-rhel@.container:
+# each collector's /tmp/cache/<name> (Minio-backed download cache) and
+# /tmp/collection/<name>.nt (collected output, pre-upload) land here. One
+# volume shared by every concurrently-running collector instance -- safe
+# because every collector script namespaces its own paths under its own
+# %i-derived subdirectory (see collectors/scripts/*.sh), so concurrent
+# instances never write to the same file.
+#
+# Backed by a dedicated data disk mounted at /var/lib/packagegraph (see
+# README.md's "Dedicated data disk" section) rather than default
+# Podman-managed storage under /, which is a much smaller root disk shared
+# with Podman's own image/container storage -- see the "Incident: root
+# disk full" note in README.md's Package collectors section for what
+# happens when large collectors write there instead. If your host has no
+# such disk, delete the Device=/Type=/Options= lines below to fall back to
+# normal Podman storage.
+
+[Volume]
+VolumeName=pg-collect-scratch
+Device=/var/lib/packagegraph/pg-collect-scratch
+Type=none
+Options=bind
+
+[Install]
+WantedBy=default.target

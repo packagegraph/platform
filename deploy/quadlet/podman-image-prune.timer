@@ -1,0 +1,16 @@
+# Schedules podman-image-prune.service. Daily is generous headroom against
+# the actual accumulation rate (a few CI publishes/day, a couple GB of
+# dangling layers each) -- see that service's comment for the incident
+# this exists to prevent a recurrence of.
+
+[Unit]
+Description=Daily schedule for podman-image-prune.service
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1800
+Persistent=true
+Unit=podman-image-prune.service
+
+[Install]
+WantedBy=timers.target

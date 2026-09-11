@@ -1,0 +1,28 @@
+# Native systemd service (NOT a quadlet/container -- this prunes the
+# host's own podman image store, so it has to run directly against the
+# host's podman rather than a nested podman-in-podman instance). Scheduled
+# by podman-image-prune.timer.
+#
+# `image prune` (no --all) removes only dangling (untagged, <none>:<none>)
+# images -- the layers left behind every time a floating tag like
+# ghcr.io/packagegraph/etl:devel-latest gets repointed at a new CI build.
+# It never touches anything still tagged, so :devel-latest, :latest, and
+# every other named image survive untouched.
+#
+# Added 2026-09-11: ~30 hours of unpruned CI publishes (a few merges/day,
+# a couple GB of dangling layers each) had already eaten most of the root
+# disk's headroom when two large collectors then ran concurrently and
+# filled it the rest of the way, corrupting podman's own database (see
+# "Incident: root disk full" in README.md's Package collectors section).
+# This alone doesn't make collector scratch space safe by itself -- see
+# pg-collect-scratch.volume for the fix that does -- it removes the
+# slow-burn baseline pressure that made the root disk's headroom
+# dangerously thin before that incident's actual trigger even happened.
+
+[Unit]
+Description=Prune dangling (untagged) podman images
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/podman image prune -f

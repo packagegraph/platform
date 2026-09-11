@@ -32,6 +32,8 @@ see "Public SPARQL reverse proxy" below.
 | `firewall/sync-trusted-source.sh` + `.service` + `.timer` | no k8s equivalent |
 | `fail2ban/` (jail.local, filter.d/, action.d/, nft-shared-ban.sh) | no k8s equivalent -- native package install, not a quadlet unit; see "Traffic filtering and abuse detection" |
 | `collectors/pg-collect@.container` + `collectors/scripts/*.sh` + `collectors/timers/*.timer` | `deploy/overlays/{dev,prod}/jobs/collect-*.yaml` -- see "Package collectors" |
+| `pg-collect-scratch.volume` | the CronJobs' `tmp` emptyDir |
+| `podman-image-prune.service` + `.timer` | no k8s equivalent (kubelet's own image GC is the analogue) |
 
 The scripts are bind-mounted into their containers read-only rather than
 baked into the `qlever-rebuild` image, so this set works against the image
@@ -39,13 +41,16 @@ already built by `make build-qlever-rebuild` / CI with no rebuild required.
 
 ## Dedicated data disk
 
-`qlever-data.volume` and `qlever-rebuild-scratch.volume` bind-mount a
-dedicated disk at `/var/lib/packagegraph` (via `Device=`/`Type=none`/
-`Options=bind`) rather than using default Podman-managed storage under `/`
--- a full rebuild's scratch space alone can approach 80G (see the comment in
-`qlever-rebuild-scratch.volume`), which will not fit on a typical root
+`qlever-data.volume`, `qlever-rebuild-scratch.volume`, and
+`pg-collect-scratch.volume` bind-mount a dedicated disk at
+`/var/lib/packagegraph` (via `Device=`/`Type=none`/`Options=bind`) rather
+than using default Podman-managed storage under `/` -- a full rebuild's
+scratch space alone can approach 80G (see the comment in
+`qlever-rebuild-scratch.volume`), and collector scratch space has its own
+history of filling a root disk (see "Incident: root disk full" in "Package
+collectors" below), neither of which will fit on a typical root
 filesystem. If your host has no such disk, delete those three lines from
-both `.volume` files to fall back to normal Podman storage.
+each `.volume` file to fall back to normal Podman storage.
 
 To provision the disk (adjust the device path for your host):
 
@@ -56,7 +61,7 @@ echo "UUID=$UUID /var/lib/packagegraph xfs defaults 0 2" >> /etc/fstab
 mkdir -p /var/lib/packagegraph
 mount -a
 
-mkdir -p /var/lib/packagegraph/qlever-data /var/lib/packagegraph/qlever-rebuild-scratch
+mkdir -p /var/lib/packagegraph/qlever-data /var/lib/packagegraph/qlever-rebuild-scratch /var/lib/packagegraph/pg-collect-scratch
 
 # SELinux (skip if not enforcing): label the tree for container access,
 # persisted so it survives future relabels.
@@ -72,6 +77,7 @@ install -m 644 deploy/quadlet/*.container deploy/quadlet/*.volume /etc/container
 install -m 755 deploy/quadlet/scripts/*.sh /etc/containers/systemd/scripts/
 install -m 600 deploy/quadlet/scripts/*.env /etc/containers/systemd/scripts/
 install -m 644 deploy/quadlet/qlever-rebuild-index.timer deploy/quadlet/sparql-proxy-certbot-renew.timer /etc/systemd/system/
+install -m 644 deploy/quadlet/podman-image-prune.service deploy/quadlet/podman-image-prune.timer /etc/systemd/system/
 install -d /etc/containers/systemd/sparql-proxy
 install -m 644 deploy/quadlet/sparql-proxy/nginx.conf /etc/containers/systemd/sparql-proxy/
 
@@ -85,6 +91,7 @@ chmod 600 /etc/containers/systemd/scripts/*.env
 systemctl daemon-reload
 systemctl enable --now qlever.service          # pulls in qlever-index-load.service first
 systemctl enable --now qlever-rebuild-index.timer
+systemctl enable --now podman-image-prune.timer
 ```
 
 `qlever.service` requires `qlever-index-load.service` (see its `Requires=`/
@@ -622,6 +629,49 @@ fresh `debian-trixie-full`-sourced corpus (see previous section) indexed
 before its discovery seed is fully clean, since the malformed names are
 still baked into whatever `nt-output/debian-trixie*.nt.gz` was indexed
 most recently as of the fix landing.
+
+### Incident: root disk full during a concurrent `rhel-9-full`/`rhel-10-full` run (2026-09-11)
+
+The first attempt at running `rhel-9-full` and `rhel-10-full` to full
+completion (both manually kicked off together, after the SELinux/TLS-cache/
+OOM fixes above) filled the root disk to 100%. Podman's own database broke
+as a result (`unable to open database file` on nearly every `podman`
+command, including `image prune` and even plain `images`), because both
+collectors' `--rm` containers died mid-write and left orphaned overlay
+`diff`/`merged` mounts podman could no longer account for.
+
+Two compounding causes, both structural, not just this one run's bad luck:
+
+1. **Collector scratch space lived on the root disk.** `/tmp` inside
+   `pg-collect@.container`/`pg-collect-rhel@.container` was the container's
+   own overlay writable layer -- backed by whatever disk hosts Podman's
+   default storage, the same 47G root filesystem as the OS itself. Each
+   RHEL collector's cache + pre-upload output alone reached ~14-15GB before
+   failing; two running at once left no headroom at all.
+2. **No automated image pruning.** Roughly 30 hours of CI-published
+   `:devel-latest` digests (several merges to `main`) had accumulated as
+   dangling (`<none>:<none>`) images with nothing ever reclaiming them,
+   eating most of the disk's headroom before the concurrent run even
+   started.
+
+Recovery (manual, one-time): confirmed QLever/sparql-proxy were still
+functionally healthy (a real SPARQL query, not just the healthcheck's
+stale status) despite showing `unhealthy`; found and unmounted the orphaned
+overlay `merged` mounts and removed their `diff` directories directly
+(bypassing podman, which couldn't write); once podman's metadata writes
+succeeded again, force-removed the zombie container records and ran
+`podman image prune -f`, reclaiming ~23GB from ~20 dangling images.
+
+**The actual fix is structural, not "don't run collectors concurrently"**
+-- running any number of collectors at once should never be able to
+exhaust the disk. Two changes: `pg-collect-scratch.volume` moves collector
+scratch space onto the dedicated data disk (see "Dedicated data disk"
+above) instead of the shared 47G root disk, and `podman-image-prune.timer`
+prunes dangling images daily so CI publishes stop accumulating baseline
+pressure between runs. Neither depends on the other: the scratch volume
+makes any single run's disk usage bounded by the data disk's 396G+ instead
+of root's headroom, and the prune timer keeps that headroom from silently
+eroding even when no collector is running at all.
 
 ## Data pipeline: collectors → Minio → QLever, and how to extend it
 
