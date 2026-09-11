@@ -642,7 +642,9 @@ enum Commands {
     /// Emits raw POM declarations, NOT effective Maven resolution.
     /// When --max-depth > 0, performs recursive BFS traversal of dependency graphs.
     Maven {
-        /// Seed file with groupId:artifactId coordinates (one per line). Omit with --endpoint to auto-discover.
+        /// Seed file, one coordinate per line: `groupId:artifactId` resolves the
+        /// newest version, `groupId:artifactId:version` pins that exact version
+        /// (and skips version resolution entirely). Omit with --endpoint to auto-discover.
         #[arg(long)]
         packages_file: Option<String>,
 
@@ -650,7 +652,9 @@ enum Commands {
         #[arg(long)]
         endpoint: Option<String>,
 
-        /// Maven search API base URL
+        /// Maven search API base URL. Used only to resolve unpinned seeds; on a
+        /// transient failure (429/5xx/transport) collection falls back to
+        /// maven-metadata.xml under --repo-base for the rest of the run.
         #[arg(long, default_value = "https://search.maven.org")]
         search_base: String,
 
