@@ -182,6 +182,61 @@ if [ "$INCOMPLETE" -gt 0 ]; then
   exit 1
 fi
 
+# Dedup by graph URI: upload-nt.sh migrated from uploading <slug>.nt to
+# <slug>.nt.gz, but never deletes the old key when a collector re-uploads
+# under the new name (nothing in this pipeline has Minio delete permission
+# -- confirmed live, `mc rm` returns Access Denied). Without this step,
+# both the stale <slug>.nt.graph and the current <slug>.nt.gz.graph get
+# discovered by the glob above and BOTH get converted below, silently
+# duplicating that graph's triples under the same graph URI with stale
+# package data mixed into the current data -- confirmed live 2026-09-11
+# against the production bucket: 24 graphs (arch, conda-forge, fedora-43,
+# debian-trixie, maven, npm, pypi, ... ) had both an old raw upload and a
+# newer .gz upload coexisting, accounting for ~10GB of pure duplicate
+# quads actually being indexed, not just idle storage.
+#
+# Group every discovered sidecar by the graph URI in its contents (not by
+# filename -- naming schemes can and have changed) and keep only the
+# newest data file per URI. The older duplicate's SOURCE key in Minio is
+# then overwritten with a 0-byte payload (confirmed live: `mc pipe` with
+# empty stdin succeeds even without delete permission, since this is a
+# plain PUT to an existing key, a different S3 permission than
+# DeleteObject -- and the bucket is unversioned, so the old bytes are
+# actually freed, not retained under a hidden version) so the exact same
+# duplication doesn't get rediscovered and reclaimed on every future run.
+echo "Deduplicating graphs by URI (keep newest upload per graph)..."
+: > /tmp/graph-candidates.txt
+for graph_file in /tmp/nt-output/*.graph; do
+    nt_file="${graph_file%.graph}"
+    graph_uri=$(tr -d '\n' < "$graph_file")
+    mtime=$(stat -c '%Y' "$nt_file")
+    printf '%s\t%s\t%s\n' "$graph_uri" "$mtime" "$graph_file" >> /tmp/graph-candidates.txt
+done
+sort -t "$(printf '\t')" -k1,1 -k2,2nr /tmp/graph-candidates.txt > /tmp/graph-candidates-sorted.txt
+rm -f /tmp/graph-candidates.txt
+
+: > /tmp/winning-graphs.txt
+STALE_COUNT=0
+LAST_URI=""
+while IFS=$'\t' read -r graph_uri _mtime graph_file; do
+    if [ "$graph_uri" != "$LAST_URI" ]; then
+        # Newest entry for this URI (sorted mtime-descending) -- winner.
+        echo "$graph_file" >> /tmp/winning-graphs.txt
+        LAST_URI="$graph_uri"
+    else
+        # Older duplicate of an already-won URI -- reclaim its storage.
+        nt_file="${graph_file%.graph}"
+        stale_key="nt-output/$(basename "$nt_file")"
+        echo "  stale duplicate: $(basename "$nt_file") <$graph_uri> — reclaiming $stale_key"
+        STALE_COUNT=$((STALE_COUNT + 1))
+        if ! printf '' | mc pipe "pgraph/${MINIO_BUCKET}/${stale_key}"; then
+            echo "WARN: failed to reclaim $stale_key — will retry next run" >&2
+        fi
+    fi
+done < /tmp/graph-candidates-sorted.txt
+rm -f /tmp/graph-candidates-sorted.txt
+echo "Dedup complete: $STALE_COUNT stale duplicate(s) reclaimed"
+
 # Per-graph gunzip+sed is independent work (no shared state, output order
 # doesn't matter -- qlever-index sorts everything internally regardless of
 # input quad order), so it runs in parallel across all available cores
@@ -219,13 +274,14 @@ convert_one_graph() {
 export -f convert_one_graph
 export NQ_PARTS
 
-find /tmp/nt-output -name '*.graph' -print0 | \
-    xargs -0 -P "$(nproc)" -I{} bash -c 'convert_one_graph "$@"' _ {}
+xargs -a /tmp/winning-graphs.txt -d '\n' -P "$(nproc)" -I{} bash -c 'convert_one_graph "$@"' _ {}
 
 # xargs runs every job regardless of earlier failures, so a mid-batch error
 # doesn't fail fast the way the old serial loop did -- verify the expected
-# fragment count landed before trusting the concatenation below.
-GRAPH_COUNT=$(find /tmp/nt-output -name '*.graph' | wc -l | tr -d ' ')
+# fragment count landed before trusting the concatenation below. Compare
+# against the deduped winner list, not a raw glob of /tmp/nt-output -- only
+# winners were ever dispatched to convert_one_graph above.
+GRAPH_COUNT=$(wc -l < /tmp/winning-graphs.txt | tr -d ' ')
 FRAGMENT_COUNT=$(find "$NQ_PARTS" -name '*.nq' | wc -l | tr -d ' ')
 if [ "$FRAGMENT_COUNT" -ne "$GRAPH_COUNT" ]; then
   echo "ERROR: expected $GRAPH_COUNT converted fragments, found $FRAGMENT_COUNT -- a parallel conversion job failed"
@@ -235,6 +291,7 @@ fi
 cat "$NQ_PARTS"/*.nq > /tmp/packagegraph.nq
 cat "$NQ_PARTS"/*.uri > /tmp/graph-uris.txt
 rm -rf "$NQ_PARTS"
+rm -f /tmp/winning-graphs.txt
 # Deliberately not deleting /tmp/nt-output or its contents: it lives on
 # qlever-rebuild-scratch.volume (a real disk, not tmpfs -- see its own
 # comment), and keeping it around is what lets next run's mc mirror above
