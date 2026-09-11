@@ -335,7 +335,6 @@ impl SourcesCollector {
                 triples += write_package_identity(writer, &dep_uri, dep_name)?;
                 // identityName + rdfs:label, not packageName: see
                 // emit::rdf::write_package_identity for why.
-                triples += 2;
 
                 // Emit Build-Depends triple with ontology-specific predicate
                 let pred_uri = if predicate == "deb:buildDepends" {

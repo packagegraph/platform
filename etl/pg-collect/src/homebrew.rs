@@ -209,7 +209,7 @@ impl HomebrewCollector {
         // identityName + rdfs:label, not packageName: see
         // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
-        triples += 3;
+        triples += 1;
 
         // Core properties
         writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), &formula.name)?;
@@ -309,7 +309,7 @@ impl HomebrewCollector {
         // identityName + rdfs:label, not packageName: see
         // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
-        triples += 3;
+        triples += 1;
 
         writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), &cask.token)?;
         writer.write_literal(&pkg_uri, &format!("{BREW}token"), &cask.token)?;
