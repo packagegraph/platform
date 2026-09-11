@@ -106,14 +106,16 @@ pub fn emit_rdf(ir: &PackageIr, writer: &mut NTriplesWriter, policy: &EmitPolicy
             writer.write_literal(&pkg_uri, &format!("{PKG}homepage"), homepage)?;
             triples += 1;
             // Upstream repository from homepage (if forge URL)
-            if let Some(upstream_uri) = normalize_forge_url(homepage) {
+            if let Some(canonical_url) = normalize_forge_url_canonical(homepage) {
+                let upstream_repo_iri = repo_uri(&canonical_url);
                 writer.write_triple(
                     &identity_uri,
                     &format!("{PKG}upstreamRepository"),
-                    &upstream_uri,
+                    &upstream_repo_iri,
                 )?;
-                writer.write_triple(&upstream_uri, RDF_TYPE, &format!("{VCS}Repository"))?;
+                writer.write_triple(&upstream_repo_iri, RDF_TYPE, &format!("{VCS}Repository"))?;
                 triples += 2;
+                triples += crate::forge::emit_upstream_project(writer, &canonical_url)?;
             }
         }
     }
@@ -480,5 +482,45 @@ mod tests {
             !content.contains("mailto:"),
             "Name-only maintainer must not have mbox"
         );
+    }
+
+    #[test]
+    fn test_emit_rdf_upstream_repo_links_to_hub() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+
+        let mut ir = sample_ir();
+        ir.metadata = Some(PackageMetadataIr {
+            summary: Some("GNU C Library".to_string()),
+            description: Some("The GNU libc libraries".to_string()),
+            homepage: Some("https://github.com/owner/repo".to_string()),
+            license: None,
+            checksum: None,
+            size_bytes: None,
+        });
+        let policy = EmitPolicy::default();
+
+        emit_rdf(&ir, &mut writer, &policy).unwrap();
+        writer.flush().unwrap();
+
+        let mut content = String::new();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+
+        assert!(content.contains("upstreamRepository"), "existing triple must still be emitted");
+        assert!(content.contains(&format!("{VCS}Repository")), "existing repo typing must be preserved");
+        assert!(content.contains("UpstreamProject"), "new hub triple");
+        assert!(
+            content.contains("\"owner/repo\""),
+            "projectName should be derived from the repo URL"
+        );
+        // hasUpstreamProject is rdfs:domain :SourcePackage; identity_uri here
+        // is a PackageIdentity, so this predicate must never appear on it.
+        // The hub is discoverable via upstreamRepository/projectRepository
+        // joining through the shared repo URI instead.
+        assert!(!content.contains("hasUpstreamProject"));
     }
 }

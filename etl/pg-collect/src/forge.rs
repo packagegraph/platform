@@ -37,7 +37,7 @@ pub struct ForgeExtraction {
 // ─── Known forge hosts ──────────────────────────────────────────────────
 
 /// Hosts that are known forges (owner/repo pattern).
-const FORGE_HOSTS: &[&str] = &["github.com", "codeberg.org", "sr.ht"];
+const FORGE_HOSTS: &[&str] = &["github.com", "codeberg.org", "sr.ht", "bitbucket.org"];
 
 /// Hosts that are known GitLab instances.
 const GITLAB_HOSTS: &[&str] = &[
@@ -103,11 +103,25 @@ fn pre_normalize(url: &str) -> Option<String> {
         .trim_end_matches(".git")
         .trim_end_matches('/');
 
-    if url.is_empty() || !url.starts_with("https://") {
+    if url.is_empty() {
         return None;
     }
 
-    Some(url.to_string())
+    // Some producers (RPM `URL:` tags, package.json `homepage`, etc.) omit
+    // the scheme entirely (e.g. "github.com/owner/repo"). A string with no
+    // "://" at all is treated as implicitly https -- this restores
+    // scheme-less resolution that the retired uris.rs matcher supported.
+    let url = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("https://{}", url)
+    };
+
+    if !url.starts_with("https://") {
+        return None;
+    }
+
+    Some(url)
 }
 
 /// Extract the path portion after stripping the protocol prefix.
@@ -217,7 +231,8 @@ fn is_high_confidence_host(path: &str) -> bool {
 /// Normalize a direct forge URL to canonical form.
 ///
 /// Handles all known forge patterns: GitHub, GitLab instances, Codeberg,
-/// Pagure, Fedora dist-git, Savannah, Sourceware, kernel.org, Gitea/Forgejo.
+/// Pagure, Fedora dist-git, Savannah, Sourceware, kernel.org, Gitea/Forgejo,
+/// Bitbucket.
 fn normalize_direct_forge(url: &str) -> Option<String> {
     let path = strip_protocol(url);
 
@@ -232,12 +247,42 @@ fn normalize_direct_forge(url: &str) -> Option<String> {
         }
     }
 
+    // Bitbucket: bitbucket.org/{owner}/{repo}
+    if path.starts_with("bitbucket.org/") {
+        let rest = path.strip_prefix("bitbucket.org/")?;
+        let caps = FORGE_OWNER_REPO_RE.captures(rest)?;
+        let owner = caps.get(1)?.as_str();
+        let repo = caps.get(2)?.as_str();
+        if !owner.is_empty() && !repo.is_empty() {
+            return Some(format!("https://bitbucket.org/{}/{}", owner, repo));
+        }
+    }
+
     // GitLab instances: gitlab.com, gitlab.freedesktop.org, etc.
     for host in GITLAB_HOSTS {
         if path.starts_with(&format!("{}/", host)) {
             let rest = path.strip_prefix(&format!("{}/", host))?;
             // GitLab repos can have nested groups: gitlab.com/group/subgroup/repo
             // Strip known subpaths: /-/tree, /-/blob, /-/archive, /-/commits, etc.
+            let rest = rest.split("/-/").next().unwrap_or(rest);
+            let rest = rest.trim_end_matches('/');
+            if !rest.is_empty() && rest.contains('/') {
+                return Some(format!("https://{}/{}", host, rest));
+            }
+        }
+    }
+
+    // Generic self-hosted GitLab instances not in the curated list above
+    // (gitlab.kitware.com, gitlab.isc.org, gitlab.torproject.org, etc.).
+    // Host-prefix match only -- NOT a substring-anywhere match -- so this
+    // does not reintroduce the false positive the loose `uris.rs` matcher
+    // had (e.g. blog.example.com/tags/gitlab.html). Confidence for these
+    // falls out as Medium automatically via is_high_confidence_host, since
+    // only the curated GITLAB_HOSTS list counts as High.
+    if let Some(host_end) = path.find('/') {
+        let host = &path[..host_end];
+        if host.starts_with("gitlab.") && !GITLAB_HOSTS.contains(&host) {
+            let rest = &path[host_end + 1..];
             let rest = rest.split("/-/").next().unwrap_or(rest);
             let rest = rest.trim_end_matches('/');
             if !rest.is_empty() && rest.contains('/') {
@@ -924,6 +969,62 @@ pub fn emit_upstream_repo(
     // Emit forge instance triples (v0.8.0)
     triples += emit_forge_triples(writer, &r_uri, repo_url)?;
 
+    // NOTE: `repo_url` here may be the validation-resolved (redirect-followed)
+    // URL when `validation` is Some, whereas the three direct writers
+    // (rpm.rs, maven.rs, emit/rdf.rs) and collect_openwrt_upstream.rs key
+    // their own emit_upstream_project calls off the raw extracted URL with
+    // no redirect resolution. Every current caller passes None for
+    // `validation`, so this doesn't diverge today -- but the first caller
+    // that passes Some(validation) would silently stop converging with
+    // direct-writer hubs for the same project, with no test to catch it.
+    triples += emit_upstream_project(writer, repo_url)?;
+
+    Ok(triples)
+}
+
+/// Mint the shared `pkg:UpstreamProject` hub node for a canonical repo URL,
+/// idempotently, if this is the first time any collector run has seen it.
+/// Keyed on the same repo_url normalize_forge_url / extract_forge_url
+/// already produced -- no new identity scheme, reuses the existing
+/// uris::upstream_uri helper.
+///
+/// Deliberately does NOT link any identity or package to the hub directly:
+/// `pkg:hasUpstreamProject` is declared `rdfs:domain :SourcePackage`
+/// (core.ttl), and every caller of this function passes a
+/// `pkg:PackageIdentity` node -- writing hasUpstreamProject there would
+/// misuse the predicate outside its declared domain and, under RDFS
+/// entailment, wrongly infer every such identity to also be a
+/// SourcePackage/Package. The hub is still fully discoverable without that
+/// edge: every caller already emits `?identity pkg:upstreamRepository
+/// ?repo`, and this function emits `?project pkg:projectRepository ?repo`,
+/// so `?identity pkg:upstreamRepository ?repo . ?project
+/// pkg:projectRepository ?repo .` joins them through the shared repository
+/// URI. collect_openwrt_upstream.rs's own, separate hasUpstreamProject
+/// write is unaffected by this function -- its subject is a genuine
+/// SourcePackage-typed node (opkg:OpkgPackage), where the predicate's
+/// domain is correctly satisfied.
+pub fn emit_upstream_project(writer: &mut NTriplesWriter, repo_url: &str) -> Result<usize> {
+    let project_uri = crate::uris::upstream_uri(repo_url);
+    let mut triples = 0;
+
+    if writer.write_triple_once(&project_uri, RDF_TYPE, &format!("{PKG}UpstreamProject"))? {
+        triples += 1;
+    }
+    if writer.write_literal_once(
+        &project_uri,
+        &format!("{PKG}projectName"),
+        &crate::uris::project_name_from_repo_url(repo_url),
+    )? {
+        triples += 1;
+    }
+    if writer.write_triple_once(
+        &project_uri,
+        &format!("{PKG}projectRepository"),
+        &crate::uris::repo_uri(repo_url),
+    )? {
+        triples += 1;
+    }
+
     Ok(triples)
 }
 
@@ -994,6 +1095,15 @@ mod tests {
         assert_eq!(pre_normalize("   "), None);
     }
 
+    #[test]
+    fn test_pre_normalize_scheme_less() {
+        // RPM `URL:` tags and various `homepage` fields commonly omit the
+        // scheme entirely -- a string with no "://" at all is treated as
+        // implicitly https, restoring what the retired uris.rs matcher did.
+        let result = pre_normalize("github.com/owner/repo");
+        assert_eq!(result, Some("https://github.com/owner/repo".to_string()));
+    }
+
     // ─── extract_forge_url ──────────────────────────────────────────
 
     #[test]
@@ -1043,6 +1153,38 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_bitbucket_direct() {
+        let result = extract_forge_url("https://bitbucket.org/owner/repo").unwrap();
+        assert_eq!(result.repo_url, "https://bitbucket.org/owner/repo");
+        assert_eq!(result.confidence, Confidence::High);
+    }
+
+    #[test]
+    fn test_extract_bitbucket_trailing_slash() {
+        let result = extract_forge_url("https://bitbucket.org/owner/repo/").unwrap();
+        assert_eq!(result.repo_url, "https://bitbucket.org/owner/repo");
+    }
+
+    #[test]
+    fn test_extract_bitbucket_git_suffix() {
+        let result = extract_forge_url("https://bitbucket.org/owner/repo.git").unwrap();
+        assert_eq!(result.repo_url, "https://bitbucket.org/owner/repo");
+    }
+
+    #[test]
+    fn test_extract_bitbucket_with_subpath() {
+        let result =
+            extract_forge_url("https://bitbucket.org/owner/repo/src/master/README.md").unwrap();
+        assert_eq!(result.repo_url, "https://bitbucket.org/owner/repo");
+    }
+
+    #[test]
+    fn test_extract_bitbucket_org_only_rejected() {
+        // No repo segment -- must not match, same as test_extract_github_org_only_rejected
+        assert!(extract_forge_url("https://bitbucket.org/owner").is_none());
+    }
+
+    #[test]
     fn test_extract_gitlab_freedesktop() {
         let result = extract_forge_url("https://gitlab.freedesktop.org/xorg/lib/libx11").unwrap();
         assert_eq!(
@@ -1056,6 +1198,37 @@ mod tests {
     fn test_extract_gitlab_with_subpath() {
         let result = extract_forge_url("https://gitlab.gnome.org/GNOME/glib/-/tree/main").unwrap();
         assert_eq!(result.repo_url, "https://gitlab.gnome.org/GNOME/glib");
+    }
+
+    #[test]
+    fn test_extract_gitlab_self_hosted_not_in_curated_list() {
+        // gitlab.kitware.com is not in GITLAB_HOSTS, but still starts with
+        // "gitlab." -- the generic self-hosted rule must resolve it.
+        let result = extract_forge_url("https://gitlab.kitware.com/cmake/cmake").unwrap();
+        assert_eq!(result.repo_url, "https://gitlab.kitware.com/cmake/cmake");
+        // Not in the curated list, so confidence falls out as Medium.
+        assert_eq!(result.confidence, Confidence::Medium);
+    }
+
+    #[test]
+    fn test_extract_gitlab_self_hosted_nested_group_with_dash_suffix() {
+        let result = extract_forge_url(
+            "https://gitlab.kitware.com/group/subgroup/project/-/archive/main.tar.gz",
+        )
+        .unwrap();
+        assert_eq!(
+            result.repo_url,
+            "https://gitlab.kitware.com/group/subgroup/project"
+        );
+    }
+
+    #[test]
+    fn test_extract_gitlab_loose_substring_still_does_not_match() {
+        // Confirms the generic host-prefix rule does NOT reintroduce the
+        // retired uris.rs loose substring match: blog.example.com does not
+        // start with "gitlab." even though it contains "gitlab." later in
+        // the path.
+        assert!(extract_forge_url("https://blog.example.com/tags/gitlab.html").is_none());
     }
 
     #[test]
@@ -1126,6 +1299,29 @@ mod tests {
         assert!(extract_forge_url("https://www.openssl.org/").is_none());
         assert!(extract_forge_url("https://example.com/downloads/foo.tar.gz").is_none());
         assert!(extract_forge_url("not a url").is_none());
+    }
+
+    #[test]
+    fn test_extract_scheme_less_github_resolves() {
+        // pre_normalize prepends https:// for scheme-less input; confirm
+        // normalize_direct_forge still recognizes the result end-to-end.
+        let result = extract_forge_url("github.com/owner/repo").unwrap();
+        assert_eq!(result.repo_url, "https://github.com/owner/repo");
+    }
+
+    #[test]
+    fn test_extract_scheme_less_self_hosted_gitlab_resolves() {
+        // Combines item B (scheme-less resolution) with item A (self-hosted
+        // GitLab host-prefix rule).
+        let result = extract_forge_url("gitlab.kitware.com/cmake/cmake").unwrap();
+        assert_eq!(result.repo_url, "https://gitlab.kitware.com/cmake/cmake");
+    }
+
+    #[test]
+    fn test_extract_scheme_less_garbage_string_still_none() {
+        // A scheme-less non-URL gets a scheme prepended by pre_normalize but
+        // still must not match any host pattern -- not a false positive.
+        assert!(extract_forge_url("not a url two words").is_none());
     }
 
     // ─── normalize_archive_url ──────────────────────────────────────
@@ -1645,7 +1841,7 @@ mod tests {
         .unwrap();
         writer.flush().unwrap();
 
-        assert_eq!(count, 7); // 3 repo + 4 forge
+        assert_eq!(count, 10); // 3 repo + 4 forge + 3 upstream project hub
         let mut content = String::new();
         std::io::Read::read_to_string(&mut temp.reopen().unwrap(), &mut content).unwrap();
         assert!(content.contains("core#upstreamRepository"));
@@ -1710,6 +1906,60 @@ mod tests {
         assert!(
             content.contains("new/repo"),
             "Should use canonical URL from redirect"
+        );
+    }
+
+    #[test]
+    fn test_emit_upstream_project_writes_hub_triples() {
+        use crate::ntriples::NTriplesWriter;
+        use std::io::Read;
+        use tempfile::NamedTempFile;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+
+        let triples = emit_upstream_project(&mut writer, "https://github.com/owner/repo").unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(triples, 3); // type, projectName, projectRepository
+
+        let mut content = String::new();
+        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+
+        assert!(content.contains("UpstreamProject"));
+        assert!(content.contains("\"owner/repo\""));
+        assert!(content.contains("projectRepository"));
+        // hasUpstreamProject is rdfs:domain :SourcePackage in the ontology.
+        // This function mints only the hub node itself and must never emit
+        // that predicate -- doing so from a PackageIdentity caller would
+        // misuse the predicate outside its declared domain.
+        assert!(!content.contains("hasUpstreamProject"));
+    }
+
+    #[test]
+    fn test_emit_upstream_project_dedupes_across_calls() {
+        use crate::ntriples::NTriplesWriter;
+        use std::io::Read;
+        use tempfile::NamedTempFile;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+
+        // Two different callers resolving to the same upstream repo.
+        let first = emit_upstream_project(&mut writer, "https://github.com/owner/repo").unwrap();
+        let second = emit_upstream_project(&mut writer, "https://github.com/owner/repo").unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(first, 3);
+        assert_eq!(second, 0, "hub already minted -- second call must be a pure no-op");
+
+        let mut content = String::new();
+        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+
+        assert_eq!(
+            content.matches(&format!("<{PKG}UpstreamProject>")).count(),
+            1,
+            "hub minted exactly once across both calls"
         );
     }
 
