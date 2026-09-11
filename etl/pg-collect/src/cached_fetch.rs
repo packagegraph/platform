@@ -13,6 +13,7 @@ use crate::http_cache::HttpCache;
 use std::time::Duration;
 
 /// Raw HTTP response returned by the `http_get` closure.
+#[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,
     pub bytes: Vec<u8>,

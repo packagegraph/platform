@@ -1,7 +1,13 @@
 //! One shared HTTP transport: retry, backoff, `Retry-After`, and per-host
 //! rate limiting. Collectors get a `send`, not just a `build`.
 
+use crate::cached_fetch::HttpResponse;
+use crate::enricher::default_http_client;
+use crate::fetch_error::FetchError;
 use once_cell::sync::Lazy;
+use reqwest::blocking::Client;
+use reqwest::header::{ETAG, IF_NONE_MATCH, RETRY_AFTER};
+use reqwest::StatusCode;
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
@@ -251,6 +257,200 @@ impl std::fmt::Display for StatsSnapshot {
     }
 }
 
+/// One attempt's outcome, plus any `Retry-After` the server sent. The
+/// header has to travel separately because `FetchError` carries no
+/// headers.
+struct Attempt {
+    result: Result<HttpResponse, FetchError>,
+    retry_after: Option<Duration>,
+}
+
+/// The crate's single HTTP send path: connection reuse, retry, backoff,
+/// `Retry-After`, and per-host pacing in one place.
+///
+/// `enricher::default_http_client()` gives callers a configured client and
+/// leaves every hard part to them, which is why 20 collectors hand-roll 58
+/// `thread::sleep` retry loops. This owns the send instead.
+#[derive(Debug)]
+pub struct HttpTransport {
+    client: Client,
+    limiter: HostLimiter,
+    policy: RetryPolicy,
+    stats: TransportStats,
+}
+
+impl HttpTransport {
+    pub fn new() -> Self {
+        Self::with_client(default_http_client())
+    }
+
+    /// Use a caller-supplied client -- needed wherever the default will not
+    /// do, e.g. RpmCollector's TLS client-cert auth against the RHEL CDN.
+    pub fn with_client(client: Client) -> Self {
+        Self {
+            client,
+            limiter: HostLimiter::default(),
+            policy: RetryPolicy::default(),
+            stats: TransportStats::default(),
+        }
+    }
+
+    pub fn with_policy(mut self, policy: RetryPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn with_limiter(mut self, limiter: HostLimiter) -> Self {
+        self.limiter = limiter;
+        self
+    }
+
+    pub fn stats(&self) -> StatsSnapshot {
+        self.stats.snapshot()
+    }
+
+    /// Fetch a URL, retrying transient failures.
+    ///
+    /// The signature matches `CachedFetcher::fetch`'s `http_get` parameter
+    /// exactly, so it can be passed straight through as
+    /// `|u, e| transport.get(u, e)` without changing `cached_fetch.rs`.
+    pub fn get(&self, url: &str, if_none_match: Option<&str>) -> Result<HttpResponse, FetchError> {
+        let host = host_of(url);
+        let mut attempt: u32 = 0;
+
+        loop {
+            self.limiter.wait_turn(&host);
+            self.stats.record_attempt();
+
+            let Attempt {
+                result,
+                retry_after,
+            } = self.send_once(url, if_none_match);
+
+            let err = match result {
+                Ok(response) => {
+                    self.stats.record_success();
+                    return Ok(response);
+                }
+                Err(e) => e,
+            };
+
+            match &err {
+                FetchError::NotFound { .. } => self.stats.record_not_found(),
+                FetchError::HttpStatus { status: 429, .. } => self.stats.record_rate_limited(),
+                _ => {}
+            }
+
+            attempt += 1;
+            if !err.is_retryable() || attempt >= self.policy.max_attempts {
+                self.stats.record_failure();
+                return Err(err);
+            }
+
+            // A server-supplied Retry-After is an instruction: obey it
+            // verbatim and slow this host down for the rest of the run.
+            // Only self-chosen backoff gets jittered.
+            let delay = match retry_after {
+                Some(wait) => {
+                    self.limiter.widen(&host, wait);
+                    wait
+                }
+                None => self.policy.jittered(self.policy.backoff_delay(attempt - 1)),
+            };
+
+            self.stats.record_retry();
+            std::thread::sleep(delay);
+        }
+    }
+
+    fn send_once(&self, url: &str, if_none_match: Option<&str>) -> Attempt {
+        let mut request = self.client.get(url);
+        if let Some(etag) = if_none_match {
+            request = request.header(IF_NONE_MATCH, etag);
+        }
+
+        let response = match request.send() {
+            Ok(r) => r,
+            Err(source) => {
+                return Attempt {
+                    result: Err(FetchError::Transport {
+                        url: url.to_string(),
+                        source,
+                    }),
+                    retry_after: None,
+                }
+            }
+        };
+
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|h| h.to_str().ok())
+            .and_then(parse_retry_after);
+
+        if status == StatusCode::NOT_FOUND {
+            return Attempt {
+                result: Err(FetchError::NotFound {
+                    url: url.to_string(),
+                }),
+                retry_after,
+            };
+        }
+
+        if !status.is_success() && status != StatusCode::NOT_MODIFIED {
+            return Attempt {
+                result: Err(FetchError::HttpStatus {
+                    url: url.to_string(),
+                    status: status.as_u16(),
+                }),
+                retry_after,
+            };
+        }
+
+        // Take an owned ETag before `bytes()` consumes the response.
+        let etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|h| h.to_str().ok())
+            .map(String::from);
+
+        match response.bytes() {
+            Ok(body) => Attempt {
+                result: Ok(HttpResponse {
+                    status: status.as_u16(),
+                    bytes: body.to_vec(),
+                    etag,
+                }),
+                retry_after,
+            },
+            Err(source) => Attempt {
+                result: Err(FetchError::Transport {
+                    url: url.to_string(),
+                    source,
+                }),
+                retry_after,
+            },
+        }
+    }
+}
+
+impl Default for HttpTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Host key for rate limiting. An unparseable URL groups under a single
+/// bucket rather than failing -- pacing an odd URL slightly wrong beats
+/// returning an error the caller cannot act on.
+fn host_of(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "<unparseable>".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +663,192 @@ mod tests {
         let snap = s.snapshot();
         assert_eq!(snap.attempts, 500);
         assert_eq!(snap.successes, 500);
+    }
+
+    // ── HttpTransport::get ──────────────────────────────────────────────
+
+    /// Millisecond delays and no jitter, so retry tests stay fast and
+    /// deterministic.
+    fn fast_policy(max_attempts: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(4),
+            jitter: false,
+        }
+    }
+
+    fn test_transport(policy: RetryPolicy) -> HttpTransport {
+        HttpTransport::new()
+            .with_policy(policy)
+            .with_limiter(HostLimiter::new(Duration::from_millis(0)))
+    }
+
+    #[test]
+    fn get_returns_body_and_etag_on_200() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/ok")
+            .with_status(200)
+            .with_header("etag", "\"v1\"")
+            .with_body("hello")
+            .expect(1)
+            .create();
+
+        let t = test_transport(fast_policy(5));
+        let resp = t.get(&format!("{}/ok", server.url()), None).unwrap();
+
+        mock.assert();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.bytes, b"hello");
+        assert_eq!(resp.etag.as_deref(), Some("\"v1\""));
+    }
+
+    #[test]
+    fn get_sends_if_none_match_when_given_an_etag() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/cond")
+            .match_header("if-none-match", "\"v1\"")
+            .with_status(304)
+            .expect(1)
+            .create();
+
+        let t = test_transport(fast_policy(5));
+        let resp = t
+            .get(&format!("{}/cond", server.url()), Some("\"v1\""))
+            .unwrap();
+
+        mock.assert();
+        assert_eq!(resp.status, 304, "304 must surface as Ok, not an error");
+    }
+
+    #[test]
+    fn get_maps_404_to_not_found_without_retrying() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/missing")
+            .with_status(404)
+            .expect(1)
+            .create();
+
+        let t = test_transport(fast_policy(5));
+        let err = t
+            .get(&format!("{}/missing", server.url()), None)
+            .unwrap_err();
+
+        mock.assert();
+        assert!(matches!(err, FetchError::NotFound { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn get_retries_5xx_and_succeeds() {
+        let mut server = mockito::Server::new();
+        let boom = server
+            .mock("GET", "/flaky")
+            .with_status(503)
+            .expect(1)
+            .create();
+        let ok = server
+            .mock("GET", "/flaky")
+            .with_status(200)
+            .with_body("recovered")
+            .expect(1)
+            .create();
+
+        let t = test_transport(fast_policy(5));
+        let resp = t.get(&format!("{}/flaky", server.url()), None).unwrap();
+
+        boom.assert();
+        ok.assert();
+        assert_eq!(resp.bytes, b"recovered");
+        assert_eq!(t.stats().retries, 1);
+    }
+
+    #[test]
+    fn get_stops_after_max_attempts_and_returns_the_last_error() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/down")
+            .with_status(500)
+            .expect(3) // max_attempts = 3 means exactly three requests
+            .create();
+
+        let t = test_transport(fast_policy(3));
+        let err = t.get(&format!("{}/down", server.url()), None).unwrap_err();
+
+        mock.assert();
+        assert!(
+            matches!(err, FetchError::HttpStatus { status: 500, .. }),
+            "got {err:?}"
+        );
+        assert_eq!(t.stats().failures, 1);
+    }
+
+    #[test]
+    fn get_does_not_retry_a_400() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/bad")
+            .with_status(400)
+            .expect(1) // is_retryable() excludes 4xx other than 429
+            .create();
+
+        let t = test_transport(fast_policy(5));
+        let err = t.get(&format!("{}/bad", server.url()), None).unwrap_err();
+
+        mock.assert();
+        assert!(
+            matches!(err, FetchError::HttpStatus { status: 400, .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn get_honours_retry_after_on_429() {
+        let mut server = mockito::Server::new();
+        let limited = server
+            .mock("GET", "/limited")
+            .with_status(429)
+            .with_header("retry-after", "1")
+            .expect(1)
+            .create();
+        let ok = server
+            .mock("GET", "/limited")
+            .with_status(200)
+            .with_body("fine")
+            .expect(1)
+            .create();
+
+        let t = test_transport(fast_policy(5));
+        let start = std::time::Instant::now();
+        let resp = t.get(&format!("{}/limited", server.url()), None).unwrap();
+
+        limited.assert();
+        ok.assert();
+        assert_eq!(resp.bytes, b"fine");
+        assert!(
+            start.elapsed() >= Duration::from_secs(1),
+            "Retry-After must be obeyed verbatim, not jittered down"
+        );
+        assert_eq!(t.stats().rate_limited, 1);
+    }
+
+    #[test]
+    fn stats_track_a_successful_fetch() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/ok")
+            .with_status(200)
+            .with_body("x")
+            .create();
+
+        let t = test_transport(fast_policy(5));
+        t.get(&format!("{}/ok", server.url()), None).unwrap();
+
+        let snap = t.stats();
+        assert_eq!(snap.attempts, 1);
+        assert_eq!(snap.successes, 1);
+        assert_eq!(snap.failures, 0);
     }
 }
