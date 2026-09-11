@@ -1,4 +1,5 @@
 pub mod uris;
+pub mod vocab;
 pub mod forge;
 pub mod ntriples;
 pub mod debian;
