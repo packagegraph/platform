@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Result};
 use tar::Archive;
+use crate::emit::rdf::write_package_identity;
 
 pub struct AlpineCollector {
     client: Client,
@@ -246,8 +247,9 @@ impl AlpineCollector {
         triples += 2;
 
         // Package identity
-        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), name)?;
+        triples += write_package_identity(writer, &identity_uri, name)?;
+        // identityName + rdfs:label, not packageName: see
+        // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 

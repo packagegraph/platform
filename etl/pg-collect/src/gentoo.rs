@@ -8,6 +8,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Result};
 use std::path::Path;
 use walkdir::WalkDir;
+use crate::emit::rdf::write_package_identity;
 
 /// Matches simple variable assignments: VAR="value" or VAR=value
 static VAR_RE_QUOTED: Lazy<Regex> = Lazy::new(|| Regex::new(r#"^\s*([A-Z_]+)="([^"]*)""#).unwrap());
@@ -227,8 +228,9 @@ impl GentooCollector {
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{GENTOO}PortagePackage"))?;
         triples += 2;
 
-        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &full_name)?;
+        triples += write_package_identity(writer, &identity_uri, &full_name)?;
+        // identityName + rdfs:label, not packageName: see
+        // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 
@@ -334,8 +336,9 @@ impl GentooCollector {
                         dep_cat,
                         dep_name,
                     );
-                    writer.write_triple(&target_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-                    writer.write_literal(&target_uri, &format!("{PKG}packageName"), dep)?;
+                    triples += write_package_identity(writer, &target_uri, dep)?;
+                    // identityName + rdfs:label, not packageName: see
+                    // emit::rdf::write_package_identity for why.
                     writer.write_triple(
                         &pkg_uri,
                         &format!("{PKG}directlyDependsOn"),

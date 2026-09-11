@@ -40,6 +40,7 @@ struct DependencyInfo {
 }
 
 use std::collections::HashMap;
+use crate::emit::rdf::write_package_identity;
 
 impl FreebsdCollector {
     pub fn new(distro_name: String, mirror: String, release: String, arch: String) -> Self {
@@ -224,8 +225,9 @@ impl FreebsdCollector {
         triples += 2;
 
         // Identity
-        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &pkg.name)?;
+        triples += write_package_identity(writer, &identity_uri, &pkg.name)?;
+        // identityName + rdfs:label, not packageName: see
+        // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 

@@ -12,6 +12,7 @@ use regex::Regex;
 use reqwest::blocking::Client;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Result};
+use crate::emit::rdf::write_package_identity;
 
 pub struct SourcesCollector {
     client: Client,
@@ -331,8 +332,9 @@ impl SourcesCollector {
                 let dep_uri = package_identity_uri(&self.distro, codename, "source", dep_name);
 
                 // Ensure identity exists
-                writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-                writer.write_literal(&dep_uri, &format!("{PKG}packageName"), dep_name)?;
+                triples += write_package_identity(writer, &dep_uri, dep_name)?;
+                // identityName + rdfs:label, not packageName: see
+                // emit::rdf::write_package_identity for why.
                 triples += 2;
 
                 // Emit Build-Depends triple with ontology-specific predicate

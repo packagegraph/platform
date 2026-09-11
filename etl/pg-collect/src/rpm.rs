@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Result};
 use std::time::Duration;
+use crate::emit::rdf::write_package_identity;
 
 /// CVE identifier regex: CVE-YYYY-NNNNN
 static CVE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"CVE-\d{4}-\d{4,}").unwrap());
@@ -833,8 +834,9 @@ impl RpmCollector {
 
         // Link to canonical identity
         let identity_uri = package_identity_uri(&self.distro_name, release_name, arch, name);
-        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), name)?;
+        triples += write_package_identity(writer, &identity_uri, name)?;
+        // identityName + rdfs:label, not packageName: see
+        // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 
@@ -1268,8 +1270,9 @@ impl RpmCollector {
             let dep_uri = package_identity_uri(&self.distro_name, release_name, arch, &dep.name);
 
             // Identity properties for graph traversal
-            writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-            writer.write_literal(&dep_uri, &format!("{PKG}packageName"), &dep.name)?;
+            triples += write_package_identity(writer, &dep_uri, &dep.name)?;
+            // identityName + rdfs:label, not packageName: see
+            // emit::rdf::write_package_identity for why.
             triples += 2;
 
             // Generic dependency link
@@ -1341,8 +1344,9 @@ impl RpmCollector {
         for dep in &conflicts {
             let dep_uri = package_identity_uri(&self.distro_name, release_name, arch, &dep.name);
 
-            writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-            writer.write_literal(&dep_uri, &format!("{PKG}packageName"), &dep.name)?;
+            triples += write_package_identity(writer, &dep_uri, &dep.name)?;
+            // identityName + rdfs:label, not packageName: see
+            // emit::rdf::write_package_identity for why.
             writer.write_triple(pkg_uri, &format!("{PKG}directlyConflictsWith"), &dep_uri)?;
             writer.write_triple(pkg_uri, &format!("{RPM}rpmConflicts"), &dep_uri)?;
             triples += 4;
@@ -1353,8 +1357,9 @@ impl RpmCollector {
         for dep in &obsoletes {
             let dep_uri = package_identity_uri(&self.distro_name, release_name, arch, &dep.name);
 
-            writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-            writer.write_literal(&dep_uri, &format!("{PKG}packageName"), &dep.name)?;
+            triples += write_package_identity(writer, &dep_uri, &dep.name)?;
+            // identityName + rdfs:label, not packageName: see
+            // emit::rdf::write_package_identity for why.
             writer.write_triple(pkg_uri, &format!("{RPM}rpmObsoletes"), &dep_uri)?;
             triples += 3;
         }
