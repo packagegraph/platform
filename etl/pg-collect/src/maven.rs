@@ -916,9 +916,6 @@ impl MavenCollector {
         // identityName + rdfs:label, not packageName: see
         // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
-        triples += 3;
-
-        writer.write_literal(&identity_uri, &format!("{PKG}identityName"), &identity_name)?;
         triples += 1;
 
         let purl = format!("pkg:maven/{}/{}", pom.group_id, pom.artifact_id);

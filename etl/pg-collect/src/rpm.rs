@@ -838,7 +838,7 @@ impl RpmCollector {
         // identityName + rdfs:label, not packageName: see
         // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
-        triples += 3;
+        triples += 1;
 
         // PURL (Package URL)
         let evr = if epoch != "0" {
@@ -1273,7 +1273,6 @@ impl RpmCollector {
             triples += write_package_identity(writer, &dep_uri, &dep.name)?;
             // identityName + rdfs:label, not packageName: see
             // emit::rdf::write_package_identity for why.
-            triples += 2;
 
             // Generic dependency link
             writer.write_triple(pkg_uri, &format!("{PKG}directlyDependsOn"), &dep_uri)?;
@@ -1349,7 +1348,7 @@ impl RpmCollector {
             // emit::rdf::write_package_identity for why.
             writer.write_triple(pkg_uri, &format!("{PKG}directlyConflictsWith"), &dep_uri)?;
             writer.write_triple(pkg_uri, &format!("{RPM}rpmConflicts"), &dep_uri)?;
-            triples += 4;
+            triples += 2;
         }
 
         // Emit obsoletes
@@ -1361,7 +1360,7 @@ impl RpmCollector {
             // identityName + rdfs:label, not packageName: see
             // emit::rdf::write_package_identity for why.
             writer.write_triple(pkg_uri, &format!("{RPM}rpmObsoletes"), &dep_uri)?;
-            triples += 3;
+            triples += 1;
         }
 
         // Emit provides

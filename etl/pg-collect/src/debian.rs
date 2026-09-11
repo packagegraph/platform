@@ -743,7 +743,7 @@ impl DebianCollector {
         // identityName + rdfs:label, not packageName: see
         // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
-        triples += 3;
+        triples += 1;
 
         // PURL (Package URL)
         let purl = crate::ntriples::format_purl(
@@ -1014,7 +1014,7 @@ impl DebianCollector {
                 writer.write_literal(&cap_uri, &format!("{PKG}capabilityName"), name)?;
                 writer.write_triple(pkg_uri, &format!("{PKG}providesCapability"), &cap_uri)?;
 
-                triples += 7;
+                triples += 5;
             }
         }
 
@@ -1054,7 +1054,6 @@ impl DebianCollector {
                 triples += write_package_identity(writer, &dep_uri, dep_name)?;
                 // identityName + rdfs:label, not packageName: see
                 // emit::rdf::write_package_identity for why.
-                triples += 2;
 
                 // Emit generic property based on dep_type
                 if dep_type == "conflicts" || dep_type == "breaks" {
