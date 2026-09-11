@@ -919,7 +919,16 @@ impl MavenCollector {
         triples += 1;
 
         let purl = format!("pkg:maven/{}/{}", pom.group_id, pom.artifact_id);
-        writer.write_literal(&identity_uri, &format!("{PKG}purl"), &purl)?;
+        // xsd:anyURI, not a plain literal: pkg:purl is rdfs:range xsd:anyURI and
+        // PackageIdentityShape constrains it with sh:datatype xsd:anyURI. rpm.rs
+        // and debian.rs already emit it typed; these two Maven sites were the
+        // only ones emitting xsd:string.
+        writer.write_typed_literal(
+            &identity_uri,
+            &format!("{PKG}purl"),
+            &purl,
+            &format!("{XSD}anyURI"),
+        )?;
         triples += 1;
 
         writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), &identity_name)?;
@@ -1029,13 +1038,20 @@ impl MavenCollector {
         let target_uri = package_identity_uri("maven", "central", "any", &dep_name);
         let mut triples = 0;
 
-        // Target identity typing
+        // Target identity typing. Via the helper so this dependency target gets
+        // the same rdf:type + identityName + rdfs:label as every other identity;
+        // it previously emitted type + identityName only, leaving it short of
+        // PackageIdentityShape's rdfs:label requirement.
         let identity_name = format!("{}:{}", resolved.group_id, resolved.artifact_id);
-        writer.write_triple(&target_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&target_uri, &format!("{PKG}identityName"), &identity_name)?;
+        triples += write_package_identity(writer, &target_uri, &identity_name)?;
         let purl = format!("pkg:maven/{}/{}", resolved.group_id, resolved.artifact_id);
-        writer.write_literal(&target_uri, &format!("{PKG}purl"), &purl)?;
-        triples += 3;
+        writer.write_typed_literal(
+            &target_uri,
+            &format!("{PKG}purl"),
+            &purl,
+            &format!("{XSD}anyURI"),
+        )?;
+        triples += 1;
 
         writer.write_triple(pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
         triples += 1;
