@@ -65,7 +65,10 @@ itself wrong.
   `forge::extract_forge_url`, so there is exactly one matcher.** This also
   narrows away a false-positive-prone loose match (any URL containing the
   substring `"gitlab."`, not just a real GitLab host) — an intentional,
-  documented behavior change, not a regression. (§3.2)
+  documented behavior change. Because that loose match was also the only
+  rule covering self-hosted GitLab instances outside the curated
+  `GITLAB_HOSTS` list, a second, narrower host-prefix rule restores that
+  coverage without reintroducing the false positive. (§3.2)
 
 ## 1. Overview
 
@@ -195,10 +198,11 @@ Round two surfaced two related bugs in the same area:
 - **Finding 1:** `uris::normalize_forge_url` (`uris.rs:266`) doesn't return a
   canonical URL — every branch already applies `repo_uri(&format!(...))`
   before returning, so its result is the `.../d/repo/...` PackageGraph node
-  IRI. Its three callers (`rpm.rs:877`, `maven.rs:891`, `emit/rdf.rs:109`)
-  bind that IRI to a variable named `upstream_uri`/`repo_uri` — a naming
-  accident that made the first revision's `emit_upstream_project_link`
-  call look consistent with these sites when it wasn't.
+  IRI. Its three `pkg:upstreamRepository`-emitting callers (`rpm.rs:877`,
+  `maven.rs:891`, `emit/rdf.rs:109`) bind that IRI to a variable named
+  `upstream_uri`/`repo_uri` — a naming accident that made the first
+  revision's `emit_upstream_project_link` call look consistent with these
+  sites when it wasn't.
 - **Finding 3:** the obvious fix for finding 1 — split `normalize_forge_url`
   into a canonical-URL matcher plus a thin `repo_uri()`-wrapping shim,
   reusing `normalize_forge_url`'s own existing match logic for the
@@ -239,14 +243,24 @@ pub fn normalize_forge_url(url: &str) -> Option<String> {
 **One intentional behavior change** falls out of this delegation:
 `uris.rs`'s old GitLab case matched *any* host containing the substring
 `"gitlab."` anywhere in the URL (e.g. it would also match
-`https://blog.example.com/tags/gitlab.html`) — a false-positive risk.
-`forge.rs` matches only its explicit `GITLAB_HOSTS` list. This narrowing is
-correct, not a regression: no legitimate host is known to depend on the
-loose match, and the explicit list is the same one every other collector
-already relies on. §8 adds a test locking this in. Two additional,
-positive side effects: the three direct writers now also benefit from
-`extract_forge_url`'s archive-URL and FTP-mirror normalization, which
-`normalize_forge_url` never had.
+`https://blog.example.com/tags/gitlab.html`) — a genuine false-positive
+risk, and removing it was necessary. But that loose match was also the
+*only* rule that covered self-hosted GitLab instances outside the curated
+`GITLAB_HOSTS` list (`gitlab.kitware.com`, `gitlab.isc.org`,
+`gitlab.torproject.org`, `gitlab.inria.fr`, `gitlab.alpinelinux.org`,
+etc.) — packages depending on those hosts would have silently lost their
+`pkg:upstreamRepository` triple. `forge.rs` therefore also gains a second,
+narrower GitLab rule alongside the curated-list loop: a host-*prefix*
+match (the host's first label is literally `gitlab.`), which restores
+self-hosted-instance coverage without reintroducing the substring false
+positive (`blog.example.com` doesn't start with `gitlab.`, so it still
+correctly resolves to `None`). Confidence for these self-hosted instances
+falls out as Medium (not High) via `is_high_confidence_host`, since only
+the curated `GITLAB_HOSTS` list counts as High. §8 adds tests locking in
+both the restored coverage and the substring-rejection behavior. Two
+additional, positive side effects: the three direct writers now also
+benefit from `extract_forge_url`'s archive-URL and FTP-mirror
+normalization, which `normalize_forge_url` never had.
 
 Each of the three direct-writer call sites changes from one call to one
 call plus a derived value, e.g. `rpm.rs`:
@@ -267,6 +281,22 @@ if let Some(canonical_url) = normalize_forge_url_canonical(url) {
 
 `maven.rs:890-896` (keying off `scm_url`) and `emit/rdf.rs:105-114` (keying
 off `homepage`) change the same way.
+
+**A fourth direct caller of the forge matcher exists and is deliberately
+excluded from this migration:** `emit/debian_ext.rs:57` calls
+`normalize_forge_url(vcs_url)` (the original wrapper, not
+`normalize_forge_url_canonical`) to populate `pkg:packagingRepository`,
+not `pkg:upstreamRepository`. It inherits the GitLab-nested-group fix,
+the self-hosted-GitLab host-prefix rule, and the scheme-less-URL fix
+automatically, since all three live in the shared matcher underneath —
+but it does *not* get an `emit_upstream_project_link` call and must not
+gain one. `packagingRepository` describes the packaging/VCS repo (e.g.
+the Salsa repo hosting Debian's packaging metadata for a source package),
+which is a distinct concept from `upstreamRepository` (the project's own
+upstream source) — the two can differ (a Debian team's Salsa packaging
+repo is not the upstream project's repo). This is a deliberate modeling
+boundary, not an oversight; a future reader should not "fix" it into
+calling the hub-link helper.
 
 ### 3.3 Identity: reuse the existing `upstream_uri` helper, don't add a new one
 

@@ -103,11 +103,25 @@ fn pre_normalize(url: &str) -> Option<String> {
         .trim_end_matches(".git")
         .trim_end_matches('/');
 
-    if url.is_empty() || !url.starts_with("https://") {
+    if url.is_empty() {
         return None;
     }
 
-    Some(url.to_string())
+    // Some producers (RPM `URL:` tags, package.json `homepage`, etc.) omit
+    // the scheme entirely (e.g. "github.com/owner/repo"). A string with no
+    // "://" at all is treated as implicitly https -- this restores
+    // scheme-less resolution that the retired uris.rs matcher supported.
+    let url = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("https://{}", url)
+    };
+
+    if !url.starts_with("https://") {
+        return None;
+    }
+
+    Some(url)
 }
 
 /// Extract the path portion after stripping the protocol prefix.
@@ -250,6 +264,25 @@ fn normalize_direct_forge(url: &str) -> Option<String> {
             let rest = path.strip_prefix(&format!("{}/", host))?;
             // GitLab repos can have nested groups: gitlab.com/group/subgroup/repo
             // Strip known subpaths: /-/tree, /-/blob, /-/archive, /-/commits, etc.
+            let rest = rest.split("/-/").next().unwrap_or(rest);
+            let rest = rest.trim_end_matches('/');
+            if !rest.is_empty() && rest.contains('/') {
+                return Some(format!("https://{}/{}", host, rest));
+            }
+        }
+    }
+
+    // Generic self-hosted GitLab instances not in the curated list above
+    // (gitlab.kitware.com, gitlab.isc.org, gitlab.torproject.org, etc.).
+    // Host-prefix match only -- NOT a substring-anywhere match -- so this
+    // does not reintroduce the false positive the loose `uris.rs` matcher
+    // had (e.g. blog.example.com/tags/gitlab.html). Confidence for these
+    // falls out as Medium automatically via is_high_confidence_host, since
+    // only the curated GITLAB_HOSTS list counts as High.
+    if let Some(host_end) = path.find('/') {
+        let host = &path[..host_end];
+        if host.starts_with("gitlab.") && !GITLAB_HOSTS.contains(&host) {
+            let rest = &path[host_end + 1..];
             let rest = rest.split("/-/").next().unwrap_or(rest);
             let rest = rest.trim_end_matches('/');
             if !rest.is_empty() && rest.contains('/') {
@@ -1006,6 +1039,15 @@ mod tests {
         assert_eq!(pre_normalize("   "), None);
     }
 
+    #[test]
+    fn test_pre_normalize_scheme_less() {
+        // RPM `URL:` tags and various `homepage` fields commonly omit the
+        // scheme entirely -- a string with no "://" at all is treated as
+        // implicitly https, restoring what the retired uris.rs matcher did.
+        let result = pre_normalize("github.com/owner/repo");
+        assert_eq!(result, Some("https://github.com/owner/repo".to_string()));
+    }
+
     // ─── extract_forge_url ──────────────────────────────────────────
 
     #[test]
@@ -1103,6 +1145,37 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_gitlab_self_hosted_not_in_curated_list() {
+        // gitlab.kitware.com is not in GITLAB_HOSTS, but still starts with
+        // "gitlab." -- the generic self-hosted rule must resolve it.
+        let result = extract_forge_url("https://gitlab.kitware.com/cmake/cmake").unwrap();
+        assert_eq!(result.repo_url, "https://gitlab.kitware.com/cmake/cmake");
+        // Not in the curated list, so confidence falls out as Medium.
+        assert_eq!(result.confidence, Confidence::Medium);
+    }
+
+    #[test]
+    fn test_extract_gitlab_self_hosted_nested_group_with_dash_suffix() {
+        let result = extract_forge_url(
+            "https://gitlab.kitware.com/group/subgroup/project/-/archive/main.tar.gz",
+        )
+        .unwrap();
+        assert_eq!(
+            result.repo_url,
+            "https://gitlab.kitware.com/group/subgroup/project"
+        );
+    }
+
+    #[test]
+    fn test_extract_gitlab_loose_substring_still_does_not_match() {
+        // Confirms the generic host-prefix rule does NOT reintroduce the
+        // retired uris.rs loose substring match: blog.example.com does not
+        // start with "gitlab." even though it contains "gitlab." later in
+        // the path.
+        assert!(extract_forge_url("https://blog.example.com/tags/gitlab.html").is_none());
+    }
+
+    #[test]
     fn test_extract_codeberg() {
         let result = extract_forge_url("https://codeberg.org/Freeyourgadget/Gadgetbridge").unwrap();
         assert_eq!(
@@ -1170,6 +1243,29 @@ mod tests {
         assert!(extract_forge_url("https://www.openssl.org/").is_none());
         assert!(extract_forge_url("https://example.com/downloads/foo.tar.gz").is_none());
         assert!(extract_forge_url("not a url").is_none());
+    }
+
+    #[test]
+    fn test_extract_scheme_less_github_resolves() {
+        // pre_normalize prepends https:// for scheme-less input; confirm
+        // normalize_direct_forge still recognizes the result end-to-end.
+        let result = extract_forge_url("github.com/owner/repo").unwrap();
+        assert_eq!(result.repo_url, "https://github.com/owner/repo");
+    }
+
+    #[test]
+    fn test_extract_scheme_less_self_hosted_gitlab_resolves() {
+        // Combines item B (scheme-less resolution) with item A (self-hosted
+        // GitLab host-prefix rule).
+        let result = extract_forge_url("gitlab.kitware.com/cmake/cmake").unwrap();
+        assert_eq!(result.repo_url, "https://gitlab.kitware.com/cmake/cmake");
+    }
+
+    #[test]
+    fn test_extract_scheme_less_garbage_string_still_none() {
+        // A scheme-less non-URL gets a scheme prepended by pre_normalize but
+        // still must not match any host pattern -- not a false positive.
+        assert!(extract_forge_url("not a url two words").is_none());
     }
 
     // ─── normalize_archive_url ──────────────────────────────────────
