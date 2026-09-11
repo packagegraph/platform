@@ -45,14 +45,6 @@ Environment=HOME=/tmp
 Environment=SPARQL_BACKEND=qlever
 Environment=FUSEKI_ENDPOINT=http://127.0.0.1:7001
 Volume=/etc/containers/systemd/scripts/collectors/%i.sh:/usr/local/bin/collect.sh:ro
-# RHEL entitlement cert/key + Red Hat CA, needed only by rhel-9-full/
-# rhel-10-full (TLS client-cert auth -- see rhel-9-full.sh/rhel-10-full.sh
-# and docs/rhel-collection.md). Mounted unconditionally on this shared
-# template rather than a separate one: harmless read-only bind mounts for
-# every other collector, but this does couple the template to these two
-# host paths existing.
-Volume=/etc/pki/entitlement:/etc/pki/entitlement:ro
-Volume=/etc/rhsm/ca:/etc/rhsm/ca:ro
 Entrypoint=/bin/sh
 Exec=/usr/local/bin/collect.sh
 NoNewPrivileges=true
