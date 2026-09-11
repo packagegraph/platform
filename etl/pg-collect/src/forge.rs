@@ -972,26 +972,38 @@ pub fn emit_upstream_repo(
     // NOTE: `repo_url` here may be the validation-resolved (redirect-followed)
     // URL when `validation` is Some, whereas the three direct writers
     // (rpm.rs, maven.rs, emit/rdf.rs) and collect_openwrt_upstream.rs key
-    // their own emit_upstream_project_link calls off the raw extracted URL
-    // with no redirect resolution. Every current caller passes None for
+    // their own emit_upstream_project calls off the raw extracted URL with
+    // no redirect resolution. Every current caller passes None for
     // `validation`, so this doesn't diverge today -- but the first caller
     // that passes Some(validation) would silently stop converging with
     // direct-writer hubs for the same project, with no test to catch it.
-    triples += emit_upstream_project_link(writer, identity_uri, repo_url)?;
+    triples += emit_upstream_project(writer, repo_url)?;
 
     Ok(triples)
 }
 
-/// Link a PackageIdentity to its UpstreamProject hub, minting the hub node
-/// (idempotently) if this is the first time any collector run has seen
-/// this canonical repo. Keyed on the same repo_url normalize_forge_url /
-/// extract_forge_url already produced -- no new identity scheme, reuses
-/// the existing uris::upstream_uri helper.
-pub fn emit_upstream_project_link(
-    writer: &mut NTriplesWriter,
-    identity_uri: &str,
-    repo_url: &str,
-) -> Result<usize> {
+/// Mint the shared `pkg:UpstreamProject` hub node for a canonical repo URL,
+/// idempotently, if this is the first time any collector run has seen it.
+/// Keyed on the same repo_url normalize_forge_url / extract_forge_url
+/// already produced -- no new identity scheme, reuses the existing
+/// uris::upstream_uri helper.
+///
+/// Deliberately does NOT link any identity or package to the hub directly:
+/// `pkg:hasUpstreamProject` is declared `rdfs:domain :SourcePackage`
+/// (core.ttl), and every caller of this function passes a
+/// `pkg:PackageIdentity` node -- writing hasUpstreamProject there would
+/// misuse the predicate outside its declared domain and, under RDFS
+/// entailment, wrongly infer every such identity to also be a
+/// SourcePackage/Package. The hub is still fully discoverable without that
+/// edge: every caller already emits `?identity pkg:upstreamRepository
+/// ?repo`, and this function emits `?project pkg:projectRepository ?repo`,
+/// so `?identity pkg:upstreamRepository ?repo . ?project
+/// pkg:projectRepository ?repo .` joins them through the shared repository
+/// URI. collect_openwrt_upstream.rs's own, separate hasUpstreamProject
+/// write is unaffected by this function -- its subject is a genuine
+/// SourcePackage-typed node (opkg:OpkgPackage), where the predicate's
+/// domain is correctly satisfied.
+pub fn emit_upstream_project(writer: &mut NTriplesWriter, repo_url: &str) -> Result<usize> {
     let project_uri = crate::uris::upstream_uri(repo_url);
     let mut triples = 0;
 
@@ -1012,8 +1024,6 @@ pub fn emit_upstream_project_link(
     )? {
         triples += 1;
     }
-    writer.write_triple(identity_uri, &format!("{PKG}hasUpstreamProject"), &project_uri)?;
-    triples += 1;
 
     Ok(triples)
 }
@@ -1831,7 +1841,7 @@ mod tests {
         .unwrap();
         writer.flush().unwrap();
 
-        assert_eq!(count, 11); // 3 repo + 4 forge + 4 upstream project hub
+        assert_eq!(count, 10); // 3 repo + 4 forge + 3 upstream project hub
         let mut content = String::new();
         std::io::Read::read_to_string(&mut temp.reopen().unwrap(), &mut content).unwrap();
         assert!(content.contains("core#upstreamRepository"));
@@ -1900,7 +1910,7 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_upstream_project_link_writes_hub_triples() {
+    fn test_emit_upstream_project_writes_hub_triples() {
         use crate::ntriples::NTriplesWriter;
         use std::io::Read;
         use tempfile::NamedTempFile;
@@ -1908,14 +1918,10 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 
-        let triples = emit_upstream_project_link(
-            &mut writer,
-            "https://packagegraph.github.io/d/pkg-identity/example",
-            "https://github.com/owner/repo",
-        ).unwrap();
+        let triples = emit_upstream_project(&mut writer, "https://github.com/owner/repo").unwrap();
         writer.flush().unwrap();
 
-        assert_eq!(triples, 4); // type, projectName, projectRepository, hasUpstreamProject
+        assert_eq!(triples, 3); // type, projectName, projectRepository
 
         let mut content = String::new();
         temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
@@ -1923,11 +1929,15 @@ mod tests {
         assert!(content.contains("UpstreamProject"));
         assert!(content.contains("\"owner/repo\""));
         assert!(content.contains("projectRepository"));
-        assert!(content.contains("hasUpstreamProject"));
+        // hasUpstreamProject is rdfs:domain :SourcePackage in the ontology.
+        // This function mints only the hub node itself and must never emit
+        // that predicate -- doing so from a PackageIdentity caller would
+        // misuse the predicate outside its declared domain.
+        assert!(!content.contains("hasUpstreamProject"));
     }
 
     #[test]
-    fn test_emit_upstream_project_link_dedupes_across_calls() {
+    fn test_emit_upstream_project_dedupes_across_calls() {
         use crate::ntriples::NTriplesWriter;
         use std::io::Read;
         use tempfile::NamedTempFile;
@@ -1935,25 +1945,22 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
 
-        // Two different packages, same upstream repo.
-        emit_upstream_project_link(&mut writer, "https://.../identity/a", "https://github.com/owner/repo").unwrap();
-        emit_upstream_project_link(&mut writer, "https://.../identity/b", "https://github.com/owner/repo").unwrap();
+        // Two different callers resolving to the same upstream repo.
+        let first = emit_upstream_project(&mut writer, "https://github.com/owner/repo").unwrap();
+        let second = emit_upstream_project(&mut writer, "https://github.com/owner/repo").unwrap();
         writer.flush().unwrap();
+
+        assert_eq!(first, 3);
+        assert_eq!(second, 0, "hub already minted -- second call must be a pure no-op");
 
         let mut content = String::new();
         temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
 
-        // Hub minted once (write_*_once), but linked from both identities.
-        // Note: matching on the bracketed rdf:type object IRI specifically,
-        // not the bare substring "UpstreamProject>" -- that substring also
-        // occurs at the end of every "hasUpstreamProject>" predicate IRI,
-        // which is written once per call (not deduped) and would otherwise
-        // inflate this count.
         assert_eq!(
             content.matches(&format!("<{PKG}UpstreamProject>")).count(),
-            1
+            1,
+            "hub minted exactly once across both calls"
         );
-        assert_eq!(content.matches("hasUpstreamProject").count(), 2);
     }
 
     #[test]

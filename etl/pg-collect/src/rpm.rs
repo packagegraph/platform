@@ -889,7 +889,7 @@ impl RpmCollector {
                 )?;
                 writer.write_triple(&upstream_repo_iri, RDF_TYPE, &format!("{VCS}Repository"))?;
                 triples += 2;
-                triples += crate::forge::emit_upstream_project_link(writer, &identity_uri, &canonical_url)?;
+                triples += crate::forge::emit_upstream_project(writer, &canonical_url)?;
             }
         }
 
@@ -2212,10 +2212,14 @@ mod tests {
         assert!(content.contains("upstreamRepository"), "existing triple must still be emitted");
         assert!(content.contains(&format!("{VCS}Repository")), "existing repo typing must be preserved");
         assert!(content.contains("UpstreamProject"), "new hub triple");
-        assert!(content.contains("hasUpstreamProject"), "new hub link");
         assert!(
             content.contains("\"owner/repo\""),
             "projectName should be derived from the repo URL"
         );
+        // hasUpstreamProject is rdfs:domain :SourcePackage; identity_uri here
+        // is a PackageIdentity, so this predicate must never appear on it.
+        // The hub is discoverable via upstreamRepository/projectRepository
+        // joining through the shared repo URI instead.
+        assert!(!content.contains("hasUpstreamProject"));
     }
 }

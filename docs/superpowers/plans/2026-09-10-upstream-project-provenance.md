@@ -10,6 +10,22 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-10-upstream-project-provenance-design.md`
 
+**Post-execution correction:** a whole-branch review (after all 7 tasks
+below were implemented) found that `emit_upstream_project_link` as
+specified here wrote `pkg:hasUpstreamProject` on every `identity_uri` it
+was called with -- but that predicate is `rdfs:domain :SourcePackage`, and
+every call site below passes a `pkg:PackageIdentity`, not a
+`pkg:SourcePackage`. The shipped code (and the spec, which this plan
+argues from) was corrected: the function was renamed to
+`emit_upstream_project`, dropped its identity/package parameter entirely,
+and never asserts `hasUpstreamProject` -- the hub is discovered via the
+`upstreamRepository`/`projectRepository` join instead. See the spec's
+"Revision note" (round three) for the full finding. Every
+`emit_upstream_project_link(writer, identity_uri, ...)` call shown in the
+task text below reflects the plan as originally written and executed, not
+the corrected final shape -- read it as history, not as the current
+contract.
+
 ## Global Constraints
 
 - No ontology version bump, no new RDF class or property. Every term used

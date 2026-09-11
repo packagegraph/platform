@@ -70,6 +70,33 @@ itself wrong.
   `GITLAB_HOSTS` list, a second, narrower host-prefix rule restores that
   coverage without reintroducing the false positive. (§3.2)
 
+**Round three** (post-implementation, whole-branch review) caught one more,
+a domain violation rather than a coverage/keying bug:
+
+- **`pkg:hasUpstreamProject` is `rdfs:domain :SourcePackage`
+  (`core.ttl:482-488`), but the hub-linking mechanism this design specified
+  wrote it on `identity_uri` — a `pkg:PackageIdentity` node — at every one
+  of its call sites** (`emit_upstream_repo`'s 7 collectors and the 3 direct
+  writers). `PackageIdentity` and `SourcePackage` are deliberately distinct
+  classes (see the round of ontology-conformance work in progress on the
+  `identityName`/`packageName` split); asserting a `SourcePackage`-domain
+  predicate on a `PackageIdentity` subject collapses that distinction right
+  back under RDFS domain entailment, for every collector this design
+  touches. **Decision: `forge::emit_upstream_project` (renamed from
+  `emit_upstream_project_link`) mints only the hub node's own triples
+  (`rdf:type`, `projectName`, `projectRepository`) and takes no
+  identity/package parameter at all — it must never assert
+  `hasUpstreamProject`.** The hub remains fully discoverable without that
+  edge: every caller already emits `?identity pkg:upstreamRepository
+  ?repo`, and the hub emits `?project pkg:projectRepository ?repo`, so
+  `?identity pkg:upstreamRepository ?repo . ?project pkg:projectRepository
+  ?repo .` joins them through the shared repository URI (§5).
+  `collect_openwrt_upstream.rs`'s own, pre-existing `hasUpstreamProject`
+  write is unaffected and stays exactly as it was — its subject
+  (`OpkgPackage` → `SourcePackage` → `Package`) genuinely satisfies the
+  predicate's declared domain; it was only the *new* call sites this design
+  added that misused it. (§3.5, §5, §6, §7)
+
 ## 1. Overview
 
 Two related gaps surfaced while discussing PackageGraph's forge/upstream-repo
@@ -90,14 +117,21 @@ tracking:
 
 Both were assumed to need new machinery. They mostly don't: the ontology
 already has a working, tested pattern for exactly this — `pkg:UpstreamProject`,
-`pkg:hasUpstreamProject`, `pkg:projectRepository`, `pkg:projectName` (all in
-the pinned v0.13.0 ontology, already implemented once in
-`collect_openwrt_upstream.rs`) — plus `pkg:DataSnapshot`
-(`snapshotGraph`/`snapshotTimestamp`/`snapshotSource`), already proven by
-`derive_comparison.rs`. This design activates both. The one piece of new
-machinery is deciding *where* `DataSnapshot` gets minted, since the obvious
-place (inside each Rust collector) turns out not to have the inputs it needs
-in production (§4).
+`pkg:projectRepository`, `pkg:projectName` (all in the pinned v0.13.0
+ontology, already implemented once in `collect_openwrt_upstream.rs`) — plus
+`pkg:DataSnapshot` (`snapshotGraph`/`snapshotTimestamp`/`snapshotSource`),
+already proven by `derive_comparison.rs`. This design activates both. The
+one piece of new machinery is deciding *where* `DataSnapshot` gets minted,
+since the obvious place (inside each Rust collector) turns out not to have
+the inputs it needs in production (§4).
+
+(`pkg:hasUpstreamProject` is also part of `collect_openwrt_upstream.rs`'s
+existing pattern, but this design does *not* extend its use — see round
+three's finding below. It's `rdfs:domain :SourcePackage`, and the identities
+this design links to the hub are `PackageIdentity` nodes, not
+`SourcePackage` ones. The hub is joined via `upstreamRepository`/
+`projectRepository` instead; `hasUpstreamProject` stays exactly where
+OpenWrt's pre-existing, genuinely-`SourcePackage`-typed usage already was.)
 
 ### Goals
 
@@ -119,10 +153,11 @@ in production (§4).
 - Any new ontology term or a `packagegraph/ontology` version bump — every
   class/property this design uses already exists in the pinned v0.13.0
   ontology.
-- Per-triple reification of the `hasUpstreamProject` edge itself.
-  `DataSnapshot` is graph-scoped by design, and every collector's output is
-  already its own named graph, so graph membership plus a `DataSnapshot`
-  join already answers "as of when."
+- Per-triple reification of the identity-to-hub link itself (the
+  `upstreamRepository`/`projectRepository` join, §5). `DataSnapshot` is
+  graph-scoped by design, and every collector's output is already its own
+  named graph, so graph membership plus a `DataSnapshot` join already
+  answers "as of when."
 - Retroactively resolving *existing* disagreements between ecosystems for
   projects that have already drifted. This design makes disagreement
   *visible and dated*, not resolved.
@@ -275,7 +310,7 @@ if let Some(upstream_uri) = normalize_forge_url(url) {
 if let Some(canonical_url) = normalize_forge_url_canonical(url) {
     let upstream_repo_iri = repo_uri(&canonical_url);
     writer.write_triple(&identity_uri, &format!("{PKG}upstreamRepository"), &upstream_repo_iri)?;
-    emit_upstream_project_link(writer, &identity_uri, &canonical_url)?;
+    emit_upstream_project(writer, &canonical_url)?;
 }
 ```
 
@@ -289,8 +324,8 @@ excluded from this migration:** `emit/debian_ext.rs:57` calls
 not `pkg:upstreamRepository`. It inherits the GitLab-nested-group fix,
 the self-hosted-GitLab host-prefix rule, and the scheme-less-URL fix
 automatically, since all three live in the shared matcher underneath —
-but it does *not* get an `emit_upstream_project_link` call and must not
-gain one. `packagingRepository` describes the packaging/VCS repo (e.g.
+but it does *not* get an `emit_upstream_project` call and must not gain
+one. `packagingRepository` describes the packaging/VCS repo (e.g.
 the Salsa repo hosting Debian's packaging metadata for a source package),
 which is a distinct concept from `upstreamRepository` (the project's own
 upstream source) — the two can differ (a Debian team's Salsa packaging
@@ -353,13 +388,21 @@ New helper in `forge.rs` (not `uris.rs` — it's called from
 depend on `forge.rs` or `uris.rs`):
 
 ```rust
-/// Link a PackageIdentity to its UpstreamProject hub, minting the hub node
-/// (idempotently) if this is the first time any collector run has seen
-/// this canonical repo. Keyed on the same repo_url normalize_forge_url /
-/// extract_forge_url already produced -- no new identity scheme.
-pub fn emit_upstream_project_link(
+/// Mint the shared UpstreamProject hub node for a canonical repo URL,
+/// idempotently, if this is the first time any collector run has seen it.
+/// Keyed on the same repo_url normalize_forge_url / extract_forge_url
+/// already produced -- no new identity scheme.
+///
+/// Deliberately takes no identity/package parameter and never asserts
+/// hasUpstreamProject: that predicate is rdfs:domain :SourcePackage, and
+/// every caller of this function has a PackageIdentity, not a
+/// SourcePackage, to link. The hub stays fully discoverable without a
+/// direct edge -- every caller already emits `?identity
+/// pkg:upstreamRepository ?repo`, and this function emits `?project
+/// pkg:projectRepository ?repo`, so joining on the shared repo URI finds
+/// the hub (§5).
+pub fn emit_upstream_project(
     writer: &mut NTriplesWriter,
-    identity_uri: &str,
     repo_url: &str,
 ) -> Result<usize> {
     let project_uri = upstream_uri(repo_url);
@@ -374,8 +417,6 @@ pub fn emit_upstream_project_link(
     if writer.write_triple_once(&project_uri, &format!("{PKG}projectRepository"), &repo_uri(repo_url))? {
         triples += 1;
     }
-    writer.write_triple(identity_uri, &format!("{PKG}hasUpstreamProject"), &project_uri)?;
-    triples += 1;
 
     Ok(triples)
 }
@@ -384,16 +425,16 @@ pub fn emit_upstream_project_link(
 **Call sites:**
 
 - **Centralized (covers 7 collectors in one change):** `forge::emit_upstream_repo`
-  gains one call to `emit_upstream_project_link(writer, identity_uri, repo_url)`
-  right after its existing `upstreamRepository` write. This alone covers
-  `debian.rs`, `gentoo.rs`, `collect_salsa.rs`, `collect_spec.rs`,
-  `cargo_collect.rs`, `yocto.rs`, and `openwrt.rs`.
+  gains one call to `emit_upstream_project(writer, repo_url)` right after its
+  existing `upstreamRepository` write. This alone covers `debian.rs`,
+  `gentoo.rs`, `collect_salsa.rs`, `collect_spec.rs`, `cargo_collect.rs`,
+  `yocto.rs`, and `openwrt.rs`.
 - **Direct writers (patched individually, since they don't go through
   `forge.rs`):** `rpm.rs`, `maven.rs`, `emit/rdf.rs` — each switches its
   existing `normalize_forge_url(url)` call to `normalize_forge_url_canonical(url)`
   (§3.2), derives the `upstreamRepository` object via `repo_uri(&canonical_url)`,
-  and adds the `emit_upstream_project_link(writer, &identity_uri, &canonical_url)`
-  call — see the exact before/after in §3.2.
+  and adds the `emit_upstream_project(writer, &canonical_url)` call — see
+  the exact before/after in §3.2.
 - **`collect_openwrt_upstream.rs` (identity-keying migration, not a new call
   site):** its git-source branch currently mints
   `upstream_uri(&format!("openwrt/{}", effective_name))` unconditionally,
@@ -501,12 +542,19 @@ Two independent fixes to the original example query:
   to the IRI `?g`, so the join would silently return zero rows even after
   fix one. Bind the literal to its own variable and compare string forms
   with `FILTER(STR(...) = STR(...))`, as the ontology's declared datatype
-  requires:
+  requires.
+- **Round three, finding 1:** it walked `?identity
+  pkg:hasUpstreamProject/pkg:projectRepository ?repo`, but
+  `hasUpstreamProject` is never asserted from a `PackageIdentity` (§3.5) —
+  that path returns zero rows for every collector this design touches.
+  Join through the repository URI instead, using only the two predicates
+  every caller actually emits:
 
 ```sparql
 SELECT ?repo ?snapshotTimestamp WHERE {
   GRAPH ?g {
-    ?identity pkg:hasUpstreamProject/pkg:projectRepository ?repo .
+    ?identity pkg:upstreamRepository ?repo .
+    ?project pkg:projectRepository ?repo .
     ?snapshot a pkg:DataSnapshot ;
               pkg:snapshotGraph ?graphLiteral ;
               pkg:snapshotTimestamp ?snapshotTimestamp .
@@ -518,13 +566,14 @@ SELECT ?repo ?snapshotTimestamp WHERE {
 ## 6. Data flow
 
 Collector run → per package: existing `pkg:upstreamRepository` write
-(unchanged) + new `emit_upstream_project_link` call, wherever a `repo_url`
-was already resolved → collector writes its `.nt` file as always, with no
+(unchanged) + new `emit_upstream_project` call, wherever a `repo_url` was
+already resolved → collector writes its `.nt` file as always, with no
 snapshot content → `upload-nt.sh` appends this graph's `DataSnapshot` →
 gzip + upload (unchanged) → next `qlever-rebuild-index` promotes it. A
 cross-ecosystem query for "which upstream, asserted by which packaging, as
-of when" becomes: find every identity sharing a `hasUpstreamProject` value,
-note which graph each came from, join to that graph's `DataSnapshot`.
+of when" becomes: find every identity sharing an `upstreamRepository` value
+with an `UpstreamProject`'s `projectRepository` (§5), note which graph each
+came from, join to that graph's `DataSnapshot`.
 
 ## 7. Error handling
 
@@ -543,9 +592,9 @@ note which graph each came from, join to that graph's `DataSnapshot`.
   graph's `DataSnapshot`. Making that disagreement visible is the goal;
   adjudicating it is out of scope.
 - Fuseki-incremental publication (`COLLECTOR_FULL_RELOAD` unset): explicitly
-  unsupported for `DataSnapshot` (§1 non-goals). `UpstreamProject`/
-  `hasUpstreamProject` triples are unaffected either way — they're
-  idempotent per canonical repo URL regardless of publication model.
+  unsupported for `DataSnapshot` (§1 non-goals). The `UpstreamProject` hub's
+  own triples are unaffected either way — they're idempotent per canonical
+  repo URL regardless of publication model.
 
 ## 8. Testing
 
@@ -577,10 +626,11 @@ note which graph each came from, join to that graph's `DataSnapshot`.
 - Unit test: `project_name_from_repo_url` on a handful of real canonical
   URLs (GitHub, GitLab nested-group, Codeberg, Bitbucket) produces the
   expected `owner/repo` slug.
-- Unit test: `emit_upstream_project_link` called twice in one run with the
-  same `repo_url` writes the `UpstreamProject` type/`projectName`/
-  `projectRepository` triples exactly once (`write_*_once`), and the
-  `hasUpstreamProject` edge twice (once per distinct `identity_uri`).
+- Unit test: `emit_upstream_project` called twice in one run with the same
+  `repo_url` writes the `UpstreamProject` type/`projectName`/
+  `projectRepository` triples exactly once (`write_*_once`) and is a pure
+  no-op the second time; never emits `hasUpstreamProject` (it takes no
+  identity/package parameter at all — see round three's finding above).
 - Unit test: `collect_openwrt_upstream.rs`'s migrated git-source branch
   produces the same `UpstreamProject` IRI as a non-OpenWrt collector given
   the same canonical repo URL; its archive-source branch is unchanged and
@@ -592,6 +642,7 @@ note which graph each came from, join to that graph's `DataSnapshot`.
   source-URL argument produces no `snapshotSource` triple (not a triple
   with an empty-string object).
 - Live verification post-deploy: SPARQL query (§5) joining
-  `hasUpstreamProject` across two real ecosystems for a project known to be
-  packaged in both, confirming both resolve to one `UpstreamProject` node
-  with distinct, correctly-timestamped `DataSnapshot`s per graph.
+  `upstreamRepository`/`projectRepository` across two real ecosystems for a
+  project known to be packaged in both, confirming both resolve to one
+  `UpstreamProject` node with distinct, correctly-timestamped
+  `DataSnapshot`s per graph.

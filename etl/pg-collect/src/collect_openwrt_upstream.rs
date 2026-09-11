@@ -320,10 +320,10 @@ mod tests {
         // This is the load-bearing test for the branch's entire cross-
         // ecosystem convergence claim (spec §8 gap): two different writers
         // -- OpenwrtUpstreamCollector (this module) and
-        // forge::emit_upstream_project_link (the shared helper the three
-        // direct writers + emit/debian_ext.rs's sibling code path route
-        // through) -- must mint the *identical* pkg:UpstreamProject hub for
-        // the same canonical repo URL, not just each in isolation.
+        // forge::emit_upstream_project (the shared helper the three direct
+        // writers + emit_upstream_repo's collectors route through) -- must
+        // mint the *identical* pkg:UpstreamProject hub for the same
+        // canonical repo URL, not just each in isolation.
         //
         // Reuses test_upstream_project_git_source_keyed_by_repo_not_name's
         // fixture: OpenWrt package "bar" with git source
@@ -361,21 +361,17 @@ mod tests {
             .read_to_string(&mut openwrt_content)
             .unwrap();
 
-        // --- Writer 2: forge::emit_upstream_project_link, called directly
-        //     with an arbitrary (different-ecosystem) identity IRI and the
-        //     same canonical repo URL the OpenWrt fixture resolves to. ---
+        // --- Writer 2: forge::emit_upstream_project, called directly with
+        //     the same canonical repo URL the OpenWrt fixture resolves to
+        //     (this function takes no identity parameter -- see forge.rs's
+        //     doc comment on why it must not link any identity/package
+        //     directly: hasUpstreamProject is rdfs:domain :SourcePackage,
+        //     and a cross-ecosystem caller here would be a PackageIdentity). ---
         let forge_file = NamedTempFile::new().unwrap();
         let mut forge_writer = NTriplesWriter::new(forge_file.reopen().unwrap());
 
-        let other_identity_uri =
-            "https://packagegraph.github.io/d/pkg/debian/trixie/amd64/bar/2.0-1";
         let canonical_repo_url = "https://github.com/example/bar";
-        crate::forge::emit_upstream_project_link(
-            &mut forge_writer,
-            other_identity_uri,
-            canonical_repo_url,
-        )
-        .unwrap();
+        crate::forge::emit_upstream_project(&mut forge_writer, canonical_repo_url).unwrap();
         forge_writer.flush().unwrap();
 
         let mut forge_content = String::new();
@@ -421,5 +417,15 @@ mod tests {
             openwrt_content, forge_content,
             "Full outputs should differ (different identity subjects) even though the hub converges"
         );
+
+        // The OpenWrt writer's subject is a genuine SourcePackage (OpkgPackage
+        // -> SourcePackage -> Package), so its own hasUpstreamProject edge is
+        // domain-conformant and expected here. forge::emit_upstream_project
+        // takes no identity/package argument at all and must never emit that
+        // predicate -- it would be a PackageIdentity subject for every one of
+        // its real callers, which violates hasUpstreamProject's declared
+        // rdfs:domain :SourcePackage.
+        assert!(openwrt_content.contains("hasUpstreamProject"));
+        assert!(!forge_content.contains("hasUpstreamProject"));
     }
 }
