@@ -37,7 +37,7 @@ pub struct ForgeExtraction {
 // ─── Known forge hosts ──────────────────────────────────────────────────
 
 /// Hosts that are known forges (owner/repo pattern).
-const FORGE_HOSTS: &[&str] = &["github.com", "codeberg.org", "sr.ht"];
+const FORGE_HOSTS: &[&str] = &["github.com", "codeberg.org", "sr.ht", "bitbucket.org"];
 
 /// Hosts that are known GitLab instances.
 const GITLAB_HOSTS: &[&str] = &[
@@ -217,7 +217,8 @@ fn is_high_confidence_host(path: &str) -> bool {
 /// Normalize a direct forge URL to canonical form.
 ///
 /// Handles all known forge patterns: GitHub, GitLab instances, Codeberg,
-/// Pagure, Fedora dist-git, Savannah, Sourceware, kernel.org, Gitea/Forgejo.
+/// Pagure, Fedora dist-git, Savannah, Sourceware, kernel.org, Gitea/Forgejo,
+/// Bitbucket.
 fn normalize_direct_forge(url: &str) -> Option<String> {
     let path = strip_protocol(url);
 
@@ -229,6 +230,17 @@ fn normalize_direct_forge(url: &str) -> Option<String> {
         let repo = caps.get(2)?.as_str();
         if !owner.is_empty() && !repo.is_empty() {
             return Some(format!("https://github.com/{}/{}", owner, repo));
+        }
+    }
+
+    // Bitbucket: bitbucket.org/{owner}/{repo}
+    if path.starts_with("bitbucket.org/") {
+        let rest = path.strip_prefix("bitbucket.org/")?;
+        let caps = FORGE_OWNER_REPO_RE.captures(rest)?;
+        let owner = caps.get(1)?.as_str();
+        let repo = caps.get(2)?.as_str();
+        if !owner.is_empty() && !repo.is_empty() {
+            return Some(format!("https://bitbucket.org/{}/{}", owner, repo));
         }
     }
 
@@ -1040,6 +1052,38 @@ mod tests {
     fn test_extract_github_org_only_rejected() {
         // github.com/org without a repo should not match
         assert!(extract_forge_url("https://github.com/tesseract-ocr").is_none());
+    }
+
+    #[test]
+    fn test_extract_bitbucket_direct() {
+        let result = extract_forge_url("https://bitbucket.org/owner/repo").unwrap();
+        assert_eq!(result.repo_url, "https://bitbucket.org/owner/repo");
+        assert_eq!(result.confidence, Confidence::High);
+    }
+
+    #[test]
+    fn test_extract_bitbucket_trailing_slash() {
+        let result = extract_forge_url("https://bitbucket.org/owner/repo/").unwrap();
+        assert_eq!(result.repo_url, "https://bitbucket.org/owner/repo");
+    }
+
+    #[test]
+    fn test_extract_bitbucket_git_suffix() {
+        let result = extract_forge_url("https://bitbucket.org/owner/repo.git").unwrap();
+        assert_eq!(result.repo_url, "https://bitbucket.org/owner/repo");
+    }
+
+    #[test]
+    fn test_extract_bitbucket_with_subpath() {
+        let result =
+            extract_forge_url("https://bitbucket.org/owner/repo/src/master/README.md").unwrap();
+        assert_eq!(result.repo_url, "https://bitbucket.org/owner/repo");
+    }
+
+    #[test]
+    fn test_extract_bitbucket_org_only_rejected() {
+        // No repo segment -- must not match, same as test_extract_github_org_only_rejected
+        assert!(extract_forge_url("https://bitbucket.org/owner").is_none());
     }
 
     #[test]
