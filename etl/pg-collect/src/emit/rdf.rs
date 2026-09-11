@@ -27,11 +27,19 @@ impl Default for EmitPolicy {
     }
 }
 
-/// Emit a complete, ontology-conformant `pkg:PackageIdentity` node.
+/// Emit the shared `pkg:PackageIdentity` triples: `rdf:type`, `identityName`
+/// and `rdfs:label`.
 ///
-/// Centralised because this exact triple set is emitted from 32 call sites
+/// This is **not** a whole-node conformance guarantee.
+/// `pkg:PackageIdentityShape` also requires exactly one `pkg:purl`, which only
+/// the caller can supply — it needs the ecosystem, namespace and version — so
+/// a node built solely from this helper is still short of the shape. An
+/// earlier version of this doc called the output "complete, ontology-
+/// conformant"; that was wrong, and independent review of PR #25 caught it.
+///
+/// Centralised because this exact triple set is emitted from 38 call sites
 /// across the collectors, and every one of them had the same two defects
-/// (production audit 2026-09-11, 8.5M violations):
+/// (production audit 2026-09-11):
 ///
 /// * `pkg:packageName` was used instead of `pkg:identityName`. packageName is
 ///   `rdfs:domain pkg:Package`; identityName is `rdfs:domain
@@ -55,6 +63,36 @@ pub fn write_package_identity(
     writer.write_literal(identity_uri, &format!("{PKG}identityName"), name)?;
     writer.write_literal(identity_uri, RDFS_LABEL, &format!("{name} Package Identity"))?;
     Ok(3)
+}
+
+/// [`write_package_identity`], but deduplicated per output file.
+///
+/// For paths that reference the same identity from many packages — RPM
+/// `Provides:` names the same capability from every provider — these
+/// definition triples are a pure function of `identity_uri`, so emitting them
+/// once per distinct identity rather than once per reference is a large
+/// output-size win. Returns the number of triples actually written, which is
+/// 0 for an identity already defined in this file.
+pub fn write_package_identity_once(
+    writer: &mut NTriplesWriter,
+    identity_uri: &str,
+    name: &str,
+) -> Result<usize> {
+    let mut n = 0;
+    if writer.write_triple_once(identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))? {
+        n += 1;
+    }
+    if writer.write_literal_once(identity_uri, &format!("{PKG}identityName"), name)? {
+        n += 1;
+    }
+    if writer.write_literal_once(
+        identity_uri,
+        RDFS_LABEL,
+        &format!("{name} Package Identity"),
+    )? {
+        n += 1;
+    }
+    Ok(n)
 }
 
 /// Emit RDF triples for a single PackageIr record.
@@ -446,6 +484,47 @@ mod tests {
         assert!(
             content.contains("core#partOfDistribution"),
             "Should emit partOfDistribution"
+        );
+    }
+
+    /// The RPM `Provides:` path reaches identities through the `_once` writers,
+    /// which is why the 2026-09-11 migration missed it and left `packageName`
+    /// on 6,558,436 triples' worth of identities. Pin both halves: the right
+    /// predicates, and the dedup that made this path use `_once` to begin with.
+    #[test]
+    fn write_package_identity_once_dedupes_and_avoids_package_name() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+
+        let uri = "https://packagegraph.github.io/data/identity/fedora/42/x86_64/libssl.so.3";
+        let first = write_package_identity_once(&mut writer, uri, "libssl.so.3").unwrap();
+        let second = write_package_identity_once(&mut writer, uri, "libssl.so.3").unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(first, 3, "first reference defines the identity");
+        assert_eq!(
+            second, 0,
+            "a second reference to the same identity must write nothing"
+        );
+
+        let mut content = String::new();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+
+        assert_eq!(
+            content.lines().count(),
+            3,
+            "exactly three lines for two references"
+        );
+        assert!(content.contains("core#PackageIdentity"));
+        assert!(content.contains("core#identityName"));
+        assert!(content.contains("Package Identity\""), "needs rdfs:label");
+        assert!(
+            !content.contains("core#packageName"),
+            "identity must not carry pkg:packageName -- it is rdfs:domain pkg:Package"
         );
     }
 

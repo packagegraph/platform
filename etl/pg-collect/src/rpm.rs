@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Result};
 use std::time::Duration;
-use crate::emit::rdf::write_package_identity;
+use crate::emit::rdf::{write_package_identity, write_package_identity_once};
 
 /// CVE identifier regex: CVE-YYYY-NNNNN
 static CVE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"CVE-\d{4}-\d{4,}").unwrap());
@@ -1383,13 +1383,15 @@ impl RpmCollector {
 
             // Definition triples for the provided identity are a pure function of
             // dep_uri; emit them once per distinct identity rather than once per
-            // providing package (see write_triple_once).
-            if writer.write_triple_once(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))? {
-                triples += 1;
-            }
-            if writer.write_literal_once(&dep_uri, &format!("{PKG}packageName"), &dep.name)? {
-                triples += 1;
-            }
+            // providing package (see write_package_identity_once).
+            //
+            // identityName + rdfs:label, not packageName: see
+            // emit::rdf::write_package_identity for why. This path kept writing
+            // packageName after the 2026-09-11 migration because it uses the
+            // _once writers, which that migration's pattern did not match --
+            // leaving the domain violation live on the highest-volume route in
+            // the corpus (rpmProvides, 6,558,436 triples).
+            triples += write_package_identity_once(writer, &dep_uri, &dep.name)?;
             // Provides edges are per (package, capability) and are never deduplicated.
             writer.write_triple(pkg_uri, &format!("{PKG}directlyProvides"), &dep_uri)?;
             writer.write_triple(pkg_uri, &format!("{RPM}rpmProvides"), &dep_uri)?;
