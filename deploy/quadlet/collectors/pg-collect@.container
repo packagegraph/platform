@@ -48,8 +48,10 @@ Environment=FUSEKI_ENDPOINT=http://127.0.0.1:7001
 # not the container's overlay writable layer -- see
 # pg-collect-scratch.volume's comment. Shared by every concurrently
 # running collector instance; safe because each script namespaces its own
-# paths under /tmp/cache/<name> and /tmp/collection/<name>.nt.
-Volume=pg-collect-scratch.volume:/tmp:Z
+# paths under /tmp/cache/<name> and /tmp/collection/<name>.nt. :z
+# (lowercase, shared label), not :Z -- see pg-collect-scratch.volume's
+# comment for the EACCES incident :Z caused here.
+Volume=pg-collect-scratch.volume:/tmp:z
 Volume=/etc/containers/systemd/scripts/collectors/%i.sh:/usr/local/bin/collect.sh:ro
 Entrypoint=/bin/sh
 Exec=/usr/local/bin/collect.sh

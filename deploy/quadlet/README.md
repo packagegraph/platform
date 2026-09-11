@@ -673,6 +673,34 @@ makes any single run's disk usage bounded by the data disk's 396G+ instead
 of root's headroom, and the prune timer keeps that headroom from silently
 eroding even when no collector is running at all.
 
+### Incident: `:Z` on a volume shared by 40+ collectors caused EACCES (2026-09-11)
+
+Hours after `pg-collect-scratch.volume` deployed (previous section),
+`pg-collect@hackage` died with `Error: Permission denied (os error 13)`
+two seconds after `pg-collect@osv` started -- and `pg-collect@gomod`
+(a ~2h run) died the same way, right as another collector started near
+its tail end. Root cause: both container templates mounted the shared
+volume with `:Z` (`Volume=pg-collect-scratch.volume:/tmp:Z`) --
+Podman/SELinux's *private/exclusive* relabel flag, meant for a volume
+used by exactly one container (correct for `qlever-rebuild-scratch.volume`,
+which only ever backs `qlever-rebuild-index.service`). Every time a
+second container mounts a `:Z` volume, SELinux reassigns its category to
+that new container, silently revoking the first container's
+already-open write access -- its next `write()` fails with EACCES.
+
+Confirmed directly, not just inferred from timing: two throwaway
+containers mounting the same volume with `:Z`, one writing in a loop,
+the second started 2s later, reproduced the exact failure on demand --
+the first container's write failed immediately once the second one
+started; killing the second and only running one container at a time
+never failed.
+
+Fixed by changing both templates' mount to `:z` (lowercase) -- the
+*shared* label, which every collector instance uses in common, so no
+per-container reassignment/revocation happens as collectors start and
+stop around each other. `pg-collect-scratch.volume`'s own comment
+documents the distinction so it isn't miscopied again.
+
 ## Data pipeline: collectors → Minio → QLever, and how to extend it
 
 The full path from a collector run to queryable data is two independently

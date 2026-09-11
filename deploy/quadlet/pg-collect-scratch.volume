@@ -6,6 +6,20 @@
 # %i-derived subdirectory (see collectors/scripts/*.sh), so concurrent
 # instances never write to the same file.
 #
+# Mounted with the SHARED SELinux label (:z, lowercase) in both container
+# templates -- NOT :Z (private/exclusive), which is what
+# qlever-rebuild-scratch.volume uses for its single, never-shared
+# consumer. :Z tells SELinux this container has exclusive use of the
+# volume and relabels it with a category private to that one container;
+# when a SECOND container mounts the same :Z volume, SELinux reassigns
+# the category to the new container and the first one's already-open
+# writes start failing with EACCES ("Permission denied") -- confirmed
+# live 2026-09-11: pg-collect@hackage died with exactly this error 2
+# seconds after pg-collect@osv started sharing this volume, and a direct
+# two-container repro reproduced it on demand. :z uses a label every
+# consumer shares, so no reassignment/revocation happens as collectors
+# start and stop around each other.
+#
 # Backed by a dedicated data disk mounted at /var/lib/packagegraph (see
 # README.md's "Dedicated data disk" section) rather than default
 # Podman-managed storage under /, which is a much smaller root disk shared
