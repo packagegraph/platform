@@ -5,6 +5,7 @@ use regex::Regex;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Result};
 use std::path::Path;
+use crate::emit::rdf::write_package_identity;
 
 // Regex for parsing Buildroot variable assignments: FOO_VERSION = bar
 static VAR_ASSIGN: Lazy<Regex> = Lazy::new(|| {
@@ -251,8 +252,9 @@ impl BuildrootCollector {
         triples += 1;
 
         // Link to canonical identity (isVersionOf)
-        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &pkg.name)?;
+        triples += write_package_identity(writer, &identity_uri, &pkg.name)?;
+        // identityName + rdfs:label, not packageName: see
+        // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 

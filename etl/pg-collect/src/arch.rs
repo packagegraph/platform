@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io::{Read, Result};
 use std::time::Duration;
 use tar::Archive;
+use crate::emit::rdf::write_package_identity;
 
 pub struct ArchCollector {
     client: Client,
@@ -221,8 +222,9 @@ impl ArchCollector {
         triples += 2;
 
         // Identity
-        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &name)?;
+        triples += write_package_identity(writer, &identity_uri, &name)?;
+        // identityName + rdfs:label, not packageName: see
+        // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 
@@ -513,8 +515,9 @@ impl ArchCollector {
         triples += 3;
 
         // Identity
-        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &pkg.name)?;
+        triples += write_package_identity(writer, &identity_uri, &pkg.name)?;
+        // identityName + rdfs:label, not packageName: see
+        // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 

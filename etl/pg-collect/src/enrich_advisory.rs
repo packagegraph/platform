@@ -569,10 +569,23 @@ fn build_nvr_match_query(
         format!("?epoch = \"{}\"", escape_sparql_literal(epoch))
     };
 
+    // Match the identity name on either predicate. The collectors now emit
+    // pkg:identityName (correct: rdfs:domain pkg:PackageIdentity); they used
+    // to emit pkg:packageName, whose domain is pkg:Package. Graphs are
+    // recollected on independent schedules -- some weekly -- so for one full
+    // cycle both forms are live in the corpus. Matching only the new one
+    // would silently return zero rows for every not-yet-recollected graph,
+    // which is exactly the failure mode this enricher cannot signal.
+    //
+    // Drop the UNION arm once every graph has been recollected; the
+    // ontology-shape-check.py run for PackageIdentity.identityName reaching
+    // 0 violations is the signal that it is safe.
     format!(
         r#"SELECT ?pkg WHERE {{
   GRAPH <{graph_uri}> {{
-    ?identity <{PKG}packageName> "{name}" .
+    {{ ?identity <{PKG}identityName> "{name}" }}
+    UNION
+    {{ ?identity <{PKG}packageName> "{name}" }}
     ?pkg <{PKG}isVersionOf> ?identity ;
          <{PKG}hasVersion> ?ver .
     ?ver <{PKG}versionString> ?versionStr .

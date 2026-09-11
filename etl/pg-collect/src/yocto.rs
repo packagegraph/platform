@@ -7,6 +7,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Result};
 use std::path::Path;
 use walkdir::WalkDir;
+use crate::emit::rdf::write_package_identity;
 
 // Regex for parsing BitBake variable assignments
 static VAR_ASSIGN: Lazy<Regex> =
@@ -350,8 +351,9 @@ impl YoctoCollector {
         triples += 1;
 
         // Link to canonical identity (isVersionOf, not hasVersion)
-        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &recipe.name)?;
+        triples += write_package_identity(writer, &identity_uri, &recipe.name)?;
+        // identityName + rdfs:label, not packageName: see
+        // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 

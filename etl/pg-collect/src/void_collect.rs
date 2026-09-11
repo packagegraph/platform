@@ -6,6 +6,7 @@ use regex::Regex;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Result};
 use std::path::Path;
+use crate::emit::rdf::write_package_identity;
 
 static VAR_RE_QUOTED: Lazy<Regex> = Lazy::new(|| Regex::new(r#"^([a-z_]+)="([^"]*)""#).unwrap());
 static VAR_RE_UNQUOTED: Lazy<Regex> = Lazy::new(|| Regex::new(r#"^([a-z_]+)=([^\s]+)"#).unwrap());
@@ -182,8 +183,9 @@ impl VoidCollector {
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{VOID}XbpsPackage"))?;
         triples += 2;
 
-        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &pkg.pkgname)?;
+        triples += write_package_identity(writer, &identity_uri, &pkg.pkgname)?;
+        // identityName + rdfs:label, not packageName: see
+        // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 

@@ -27,6 +27,36 @@ impl Default for EmitPolicy {
     }
 }
 
+/// Emit a complete, ontology-conformant `pkg:PackageIdentity` node.
+///
+/// Centralised because this exact triple set is emitted from 32 call sites
+/// across the collectors, and every one of them had the same two defects
+/// (production audit 2026-09-11, 8.5M violations):
+///
+/// * `pkg:packageName` was used instead of `pkg:identityName`. packageName is
+///   `rdfs:domain pkg:Package`; identityName is `rdfs:domain
+///   pkg:PackageIdentity` and is defined as "distinct from the versioned
+///   packageName on Package instances". Emitting packageName here violates
+///   that domain, and under RDFS entailment infers every identity to also be
+///   a Package -- collapsing the version-agnostic/versioned distinction this
+///   class exists to draw.
+/// * No `rdfs:label`. In this ontology rdfs:label is a human-readable
+///   description rather than a restatement of the name, so it is required
+///   alongside identityName rather than instead of it.
+///
+/// Callers must not additionally write `pkg:packageName` on the identity URI.
+/// The versioned package URI is a different subject and still carries it.
+pub fn write_package_identity(
+    writer: &mut NTriplesWriter,
+    identity_uri: &str,
+    name: &str,
+) -> Result<usize> {
+    writer.write_triple(identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
+    writer.write_literal(identity_uri, &format!("{PKG}identityName"), name)?;
+    writer.write_literal(identity_uri, RDFS_LABEL, &format!("{name} Package Identity"))?;
+    Ok(3)
+}
+
 /// Emit RDF triples for a single PackageIr record.
 ///
 /// Returns the number of triples written.
@@ -54,10 +84,9 @@ pub fn emit_rdf(ir: &PackageIr, writer: &mut NTriplesWriter, policy: &EmitPolicy
 
     // === PackageIdentity ===
     let identity_uri = package_identity_uri(&scope.distro, release_name, &pkg.arch, &pkg.name);
-    writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-    writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &pkg.name)?;
+    triples += write_package_identity(writer, &identity_uri, &pkg.name)?;
     writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
-    triples += 3;
+    triples += 1;
 
     // === Package name ===
     writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), &pkg.name)?;
@@ -329,6 +358,34 @@ mod tests {
         assert!(
             content.contains("core#PackageIdentity"),
             "Should create PackageIdentity"
+        );
+        // pkg:identityName, not pkg:packageName. packageName is
+        // rdfs:domain pkg:Package; identityName is rdfs:domain
+        // pkg:PackageIdentity and is defined as "distinct from the versioned
+        // packageName on Package instances". Emitting packageName on an
+        // identity violates that domain and, under RDFS entailment, infers
+        // every identity to also be a Package -- collapsing the
+        // version-agnostic/versioned split the class exists to draw.
+        assert!(
+            content.contains("core#identityName"),
+            "identity must carry pkg:identityName"
+        );
+        assert!(
+            content.contains("Package Identity\""),
+            "identity must carry a human-readable rdfs:label"
+        );
+        // Regression guard: the identity must NOT carry packageName. The
+        // versioned pkg_uri still does, so assert on the identity line only.
+        let identity_line = content
+            .lines()
+            .find(|l| l.contains("core#identityName"))
+            .expect("identityName triple present");
+        let identity_subject = identity_line.split_whitespace().next().unwrap();
+        assert!(
+            !content
+                .lines()
+                .any(|l| l.starts_with(identity_subject) && l.contains("core#packageName")),
+            "identity subject {identity_subject} must not carry pkg:packageName"
         );
         assert!(
             content.contains("core#isVersionOf"),

@@ -7,6 +7,7 @@ use serde::Deserialize;
 use std::fs::File;
 use std::io::Result;
 use std::time::Duration;
+use crate::emit::rdf::write_package_identity;
 
 pub struct SnapCollector {
     distro_name: String,
@@ -307,8 +308,9 @@ impl SnapCollector {
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{SNAP}SnapPackage"))?;
         triples += 2;
 
-        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &info.name)?;
+        triples += write_package_identity(writer, &identity_uri, &info.name)?;
+        // identityName + rdfs:label, not packageName: see
+        // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 
