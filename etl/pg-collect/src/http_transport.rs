@@ -3,9 +3,11 @@
 
 use once_cell::sync::Lazy;
 use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// How many times to retry, and how long to wait between attempts.
 #[derive(Debug, Clone)]
@@ -89,6 +91,96 @@ pub fn parse_retry_after(value: &str) -> Option<Duration> {
         .ok()
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HostState {
+    interval: Duration,
+    /// Earliest instant at which the next request to this host may start.
+    next_allowed: Instant,
+}
+
+/// Paces requests per host. One instance is shared by every collector, so
+/// two collectors hitting the same registry cannot jointly exceed its
+/// limit the way independent `rate_limit()` sleeps could.
+#[derive(Debug)]
+pub struct HostLimiter {
+    default_interval: Duration,
+    state: Mutex<HashMap<String, HostState>>,
+}
+
+impl HostLimiter {
+    pub fn new(default_interval: Duration) -> Self {
+        Self {
+            default_interval,
+            state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Builder-style per-host override, for known rate-sensitive hosts.
+    pub fn with_host(self, host: &str, interval: Duration) -> Self {
+        {
+            let mut guard = self.lock();
+            guard.insert(
+                host.to_string(),
+                HostState {
+                    interval,
+                    next_allowed: Instant::now(),
+                },
+            );
+        }
+        self
+    }
+
+    /// A poisoned lock means another thread panicked mid-update. The map is
+    /// still structurally valid and the worst case is one mistimed request,
+    /// so recover rather than propagate: there is no error for callers to
+    /// handle.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, HostState>> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Block until this host's next slot, reserving it for this caller.
+    pub fn wait_turn(&self, host: &str) {
+        let slot = {
+            let mut guard = self.lock();
+            let now = Instant::now();
+            let default_interval = self.default_interval;
+            let entry = guard.entry(host.to_string()).or_insert(HostState {
+                interval: default_interval,
+                next_allowed: now,
+            });
+            let slot = entry.next_allowed.max(now);
+            entry.next_allowed = slot + entry.interval;
+            slot
+        }; // lock released before sleeping
+
+        let now = Instant::now();
+        if slot > now {
+            std::thread::sleep(slot - now);
+        }
+    }
+
+    /// Widen a host's interval, e.g. after it sent `Retry-After`. Never
+    /// shrinks an existing interval.
+    pub fn widen(&self, host: &str, at_least: Duration) {
+        let mut guard = self.lock();
+        let now = Instant::now();
+        let default_interval = self.default_interval;
+        let entry = guard.entry(host.to_string()).or_insert(HostState {
+            interval: default_interval,
+            next_allowed: now,
+        });
+        if at_least > entry.interval {
+            entry.interval = at_least;
+        }
+    }
+}
+
+impl Default for HostLimiter {
+    fn default() -> Self {
+        Self::new(crate::enricher::DEFAULT_RATE_LIMIT)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +261,81 @@ mod tests {
     fn retry_after_garbage_yields_none() {
         assert_eq!(parse_retry_after("soon"), None);
         assert_eq!(parse_retry_after(""), None);
+    }
+
+    // ── HostLimiter ─────────────────────────────────────────────────────
+
+    #[test]
+    fn same_host_calls_are_spaced_by_the_interval() {
+        let limiter = HostLimiter::new(Duration::from_millis(120));
+        let start = std::time::Instant::now();
+        limiter.wait_turn("example.com");
+        limiter.wait_turn("example.com");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(120),
+            "second call should have waited, elapsed {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn different_hosts_do_not_block_each_other() {
+        let limiter = HostLimiter::new(Duration::from_millis(300));
+        let start = std::time::Instant::now();
+        limiter.wait_turn("a.example.com");
+        limiter.wait_turn("b.example.com");
+        limiter.wait_turn("c.example.com");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "distinct hosts must not serialise, elapsed {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn per_host_override_beats_the_default() {
+        let limiter = HostLimiter::new(Duration::from_millis(1))
+            .with_host("slow.example.com", Duration::from_millis(150));
+        let start = std::time::Instant::now();
+        limiter.wait_turn("slow.example.com");
+        limiter.wait_turn("slow.example.com");
+        assert!(start.elapsed() >= Duration::from_millis(150));
+    }
+
+    #[test]
+    fn widen_increases_a_hosts_interval_for_the_rest_of_the_run() {
+        let limiter = HostLimiter::new(Duration::from_millis(1));
+        limiter.wait_turn("example.com");
+        limiter.widen("example.com", Duration::from_millis(150));
+        let start = std::time::Instant::now();
+        limiter.wait_turn("example.com");
+        limiter.wait_turn("example.com");
+        assert!(start.elapsed() >= Duration::from_millis(150));
+    }
+
+    #[test]
+    fn widen_never_shrinks_an_interval() {
+        let limiter = HostLimiter::new(Duration::from_millis(200));
+        limiter.widen("example.com", Duration::from_millis(1));
+        let start = std::time::Instant::now();
+        limiter.wait_turn("example.com");
+        limiter.wait_turn("example.com");
+        assert!(start.elapsed() >= Duration::from_millis(200));
+    }
+
+    #[test]
+    fn limiter_is_sync_and_usable_across_rayon_threads() {
+        use rayon::prelude::*;
+        let limiter = HostLimiter::new(Duration::from_millis(20));
+        let start = std::time::Instant::now();
+        // Four requests to one host must serialise to at least 3 intervals.
+        (0..4).into_par_iter().for_each(|_| {
+            limiter.wait_turn("example.com");
+        });
+        assert!(
+            start.elapsed() >= Duration::from_millis(60),
+            "concurrent callers must not all fire at once, elapsed {:?}",
+            start.elapsed()
+        );
     }
 }
