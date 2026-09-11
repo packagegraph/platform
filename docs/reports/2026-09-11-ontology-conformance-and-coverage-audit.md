@@ -2,9 +2,10 @@
 
 **Date:** 2026-09-11
 **Endpoint:** `https://packagegraph.di.riseproject.dev` (QLever, 52 named graphs, ~200M triples)
-**Ontology:** `packagegraph/ontology` @ `v0.13.0` — 75 modules, 36 SHACL shape files, 115 `sh:targetClass`
-**Method:** every SHACL property constraint compiled to SPARQL and counted exactly, corpus-wide. No sampling.
+**Ontology:** `packagegraph/ontology` @ `v0.13.0` — 37 deployed modules, 36 SHACL shape files, 115 `sh:targetClass`
+**Method:** a subset of SHACL property constraints compiled to SPARQL and counted exactly, corpus-wide. No sampling, and no full-SHACL claim — see the scope note under Summary.
 **Scripts:** `etl/scripts/ontology-shape-check.py`, `etl/scripts/ontology-coverage-check.py`
+**Status:** several findings below carry corrections from an independent review of PR #25 (`docs/reviews/pr25-f172603/`). Each correction is marked inline.
 
 ## Summary
 
@@ -12,6 +13,24 @@ Two questions, answered separately.
 
 **Conformance — is what we emit valid?** 300 constraints checked against classes
 that have data. **43 violate, 257 are clean, 0 errored.**
+
+> **This is not a conformance verdict, and an earlier draft of this report
+> presented it as one.** The checker translates five SHACL components —
+> `minCount`, `maxCount`, `class`, `datatype`, `in` — and reported
+> `skipped: 0`, which read as full coverage. It was not skipping zero; it was
+> not looking. Against the pinned shapes it leaves **17 constraints
+> untranslated** (4 `sh:pattern`, 6 `sh:minInclusive`, 5 `sh:maxInclusive`,
+> 1 `sh:nodeKind`, 1 `sh:minLength`) and cannot reach **11 NodeShapes without
+> `sh:targetClass`, 7 `sh:targetSubjectsOf` targets, and 15 `sh:sparql`
+> constraints** at all.
+>
+> The consequence is concrete: `pkg:PURLShape`'s `sh:pattern` is one of the
+> four never evaluated, so every versionless Maven purl in the corpus violates
+> a constraint this audit reported nothing about. The checker now enumerates
+> every `sh:*` term on each property shape and emits one skip record per
+> untranslated component, reports its shape-discovery gaps, and exits non-zero
+> on an incomplete run. Read the numbers above as *"43 violations among the
+> constraints this subset covers"*, not as a corpus verdict.
 
 **Coverage — do we emit anything at all?** Of packagegraph-owned terms:
 
@@ -162,33 +181,52 @@ says dependencies point at it *instead of* versioned instances.
 `PackageIdentity` nodes. 4,253,705 violations, and a real semantic defect
 rather than a naming quibble.
 
-## Finding 3 — datatype mismatches: all eight are the collector's side
+## Finding 3 — datatype mismatches: four of eight are the collector's side
 
 Every one is a compatible-but-different literal type, so no value is wrong —
 only its declared type. Actual types measured per constraint:
 
-| Constraint | Shape expects | Collector emits | Triples |
-|---|---|---|---|
-| `Repository.repositoryURL` | `xsd:anyURI` | `xsd:string` | 432,667 |
-| `CVSSScore.baseScore` | `xsd:decimal` | `xsd:double` | 92,014 |
-| `EPSSAssessment.epssScore` | `xsd:decimal` | `xsd:double` | 9,026 |
-| `EPSSAssessment.epssPercentile` | `xsd:decimal` | `xsd:double` | 9,026 |
-| `Forge.forgeUrl` | `xsd:anyURI` | `xsd:string` | 1,191 |
-| `PackageIdentity.purl` | `xsd:anyURI` | `xsd:string` | 2,674 |
-| `TransparencyLogEntry.logIndex` | `xsd:long` | `xsd:int` | 142 |
-| `Builder.builderId` | `xsd:anyURI` | `xsd:string` | 1 |
+| Constraint | Shape expects | Observed in store | Triples | Whose side |
+|---|---|---|---|---|
+| `Repository.repositoryURL` | `xsd:anyURI` | `xsd:string` | 432,667 | collector |
+| `CVSSScore.baseScore` | `xsd:decimal` | `xsd:double` | 92,014 | **store** |
+| `EPSSAssessment.epssScore` | `xsd:decimal` | `xsd:double` | 9,026 | **store** |
+| `EPSSAssessment.epssPercentile` | `xsd:decimal` | `xsd:double` | 9,026 | **store** |
+| `Forge.forgeUrl` | `xsd:anyURI` | `xsd:string` | 1,191 | collector |
+| `PackageIdentity.purl` | `xsd:anyURI` | `xsd:string` | 2,674 | collector — **fixed** |
+| `TransparencyLogEntry.logIndex` | `xsd:long` | `xsd:int` | 142 | **store** |
+| `Builder.builderId` | `xsd:anyURI` | `xsd:string` | 1 | collector |
 
-Three reasons to fix these on the collector side rather than relax the shapes:
+### Correction: three of these are not the collector's side
 
-1. **`purl` proves the codebase already agrees with the shape.** 662,690 purl
-   literals are correctly `xsd:anyURI`; only 2,674 are `xsd:string`. This is an
-   inconsistency among emitters, not a shape that nobody can satisfy.
-2. **`logIndex` as `xsd:int` is a latent overflow bug.** `xsd:int` is 32-bit
-   and Rekor transparency-log indices are already in the hundreds of millions.
-   The shape's `xsd:long` is correct and the collector will break on its own.
-3. **`decimal` is the right type for CVSS and EPSS scores.** They are exact
-   decimal quantities; `xsd:double` is binary floating point, so values round-
-   trip inexactly and equality comparisons in SPARQL become unreliable.
+This finding was headed "all eight are the collector's side". Four are not,
+and the recommendation that followed from it would have changed emitters that
+are already correct.
+
+`enrich_nvd.rs:606` writes `"..."^^<xsd:decimal>` and `enrich_epss.rs` does the
+same at four sites. `ntriples.rs`'s `write_integer` serialises `xsd:integer`,
+not `xsd:int`. What the audit measured is what QLever **stores**: it
+normalises `decimal` to `double` and the integer family to `int`. The emitted
+RDF is right; the query result is a different representation of it.
+
+Two consequences. There is nothing to fix for `baseScore`, `epssScore`,
+`epssPercentile` or `logIndex` — 110,208 of the 546,741 triples in this table.
+And the "latent 32-bit overflow" argument in the previous draft was
+unsupported: `xsd:integer` is unbounded, so Rekor indices in the hundreds of
+millions were never at risk from the collector. An `xsd:integer`-versus-`long`
+mismatch against `attestation.shacl.ttl:180` does remain, but it is a shape
+question, not an overflow.
+
+The general lesson is that this checker cannot distinguish emitted RDF from
+stored representation, because it only ever sees the latter. Datatype findings
+need verifying against raw collector output before they are attributed.
+
+The four genuine collector rows stand, and `purl` is the argument for fixing
+them rather than relaxing the shapes: 662,690 purl literals are correctly
+`xsd:anyURI` and only 2,674 were `xsd:string`, so it was an inconsistency among
+emitters rather than a shape nobody can satisfy. Those 2,674 are fixed.
+
+Credit: independent review of PR #25 (`docs/reviews/pr25-f172603/`).
 
 ## Finding 4 — real data-quality violations
 
@@ -399,10 +437,25 @@ Shapes exist for classes that were never populated: `CVE`, `Checksum`,
 `Branch`, `Diff`, `Feed`, and 37 more.
 
 This is the check that speaks to the **40 of 65 competency questions returning
-zero rows** found while benchmarking. Empty CQ results are a coverage failure,
-not a conformance failure — the data is not wrong, it is absent. Note
-`graph/nuget` and `graph/hex` hold **6 triples each**, and
-`graph/enrichment/forge-version` holds 14.
+zero rows** found while benchmarking. Note `graph/nuget` and `graph/hex` hold
+**6 triples each**, and `graph/enrichment/forge-version` holds 14.
+
+> **Correction: "empty CQ means absent data" does not hold.** An earlier draft
+> said empty CQ results are "a coverage failure, not a conformance failure —
+> the data is not wrong, it is absent." At least one is neither: ontology issue
+> #7 shows the "unpatched vulnerabilities in web frameworks" CQ joins on an
+> identity-side `pkg:hasUpstreamProject`, which no collector emits *by design*,
+> because that property is `rdfs:domain :SourcePackage` and writing it on an
+> identity would infer every such identity to be a SourcePackage. `forge.rs`
+> carries an explicit comment saying so and four files have regression tests
+> asserting the edge is absent. That CQ returns zero rows against correct data
+> and always will.
+>
+> A zero-row CQ can mean absent data, a query defect, a graph or inference
+> scope mismatch, or a filter that excludes everything. A term histogram cannot
+> distinguish them, so "40 of 65" is a count of questions to investigate, not a
+> measure of missing data. Each needs attributing individually before any of it
+> is called a coverage failure.
 
 Caveat on the headline percentage: a naive count says 6.5% of declared classes
 are populated, but 872 of the 1,134 unpopulated classes are `schema.org` and
@@ -490,9 +543,13 @@ owns the model rather than inferred from what the collectors happen to emit:
    with no analogue in a registry, and rolling releases have no codename by
    definition. If `DistributionRelease` is meant only for OS distro releases,
    the requirements are right and item 1 is the real issue.
-3. **`maven#MavenEcosystem` is an ontology class URI used as an instance** of
-   `pkg:Ecosystem`. Almost certainly meant to be `d/ecosystem/maven`, which
-   exists.
+3. ~~**`maven#MavenEcosystem` is an ontology class URI used as an instance**~~
+   — **withdrawn.** `maven.ttl:161` declares it
+   `maven:MavenEcosystem a owl:NamedIndividual, pkg:Ecosystem`. It is a
+   correctly declared individual, not a class used as one, and the proposed
+   migration to `d/ecosystem/maven` would have renamed a validly published
+   term. The audit's declared-term set omitted named individuals, which is the
+   same generator gap that made `slsa:L2` and `att:GPG` look undeclared.
 4. **`pkg:partOfEcosystem` has 0 uses.** The property connecting
    `Distribution` to `Ecosystem` is declared and shaped but never emitted, so
    the 18 `Ecosystem` nodes float unattached to the distribution graph.
@@ -506,9 +563,13 @@ owns the model rather than inferred from what the collectors happen to emit:
    specification makes the version component optional. Three ways out:
    - **Version-less identity purl** (`pkg:rpm/fedora/bash`): relax the pattern
      to `^pkg:[a-z]+/[^@]+(@.+)?$`, and stop putting the EVR in the identity's
-     purl in `rpm.rs`/`debian.rs`. Resolves both violation classes; the
-     versioned purl, if wanted, belongs on the `Package` rather than the
-     identity. Requires an ontology change and a re-collection.
+     purl in `rpm.rs`/`debian.rs`. Resolves both violation classes.
+     Requires an ontology change and a re-collection. Note that relocating the
+     versioned purl to `Package` is **not** available as a sub-option:
+     `pkg:purl` is `rdfs:domain pkg:PackageIdentity`, and a second
+     `rdfs:domain` intersects rather than widens, so it would infer every such
+     Package to be a PackageIdentity. Keeping a versioned identifier on the
+     versioned node needs its own property, or an export-layer field.
    - **Don't type unresolved dependency targets as `PackageIdentity`.** More
      faithful — an RPM `Requires: libssl.so.3` names a capability, and
      `pkg:Capability` already exists and is already used this way by
@@ -531,19 +592,19 @@ owns the model rather than inferred from what the collectors happen to emit:
 | Emit `rdf:type pkg:VersionConstraint` on constraint nodes | version-constraint emitter | 1,405,318 |
 | Emit `rdfs:label` on `Capability` (a description, not the name) | capability emitter | 908,627 |
 | `Repository.repositoryURL`: `xsd:string` → `xsd:anyURI` | vcs emitter | 432,667 |
-| `CVSSScore.baseScore`: `xsd:double` → `xsd:decimal` | `enrich_nvd.rs` / OSV | 92,014 |
+| ~~`CVSSScore.baseScore`: `xsd:double` → `xsd:decimal`~~ — **not a defect**: `enrich_nvd.rs:606` already emits `xsd:decimal`; the `double` is QLever store normalization | — | 92,014 |
 | Emit `rdfs:label` on `Vulnerability` (canonical CVE/OSV id) | NVD + Alpine secdb | 78,899 |
 | Give `pkg:License` nodes any content at all | license emitter | 19,858 |
 | Emit `CVSSScore.baseScore` where missing | OSV collector | 30,016 |
 | Emit `rdf:type` on dependency-target nodes | dependency emitter | 29,555 |
-| `EPSS` score/percentile: `xsd:double` → `xsd:decimal` | `enrich_epss.rs` | 18,052 |
+| ~~`EPSS` score/percentile: `xsd:double` → `xsd:decimal`~~ — **not a defect**: `enrich_epss.rs` already emits `xsd:decimal` | — | 18,052 |
 | Dedupe `RangeEvent.eventVersion` | OSV range emitter | 22,781 |
 | Dedupe `VersionConstraint.versionConstraintValue` | version-constraint emitter | 14,031 |
 | Dedupe `CVSSScore.vectorString` | CVSS emitter | 7,519 |
 | Resolve conflicting `purl` per identity — same root cause as the 3.8M; a version-less identity purl removes the conflict by construction | purl emitter | 7,215 |
 | `Forge.forgeUrl`, `Builder.builderId`: → `xsd:anyURI` | respective emitters | 1,192 |
 | ~~`purl`: → `xsd:anyURI`~~ — **done**, `maven.rs` was the only emitter using `xsd:string` | `maven.rs` | 2,674 |
-| `TransparencyLogEntry.logIndex`: `xsd:int` → `xsd:long` | attestation emitter | 142 |
+| ~~`TransparencyLogEntry.logIndex`: `xsd:int` → `xsd:long`~~ — **not a defect**: `write_integer` emits unbounded `xsd:integer`; an `integer`-vs-`long` shape question remains | — | 142 |
 | Emit `label` / `distributionName` / `repoType` on the 24–31 `Distribution` and `DistributionRelease` singletons | distro metadata emitter | ~100 |
 
 The datatype rows are a single mechanical sweep — pick the right `xsd:` type at
