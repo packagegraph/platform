@@ -4,6 +4,7 @@ use crate::uris::*;
 use flate2::read::GzDecoder;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Result};
+use crate::emit::rdf::write_package_identity;
 
 /// Collects binary package metadata from opkg Packages.gz or apk APKINDEX.tar.gz
 pub struct OpkgIndexCollector {
@@ -175,8 +176,9 @@ impl OpkgIndexCollector {
         triples += 1;
 
         // Link to binary identity (isVersionOf)
-        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), name)?;
+        triples += write_package_identity(writer, &identity_uri, name)?;
+        // identityName + rdfs:label, not packageName: see
+        // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 

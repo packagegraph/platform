@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
 use std::time::Duration;
+use crate::emit::rdf::write_package_identity;
 
 pub struct MavenCollector {
     client: Client,
@@ -911,8 +912,9 @@ impl MavenCollector {
         writer.write_triple(&pkg_uri, RDF_TYPE, &format!("{MAVEN}MavenArtifact"))?;
         triples += 2;
 
-        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &identity_name)?;
+        triples += write_package_identity(writer, &identity_uri, &identity_name)?;
+        // identityName + rdfs:label, not packageName: see
+        // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 

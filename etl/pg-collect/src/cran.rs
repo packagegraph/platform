@@ -4,6 +4,7 @@ use flate2::read::GzDecoder;
 use reqwest::blocking::Client;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
+use crate::emit::rdf::write_package_identity;
 
 pub struct CranCollector {
     client: Client,
@@ -215,8 +216,9 @@ impl CranCollector {
         triples += 2;
 
         // Identity
-        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &pkg.package)?;
+        triples += write_package_identity(writer, &identity_uri, &pkg.package)?;
+        // identityName + rdfs:label, not packageName: see
+        // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 

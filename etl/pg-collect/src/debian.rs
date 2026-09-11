@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
 use std::time::Duration;
+use crate::emit::rdf::write_package_identity;
 
 /// Normalize an architecture argument to (repo_path, rdf_identity).
 ///
@@ -738,8 +739,9 @@ impl DebianCollector {
         triples += 2;
 
         // Link to canonical identity
-        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), pkg_name)?;
+        triples += write_package_identity(writer, &identity_uri, pkg_name)?;
+        // identityName + rdfs:label, not packageName: see
+        // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 
@@ -1000,8 +1002,9 @@ impl DebianCollector {
 
                 let dep_uri = package_identity_uri(&self.distro_name, codename, arch_name, name);
 
-                writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-                writer.write_literal(&dep_uri, &format!("{PKG}packageName"), name)?;
+                triples += write_package_identity(writer, &dep_uri, name)?;
+                // identityName + rdfs:label, not packageName: see
+                // emit::rdf::write_package_identity for why.
                 writer.write_triple(pkg_uri, &format!("{PKG}directlyProvides"), &dep_uri)?;
                 writer.write_triple(pkg_uri, &format!("{DEB}debProvides"), &dep_uri)?;
 
@@ -1048,8 +1051,9 @@ impl DebianCollector {
                     package_identity_uri(&self.distro_name, codename, arch_name, dep_name);
 
                 // Ensure identity has basic properties for graph traversal
-                writer.write_triple(&dep_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-                writer.write_literal(&dep_uri, &format!("{PKG}packageName"), dep_name)?;
+                triples += write_package_identity(writer, &dep_uri, dep_name)?;
+                // identityName + rdfs:label, not packageName: see
+                // emit::rdf::write_package_identity for why.
                 triples += 2;
 
                 // Emit generic property based on dep_type

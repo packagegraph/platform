@@ -7,6 +7,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Result};
 use std::path::Path;
 use walkdir::WalkDir;
+use crate::emit::rdf::write_package_identity;
 
 // Regex for parsing PKG_* variables: PKG_VERSION = 1.2.3
 static PKG_VAR: Lazy<Regex> = Lazy::new(|| {
@@ -331,8 +332,9 @@ impl OpenWrtCollector {
         triples += 1;
 
         // Link to canonical identity (isVersionOf)
-        writer.write_triple(&identity_uri, RDF_TYPE, &format!("{PKG}PackageIdentity"))?;
-        writer.write_literal(&identity_uri, &format!("{PKG}packageName"), &pkg.name)?;
+        triples += write_package_identity(writer, &identity_uri, &pkg.name)?;
+        // identityName + rdfs:label, not packageName: see
+        // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 3;
 
