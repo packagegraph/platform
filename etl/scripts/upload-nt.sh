@@ -6,12 +6,14 @@ set -euo pipefail
 # into the file before it's gzipped, so it lands in the same named graph
 # as the data it describes.
 #
-# NOTE: this mutates the local .nt file in place by appending. Running
-# this script twice against the same .nt file (or uploading one file to
-# two different graphs) accumulates multiple DataSnapshot triples in the
-# same local file. No current caller does this -- osv.sh and
+# NOTE: this mutates the local .nt file in place by appending. A retried
+# invocation against the same local file strips any DataSnapshot block it
+# previously appended (matched by IRI prefix, see SNAPSHOT_PREFIX below)
+# before appending a fresh one, so retries don't accumulate duplicates.
+# Uploading the same local file to two different graphs is still the
+# caller's responsibility to avoid -- osv.sh and
 # enrichers/scripts/security.sh already concatenate all input before a
-# single upload call -- but be aware of it if you add a new caller.
+# single upload call.
 #
 # Usage: upload-nt.sh <local-file.nt> <graph-uri> [source-url]
 #
@@ -39,6 +41,39 @@ if [ ! -f "$LOCAL_FILE" ]; then
     exit 1
 fi
 
+# Reject anything that can't validly appear in an IRI reference, even though
+# GRAPH_URI/SOURCE_URL are only ever embedded as string literals below (never
+# as a bare <...> IRIREF) -- a value that isn't even a well-formed IRI has no
+# business being called a graph or source URI regardless of literal escaping.
+nt_check_iri_chars() {
+  local label=$1 value=$2
+  case "$value" in
+    *[\<\>\"{}\|\^\`]*)
+      echo "Error: $label contains a character forbidden in an IRI reference: $value" >&2
+      exit 1
+      ;;
+  esac
+  if printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    echo "Error: $label contains a control character: $value" >&2
+    exit 1
+  fi
+}
+nt_check_iri_chars "graph-uri" "$GRAPH_URI"
+[ -n "$SOURCE_URL" ] && nt_check_iri_chars "source-url" "$SOURCE_URL"
+
+# Escape a value for use inside an N-Triples STRING_LITERAL_QUOTE ("...").
+# Backslash must be escaped first -- escaping it after the other characters
+# would double-escape the backslashes those substitutions just introduced.
+nt_escape() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
 # Derive Minio filename from graph URI
 # https://packagegraph.github.io/graph/debian/trixie → debian-trixie
 # https://packagegraph.github.io/graph/security/osv → security-osv
@@ -51,13 +86,23 @@ GRAPH_SLUG=$(echo "$GRAPH_URI" | sed 's|https://packagegraph.github.io/graph/||;
 # same graph these triples describe.
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 SNAPSHOT_TIMESTAMP_COMPACT=$(echo "$NOW" | tr -d ':-')
-SNAPSHOT_IRI="https://packagegraph.github.io/d/snapshot/collector/${GRAPH_SLUG}/${SNAPSHOT_TIMESTAMP_COMPACT}"
-# NOTE: $GRAPH_URI / $SOURCE_URL are not escaped for N-Triples literal/IRI
-# syntax below -- a `"`, `<`, `>`, or `\` in either would produce one
-# malformed line and fail that graph's parse at index time. Acceptable
-# today because both are hardcoded, trusted values passed by deploy
-# scripts, not user input -- but worth flagging for anyone adding a new
-# caller with a less-trusted source.
+SNAPSHOT_PREFIX="https://packagegraph.github.io/d/snapshot/collector/${GRAPH_SLUG}/"
+SNAPSHOT_IRI="${SNAPSHOT_PREFIX}${SNAPSHOT_TIMESTAMP_COMPACT}"
+
+# Idempotent retry: a previous invocation may have appended its own
+# DataSnapshot block to this same $LOCAL_FILE and then failed before the
+# upload completed. Strip any prior block for this graph slug (by its
+# snapshot IRI prefix, not the timestamp suffix, so it catches every past
+# attempt) before appending a fresh one, so a retry can't accumulate
+# duplicate/conflicting DataSnapshot records.
+if grep -qF "<${SNAPSHOT_PREFIX}" "$LOCAL_FILE"; then
+  TMP_STRIPPED=$(mktemp)
+  grep -vF "<${SNAPSHOT_PREFIX}" "$LOCAL_FILE" > "$TMP_STRIPPED"
+  mv "$TMP_STRIPPED" "$LOCAL_FILE"
+fi
+
+GRAPH_URI_ESC=$(nt_escape "$GRAPH_URI")
+NOW_ESC=$(nt_escape "$NOW")
 {
   printf '<%s> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#DataSnapshot> .\n' "$SNAPSHOT_IRI"
   # snapshotGraph is owl:DatatypeProperty, range xsd:anyURI (core.ttl:823-829)
@@ -65,14 +110,14 @@ SNAPSHOT_IRI="https://packagegraph.github.io/d/snapshot/collector/${GRAPH_SLUG}/
   # the join query in the design spec's §5 silently return zero rows (an
   # IRI and a literal never test equal in SPARQL, even with identical
   # string content).
-  printf '<%s> <https://purl.org/packagegraph/ontology/core#snapshotGraph> "%s"^^<http://www.w3.org/2001/XMLSchema#anyURI> .\n' "$SNAPSHOT_IRI" "$GRAPH_URI"
+  printf '<%s> <https://purl.org/packagegraph/ontology/core#snapshotGraph> "%s"^^<http://www.w3.org/2001/XMLSchema#anyURI> .\n' "$SNAPSHOT_IRI" "$GRAPH_URI_ESC"
   # DataSnapshotShape only requires rdfs:label (see derive_comparison.rs's
   # sibling DataSnapshot-minting code) -- without this, every DataSnapshot
   # minted here is shape-invalid relative to the rest of the corpus.
-  printf '<%s> <http://www.w3.org/2000/01/rdf-schema#label> "Snapshot of graph %s uploaded %s" .\n' "$SNAPSHOT_IRI" "$GRAPH_URI" "$NOW"
-  printf '<%s> <https://purl.org/packagegraph/ontology/core#snapshotTimestamp> "%s"^^<http://www.w3.org/2001/XMLSchema#dateTime> .\n' "$SNAPSHOT_IRI" "$NOW"
+  printf '<%s> <http://www.w3.org/2000/01/rdf-schema#label> "Snapshot of graph %s uploaded %s" .\n' "$SNAPSHOT_IRI" "$GRAPH_URI_ESC" "$NOW_ESC"
+  printf '<%s> <https://purl.org/packagegraph/ontology/core#snapshotTimestamp> "%s"^^<http://www.w3.org/2001/XMLSchema#dateTime> .\n' "$SNAPSHOT_IRI" "$NOW_ESC"
   if [ -n "$SOURCE_URL" ]; then
-    printf '<%s> <https://purl.org/packagegraph/ontology/core#snapshotSource> "%s" .\n' "$SNAPSHOT_IRI" "$SOURCE_URL"
+    printf '<%s> <https://purl.org/packagegraph/ontology/core#snapshotSource> "%s" .\n' "$SNAPSHOT_IRI" "$(nt_escape "$SOURCE_URL")"
   fi
 } >> "$LOCAL_FILE"
 
