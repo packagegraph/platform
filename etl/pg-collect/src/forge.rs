@@ -969,6 +969,52 @@ pub fn emit_upstream_repo(
     // Emit forge instance triples (v0.8.0)
     triples += emit_forge_triples(writer, &r_uri, repo_url)?;
 
+    // NOTE: `repo_url` here may be the validation-resolved (redirect-followed)
+    // URL when `validation` is Some, whereas the three direct writers
+    // (rpm.rs, maven.rs, emit/rdf.rs) and collect_openwrt_upstream.rs key
+    // their own emit_upstream_project_link calls off the raw extracted URL
+    // with no redirect resolution. Every current caller passes None for
+    // `validation`, so this doesn't diverge today -- but the first caller
+    // that passes Some(validation) would silently stop converging with
+    // direct-writer hubs for the same project, with no test to catch it.
+    triples += emit_upstream_project_link(writer, identity_uri, repo_url)?;
+
+    Ok(triples)
+}
+
+/// Link a PackageIdentity to its UpstreamProject hub, minting the hub node
+/// (idempotently) if this is the first time any collector run has seen
+/// this canonical repo. Keyed on the same repo_url normalize_forge_url /
+/// extract_forge_url already produced -- no new identity scheme, reuses
+/// the existing uris::upstream_uri helper.
+pub fn emit_upstream_project_link(
+    writer: &mut NTriplesWriter,
+    identity_uri: &str,
+    repo_url: &str,
+) -> Result<usize> {
+    let project_uri = crate::uris::upstream_uri(repo_url);
+    let mut triples = 0;
+
+    if writer.write_triple_once(&project_uri, RDF_TYPE, &format!("{PKG}UpstreamProject"))? {
+        triples += 1;
+    }
+    if writer.write_literal_once(
+        &project_uri,
+        &format!("{PKG}projectName"),
+        &crate::uris::project_name_from_repo_url(repo_url),
+    )? {
+        triples += 1;
+    }
+    if writer.write_triple_once(
+        &project_uri,
+        &format!("{PKG}projectRepository"),
+        &crate::uris::repo_uri(repo_url),
+    )? {
+        triples += 1;
+    }
+    writer.write_triple(identity_uri, &format!("{PKG}hasUpstreamProject"), &project_uri)?;
+    triples += 1;
+
     Ok(triples)
 }
 
@@ -1785,7 +1831,7 @@ mod tests {
         .unwrap();
         writer.flush().unwrap();
 
-        assert_eq!(count, 7); // 3 repo + 4 forge
+        assert_eq!(count, 11); // 3 repo + 4 forge + 4 upstream project hub
         let mut content = String::new();
         std::io::Read::read_to_string(&mut temp.reopen().unwrap(), &mut content).unwrap();
         assert!(content.contains("core#upstreamRepository"));
@@ -1851,6 +1897,63 @@ mod tests {
             content.contains("new/repo"),
             "Should use canonical URL from redirect"
         );
+    }
+
+    #[test]
+    fn test_emit_upstream_project_link_writes_hub_triples() {
+        use crate::ntriples::NTriplesWriter;
+        use std::io::Read;
+        use tempfile::NamedTempFile;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+
+        let triples = emit_upstream_project_link(
+            &mut writer,
+            "https://packagegraph.github.io/d/pkg-identity/example",
+            "https://github.com/owner/repo",
+        ).unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(triples, 4); // type, projectName, projectRepository, hasUpstreamProject
+
+        let mut content = String::new();
+        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+
+        assert!(content.contains("UpstreamProject"));
+        assert!(content.contains("\"owner/repo\""));
+        assert!(content.contains("projectRepository"));
+        assert!(content.contains("hasUpstreamProject"));
+    }
+
+    #[test]
+    fn test_emit_upstream_project_link_dedupes_across_calls() {
+        use crate::ntriples::NTriplesWriter;
+        use std::io::Read;
+        use tempfile::NamedTempFile;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+
+        // Two different packages, same upstream repo.
+        emit_upstream_project_link(&mut writer, "https://.../identity/a", "https://github.com/owner/repo").unwrap();
+        emit_upstream_project_link(&mut writer, "https://.../identity/b", "https://github.com/owner/repo").unwrap();
+        writer.flush().unwrap();
+
+        let mut content = String::new();
+        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+
+        // Hub minted once (write_*_once), but linked from both identities.
+        // Note: matching on the bracketed rdf:type object IRI specifically,
+        // not the bare substring "UpstreamProject>" -- that substring also
+        // occurs at the end of every "hasUpstreamProject>" predicate IRI,
+        // which is written once per call (not deduped) and would otherwise
+        // inflate this count.
+        assert_eq!(
+            content.matches(&format!("<{PKG}UpstreamProject>")).count(),
+            1
+        );
+        assert_eq!(content.matches("hasUpstreamProject").count(), 2);
     }
 
     #[test]

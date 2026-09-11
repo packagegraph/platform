@@ -232,6 +232,21 @@ pub fn upstream_uri(name: &str) -> String {
     format!("{DATA}upstream/{}", encode(name))
 }
 
+/// Derive a human-readable UpstreamProject name from its canonical repo
+/// URL -- the owner/repo slug, e.g. "FasterXML/jackson-databind". Used as
+/// pkg:projectName, which UpstreamProject requires (OWL cardinality 1 on
+/// :projectName, core.ttl:1319).
+pub fn project_name_from_repo_url(repo_url: &str) -> String {
+    let path = repo_url
+        .strip_prefix("https://")
+        .or_else(|| repo_url.strip_prefix("http://"))
+        .unwrap_or(repo_url);
+    path.splitn(2, '/')
+        .nth(1)
+        .unwrap_or(path)
+        .to_string()
+}
+
 /// Build a Vulnerability URI from CVE ID.
 pub fn cve_uri(cve_id: &str) -> String {
     format!("{DATA}cve/{}", encode(cve_id))
@@ -262,7 +277,7 @@ pub fn repo_uri(url: &str) -> String {
 /// round-two finding 3 in the design spec for why two independently
 /// maintained copies drifted (a GitLab nested-group truncation bug).
 pub fn normalize_forge_url_canonical(url: &str) -> Option<String> {
-    crate::forge::extract_forge_url(url).map(|extraction| extraction.repo_url)
+    crate::forge::normalize_repo_url(url)
 }
 
 /// Try to normalize a URL into a canonical forge repository URI.
@@ -768,6 +783,30 @@ mod tests {
         assert_eq!(
             normalize_forge_url("https://github.com/owner/repo"),
             Some(repo_uri("https://github.com/owner/repo"))
+        );
+    }
+
+    #[test]
+    fn test_project_name_from_repo_url_github() {
+        assert_eq!(
+            project_name_from_repo_url("https://github.com/FasterXML/jackson-databind"),
+            "FasterXML/jackson-databind"
+        );
+    }
+
+    #[test]
+    fn test_project_name_from_repo_url_gitlab_nested() {
+        assert_eq!(
+            project_name_from_repo_url("https://gitlab.com/group/subgroup/project"),
+            "group/subgroup/project"
+        );
+    }
+
+    #[test]
+    fn test_project_name_from_repo_url_bitbucket() {
+        assert_eq!(
+            project_name_from_repo_url("https://bitbucket.org/owner/repo"),
+            "owner/repo"
         );
     }
 
