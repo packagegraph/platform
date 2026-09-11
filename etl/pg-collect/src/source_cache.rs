@@ -71,13 +71,25 @@ impl SourceCache {
     ///
     /// Creates the cache directory if it doesn't exist.
     pub fn new(cache_dir: &str, collector_name: &str) -> io::Result<Self> {
-        let dir = Path::new(cache_dir).join(collector_name);
-        fs::create_dir_all(&dir)?;
-
         let client = crate::enricher::http_client_builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        Self::with_client(cache_dir, collector_name, client)
+    }
+
+    /// Create a source cache that fetches through a caller-supplied client
+    /// rather than building a plain one. Needed by any collector whose
+    /// requests require more than the default client -- e.g. RpmCollector's
+    /// TLS client-cert auth against the RHEL CDN, which `new` silently
+    /// dropped: `fetch_or_reuse` always downloaded through `self.client`
+    /// here, so plugging in `--cache-dir` on a TLS-authenticated collector
+    /// made every request hit cdn.redhat.com without the client cert,
+    /// failing outright (confirmed live 2026-09-11).
+    pub fn with_client(cache_dir: &str, collector_name: &str, client: Client) -> io::Result<Self> {
+        let dir = Path::new(cache_dir).join(collector_name);
+        fs::create_dir_all(&dir)?;
 
         Ok(Self {
             cache_dir: dir,
