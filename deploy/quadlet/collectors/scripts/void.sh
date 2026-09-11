@@ -12,4 +12,4 @@ tar -xzf /tmp/void.tar.gz -C /tmp/void-repo --strip-components=1
 rm /tmp/void.tar.gz
 
 pg-collect void --repo-path /tmp/void-repo --output /tmp/void.nt
-/app/scripts/upload-nt.sh /tmp/void.nt "$GRAPH_URI"
+/app/scripts/upload-nt.sh /tmp/void.nt "$GRAPH_URI" "https://github.com/void-linux/void-packages/archive/refs/heads/master.tar.gz"
