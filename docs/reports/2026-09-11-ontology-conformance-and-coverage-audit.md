@@ -32,6 +32,57 @@ that have data. **43 violate, 257 are clean, 0 errored.**
 > on an incomplete run. Read the numbers above as *"43 violations among the
 > constraints this subset covers"*, not as a corpus verdict.
 
+### Re-run with the corrected checker
+
+Re-run 2026-09-11 against the same endpoint, after the corrections above.
+The result is **complete**: `checked=300 violating=43 clean=257 errors=0`,
+with `unexecuted=0` and `target counts failed=0`, exiting 0. The violating and
+clean counts are unchanged from the first run even though the corpus grew by
+~338,000 identities, which is a reasonable stability signal for the subset
+being measured.
+
+What is new is that the scope is now stated rather than implied:
+
+| | |
+|---|---|
+| Components translated | `minCount`, `maxCount`, `class`, `datatype`, `in` |
+| Constraints translated | 536 |
+| Constraints **not** translated | **17** — `minInclusive` 6, `maxInclusive` 5, `pattern` 4, `nodeKind` 1, `minLength` 1 |
+| Shape targets unreachable | **33** — 11 NodeShapes without `sh:targetClass`, 15 `sh:sparql`, 7 `sh:targetSubjectsOf` |
+
+**43 violating constraints is 41 distinct defects.** Five NodeShapes target
+`PackageIdentity`, so `purl`'s `maxCount` (12,746) and `datatype` (2,674) are
+each counted twice — the double-count predicted in Finding 7, now visible in
+the results rather than inferred.
+
+Two constraints improved by an order of magnitude since the first run, both in
+areas PR #32 touched (forge URL normalization and repository IRI minting).
+The coincidence is strong but I have not verified the attribution:
+
+| Constraint | First run | Re-run | Change |
+|---|---|---|---|
+| `Repository.repositoryURL` datatype | 432,667 | **24,531** | −94% |
+| `Forge.forgeUrl` datatype | 1,191 | **17** | −99% |
+
+Two constraints appear that earlier tables did not list, both at 100%:
+`Commit.commitTimestamp` `minCount` (1,211) and
+`ProvenanceAttestation.attestationDigest` `minCount` (142).
+
+Everything else moved only with corpus growth. `PackageIdentity.identityName`
+`minCount` stands at **4,591,302 / 4,593,976 (99.94%)**, which confirms the
+endpoint is still serving pre-#37 data — the identity fix had not yet reached
+the index at the time of this run, so these figures are the "before" baseline
+against which that work should be measured.
+
+Coverage was re-run too, and the script now reports packagegraph-owned figures
+directly — **78/281 classes (27.8%)** and **212/1005 properties (21.1%)** —
+rather than the report having to correct a raw 6.5% by hand. Its denominators
+previously came from globbing the ontology checkout, which pulled in
+schema.org, SHACL's own vocabulary and negative test fixtures; they now come
+from the 37 deployed modules.
+
+Raw output: `shape-check-2026-09-11b.json`, `coverage-2026-09-11c.json`.
+
 **Coverage — do we emit anything at all?** Of packagegraph-owned terms:
 
 | | Populated | Total | |
