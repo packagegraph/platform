@@ -85,20 +85,32 @@ One root cause, seven constraints, 5.3M affected subjects.
 | `Vulnerability` | 55,517 | 16.9% |
 | `Distribution` | 11 | 45.8% |
 
-This is a **model gap, not a collector bug**, everywhere the class already
-carries an equivalent name property. `pkg:Capability` instances carry exactly
-two predicates — `rdf:type` and `pkg:capabilityName` (1,595,057 each) — and
-nothing else. The shape demands both `rdfs:label` and `pkg:capabilityName`,
-which is redundant.
+These do **not** all have the same cause. Checking what each class actually
+carries splits them three ways:
 
-`Vulnerability` is the exception and **is** a collector bug: the shape calls
-`rdfs:label` the canonical OSV/CVE identifier. `graph/security/osv` has **0**
-violations; `graph/cve/nvd` has **46,010 of 52,268 (88%)**. The NVD collector
-omits what the OSV collector emits.
+| Class | What it actually carries | Verdict |
+|---|---|---|
+| `Capability` | `capabilityName` (100%) and nothing else | **Shape**: `rdfs:label` is redundant |
+| `PackageIdentity` | `packageName` (4,963,521) + purl, repos | **Shape**: redundant |
+| `DataQualityIssue` | `issueType`, `severity`, `detectedAt` | **Shape**: redundant |
+| `License` | **`rdf:type` only** — 19,858 triples, nothing else | **Collector**: nodes are empty |
+| `Distribution`, `DistributionRelease` | partial; 11–31 singleton nodes | **Collector**: emit the metadata |
+| `Vulnerability` | `rdfs:label` *is* the canonical CVE/OSV id | **Collector**: NVD + Alpine omit it |
 
-**Recommendation:** drop the redundant `rdfs:label` `minCount` from the six
-shapes whose class has a name property; fix the NVD collector to emit
-`rdfs:label`.
+So `License` is the opposite of a redundant-label problem: every
+`pkg:License` node in the corpus is a bare typed node with no identifier, name,
+or SPDX id at all. The shape is right and the collector emits nothing.
+
+`Vulnerability` splits by producer: `graph/security/osv` has **0** violations,
+while `graph/cve/nvd` has **56,172** and the Alpine graphs another **~22,700**
+(`alpine/edge/riscv64` 8,753, `alpine/v3.20` 6,987, `alpine/v3.20/aarch64`
+6,987). Two collectors omit what a third emits correctly.
+
+**Recommendation:** drop the redundant `rdfs:label` `minCount` from the three
+shapes whose class has a working discriminator (`Capability`,
+`PackageIdentity`, `DataQualityIssue`); fix the NVD and Alpine collectors to
+emit it for `Vulnerability`; and treat `License` as its own bug — those nodes
+need content, not a label.
 
 ## Finding 2 — the ontology contradicts itself on `PackageIdentity`'s name
 
@@ -119,46 +131,75 @@ shape is the outlier.
 either deprecate `identityName` or document what distinguishes it. This single
 edit removes 4.25M violations.
 
-## Finding 3 — datatype mismatches, six of them at 100%
+## Finding 3 — datatype mismatches: all eight are the collector's side
 
-A 100% datatype violation means the collector emits one literal type and the
-shape expects another. These are unambiguous and cheap to fix.
+Every one is a compatible-but-different literal type, so no value is wrong —
+only its declared type. Actual types measured per constraint:
 
-| Constraint | Violations | Rate |
-|---|---|---|
-| `EPSSAssessment.epssScore` | 9,026 | 100% |
-| `EPSSAssessment.epssPercentile` | 9,026 | 100% |
-| `TransparencyLogEntry.logIndex` | 142 | 100% |
-| `Forge.forgeUrl` | 17 | 100% |
-| `Builder.builderId` | 1 | 100% |
-| `CVSSScore.baseScore` | 64,568 | 67.0% |
-| `Repository.repositoryURL` | 24,531 | 17.0% |
-| `PackageIdentity.purl` | 2,674 | 0.06% |
+| Constraint | Shape expects | Collector emits | Triples |
+|---|---|---|---|
+| `Repository.repositoryURL` | `xsd:anyURI` | `xsd:string` | 432,667 |
+| `CVSSScore.baseScore` | `xsd:decimal` | `xsd:double` | 92,014 |
+| `EPSSAssessment.epssScore` | `xsd:decimal` | `xsd:double` | 9,026 |
+| `EPSSAssessment.epssPercentile` | `xsd:decimal` | `xsd:double` | 9,026 |
+| `Forge.forgeUrl` | `xsd:anyURI` | `xsd:string` | 1,191 |
+| `PackageIdentity.purl` | `xsd:anyURI` | `xsd:string` | 2,674 |
+| `TransparencyLogEntry.logIndex` | `xsd:long` | `xsd:int` | 142 |
+| `Builder.builderId` | `xsd:anyURI` | `xsd:string` | 1 |
 
-`CVSSScore.baseScore` at 67% (not 100%) means *some* producers get it right —
-worth finding which, since that settles whether the shape or the collector is
-wrong.
+Three reasons to fix these on the collector side rather than relax the shapes:
+
+1. **`purl` proves the codebase already agrees with the shape.** 662,690 purl
+   literals are correctly `xsd:anyURI`; only 2,674 are `xsd:string`. This is an
+   inconsistency among emitters, not a shape that nobody can satisfy.
+2. **`logIndex` as `xsd:int` is a latent overflow bug.** `xsd:int` is 32-bit
+   and Rekor transparency-log indices are already in the hundreds of millions.
+   The shape's `xsd:long` is correct and the collector will break on its own.
+3. **`decimal` is the right type for CVSS and EPSS scores.** They are exact
+   decimal quantities; `xsd:double` is binary floating point, so values round-
+   trip inexactly and equality comparisons in SPARQL become unreliable.
 
 ## Finding 4 — real data-quality violations
 
 These are neither naming nor datatype artifacts. They are the findings worth
 filing as collector bugs.
 
-| Constraint | Violations | Rate | Reading |
+| Constraint | Violations | Rate | Diagnosed cause |
 |---|---|---|---|
-| `PackageIdentity.purl` `minCount` | 3,826,660 | 89.9% | purl emitted by only a few collectors |
-| `Dependency.hasVersionConstraint` `sh:class` | 1,385,911 | 17.5% | constraint node not typed `VersionConstraint` |
-| `CVSSScore.baseScore` `minCount` | 31,863 | 33.0% | a third of CVSS scores have no base score |
-| `Dependency.dependencyTarget` `sh:class` | 293,331 | 3.7% | target not under `PackageEntity` |
+| `PackageIdentity.purl` `minCount` | 3,826,660 | 89.9% | RPM-family + openSUSE collectors never emit purl |
+| `Dependency.hasVersionConstraint` `sh:class` | 1,385,911 | 17.5% | 1,405,318 constraint nodes are **untyped** |
+| `CVSSScore.baseScore` `minCount` | 31,863 | 33.0% | all 30,016 in `graph/security/osv` |
+| `Dependency.dependencyTarget` `sh:class` | 293,331 | 3.7% | 29,555 target nodes are **untyped** |
 | `RangeEvent.eventVersion` `maxCount` | 22,781 | 7.1% | multiple versions on one event |
-| `CVSSScore.vectorString` `maxCount` | 7,513 | 7.8% | duplicate vector strings |
-| `PackageIdentity.purl` `maxCount` | 9,422 | 0.22% | more than one purl per identity |
-| `VersionConstraint.versionConstraintValue` `maxCount` | 14,014 | 0.60% | |
+| `VersionConstraint.versionConstraintValue` `maxCount` | 14,031 | 0.60% | |
+| `CVSSScore.vectorString` `maxCount` | 7,519 | 7.8% | duplicate vector strings |
+| `PackageIdentity.purl` `maxCount` | 7,215 | 0.17% | conflicting purls on one identity |
 | `NixPackage.attrPath` `maxCount` | 1,689 | 1.5% | |
-| `Person.name` `maxCount` | 218 | 0.84% | |
+| `Person.name` `maxCount` | 498 | 0.84% | |
 
-`PackageIdentity.purl` at 89.9% missing is the one to weigh first: purl is the
-cross-ecosystem join key, and nine in ten identities lack it.
+Two diagnoses change the fix:
+
+**The `sh:class` failures are missing type triples, not wrong targets.** Both
+offending object sets are entirely `<UNTYPED>` — 1,405,318 version-constraint
+nodes and 29,555 dependency-target nodes carry no `rdf:type` at all. The
+corpus has 2,340,586 correctly typed `VersionConstraint` instances, so roughly
+37% of constraint nodes are emitted without their type triple. One emitter
+path, not a modelling disagreement.
+
+**`purl` is missing by ecosystem, not at random.** The top graphs are
+`opensuse/tumbleweed` (546,218), `fedora/rawhide` (511,603), `fedora/43`
+(441,246), `fedora/42` (440,264) — RPM-family only. Maven, PyPI, npm and Cargo
+emit it. purl is the cross-ecosystem join key, so fixing `rpm.rs` alone
+recovers the bulk of 3.8M.
+
+**Caveat on `maxCount` counts.** The figures above are same-graph counts, which
+is the honest scope: `shape-check.json` counts values across the union of all
+named graphs, so a subject appearing in several graphs with a different value
+in each registers as a violation that does not exist within any single graph.
+The two forms also count different units (distinct subjects vs. subject/graph
+pairs), so they are not directly comparable. Only
+`DistributionRelease.repoType` was purely a union-graph artifact (1 → 0); the
+rest are real within individual graphs.
 
 ## Finding 5 — undeclared vocabulary
 
@@ -214,26 +255,88 @@ Five NodeShapes target `PackageIdentity` (`PackageIdentityShape`, `PURLShape`,
 twice. Harmless to correctness, but it double-counts in any report and makes
 "which shape failed" ambiguous.
 
-## Recommended sequence
+## Resolution plan
 
-Do **not** turn on a CI gate first. 43 constraints violate today; a gate would
-go permanently red and tell you nothing about whether the shapes or the
-collectors are wrong.
+Every violating constraint has been triaged to a side. Do **not** turn on a CI
+gate first: 43 constraints violate today, so a gate would go permanently red
+without telling anyone which side is wrong.
 
-1. **Ontology fixes** — `PackageIdentityShape` → `packageName` (−4.25M
-   violations); drop redundant `rdfs:label` `minCount` from the six shapes whose
-   class has a name property (−5.24M); declare the 28 undeclared properties and
-   2 classes, or remove them from the collectors.
-2. **Collector fixes** — NVD `rdfs:label` (46,010); the six 100% datatype
-   mismatches; `CVSSScore.baseScore` missing on 33%.
-3. **Re-run both scripts.** Everything above is mechanical; the residue is the
-   real backlog.
-4. **Then gate.** Coverage regression is the cheap, CI-able one: baseline the
-   numbers and fail when they drop. Conformance is a nightly job — the full
-   sweep is 300 queries and the `PackageIdentity` drill-down alone took 42.9s.
-5. **Fix the upstream script or delete it.** `production_shacl_validate.py`
-   exits 0 on total failure; leaving it in place is worse than having nothing,
-   because it looks like coverage.
+### Step 1 — ontology repo, 4 edits, removes ~9.4M violations
+
+| Edit | File | Removes |
+|---|---|---|
+| `PackageIdentityShape`: `sh:path pkg:identityName` → `pkg:packageName` | `core/core.shacl.ttl:278` | 4,253,705 |
+| Drop `rdfs:label` `minCount` from `PackageIdentityShape` | `core/core.shacl.ttl` | 4,256,379 |
+| Drop `rdfs:label` `minCount` from `CapabilityShape` | `core/core.shacl.ttl` | 908,627 |
+| Drop `rdfs:label` `minCount` from `DataQualityIssueShape` | `extensions/dq/dq.shacl.ttl` | 63,252 |
+
+Each of these three classes has a working discriminator
+(`packageName`, `capabilityName`, `issueType`) so the label requirement is
+redundant. Do **not** drop it from `VulnerabilityShape`, `LicenseShape`,
+`DistributionShape` or `DistributionReleaseShape` — those are collector bugs.
+
+Also in the ontology, not violation-reducing but load-bearing:
+
+- **Declare the 28 undeclared properties and 2 classes**, or delete them from
+  the collectors. `rpm:rpmProvides` alone is 6.56M triples that no consumer can
+  discover from the published ontology.
+- **Add a shape-hygiene check to `make validate`** asserting that every
+  `sh:path` and `sh:targetClass` resolves to a declared term. That check would
+  have caught `nix:attrPath` and `nix:NixPackage`, which exist only in
+  `nix.shacl.ttl` and are declared nowhere.
+- **Collapse the five NodeShapes targeting `PackageIdentity`** (finding 7), or
+  accept that violations against it are double-reported.
+
+### Step 2 — collectors, by expected impact
+
+| Fix | Where | Removes |
+|---|---|---|
+| Emit `purl` for RPM-family + openSUSE | `rpm.rs` | ~3.8M |
+| Emit `rdf:type pkg:VersionConstraint` on constraint nodes | version-constraint emitter | 1,405,318 |
+| `Repository.repositoryURL`: `xsd:string` → `xsd:anyURI` | vcs emitter | 432,667 |
+| `CVSSScore.baseScore`: `xsd:double` → `xsd:decimal` | `enrich_nvd.rs` / OSV | 92,014 |
+| Emit `rdfs:label` on `Vulnerability` (canonical CVE/OSV id) | NVD + Alpine secdb | 78,899 |
+| Give `pkg:License` nodes any content at all | license emitter | 19,858 |
+| Emit `CVSSScore.baseScore` where missing | OSV collector | 30,016 |
+| Emit `rdf:type` on dependency-target nodes | dependency emitter | 29,555 |
+| `EPSS` score/percentile: `xsd:double` → `xsd:decimal` | `enrich_epss.rs` | 18,052 |
+| Dedupe `RangeEvent.eventVersion` | OSV range emitter | 22,781 |
+| Dedupe `VersionConstraint.versionConstraintValue` | version-constraint emitter | 14,031 |
+| Dedupe `CVSSScore.vectorString` | CVSS emitter | 7,519 |
+| Resolve conflicting `purl` per identity | purl emitter | 7,215 |
+| `Forge.forgeUrl`, `Builder.builderId`, `purl`: → `xsd:anyURI` | respective emitters | 3,866 |
+| `TransparencyLogEntry.logIndex`: `xsd:int` → `xsd:long` | attestation emitter | 142 |
+| Emit `label` / `distributionName` / `repoType` on the 24–31 `Distribution` and `DistributionRelease` singletons | distro metadata emitter | ~100 |
+
+The datatype rows are a single mechanical sweep — pick the right `xsd:` type at
+the emit site. The dedupe rows need a look at *why* two values arrive, which
+may be one upstream record parsed twice.
+
+### Step 3 — one modelling question to settle, not fix
+
+`Distribution.distributionName` and `DistributionRelease.repoType` are missing
+on `gentoo`, `void`, `snap`, `rubygems`, `pypi`, `nuget` — the language
+ecosystems and app stores, which are modelled as `Distribution` but have no
+distribution name or repo type in any meaningful sense. Either they should not
+be `Distribution`, or those properties should not be required. Volume is
+trivial (one node per graph); the modelling answer is not.
+
+### Step 4 — re-run, then gate
+
+Re-run both checkers. Everything in steps 1–2 is mechanical, so what survives
+is the real backlog. Then:
+
+- **Coverage regression in CI** — cheap (two queries), baseline the numbers,
+  fail when they drop.
+- **Conformance nightly** — 300 queries; the `PackageIdentity` drill-down alone
+  took 42.9s, and some legitimate aggregates exceed the proxy's 60s
+  `proxy_read_timeout` (a `License` histogram returned HTTP 504), so this
+  belongs on the host against port 7001 rather than through the public proxy.
+
+### Step 5 — delete or fix the upstream script
+
+`production_shacl_validate.py` exits 0 on total failure. Leaving it in place is
+worse than having nothing, because it looks like coverage.
 
 ## Also fixed during this audit
 
