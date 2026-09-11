@@ -946,6 +946,12 @@ enum Commands {
         #[arg(long, required = true, value_parser = ["rhsa", "dsa"])]
         advisory_type: String,
 
+        /// SPARQL endpoint URL (used by RHSA to resolve advisoryForPackage
+        /// against currently-collected RHEL/AlmaLinux/Rocky packages; DSA
+        /// doesn't query it but still requires the flag for a uniform CLI)
+        #[arg(long, required = true)]
+        endpoint: String,
+
         /// Output N-Triples file
         #[arg(short, long, required = true)]
         output: String,
@@ -1310,6 +1316,18 @@ enum Commands {
         /// Output N-Triples file
         #[arg(short, long, required = true)]
         output: String,
+
+        /// TLS client certificate PEM file (for RHEL CDN access)
+        #[arg(long)]
+        sslclientcert: Option<String>,
+
+        /// TLS client key PEM file (for RHEL CDN access)
+        #[arg(long)]
+        sslclientkey: Option<String>,
+
+        /// TLS CA certificate PEM file (for RHEL CDN access)
+        #[arg(long)]
+        sslcacert: Option<String>,
 
         /// Enable Koji build provenance enrichment
         #[arg(long)]
@@ -2802,6 +2820,7 @@ fn main() {
 
         Commands::EnrichAdvisory {
             advisory_type,
+            endpoint,
             output,
             days_back,
             cache_dir,
@@ -2815,11 +2834,19 @@ fn main() {
                 "=== PackageGraph Advisory Enricher ({}) ===",
                 advisory_type.to_uppercase()
             );
+            eprintln!("Endpoint: {}", endpoint);
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let enricher = AdvisoryEnricher::new(at, days_back, cache_dir.as_deref())
-                .with_graph(graph_uri.clone());
+            let enricher = AdvisoryEnricher::new(
+                at,
+                days_back,
+                cache_dir.as_deref(),
+                &endpoint,
+                auth.clone(),
+                make_backend(),
+            )
+            .with_graph(graph_uri.clone());
             enricher.enrich(&output)
         }
 
@@ -3477,6 +3504,9 @@ fn main() {
             distro,
             release,
             output,
+            sslclientcert,
+            sslclientkey,
+            sslcacert,
             with_koji,
             koji_hub,
             with_spec,
@@ -3522,9 +3552,29 @@ fn main() {
                 let mut total_triples = 0;
 
                 // Stage 1: Multi-arch RPM collection
+                let use_tls = sslclientcert.is_some();
+                if use_tls {
+                    eprintln!(
+                        "TLS client cert: {}",
+                        sslclientcert.as_deref().unwrap_or("")
+                    );
+                }
                 for (i, url) in urls.iter().enumerate() {
                     eprintln!("\n--- Arch {} of {} ---", i + 1, urls.len());
-                    let collector = RpmCollector::new(url.clone(), distro.clone(), release.clone());
+                    let collector = if let (Some(cert), Some(key), Some(ca)) =
+                        (&sslclientcert, &sslclientkey, &sslcacert)
+                    {
+                        RpmCollector::new_with_tls(
+                            url.clone(),
+                            distro.clone(),
+                            release.clone(),
+                            cert,
+                            key,
+                            ca,
+                        )
+                    } else {
+                        RpmCollector::new(url.clone(), distro.clone(), release.clone())
+                    };
                     let collector = if let Some(ref dir) = cache_dir {
                         collector.with_cache(dir)?
                     } else {

@@ -393,9 +393,22 @@ x86_64+aarch64 URL pair, same periodic cache-sync loop baked in from
 creation -- see the fedora-43-full incident below for why that loop
 matters). Weekly cadence (stable RHEL rebuild, low churn), staggered at
 04:00 UTC across Mon/Tue/Wed/Thu to avoid clustering with the existing
-02:00-03:00 rpm-full jobs. `rhel/9`/`rhel/10` themselves are not collected
-here -- RHEL package repos require a subscription; only the diff target
-(RHEL) is currently absent, not this session's four rebuild-distro sides.
+02:00-03:00 rpm-full jobs.
+
+**`rhel-9-full`, `rhel-10-full`** were added 2026-09-11, filling in the
+`rhel/9`/`rhel/10` graphs the alma/rocky drift analysis above already
+expected as its comparison target. Authenticates via `rpm-full`'s TLS
+client-cert flags (`--sslclientcert`/`--sslclientkey`/`--sslcacert`,
+mirroring the pre-existing `Rpm` subcommand's own flags of the same
+name): the scripts glob `/etc/pki/entitlement/[0-9]*.pem` for the cert
+(its filename embeds a serial number that rotates on renewal) and point
+`--sslcacert` at `/etc/rhsm/ca/redhat-uep.pem`. Both paths are bind-mounted
+read-only into `pg-collect@.container` unconditionally -- harmless for
+every other collector, but this does couple the shared template to these
+two host paths existing. Weekly cadence, Fri/Sat 04:00 UTC (continuing the
+alma/rocky stagger). See `docs/rhel-collection.md` for the TLS setup and
+`docs/superpowers/specs/2026-09-10-rhel-collection-rhsa-correlation-design.md`
+for how RHSA advisories get correlated against packages collected here.
 
 Install:
 

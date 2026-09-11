@@ -1,0 +1,19 @@
+# Schedules pg-collect@rhel-10-full.service (deploy/quadlet/collectors/pg-collect@.container,
+# instantiated with %i=rhel-10-full, script: scripts/collectors/rhel-10-full.sh).
+# Plain systemd timer, not a quadlet unit -- Podman Quadlet has no .timer
+# generator (see qlever-rebuild-index.timer's comment) -- installed as-is
+# under /etc/systemd/system/.
+
+[Unit]
+Description=Schedule for pg-collect@rhel-10-full.service
+
+# Cadence: stable RHEL release, weekly is plenty. Continues the
+# almalinux/rocky/rhel-9 Mon-Fri 04:00 UTC stagger onto Saturday.
+[Timer]
+OnCalendar=Sat *-*-* 04:00:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pg-collect@rhel-10-full.service
+
+[Install]
+WantedBy=timers.target

@@ -19,6 +19,7 @@ for TYPE in rhsa dsa; do
   ENRICH_OK=0
   pg-collect enrich-advisory \
     --advisory-type "$TYPE" \
+    --endpoint "$FUSEKI_ENDPOINT" \
     -o "/tmp/enrichment/advisory_${TYPE}.nt" \
     --cache-dir "${CACHE_DIR}" \
     --days-back 365 || ENRICH_OK=$?
