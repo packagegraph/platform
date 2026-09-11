@@ -119,8 +119,14 @@ impl RpmCollector {
         }
     }
 
+    /// Reuses `self.client` rather than `SourceCache::new`'s plain default
+    /// client -- essential when this collector was built with
+    /// `new_with_tls`/`new_with_tls_and_repo_type`, since `SourceCache`
+    /// downloads every cached fetch through its own client, and a plain
+    /// client silently has no TLS client-cert for RHEL CDN auth (see
+    /// `SourceCache::with_client`'s doc comment).
     pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
-        self.source_cache = Some(SourceCache::new(cache_dir, "rpm")?);
+        self.source_cache = Some(SourceCache::with_client(cache_dir, "rpm", self.client.clone())?);
         Ok(self)
     }
 
