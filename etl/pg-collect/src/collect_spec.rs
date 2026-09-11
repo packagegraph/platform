@@ -318,21 +318,31 @@ impl SpecCollector {
     fn fetch_spec(&self, source_name: &str) -> Result<String> {
         let urls = self.spec_urls(source_name);
 
+        let mut last_err: Option<std::io::Error> = None;
         for url in &urls {
             match self.fetch_url(url, source_name) {
                 Ok(content) => return Ok(content),
-                Err(_) => continue,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
             }
         }
 
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
+        let detail = match last_err {
+            Some(e) => format!(
+                "Spec file not found for {} (tried {} URLs; last error: {})",
+                source_name,
+                urls.len(),
+                e
+            ),
+            None => format!(
                 "Spec file not found for {} (tried {} URLs)",
                 source_name,
                 urls.len()
             ),
-        ))
+        };
+        Err(std::io::Error::new(std::io::ErrorKind::NotFound, detail))
     }
 
     fn spec_urls(&self, source_name: &str) -> Vec<String> {

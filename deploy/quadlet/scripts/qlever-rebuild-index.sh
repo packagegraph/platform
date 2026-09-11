@@ -204,23 +204,36 @@ fi
 # DeleteObject -- and the bucket is unversioned, so the old bytes are
 # actually freed, not retained under a hidden version) so the exact same
 # duplication doesn't get rediscovered and reclaimed on every future run.
-echo "Deduplicating graphs by URI (keep newest upload per graph)..."
+echo "Deduplicating graphs by URI (keep newest non-empty upload per graph)..."
 : > /tmp/graph-candidates.txt
 for graph_file in /tmp/nt-output/*.graph; do
     nt_file="${graph_file%.graph}"
     graph_uri=$(tr -d '\n' < "$graph_file")
     mtime=$(stat -c '%Y' "$nt_file")
-    printf '%s\t%s\t%s\n' "$graph_uri" "$mtime" "$graph_file" >> /tmp/graph-candidates.txt
+    size=$(stat -c '%s' "$nt_file")
+    # A reclaimed (zeroed) file's mtime is refreshed to the time of the
+    # reclaim PUT, making it look newer than the real data it replaced.
+    # Without this guard, the *next* run sees the now-empty file as
+    # "newest" and reclaims the actual good copy instead -- a two-run
+    # oscillation that destroyed ubuntu-noble and ~20 other graphs'
+    # only good copies in production on 2026-09-11. A size-0 file must
+    # never outrank a non-empty one, so the nonzero flag sorts ahead of
+    # mtime; only among candidates in the same zero/nonzero class does
+    # mtime decide.
+    nonzero=1
+    [ "$size" -eq 0 ] && nonzero=0
+    printf '%s\t%s\t%s\t%s\n' "$graph_uri" "$nonzero" "$mtime" "$graph_file" >> /tmp/graph-candidates.txt
 done
-sort -t "$(printf '\t')" -k1,1 -k2,2nr /tmp/graph-candidates.txt > /tmp/graph-candidates-sorted.txt
+sort -t "$(printf '\t')" -k1,1 -k2,2nr -k3,3nr /tmp/graph-candidates.txt > /tmp/graph-candidates-sorted.txt
 rm -f /tmp/graph-candidates.txt
 
 : > /tmp/winning-graphs.txt
 STALE_COUNT=0
 LAST_URI=""
-while IFS=$'\t' read -r graph_uri _mtime graph_file; do
+while IFS=$'\t' read -r graph_uri _nonzero _mtime graph_file; do
     if [ "$graph_uri" != "$LAST_URI" ]; then
-        # Newest entry for this URI (sorted mtime-descending) -- winner.
+        # Newest non-empty entry for this URI (nonzero-first, then
+        # mtime-descending) -- winner.
         echo "$graph_file" >> /tmp/winning-graphs.txt
         LAST_URI="$graph_uri"
     else

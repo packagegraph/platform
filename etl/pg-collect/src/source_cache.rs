@@ -12,9 +12,16 @@ use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
+
+/// Counter for unique temp file names within a process (mirrors
+/// `http_cache.rs`'s `TEMP_COUNTER` pattern for atomic tmp-file + rename
+/// writes). Kept as its own separate static -- see this file's top-of-file
+/// doc comment on why `SourceCache` and `HttpCache` stay independent types.
+static MANIFEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Scope identifier for a cached artifact.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -264,13 +271,10 @@ impl SourceCache {
         manifest_path: &Path,
         logical_name: &str,
     ) -> io::Result<Option<ArtifactMeta>> {
-        if !manifest_path.exists() {
-            return Ok(None);
-        }
-
-        let content = fs::read_to_string(manifest_path)?;
-        let manifest: CacheManifest = serde_json::from_str(&content)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let manifest = match self.load_manifest(manifest_path)? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
 
         Ok(manifest
             .artifacts
@@ -278,23 +282,47 @@ impl SourceCache {
             .find(|a| a.logical_name == logical_name))
     }
 
+    /// Load and parse a manifest file, self-healing on corruption.
+    ///
+    /// Returns `Ok(None)` if the file doesn't exist OR fails to parse (a
+    /// truncated file from a SIGTERM/OOM mid-write, disk corruption,
+    /// etc.). In the parse-failure case, the corrupt file is deleted
+    /// (best-effort) so it can't keep failing every subsequent call --
+    /// this is what caused ~24,000 spec fetches to hard-fail from one
+    /// truncated shared manifest.json (2026-09-11 fedora-43 incident).
+    /// Genuine IO errors (permission denied, etc.) still propagate.
+    fn load_manifest(&self, manifest_path: &Path) -> io::Result<Option<CacheManifest>> {
+        if !manifest_path.exists() {
+            return Ok(None);
+        }
+
+        let content = fs::read_to_string(manifest_path)?;
+        match serde_json::from_str::<CacheManifest>(&content) {
+            Ok(manifest) => Ok(Some(manifest)),
+            Err(e) => {
+                eprintln!(
+                    "Warning: evicting unparseable cache manifest {}: {}",
+                    manifest_path.display(),
+                    e
+                );
+                let _ = fs::remove_file(manifest_path);
+                Ok(None)
+            }
+        }
+    }
+
     fn write_manifest(&self, scope: &CacheScope, new_meta: ArtifactMeta) -> io::Result<()> {
         let manifest_path = self.manifest_path(scope);
         fs::create_dir_all(manifest_path.parent().unwrap())?;
 
-        // Read existing manifest or create new
-        let mut manifest = if manifest_path.exists() {
-            let content = fs::read_to_string(&manifest_path)?;
-            serde_json::from_str::<CacheManifest>(&content)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
-        } else {
-            CacheManifest {
+        let mut manifest = self
+            .load_manifest(&manifest_path)?
+            .unwrap_or_else(|| CacheManifest {
                 schema: "artifact-cache/v1".to_string(),
                 collector: self.collector_name.clone(),
                 scope: scope.clone(),
                 artifacts: Vec::new(),
-            }
-        };
+            });
 
         // Update or append artifact metadata
         if let Some(existing) = manifest
@@ -307,11 +335,39 @@ impl SourceCache {
             manifest.artifacts.push(new_meta);
         }
 
-        // Write manifest
-        let content = serde_json::to_string_pretty(&manifest)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        fs::write(&manifest_path, content)?;
+        self.write_manifest_atomic(&manifest_path, &manifest)
+    }
 
+    /// Serialize and write a manifest atomically via temp file + rename.
+    ///
+    /// Mirrors `http_cache.rs`'s `write_envelope_atomic`: write to a
+    /// uniquely-named `.tmp` file in the same directory, `sync_all()` it,
+    /// drop the handle, then `fs::rename` over the target. Rename within
+    /// the same directory is atomic on POSIX filesystems, so a process
+    /// kill (SIGTERM via `systemctl stop`, OOM) can never leave a
+    /// truncated/corrupt `manifest.json` -- readers see either the old
+    /// complete file or the new complete file, never a partial one.
+    fn write_manifest_atomic(
+        &self,
+        manifest_path: &Path,
+        manifest: &CacheManifest,
+    ) -> io::Result<()> {
+        let parent = manifest_path.parent().unwrap();
+        fs::create_dir_all(parent)?;
+
+        let counter = MANIFEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let tmp_path = parent.join(format!("manifest.json.{}.{}.tmp", pid, counter));
+
+        let content = serde_json::to_string_pretty(manifest)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+
+        fs::rename(&tmp_path, manifest_path)?;
         Ok(())
     }
 }
@@ -444,5 +500,203 @@ mod tests {
         // Verify SHA-256 hash
         let expected_hash = format!("{:x}", Sha256::digest(b"content"));
         assert_eq!(manifest.artifacts[0].sha256, expected_hash);
+    }
+
+    #[test]
+    fn test_corrupt_manifest_treated_as_cache_miss() {
+        let tmp = TempDir::new().unwrap();
+        let cache = SourceCache::new(tmp.path().to_str().unwrap(), "test").unwrap();
+
+        let scope = CacheScope {
+            collector: "test".to_string(),
+            distro: "fedora".to_string(),
+            release: "43".to_string(),
+            repo: Some("fedora".to_string()),
+            arch: Some("x86_64".to_string()),
+        };
+
+        // Simulate a SIGTERM/OOM mid-write: manifest.json exists but is
+        // truncated garbage, exactly like the live fedora-43 incident.
+        let manifest_path = cache.manifest_path(&scope);
+        fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        fs::write(&manifest_path, b"{\"schema\": \"artifact-cache/v1\", \"artifacts\": [ { \"logical_nam")
+            .unwrap();
+
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/repomd.xml")
+            .with_status(200)
+            .with_header("etag", "\"abc123\"")
+            .with_body("test content")
+            .create();
+
+        let url = format!("{}/repomd.xml", server.url());
+
+        // Must NOT hard-fail: corrupt manifest => cache miss => fresh download.
+        let result = cache
+            .fetch_or_reuse(&url, &scope, "repomd.xml")
+            .expect("corrupt manifest must be treated as a cache miss, not an error");
+
+        mock.assert();
+        match result {
+            CacheResult::Fresh(bytes) => assert_eq!(bytes, b"test content"),
+            _ => panic!("Expected Fresh, got {:?}", result),
+        }
+
+        // Manifest must now be valid JSON reflecting the fresh write.
+        let content = fs::read_to_string(&manifest_path).unwrap();
+        let manifest: CacheManifest = serde_json::from_str(&content)
+            .expect("manifest must be valid JSON after self-healing write");
+        assert_eq!(manifest.artifacts.len(), 1);
+        assert_eq!(manifest.artifacts[0].logical_name, "repomd.xml");
+    }
+
+    #[test]
+    fn test_write_recovers_from_corrupt_existing_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let cache = SourceCache::new(tmp.path().to_str().unwrap(), "test").unwrap();
+
+        let scope = CacheScope {
+            collector: "test".to_string(),
+            distro: "fedora".to_string(),
+            release: "43".to_string(),
+            repo: None,
+            arch: None,
+        };
+
+        // Corrupt manifest already on disk before any fetch happens (e.g.
+        // left behind by a killed prior run for a *different* artifact).
+        let manifest_path = cache.manifest_path(&scope);
+        fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        fs::write(&manifest_path, b"not even close to json").unwrap();
+
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/primary.xml")
+            .with_status(200)
+            .with_body("primary content")
+            .create();
+        let url = format!("{}/primary.xml", server.url());
+
+        cache
+            .fetch_or_reuse(&url, &scope, "primary.xml")
+            .expect("write against a corrupt existing manifest must succeed");
+        mock.assert();
+
+        // The write must have produced a fresh, valid, single-entry manifest
+        // rather than propagating the old corruption or erroring out.
+        let content = fs::read_to_string(&manifest_path).unwrap();
+        let manifest: CacheManifest = serde_json::from_str(&content).unwrap();
+        assert_eq!(manifest.artifacts.len(), 1);
+        assert_eq!(manifest.artifacts[0].logical_name, "primary.xml");
+    }
+
+    #[test]
+    fn test_stray_tmp_file_does_not_affect_read_or_write() {
+        let tmp = TempDir::new().unwrap();
+        let cache = SourceCache::new(tmp.path().to_str().unwrap(), "test").unwrap();
+
+        let scope = CacheScope {
+            collector: "test".to_string(),
+            distro: "fedora".to_string(),
+            release: "43".to_string(),
+            repo: None,
+            arch: None,
+        };
+
+        let mut server = mockito::Server::new();
+        let url = format!("{}/repomd.xml", server.url());
+
+        // First write: establishes a valid manifest.json.
+        let mock1 = server
+            .mock("GET", "/repomd.xml")
+            .with_status(200)
+            .with_header("etag", "\"abc123\"")
+            .with_body("first content")
+            .create();
+        cache.fetch_or_reuse(&url, &scope, "repomd.xml").unwrap();
+        mock1.assert();
+
+        // Simulate a crashed write: a stray .tmp file left in the same
+        // directory as manifest.json (process killed after File::create
+        // but before fs::rename).
+        let manifest_path = cache.manifest_path(&scope);
+        let stray_tmp = manifest_path
+            .parent()
+            .unwrap()
+            .join("manifest.json.999999.0.tmp");
+        fs::write(&stray_tmp, b"garbage from a crashed write").unwrap();
+
+        // A subsequent read (via 304) must still see the real manifest,
+        // untouched by the stray tmp file.
+        let mock2 = server
+            .mock("GET", "/repomd.xml")
+            .match_header("if-none-match", "\"abc123\"")
+            .with_status(304)
+            .create();
+        let result = cache.fetch_or_reuse(&url, &scope, "repomd.xml").unwrap();
+        mock2.assert();
+        assert!(matches!(result, CacheResult::NotModified(_)));
+
+        // A subsequent write must also succeed cleanly, ignoring the stray tmp.
+        let mock3 = server
+            .mock("GET", "/repomd.xml")
+            .with_status(200)
+            .with_header("etag", "\"def456\"")
+            .with_body("second content")
+            .create();
+        cache.fetch_or_reuse(&url, &scope, "repomd.xml").unwrap();
+        mock3.assert();
+
+        let content = fs::read_to_string(&manifest_path).unwrap();
+        let manifest: CacheManifest = serde_json::from_str(&content).unwrap();
+        assert_eq!(manifest.artifacts.len(), 1);
+        assert_eq!(
+            manifest.artifacts[0].sha256,
+            format!("{:x}", Sha256::digest(b"second content"))
+        );
+
+        // Stray tmp file is inert leftover cruft, not touched by our code
+        // path (only the target manifest.json is managed) — confirm it's
+        // simply ignored rather than corrupting anything.
+        assert!(stray_tmp.exists());
+    }
+
+    #[test]
+    fn test_fetch_or_reuse_returns_err_only_for_real_io_errors() {
+        // Guard against a regression where corruption-tolerance
+        // accidentally swallows genuine IO errors (e.g. permission denied)
+        // too. Uses a manifest path that is a directory (not a file) to
+        // force a real fs::read_to_string error distinct from a parse error.
+        let tmp = TempDir::new().unwrap();
+        let cache = SourceCache::new(tmp.path().to_str().unwrap(), "test").unwrap();
+
+        let scope = CacheScope {
+            collector: "test".to_string(),
+            distro: "fedora".to_string(),
+            release: "43".to_string(),
+            repo: None,
+            arch: None,
+        };
+
+        let manifest_path = cache.manifest_path(&scope);
+        fs::create_dir_all(&manifest_path).unwrap(); // manifest.json is a directory, not a file
+
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/repomd.xml")
+            .with_status(200)
+            .with_body("content")
+            .expect(0) // the read error must occur before the HTTP call is ever attempted
+            .create();
+        let url = format!("{}/repomd.xml", server.url());
+
+        // Real IO errors (not "file has malformed JSON") must still surface.
+        let result = cache.fetch_or_reuse(&url, &scope, "repomd.xml");
+        assert!(
+            result.is_err(),
+            "a genuine IO error (path is a directory) must not be silently swallowed"
+        );
+        mock.assert();
     }
 }
