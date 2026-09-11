@@ -315,6 +315,18 @@ impl HttpTransport {
     /// exactly, so it can be passed straight through as
     /// `|u, e| transport.get(u, e)` without changing `cached_fetch.rs`.
     pub fn get(&self, url: &str, if_none_match: Option<&str>) -> Result<HttpResponse, FetchError> {
+        self.get_with(url, &[], if_none_match)
+    }
+
+    /// Like [`get`](Self::get), with extra request headers applied to every
+    /// attempt -- e.g. hackage's `Accept: application/json` or the snap
+    /// store's `Snap-Device-Series`.
+    pub fn get_with(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        if_none_match: Option<&str>,
+    ) -> Result<HttpResponse, FetchError> {
         let host = host_of(url);
         let mut attempt: u32 = 0;
 
@@ -325,7 +337,7 @@ impl HttpTransport {
             let Attempt {
                 result,
                 retry_after,
-            } = self.send_once(url, if_none_match);
+            } = self.send_once(url, headers, if_none_match);
 
             let err = match result {
                 Ok(response) => {
@@ -363,8 +375,16 @@ impl HttpTransport {
         }
     }
 
-    fn send_once(&self, url: &str, if_none_match: Option<&str>) -> Attempt {
+    fn send_once(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        if_none_match: Option<&str>,
+    ) -> Attempt {
         let mut request = self.client.get(url);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
         if let Some(etag) = if_none_match {
             request = request.header(IF_NONE_MATCH, etag);
         }
@@ -832,6 +852,56 @@ mod tests {
             "Retry-After must be obeyed verbatim, not jittered down"
         );
         assert_eq!(t.stats().rate_limited, 1);
+    }
+
+    #[test]
+    fn get_with_sends_caller_supplied_headers() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/hdr")
+            .match_header("accept", "application/json")
+            .match_header("snap-device-series", "16")
+            .with_status(200)
+            .with_body("ok")
+            .expect(1)
+            .create();
+
+        let t = test_transport(fast_policy(5));
+        let resp = t
+            .get_with(
+                &format!("{}/hdr", server.url()),
+                &[("Accept", "application/json"), ("Snap-Device-Series", "16")],
+                None,
+            )
+            .unwrap();
+
+        mock.assert();
+        assert_eq!(resp.bytes, b"ok");
+    }
+
+    #[test]
+    fn get_with_retries_carry_the_headers_on_every_attempt() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/hdr-retry")
+            .match_header("accept", "application/json")
+            .with_status(503)
+            .expect(3)
+            .create();
+
+        let t = test_transport(fast_policy(3));
+        let err = t
+            .get_with(
+                &format!("{}/hdr-retry", server.url()),
+                &[("Accept", "application/json")],
+                None,
+            )
+            .unwrap_err();
+
+        // All three attempts matched the header matcher, so headers are not
+        // lost on retry.
+        mock.assert();
+        assert!(matches!(err, FetchError::HttpStatus { status: 503, .. }));
     }
 
     #[test]
