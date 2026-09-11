@@ -21,10 +21,19 @@ that have data. **43 violate, 257 are clean, 0 errored.**
 | Properties | 212 | 1005 | 21.1% |
 | `sh:targetClass` shapes with instances | 62 | 115 | 53.9% |
 
-And the inverse: **28 properties and 2 classes are emitted, at volume, that the
-ontology never declares.** Including `rpm:rpmProvides` (6.56M uses),
-`rpm:rpmRequires` (4.51M), `deb:debDepends` (1.46M), and `core:checksum`
-(1.13M) — none of which appear anywhere in the ontology, not even in a shape.
+And the inverse: **28 properties and 2 classes are emitted into the production
+graph in a role the ontology does not declare.** Including `rpm:rpmProvides`
+(6.56M uses), `rpm:rpmRequires` (4.51M), `deb:debDepends` (1.46M), and
+`core:checksum` (1.13M) — none of which appear anywhere in the ontology, not
+even in a shape — plus `rpm:RPMGroup` (523,728), which is declared as a class
+and written as a predicate.
+
+Scanning the collector source instead of the graph finds **61**: 60 terms with
+no declaration at all, and that one role violation. The two figures count
+different things and neither supersedes the other — the graph shows what
+actually shipped, the source shows what the code can emit including paths that
+have not run. Both are stated wherever they are used; earlier drafts quoted
+"28+2" and "29+1" interchangeably, which was simply unreconciled arithmetic.
 
 The headline: **the ontology is a sound specification and the collectors have
 drifted from it.** Not one of the 43 violations is best fixed by weakening a
@@ -115,6 +124,15 @@ clearest evidence that the requirement is satisfiable and the shape is right.
 
 ## Finding 2 — the collectors violate `packageName`'s declared domain
 
+> **Status.** The migration described here covered 38 call sites but **missed
+> the RPM `Provides:` path**, which reaches identities through the `_once`
+> writers that the migration's pattern did not match. That path is
+> `rpmProvides` — 6,558,436 triples, the highest-volume route in the corpus —
+> so the "8,510,084 violations resolved" figure quoted when the migration
+> landed was overstated. Fixed at `rpm.rs:1385` via
+> `write_package_identity_once`, which preserves the per-file dedup that made
+> that path use `_once` to begin with. Found by independent review of PR #25.
+
 `PackageIdentityShape` requires `pkg:identityName`. Reality:
 
 | Predicate on `PackageIdentity` | Uses |
@@ -179,7 +197,7 @@ filing as collector bugs.
 
 | Constraint | Violations | Rate | Diagnosed cause |
 |---|---|---|---|
-| `PackageIdentity.purl` `minCount` | 3,826,660 | 89.9% | RPM-family + openSUSE collectors never emit purl |
+| `PackageIdentity.purl` `minCount` | 3,826,660 | 89.9% | dependency-target identities, which have no version to put in a purl — see below |
 | `Dependency.hasVersionConstraint` `sh:class` | 1,385,911 | 17.5% | 1,405,318 constraint nodes are **untyped** |
 | `CVSSScore.baseScore` `minCount` | 31,863 | 33.0% | all 30,016 in `graph/security/osv` |
 | `Dependency.dependencyTarget` `sh:class` | 293,331 | 3.7% | 29,555 target nodes are **untyped** |
@@ -202,8 +220,55 @@ path, not a modelling disagreement.
 **`purl` is missing by ecosystem, not at random.** The top graphs are
 `opensuse/tumbleweed` (546,218), `fedora/rawhide` (511,603), `fedora/43`
 (441,246), `fedora/42` (440,264) — RPM-family only. Maven, PyPI, npm and Cargo
-emit it. purl is the cross-ecosystem join key, so fixing `rpm.rs` alone
-recovers the bulk of 3.8M.
+emit it.
+
+### Correction: it is not that `rpm.rs` never emits purl
+
+An earlier draft concluded "RPM-family + openSUSE collectors never emit purl"
+and put the fix at "emit purl in `rpm.rs`". That diagnosis was wrong, and the
+fix it implied is not implementable.
+
+`rpm.rs:849` *does* emit purl, correctly typed `xsd:anyURI`, for every binary
+package it collects. What it does not emit purl for are the identity nodes it
+creates for **dependency targets** — every `requires`, `provides`, `conflicts`
+and `obsoletes` name becomes a `pkg:PackageIdentity` via
+`package_identity_uri(distro, release, arch, dep_name)`. The code says so at
+`rpm.rs:1267`: "Dependency targets point to canonical identity URI (no
+version)". With dozens of dependencies per package across four RPM-family
+distros, those nodes are the 3.8M.
+
+They have no version by construction — an RPM `Requires: libssl.so.3` names a
+capability, not a release — so no versioned purl can be synthesized for them.
+This is why the volume is RPM-family-heavy: RPM records far more fine-grained
+soname and file dependencies than Debian or the language ecosystems.
+
+### The constraint set is internally inconsistent here
+
+Three statements in the ontology cannot all hold:
+
+1. `pkg:directlyDependsOn` is `rdfs:range pkg:PackageEntity`, and its own
+   definition says "The target may be a concrete Package or a
+   **version-independent PackageIdentity**." So a version-independent identity
+   as a dependency target is explicitly sanctioned.
+2. `pkg:PackageIdentityShape` requires `sh:minCount 1` on `pkg:purl`.
+3. `pkg:PURLShape` constrains `pkg:purl` with `sh:pattern "^pkg:[a-z]+/.+@.+"`,
+   which requires an `@version` component.
+
+A version-independent identity cannot satisfy 2 and 3 together. Note also that
+in the purl specification the version component is **optional** —
+`pkg:rpm/fedora/bash` is a well-formed purl — so the pattern is stricter than
+the standard it implements.
+
+There is a second symptom of the same tension. `pkg:PackageIdentity` is
+version-agnostic by definition (`identityName` is documented as "distinct from
+the versioned `packageName`"), yet `rpm.rs` and `debian.rs` build the identity's
+purl *with* the version in it. Where a release carries two versions of one
+package, both write a different purl to the same identity URI — which is
+exactly the `maxCount` violation at 7,215. A version-less purl on the identity
+would make that class of violation impossible rather than merely rarer.
+
+This one needs an ontology-owner decision, not a collector patch; it is filed
+in the open questions below.
 
 **Caveat on `maxCount` counts.** The figures above are same-graph counts, which
 is the honest scope: `shape-check.json` counts values across the union of all
@@ -216,19 +281,23 @@ rest are real within individual graphs.
 
 ## Finding 5 — undeclared vocabulary
 
-28 properties and 2 classes are emitted that the ontology never declares.
-Highest-volume:
+28 properties and 2 classes are emitted **into the production graph** in a role
+the ontology does not declare. Highest-volume:
 
-| Term | Uses |
-|---|---|
-| `rpm:rpmProvides` | 6,558,436 |
-| `rpm:rpmRequires` | 4,507,102 |
-| `deb:debDepends` | 1,456,519 |
-| `core:checksum` | 1,129,117 |
-| `deb:debProvides` | 363,480 |
-| `core:upstreamPackageVersion` | 186,722 |
-| `nix:attrPath` | 116,156 |
-| `rpm:RPMGroup` | 523,728 |
+| Term | Uses | Problem |
+|---|---|---|
+| `rpm:rpmProvides` | 6,558,436 | undeclared |
+| `rpm:rpmRequires` | 4,507,102 | undeclared |
+| `deb:debDepends` | 1,456,519 | undeclared |
+| `core:checksum` | 1,129,117 | undeclared |
+| `rpm:RPMGroup` | 523,728 | declared `owl:Class`, written as a predicate |
+| `deb:debProvides` | 363,480 | undeclared |
+| `core:upstreamPackageVersion` | 186,722 | undeclared |
+| `nix:attrPath` | 116,156 | constrained by a shape, declared nowhere |
+
+These counts come from a historical `coverage-check.json`, not from a fresh
+sweep, and are quoted as that run's results rather than as current production
+state.
 
 `rpmProvides`, `rpmRequires` and `debDepends` appear **nowhere** in the
 ontology — not in a module, not in a shape. `core:checksum` does not exist
@@ -239,6 +308,88 @@ check that shapes reference declared terms.
 
 Anyone writing queries from the published ontology cannot discover 12.7M
 triples' worth of predicates.
+
+### The graph understates this by half
+
+Counting from the graph only finds terms whose code path ran during a
+collection. Scanning the collector source instead — which
+`pg_collect::vocab` now does on every `cargo test` — finds **61**, spread
+across 13 modules:
+
+| Module | Findings | Module | Findings |
+|---|---|---|---|
+| `core` | 17 | `bsdpkg` | 4 |
+| `vcs` | 16 | `metrics` | 3 |
+| `deb` | 6 | `nix` | 3 |
+| `rpm` | 5 | `chocolatey` | 2 |
+| others (`bitbake`, `buildroot`, `flatpak`, `maven`, `xbps`) | 1 each | | |
+
+The 31 the graph misses are not lower-risk — they are the same defect sitting
+behind a branch that has not run yet. Sixteen are the GitHub repository
+metadata in `enrich_github.rs` (`vcs:isArchived`, `vcs:isFork`,
+`vcs:openIssuesCount`, `vcs:topic`, …), which will land at scale the first
+time that enrichment runs broadly.
+
+**What this scan does and does not cover.** 53 findings are predicate-position
+uses and 4 are `rdf:type` objects, both read directly off a writer call site,
+so the required role is known. The remaining 4 — the `deb:debDepends` family —
+are assembled in the dependency-kind table at `debian.rs:965` and reach the
+writer through a variable, so no call site states their role; they are checked
+for declaration only and carry an explicit `unknown-role` marker. The gate
+does not claim role coverage it does not have. It also skips `#[cfg(test)]`
+modules: a term referenced only from a fixture is not emitted into any graph,
+and counting it overstates what the collectors produce.
+
+### Six are worse than undeclared: right name, wrong module
+
+The gate also surfaced a class the graph cannot show at all. For six terms
+the local name *is* declared — in another module, scoped by `rdfs:domain` to
+a different class. The name resolves, so nothing looks wrong, but the triple
+asserts something false:
+
+| Emitted | Declared elsewhere as | Why the prefix swap is not the fix |
+|---|---|---|
+| `vcs:hasRelease` | `core:hasRelease` | domain `:Distribution`, range `:DistributionRelease` — a distro release like Debian 12, not a forge release |
+| `vcs:repositoryStatus` | `core:repositoryStatus` | domain `:Repository`, the *package* repository, not the VCS one |
+| `core:observedAt` | `vcs:observedAt` | domain `vcs:ForgeVersionObservation`; this subject is a `pkg:EmailObservation` |
+| `core:versionConstraint` | `deb:` / `rpm:versionConstraint` | domain `deb:Dependency`; emitted generically by `emit/rdf.rs` for every ecosystem |
+| `deb:installedSize` | `flatpak:` / `opkg:installedSize` | domain `flatpak:FlatpakApp` |
+| `chocolatey:isPrerelease` | `nuget:isPrerelease` | domain `nuget:NuGetPackage`; `choco:ChocolateyPackage` is not a subclass of it |
+
+Each needs a declaration in its own module, not a repointed prefix. Under
+`rdfs:domain` entailment, repointing would infer that a VCS repository is a
+`:Distribution` and a Chocolatey package is a `nuget:NuGetPackage`.
+
+### `rpm:RPMGroup` is a role violation, not a missing declaration
+
+`rpm:RPMGroup` is emitted 523,728 times, and both of the previous accounts of
+it were wrong.
+
+The first draft listed it among terms "the ontology never declares." It does
+declare it: `rpm.ttl:550`, `rpm:RPMGroup a owl:Class`, with four individuals
+typed by it.
+
+The second draft therefore struck it as a false finding. That was the worse
+error. `rpm.rs:948` and `emit/rpm_ext.rs:41` both do:
+
+```rust
+writer.write_literal(&pkg_uri, &format!("{RPM}RPMGroup"), group)?;
+```
+
+That uses a declared **class** URI as a **predicate**, with a string literal
+object. The URI resolves, so a declared-or-not test says it is fine; what is
+wrong is the role. Half a million triples assert a class as a property.
+
+The remedy is neither a declaration nor a deletion: a real property —
+`rpm:inGroup` — pointing at one of the four existing `rpm:RPMGroup`
+individuals, so the group becomes a resource instead of a string.
+
+This is also why the vocabulary gate now records and checks **roles** rather
+than URIs. A membership test could not see this defect, and in its first form
+it accepted it.
+
+Credit: found by independent review of PR #25
+(`docs/reviews/pr25-f172603/`).
 
 ## Finding 6 — 53 of 115 shapes have no data, and 203 classes are unpopulated
 
@@ -345,6 +496,29 @@ owns the model rather than inferred from what the collectors happen to emit:
 4. **`pkg:partOfEcosystem` has 0 uses.** The property connecting
    `Distribution` to `Ecosystem` is declared and shaped but never emitted, so
    the 18 `Ecosystem` nodes float unattached to the distribution graph.
+5. **Should a `PackageIdentity`'s purl carry a version?** This is the single
+   highest-volume question in the audit: 3,826,660 `minCount` violations plus
+   7,215 `maxCount` violations turn on it, and it cannot be resolved
+   collector-side. The class is version-agnostic and `directlyDependsOn`
+   explicitly sanctions version-independent identities as dependency targets,
+   but `PURLShape`'s `sh:pattern` requires `@version` while
+   `PackageIdentityShape` requires the property outright. The purl
+   specification makes the version component optional. Three ways out:
+   - **Version-less identity purl** (`pkg:rpm/fedora/bash`): relax the pattern
+     to `^pkg:[a-z]+/[^@]+(@.+)?$`, and stop putting the EVR in the identity's
+     purl in `rpm.rs`/`debian.rs`. Resolves both violation classes; the
+     versioned purl, if wanted, belongs on the `Package` rather than the
+     identity. Requires an ontology change and a re-collection.
+   - **Don't type unresolved dependency targets as `PackageIdentity`.** More
+     faithful — an RPM `Requires: libssl.so.3` names a capability, and
+     `pkg:Capability` already exists and is already used this way by
+     `debian.rs` — but it changes the shape of the graph that consumers query
+     for dependency traversal, and would need `dependencyTarget`'s `sh:class`
+     revisited.
+   - **Resolve dependencies to concrete providers at collection time**, so
+     targets are real packages with real purls. Semantically best, most
+     expensive, and impossible for dependencies satisfied outside the
+     collected repo set.
 
 ### Step 2 — collectors, by expected impact
 
@@ -352,7 +526,8 @@ owns the model rather than inferred from what the collectors happen to emit:
 |---|---|---|
 | Emit `pkg:identityName` on `PackageIdentity` instead of `pkg:packageName` (domain violation) | identity emitter, all collectors | 4,253,705 |
 | Emit `rdfs:label` on `PackageIdentity` | identity emitter | 4,256,379 |
-| Emit `purl` for RPM-family + openSUSE | `rpm.rs` | ~3.8M |
+| Add `rpm:inGroup` → an `rpm:RPMGroup` individual, replacing the class-URI-as-predicate | `rpm.rs`, `emit/rpm_ext.rs` | 523,728 |
+| ~~Emit `purl` for RPM-family + openSUSE~~ — **blocked**, and misdiagnosed: `rpm.rs` already emits purl for real packages. The 3.8M are dependency-target identities with no version to put in a purl. Needs the purl-versioning decision in open question 5. | `rpm.rs` | ~3.8M |
 | Emit `rdf:type pkg:VersionConstraint` on constraint nodes | version-constraint emitter | 1,405,318 |
 | Emit `rdfs:label` on `Capability` (a description, not the name) | capability emitter | 908,627 |
 | `Repository.repositoryURL`: `xsd:string` → `xsd:anyURI` | vcs emitter | 432,667 |
@@ -365,8 +540,9 @@ owns the model rather than inferred from what the collectors happen to emit:
 | Dedupe `RangeEvent.eventVersion` | OSV range emitter | 22,781 |
 | Dedupe `VersionConstraint.versionConstraintValue` | version-constraint emitter | 14,031 |
 | Dedupe `CVSSScore.vectorString` | CVSS emitter | 7,519 |
-| Resolve conflicting `purl` per identity | purl emitter | 7,215 |
-| `Forge.forgeUrl`, `Builder.builderId`, `purl`: → `xsd:anyURI` | respective emitters | 3,866 |
+| Resolve conflicting `purl` per identity — same root cause as the 3.8M; a version-less identity purl removes the conflict by construction | purl emitter | 7,215 |
+| `Forge.forgeUrl`, `Builder.builderId`: → `xsd:anyURI` | respective emitters | 1,192 |
+| ~~`purl`: → `xsd:anyURI`~~ — **done**, `maven.rs` was the only emitter using `xsd:string` | `maven.rs` | 2,674 |
 | `TransparencyLogEntry.logIndex`: `xsd:int` → `xsd:long` | attestation emitter | 142 |
 | Emit `label` / `distributionName` / `repoType` on the 24–31 `Distribution` and `DistributionRelease` singletons | distro metadata emitter | ~100 |
 
@@ -388,6 +564,28 @@ trivial (one node per graph); the modelling answer is not.
 Re-run both checkers. Everything in steps 1–2 is mechanical, so what survives
 is the real backlog. Then:
 
+- **Undeclared and misused vocabulary — done, in `cargo test`.**
+  `pg_collect::vocab` resolves every whole-string `format!("{PREFIX}Term")` in
+  the crate against a checked-in manifest of declared terms *and their roles*,
+  then checks each use against the role its argument position requires:
+  predicate ⇒ property, `rdf:type` object ⇒ class, other object ⇒ class or
+  individual. It runs offline in the normal test job and needs no endpoint.
+  Verified against both bug classes: renaming `packageName` to `packageNaem`
+  fails with "used as property, but not declared at all", and writing a
+  declared class in predicate position fails with "used as property, but the
+  ontology declares it only as class" — the `rpm:RPMGroup` defect.
+
+  The manifest is generated from the 37-module `EXPECTED_FILES` allowlist in
+  `sync-ontology.sh`, which is what actually ships, and records the ontology
+  commit it was built from. An earlier version globbed `**/*.ttl` and swept 34
+  non-deployed files — mostly negative SHACL fixtures — which inflated the
+  declared set by 15 terms and would have let the gate accept vocabulary the
+  published ontology does not have.
+
+  The 61 pre-existing findings are baselined in a `KNOWN_BAD` list that is only
+  allowed to shrink — a second test fails if an entry becomes declared in the
+  role used, or stops being emitted that way, so the baseline cannot rot into
+  noise.
 - **Coverage regression in CI** — cheap (two queries), baseline the numbers,
   fail when they drop.
 - **Conformance nightly** — 300 queries; the `PackageIdentity` drill-down alone
@@ -424,3 +622,13 @@ etl/scripts/ontology-coverage-check.py \
 
 Both are `uv` inline-dependency scripts — no venv to manage. Both default to
 the public endpoint and are read-only.
+
+The undeclared-vocabulary gate needs neither:
+
+```bash
+# Offline; reads etl/pg-collect/ontology-vocab.txt, no endpoint
+cd etl/pg-collect && cargo test --lib vocab
+
+# Regenerate the manifest after bumping etl/ONTOLOGY_VERSION
+etl/scripts/gen-ontology-vocab.py --ontology-dir ../ontology
+```
