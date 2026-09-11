@@ -40,7 +40,13 @@ Entrypoint=/bin/sh
 Exec=/usr/local/bin/collect.sh
 NoNewPrivileges=true
 DropCapability=ALL
-Memory=4g
+# Raised from the shared template's 4g: the first real run OOM-killed at
+# 4g decompressing/parsing BaseOS's ~137MB primary.xml.gz for a second
+# arch (aarch64) with --with-spec --with-maintainers both enabled --
+# confirmed live 2026-09-11. Safe to raise independently of the shared
+# pg-collect@.container's limit now that these two collectors have their
+# own template; host has 37Gi free at the time of writing.
+Memory=12g
 PodmanArgs=--cpus=2
 
 [Service]
