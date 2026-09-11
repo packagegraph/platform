@@ -441,4 +441,126 @@ mod tests {
         assert!(content.contains("npm#integrity"));
         assert!(triples > 15);
     }
+
+    // ── Characterization: what fetch_package_with_retry does TODAY ──────
+    // These pin existing behaviour so the shared-transport migration can
+    // prove it changed nothing unintended. No transport-error test: those
+    // retries sleep 1+2+4+8 = 15 seconds.
+
+    #[test]
+    fn characterize_fetch_returns_doc_on_200() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/left-pad")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"name":"left-pad","versions":{}}"#)
+            .expect(1)
+            .create();
+
+        let collector = NpmCollector::new(server.url());
+        let mut base_delay_ms = 200u64;
+        let doc = collector
+            .fetch_package_with_retry("left-pad", &mut base_delay_ms)
+            .expect("200 should yield a package doc");
+
+        mock.assert();
+        assert_eq!(doc.name, "left-pad");
+    }
+
+    #[test]
+    fn characterize_fetch_404_returns_prefixed_error_without_retry() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/definitely-missing")
+            .with_status(404)
+            .expect(1) // exactly one request: 404 is terminal today
+            .create();
+
+        let collector = NpmCollector::new(server.url());
+        let mut base_delay_ms = 200u64;
+        let err = collector
+            .fetch_package_with_retry("definitely-missing", &mut base_delay_ms)
+            .expect_err("404 should be an error");
+
+        mock.assert();
+        assert_eq!(err, "404: definitely-missing");
+    }
+
+    #[test]
+    fn characterize_429_with_retry_after_is_retried_then_succeeds() {
+        let mut server = mockito::Server::new();
+        let rate_limited = server
+            .mock("GET", "/slowpkg")
+            .with_status(429)
+            .with_header("retry-after", "1")
+            .expect(1)
+            .create();
+        let ok = server
+            .mock("GET", "/slowpkg")
+            .with_status(200)
+            .with_body(r#"{"name":"slowpkg"}"#)
+            .expect(1)
+            .create();
+
+        let collector = NpmCollector::new(server.url());
+        let mut base_delay_ms = 200u64;
+        let doc = collector
+            .fetch_package_with_retry("slowpkg", &mut base_delay_ms)
+            .expect("should succeed after the rate limit clears");
+
+        rate_limited.assert();
+        ok.assert();
+        assert_eq!(doc.name, "slowpkg");
+        // 429 handling doubles the inter-request base delay, capped at 5000.
+        assert_eq!(base_delay_ms, 400);
+    }
+
+    #[test]
+    fn characterize_500_is_not_retried_and_fails_as_a_parse_error() {
+        // Documents a real gap: npm ignores 5xx entirely and hands the body
+        // to serde_json. The migration changes this deliberately.
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/brokenpkg")
+            .with_status(500)
+            .with_body("upstream exploded")
+            .expect(1) // exactly one request -- no retry today
+            .create();
+
+        let collector = NpmCollector::new(server.url());
+        let mut base_delay_ms = 200u64;
+        let err = collector
+            .fetch_package_with_retry("brokenpkg", &mut base_delay_ms)
+            .expect_err("500 body is not valid JSON");
+
+        mock.assert();
+        assert!(
+            !err.starts_with("404:"),
+            "500 must not be reported as a 404, got: {err}"
+        );
+    }
+
+    #[test]
+    fn characterize_malformed_json_body_is_a_parse_error() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/badjson")
+            .with_status(200)
+            .with_body("{not json")
+            .expect(1)
+            .create();
+
+        let collector = NpmCollector::new(server.url());
+        let mut base_delay_ms = 200u64;
+        let err = collector
+            .fetch_package_with_retry("badjson", &mut base_delay_ms)
+            .expect_err("malformed JSON should fail");
+
+        mock.assert();
+        assert!(
+            !err.starts_with("404:"),
+            "parse failure must not be reported as a 404, got: {err}"
+        );
+    }
 }
