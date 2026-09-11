@@ -181,6 +181,76 @@ impl Default for HostLimiter {
     }
 }
 
+/// Counters for one transport's lifetime. Collectors print a snapshot at
+/// end of run so a pathological cache-miss or failure rate is visible in
+/// one line instead of invisible for months.
+#[derive(Debug, Default)]
+pub struct TransportStats {
+    attempts: AtomicU64,
+    successes: AtomicU64,
+    retries: AtomicU64,
+    rate_limited: AtomicU64,
+    not_found: AtomicU64,
+    failures: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatsSnapshot {
+    pub attempts: u64,
+    pub successes: u64,
+    pub retries: u64,
+    pub rate_limited: u64,
+    pub not_found: u64,
+    pub failures: u64,
+}
+
+impl TransportStats {
+    pub fn record_attempt(&self) {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_success(&self) {
+        self.successes.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_retry(&self) {
+        self.retries.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_rate_limited(&self) {
+        self.rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_not_found(&self) {
+        self.not_found.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_failure(&self) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            attempts: self.attempts.load(Ordering::Relaxed),
+            successes: self.successes.load(Ordering::Relaxed),
+            retries: self.retries.load(Ordering::Relaxed),
+            rate_limited: self.rate_limited.load(Ordering::Relaxed),
+            not_found: self.not_found.load(Ordering::Relaxed),
+            failures: self.failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl std::fmt::Display for StatsSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "http: attempts={} ok={} retries={} 429={} 404={} failed={}",
+            self.attempts,
+            self.successes,
+            self.retries,
+            self.rate_limited,
+            self.not_found,
+            self.failures
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +407,61 @@ mod tests {
             "concurrent callers must not all fire at once, elapsed {:?}",
             start.elapsed()
         );
+    }
+
+    // ── TransportStats ──────────────────────────────────────────────────
+
+    #[test]
+    fn stats_start_at_zero() {
+        let s = TransportStats::default();
+        let snap = s.snapshot();
+        assert_eq!(snap.attempts, 0);
+        assert_eq!(snap.successes, 0);
+        assert_eq!(snap.failures, 0);
+    }
+
+    #[test]
+    fn stats_count_each_category_independently() {
+        let s = TransportStats::default();
+        s.record_attempt();
+        s.record_attempt();
+        s.record_success();
+        s.record_retry();
+        s.record_rate_limited();
+        s.record_not_found();
+        s.record_failure();
+
+        let snap = s.snapshot();
+        assert_eq!(snap.attempts, 2);
+        assert_eq!(snap.successes, 1);
+        assert_eq!(snap.retries, 1);
+        assert_eq!(snap.rate_limited, 1);
+        assert_eq!(snap.not_found, 1);
+        assert_eq!(snap.failures, 1);
+    }
+
+    #[test]
+    fn stats_summary_line_names_every_nonzero_category() {
+        let s = TransportStats::default();
+        s.record_attempt();
+        s.record_success();
+        s.record_rate_limited();
+        let line = format!("{}", s.snapshot());
+        assert!(line.contains("attempts=1"), "got: {line}");
+        assert!(line.contains("ok=1"), "got: {line}");
+        assert!(line.contains("429=1"), "got: {line}");
+    }
+
+    #[test]
+    fn stats_are_sync_and_total_correctly_under_concurrency() {
+        use rayon::prelude::*;
+        let s = TransportStats::default();
+        (0..500).into_par_iter().for_each(|_| {
+            s.record_attempt();
+            s.record_success();
+        });
+        let snap = s.snapshot();
+        assert_eq!(snap.attempts, 500);
+        assert_eq!(snap.successes, 500);
     }
 }
