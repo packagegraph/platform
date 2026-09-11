@@ -26,9 +26,13 @@ ontology never declares.** Including `rpm:rpmProvides` (6.56M uses),
 `rpm:rpmRequires` (4.51M), `deb:debDepends` (1.46M), and `core:checksum`
 (1.13M) — none of which appear anywhere in the ontology, not even in a shape.
 
-The headline is not "the data is broken." Most violations trace to a handful of
-places where the ontology and the collectors disagree about a name or a
-datatype. Fix the disagreements and the violation count collapses.
+The headline: **the ontology is a sound specification and the collectors have
+drifted from it.** Not one of the 43 violations is best fixed by weakening a
+shape. An earlier draft of this report proposed four shape relaxations that
+would have erased ~9.4M violations at a stroke; every one of them turned out to
+be the ontology being right — see "The ontology is not the thing to change"
+below. `make validate` on the ontology repo passes unmodified, which is the
+short version of the same point.
 
 ## Methodology, and why not pyshacl
 
@@ -85,34 +89,31 @@ One root cause, seven constraints, 5.3M affected subjects.
 | `Vulnerability` | 55,517 | 16.9% |
 | `Distribution` | 11 | 45.8% |
 
-These do **not** all have the same cause. Checking what each class actually
-carries splits them three ways:
+All seven are collector-side. `rdfs:label` in this ontology is a
+human-readable description, not a restatement of the name — the examples give
+`pkg:Capability` both `pkg:capabilityName "libssl.so.3"` and
+`rdfs:label "OpenSSL shared library libssl.so.3"`. Nothing in the corpus
+supplies that second string.
 
-| Class | What it actually carries | Verdict |
+| Class | What it actually carries | What is missing |
 |---|---|---|
-| `Capability` | `capabilityName` (100%) and nothing else | **Shape**: `rdfs:label` is redundant |
-| `PackageIdentity` | `packageName` (4,963,521) + purl, repos | **Shape**: redundant |
-| `DataQualityIssue` | `issueType`, `severity`, `detectedAt` | **Shape**: redundant |
-| `License` | **`rdf:type` only** — 19,858 triples, nothing else | **Collector**: nodes are empty |
-| `Distribution`, `DistributionRelease` | partial; 11–31 singleton nodes | **Collector**: emit the metadata |
-| `Vulnerability` | `rdfs:label` *is* the canonical CVE/OSV id | **Collector**: NVD + Alpine omit it |
+| `PackageIdentity` | `packageName`, purl, repo links | a description |
+| `Capability` | `capabilityName` only | a description |
+| `DataQualityIssue` | `issueType`, `severity`, `detectedAt` | a description |
+| `License` | **`rdf:type` only** — 19,858 triples, nothing else | everything |
+| `Distribution`, `DistributionRelease` | partial; 11–31 singleton nodes | name/label metadata |
+| `Vulnerability` | `rdfs:label` *is* the canonical CVE/OSV id | the identifier |
 
-So `License` is the opposite of a redundant-label problem: every
-`pkg:License` node in the corpus is a bare typed node with no identifier, name,
-or SPDX id at all. The shape is right and the collector emits nothing.
+`License` is the worst of them: every `pkg:License` node in the corpus is a
+bare typed node with no identifier, name, or SPDX id at all.
 
 `Vulnerability` splits by producer: `graph/security/osv` has **0** violations,
 while `graph/cve/nvd` has **56,172** and the Alpine graphs another **~22,700**
 (`alpine/edge/riscv64` 8,753, `alpine/v3.20` 6,987, `alpine/v3.20/aarch64`
-6,987). Two collectors omit what a third emits correctly.
+6,987). Two collectors omit what a third emits correctly — which is the
+clearest evidence that the requirement is satisfiable and the shape is right.
 
-**Recommendation:** drop the redundant `rdfs:label` `minCount` from the three
-shapes whose class has a working discriminator (`Capability`,
-`PackageIdentity`, `DataQualityIssue`); fix the NVD and Alpine collectors to
-emit it for `Vulnerability`; and treat `License` as its own bug — those nodes
-need content, not a label.
-
-## Finding 2 — the ontology contradicts itself on `PackageIdentity`'s name
+## Finding 2 — the collectors violate `packageName`'s declared domain
 
 `PackageIdentityShape` requires `pkg:identityName`. Reality:
 
@@ -121,15 +122,27 @@ need content, not a label.
 | `pkg:packageName` | 4,963,521 |
 | `pkg:identityName` | 2,674 |
 
-Both are declared `owl:DatatypeProperty` in `core.ttl` (lines 1112 and 583).
-`core.shacl.ttl` uses `packageName` in four shapes and `identityName` in exactly
-one — `PackageIdentityShape`, line 278. So the reported **99.94% violation rate
-is an ontology bug**, not a data problem. The collectors are consistent; the
-shape is the outlier.
+This looks at first like the shape being the outlier — 99.94% of instances
+disagree with it. It is not. The two properties are deliberately different:
 
-**Recommendation:** change `PackageIdentityShape` to `pkg:packageName` and
-either deprecate `identityName` or document what distinguishes it. This single
-edit removes 4.25M violations.
+- `pkg:identityName` — `rdfs:domain pkg:PackageIdentity`, defined as *"the
+  package name as used for the version-agnostic identity... distinct from the
+  versioned packageName on Package instances"* (`core.ttl:583`).
+- `pkg:packageName` — `rdfs:domain pkg:Package` (`core.ttl:1112`).
+
+The four other shapes that use `packageName` target `Package`, `MetaPackage`,
+`PhantomPackage` and `SourcePackage` — all Package-family, where it is correct.
+None of them targets `PackageIdentity`.
+
+So emitting `packageName` on a `PackageIdentity` violates that property's
+declared domain. Under RDFS entailment it infers every `PackageIdentity` to
+also be a `Package`, collapsing precisely the version-agnostic/versioned
+distinction the class exists to draw — and `PackageIdentity`'s own definition
+says dependencies point at it *instead of* versioned instances.
+
+**Recommendation:** fix the collectors to emit `pkg:identityName` on
+`PackageIdentity` nodes. 4,253,705 violations, and a real semantic defect
+rather than a naming quibble.
 
 ## Finding 3 — datatype mismatches: all eight are the collector's side
 
@@ -261,21 +274,42 @@ Every violating constraint has been triaged to a side. Do **not** turn on a CI
 gate first: 43 constraints violate today, so a gate would go permanently red
 without telling anyone which side is wrong.
 
-### Step 1 — ontology repo, 4 edits, removes ~9.4M violations
+### The ontology is not the thing to change
 
-| Edit | File | Removes |
-|---|---|---|
-| `PackageIdentityShape`: `sh:path pkg:identityName` → `pkg:packageName` | `core/core.shacl.ttl:278` | 4,253,705 |
-| Drop `rdfs:label` `minCount` from `PackageIdentityShape` | `core/core.shacl.ttl` | 4,256,379 |
-| Drop `rdfs:label` `minCount` from `CapabilityShape` | `core/core.shacl.ttl` | 908,627 |
-| Drop `rdfs:label` `minCount` from `DataQualityIssueShape` | `extensions/dq/dq.shacl.ttl` | 63,252 |
+An earlier draft of this report proposed four shape edits that would have
+removed ~9.4M violations at a stroke: repoint `PackageIdentityShape` from
+`pkg:identityName` to `pkg:packageName`, and drop the `rdfs:label` `minCount`
+from `PackageIdentityShape`, `CapabilityShape` and `DataQualityIssueShape` on
+the grounds that each class already had a name property.
 
-Each of these three classes has a working discriminator
-(`packageName`, `capabilityName`, `issueType`) so the label requirement is
-redundant. Do **not** drop it from `VulnerabilityShape`, `LicenseShape`,
-`DistributionShape` or `DistributionReleaseShape` — those are collector bugs.
+That was wrong, and the ontology repo's own `make validate` caught it: `main`
+passes unmodified, and repointing the shape broke 36 usages across 24 example
+files. Checking the definitions explains why.
 
-Also in the ontology, not violation-reducing but load-bearing:
+- `pkg:identityName` is `rdfs:domain pkg:PackageIdentity` and its definition
+  reads *"distinct from the versioned packageName on Package instances"*.
+  `pkg:packageName` is `rdfs:domain pkg:Package`. The distinction is
+  deliberate. The four other shapes using `packageName` target `Package`,
+  `MetaPackage`, `PhantomPackage` and `SourcePackage` — all Package-family,
+  where it is correct. None targeted `PackageIdentity`.
+- The `rdfs:label` requirements are not redundant either. The examples give
+  `pkg:Capability` both `pkg:capabilityName "libssl.so.3"` and
+  `rdfs:label "OpenSSL shared library libssl.so.3"` — a human-readable
+  description, not a restatement of the name.
+
+So the ontology and its examples are internally consistent, and every
+violation is the collectors having drifted from a deliberate model. Weakening
+the shapes to match the drift would have destroyed the only specification of
+what the data is supposed to look like, and it would have done so under cover
+of a 9.4M-violation improvement.
+
+`PackageIdentity.packageName` is a concrete example of why this matters:
+emitting it violates `packageName`'s declared domain, so under RDFS entailment
+every `PackageIdentity` would be inferred to also be a `Package` — collapsing
+exactly the version-agnostic/versioned distinction the class exists to draw.
+
+Three things in the ontology repo are still worth doing, none of them a shape
+relaxation:
 
 - **Declare the 28 undeclared properties and 2 classes**, or delete them from
   the collectors. `rpm:rpmProvides` alone is 6.56M triples that no consumer can
@@ -287,12 +321,40 @@ Also in the ontology, not violation-reducing but load-bearing:
 - **Collapse the five NodeShapes targeting `PackageIdentity`** (finding 7), or
   accept that violations against it are double-reported.
 
+### Open questions for the ontology owners
+
+These are modelling calls, not defects, and they should be decided by whoever
+owns the model rather than inferred from what the collectors happen to emit:
+
+1. **Should language registries be `pkg:Distribution`?** They are today, and
+   the links are load-bearing — `d/distro/pypi` alone is the object of 4,172
+   `pkg:partOfDistribution` triples. But the class is defined as *"A complete
+   operating system distribution"*, and `pkg:Ecosystem` means something
+   different here (a family of distributions, *"the Debian ecosystem including
+   Ubuntu derivatives"*), already carrying `pkg:upstreamEcosystem` (137,205)
+   and `sec:affectsEcosystem` (15,473) via `d/ecosystem/pypi`. Either widen
+   the definition, or stop typing registries as distributions — but not both.
+2. **Should `repoType` and `releaseCodename` be required?** `repoType`'s own
+   definition is Koji/RPM vocabulary (*"Build repos are Koji build targets"*)
+   with no analogue in a registry, and rolling releases have no codename by
+   definition. If `DistributionRelease` is meant only for OS distro releases,
+   the requirements are right and item 1 is the real issue.
+3. **`maven#MavenEcosystem` is an ontology class URI used as an instance** of
+   `pkg:Ecosystem`. Almost certainly meant to be `d/ecosystem/maven`, which
+   exists.
+4. **`pkg:partOfEcosystem` has 0 uses.** The property connecting
+   `Distribution` to `Ecosystem` is declared and shaped but never emitted, so
+   the 18 `Ecosystem` nodes float unattached to the distribution graph.
+
 ### Step 2 — collectors, by expected impact
 
 | Fix | Where | Removes |
 |---|---|---|
+| Emit `pkg:identityName` on `PackageIdentity` instead of `pkg:packageName` (domain violation) | identity emitter, all collectors | 4,253,705 |
+| Emit `rdfs:label` on `PackageIdentity` | identity emitter | 4,256,379 |
 | Emit `purl` for RPM-family + openSUSE | `rpm.rs` | ~3.8M |
 | Emit `rdf:type pkg:VersionConstraint` on constraint nodes | version-constraint emitter | 1,405,318 |
+| Emit `rdfs:label` on `Capability` (a description, not the name) | capability emitter | 908,627 |
 | `Repository.repositoryURL`: `xsd:string` → `xsd:anyURI` | vcs emitter | 432,667 |
 | `CVSSScore.baseScore`: `xsd:double` → `xsd:decimal` | `enrich_nvd.rs` / OSV | 92,014 |
 | Emit `rdfs:label` on `Vulnerability` (canonical CVE/OSV id) | NVD + Alpine secdb | 78,899 |
