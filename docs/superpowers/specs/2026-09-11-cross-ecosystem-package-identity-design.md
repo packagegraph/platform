@@ -66,7 +66,7 @@ RPM has a standard declaration for this class of fact —
 Note that resolving *this particular* `Source1` requires recursive `%global`
 macro expansion, which is sub-project 3. What this design delivers on bundling
 is the declaration-based path (§5), which covers the large `rust2rpm` /
-`go2rpm` population today; the Haskell subpackage path is §12.4. The example
+`go2rpm` population today; the Haskell subpackage path is sub-project 4 (§12). The example
 is used here because it makes the shape of the missing relationship legible,
 not because §5 resolves it.
 
@@ -80,9 +80,13 @@ not because §5 resolves it.
 3. Complete the `distro → registry → forge` chain by wiring the nine registry
    collectors that currently discard upstream repository URLs into the
    existing `UpstreamProject` hub.
-4. Correct the RDFS domain violations found in the current
-   `upstreamPackageName` emission sites.
+4. Correct three defects in the pinned ontology (§2.4): an undeclared
+   `upstreamPackageVersion`, and wrong `rdfs:domain` on `upstreamEcosystem`
+   and `upstreamPackageName` that makes four current emitters illegal.
 5. Add version-level links where, and only where, both endpoints exist.
+
+The landing order in §12 is load-bearing: an ontology release and a
+prerequisite `rpm.rs` fix must both precede the collector work.
 
 ### Non-goals (this design)
 
@@ -137,8 +141,8 @@ and `pkg:upstreamPackageName` (core.ttl:940) already carries its own
 deprecation note: *"Retained for backward compatibility — prefer
 upstreamPackageIdentity for new data."*
 
-**This design uses those terms as-is. No ontology change is required for the
-identity join.**
+**This design uses those terms as-is.** The identity join itself needs no new
+vocabulary; §2.4 covers the separate corrections required to existing terms.
 
 ### 2.2 New terms
 
@@ -166,10 +170,16 @@ family.
     rdfs:isDefinedBy : .
 ```
 
-`npm:bundledDependency` is retained and emitted alongside `pkg:bundles` for
-npm, since it already exists and is ecosystem-idiomatic. `cpan:containsModule`
-(cpan.ttl:23) is left alone — it is a distribution→module relation, not
-bundling, and is out of scope per §3.3.
+`npm:bundledDependency` (npm.ttl:9-14) is **not** emitted in v1. Its range is
+`npm:NpmPackage`, the versioned class, but `bundledDependencies` in a package
+manifest is a bare array of names with no versions, so no legal object can be
+constructed. Emitting an identity URI there would violate the range. npm
+bundling is expressed through `pkg:bundles` at identity level only; revisit
+`npm:bundledDependency` if and when the artifact-inspection tier (sub-project 2, §12)
+supplies resolved versions.
+
+`cpan:containsModule` (cpan.ttl:23) is left alone — it is a
+distribution→module relation, not bundling, and is out of scope per §3.3.
 
 ### 2.3 Evidence annotation
 
@@ -197,6 +207,82 @@ derivation method via the existing `emit_dq_issue` mechanism
 | `ecosystem-provides` | high | `ghc-pkg(X)`, `crate(X)`, `python3dist(X)` etc. |
 | `source0-domain` | high | Source0 URL domain (existing) |
 | `name-prefix` | medium | `ghc-`, `python3-`, `rust-` prefix (existing) |
+
+### 2.4 Corrections to existing ontology terms
+
+Three defects in the pinned ontology block this design. All are in the sibling
+`packagegraph/ontology` repository and must land and be released before the
+collector changes.
+
+**(a) `pkg:upstreamPackageVersion` is undeclared.** `rpm.rs:1130` has been
+emitting it, and the §7 deriver joins on it, but grep over `core.ttl` finds no
+declaration. Declare it. This property *is* genuinely version-specific, so it
+is the one member of the family that belongs on `:Package`:
+
+```turtle
+:upstreamPackageVersion a owl:DatatypeProperty ;
+    rdfs:label "upstream package version"@en ;
+    IAO:0000115 "The version of the upstream software in its native package
+      ecosystem, as declared by a versioned ecosystem capability such as
+      crate(foo) = 1.2.3. Version-specific, and therefore asserted on the
+      versioned Package rather than on its identity."@en ;
+    rdfs:domain :Package ;
+    rdfs:range xsd:string ;
+    rdfs:isDefinedBy : .
+```
+
+**(b) and (c) `upstreamEcosystem` and `upstreamPackageName` have the wrong
+domain.** Both are declared `rdfs:domain :Package` (core.ttl:917 and
+core.ttl:942), but four of their five emitters write them on a
+`PackageIdentity` subject — `collect_spec.rs:433-445`, `debian.rs:613-623`,
+`collect_salsa.rs:340-352`, `collect_sources.rs:241-262` — and
+`PackageIdentity` is `rdfs:subClassOf :PackageEntity` (core.ttl:1466), not of
+`:Package`. Those four are live RDFS domain violations today.
+
+The emitters are right and the ontology is wrong. Both properties are
+semantically version-independent: which ecosystem a package comes from, and
+what it is called upstream, do not change between builds of the same package.
+`pkg:upstreamPackageIdentity` — the new edge this design centres on — already
+has `rdfs:domain :PackageIdentity` for exactly that reason.
+
+Widen both to the existing common superclass:
+
+```turtle
+:upstreamEcosystem   rdfs:domain :PackageEntity .   # was :Package
+:upstreamPackageName rdfs:domain :PackageEntity .   # was :Package
+```
+
+`:PackageEntity` (core.ttl:1649-1654) exists for precisely this case; its own
+definition says it was *"Introduced to allow dependency properties to accept
+both version-specific packages and version-independent identities without
+collapsing their types under RDFS/OWL reasoning."*
+
+This was considered and rejected in favour of moving the emitters to the
+`:Package` altitude. That alternative is not implementable: `collect_spec.rs`,
+`collect_salsa.rs`, and `collect_sources.rs` have no versioned package URI and
+cannot construct one, because the release component (`-2.fc44`) comes from RPM
+repodata while the spec's own `Release: 2%{?dist}` is an unexpanded macro
+requiring sub-project 3. Widening the domain resolves the violation without
+blocking on out-of-scope work.
+
+Widening a domain is monotonically safe for existing data: it removes
+entailments (fewer resources inferred into `:Package`) rather than adding
+them, and every triple legal under the old domain remains legal.
+
+**Sequencing.** The ontology is consumed as a pinned, released artifact
+(loaded into QLever by `upload-ontology.sh`), so these changes must land in a
+strict order:
+
+1. Ontology PR: declare `upstreamPackageVersion`; widen the two domains; add
+   `:bundles` and `:upstreamPackageRelease` from §2.2. Bump the ontology
+   version and update `CHANGELOG.md`.
+2. Ontology release + `upload-ontology.sh` run, so the graph carries the new
+   declarations.
+3. Only then, the collector changes in this design.
+
+Emitting `pkg:bundles` or `pkg:upstreamPackageRelease` against an ontology
+that does not declare them produces triples no consumer can reason over, and
+SHACL validation in `core.shacl.ttl` would flag them.
 
 ## 3. The registry identity resolver
 
@@ -303,50 +389,61 @@ than the object side.
 
 ## 4. Emission sites and subject altitude
 
-### 4.1 The existing domain violation
+### 4.1 Altitudes after the §2.4 corrections
 
-`pkg:upstreamPackageName` has `rdfs:domain :Package` (core.ttl:942).
-`PackageIdentity` is `rdfs:subClassOf :PackageEntity` (core.ttl:1466) — it is
-**not** a subclass of `:Package`.
+With `upstreamEcosystem` and `upstreamPackageName` widened to
+`:PackageEntity`, every existing emitter becomes legal at the subject it
+already uses, and the new edge slots in at the identity:
 
-Four collectors emit `upstreamPackageName` on a `PackageIdentity` subject:
-
-| Site | Subject | Correct? |
+| Property | Domain (post-§2.4) | Subject used |
 |---|---|---|
-| rpm.rs:1115-1131 | versioned `pkg_uri` | yes |
-| collect_spec.rs:441-445 | `PackageIdentity` | **domain violation** |
-| debian.rs:612-623 | `PackageIdentity` | **domain violation** |
-| collect_salsa.rs:340-352 | `PackageIdentity` | **domain violation** |
-| collect_sources.rs:241-262 | `PackageIdentity` | **domain violation** |
+| `pkg:upstreamPackageIdentity` | `:PackageIdentity` | identity |
+| `pkg:bundles` | `:PackageIdentity` | identity |
+| `pkg:upstreamEcosystem` | `:PackageEntity` | either (unchanged per collector) |
+| `pkg:upstreamPackageName` | `:PackageEntity` | either (unchanged per collector) |
+| `pkg:upstreamPackageVersion` | `:Package` | versioned package |
+| `pkg:upstreamPackageRelease` | `:Package` | versioned package |
 
-Under RDFS entailment these wrongly infer those identities into `:Package`.
-This is the same bug class that commit `45a0aaf` fixed for
-`pkg:hasUpstreamProject`, rediscovered in a neighbouring predicate.
-
-### 4.2 The correction, and the inverted altitude of the new edge
-
-The new `pkg:upstreamPackageIdentity` has domain `PackageIdentity` — the
-**opposite** altitude from `upstreamPackageName`. Both must be emitted, at
-different subjects, from the same call site:
+For a Fedora RPM the result is:
 
 ```turtle
 # identity-level — the new traversable edge
 <d/pkg/fedora/43/x86_64/ghc-hoauth2>
     pkg:upstreamPackageIdentity <d/pkg/hackage/hackage/any/hoauth2> .
 
-# package-level — the retained literal, on the versioned subject
+# package-level — genuinely version-specific facts
 <d/pkg/fedora/43/x86_64/ghc-hoauth2/2.14.3-2.fc44>
-    pkg:upstreamPackageName "hoauth2" ;
+    pkg:upstreamPackageName    "hoauth2" ;
     pkg:upstreamPackageVersion "2.14.3" .
 ```
 
-Emitting the new edge on the versioned package, or the literal on the
-identity, reintroduces `45a0aaf`. Tests in §11 assert both altitudes
-explicitly.
+`rpm.rs` keeps `upstreamPackageName` on the versioned package (where it
+already is) and `collect_spec.rs` / `debian.rs` / `collect_salsa.rs` /
+`collect_sources.rs` keep it on the identity (where they already have it).
+**No emitter moves subjects.** The only change to those call sites is the
+addition of the new `upstreamPackageIdentity` edge, which always goes on an
+identity.
 
-`pkg:upstreamEcosystem` is left on its current subjects for now — changing it
-would break `enrich_taxonomy.rs:88-92` and `seed.rs:16-47`, which read it off
-the identity. Noted as follow-on.
+This matters for implementability: three of those four collectors have no
+versioned package URI in scope and cannot construct one (§2.4). Had the
+correction gone the other way, they would have blocked on sub-project 3.
+
+### 4.2 Threading the identity URI into `rpm.rs`
+
+`rpm.rs::emit_ecosystem_triples` (rpm.rs:1041-1046) currently takes only the
+versioned URI:
+
+```rust
+fn emit_ecosystem_triples(&self, writer, pkg_uri: &str, deps: &[RpmDep]) -> Result<usize>
+```
+
+It needs the identity to emit the new edge. `identity_uri` is already live at
+the call site (bound at rpm.rs:835, called from rpm.rs:1015), so this is a
+single added parameter — no new derivation, no new state.
+
+The other four sites already receive identity URIs
+(`collect_spec.rs:415-420` takes `identity_uris: &[String]`) and need no
+plumbing change at all.
 
 ### 4.3 Where the resolver is called
 
@@ -364,7 +461,7 @@ upstream ecosystem and name:
 (uris.rs:405-407). The output is byte-identical; consolidate onto the helper
 while touching the function.
 
-### 4.4 Why this join is lossless
+### 4.4 Why this join is lossless — and the prerequisite that makes it so
 
 `seed.rs::discover_by_ecosystem` (seed.rs:16-47) queries Fuseki for
 `upstreamPackageName` literals filtered by ecosystem and writes them to a seed
@@ -373,9 +470,39 @@ file; `hackage.rs:62-65` and its ten siblings feed that file straight into
 string the distro run recorded** — byte-identical by construction, for the 11
 collectors wired this way (`cran.rs` and `conda.rs` are not).
 
-This makes the identity join deterministic rather than heuristic for the
-seeded path, and is the reason §3.2's transforms are the only normalization
-needed.
+**This argument does not hold against the current `rpm.rs`, and this design
+depends on a prerequisite fix.** `rpm.rs::emit_ecosystem_triples` latches a
+single `emitted_ecosystem` boolean on the *first* matching `Provides:`
+capability (rpm.rs:1113-1119) while writing `upstreamPackageName` for *every*
+matching capability in the same loop (rpm.rs:1120-1126). A package providing
+both `python3dist(foo)` and `crate(bar)` therefore emits one
+`upstreamEcosystem → pypi` alongside two names, and `seed.rs`'s join hands
+`bar` — a crate name — to the PyPI collector.
+
+That is a live data-quality bug independent of this design: seeded registry
+collectors have been receiving wrong-ecosystem names for as long as this has
+shipped. It is fixed in its own PR, landing **before** this work:
+
+> Move the ecosystem emission inside the per-capability branch, keyed on the
+> capability's own `ecosystem` value and de-duplicated with a
+> `HashSet<&str>` of already-emitted ecosystems rather than a single bool, so
+> a package that genuinely spans ecosystems emits one `upstreamEcosystem` per
+> ecosystem and each name is attributable to the right one.
+
+Only once that lands is the seeded registry node guaranteed to correspond to
+the ecosystem it was filed under, and only then is the join deterministic
+rather than heuristic. The resolver in §3 is unaffected either way — it is
+called inside the per-capability branch with that branch's own `ecosystem`
+value, so it pairs names and ecosystems correctly regardless. What the
+prerequisite protects is the *pre-existence* of the target node.
+
+The size of the existing pollution is measurable before fixing, with:
+
+```sparql
+SELECT ?pkg (COUNT(DISTINCT ?name) AS ?names) WHERE {
+  ?pkg pkg:upstreamPackageName ?name ; pkg:upstreamEcosystem ?eco .
+} GROUP BY ?pkg HAVING (COUNT(DISTINCT ?name) > 1)
+```
 
 ## 5. Bundled components
 
@@ -412,7 +539,7 @@ bundled components are **not** modelled in v1 — a package bundling several
 components cannot attribute a flat `pkg:upstreamPackageVersion` literal to any
 one of them, so version-bearing bundles need a qualified (reified) structure.
 The §7 deriver therefore covers repackaging only, not bundling. Deferred with
-the artifact-inspection tier (§12.2), where exact per-component versions
+the artifact-inspection tier (sub-project 2, §12), where exact per-component versions
 arrive anyway.
 
 `primary.xml` is already parsed and already carries the full `Provides:` list
@@ -422,16 +549,23 @@ arrive anyway.
 
 `npm.rs` does not currently deserialize `bundledDependencies` /
 `bundleDependencies` at all. Add the field to the version struct, and for each
-entry emit both:
+entry emit exactly one triple:
 
 ```turtle
-<npm-identity> pkg:bundles           <d/pkg/npm/registry/any/lodash> .
-<npm-identity> npm:bundledDependency <d/pkg/npm/registry/any/lodash> .
+<d/pkg/npm/registry/any/express> pkg:bundles <d/pkg/npm/registry/any/lodash> .
 ```
 
-`npm:bundledDependency` (npm.ttl:9-14) has domain and range `npm:NpmPackage`,
-which is the versioned class — so that triple goes on the versioned subject
-while `pkg:bundles` goes on the identity. Same split as §4.2.
+`npm:bundledDependency` is **not** emitted, for the reason given in §2.2: its
+range is `npm:NpmPackage` (the versioned class), while `bundledDependencies`
+is a bare name array carrying no versions. There is no legal object to
+construct, and supplying an identity URI would violate the range. Both
+subject and object here are identities, matching `pkg:bundles`'s declared
+domain and range.
+
+Note that the field is a JSON array of names, but npm also permits the
+legacy boolean `bundledDependencies: true` (meaning "bundle everything in
+`dependencies`"). Deserialization must tolerate both shapes and emit nothing
+for the boolean form, which carries no per-package information.
 
 The registry document is already fetched; this reads a field already in the
 response body.
@@ -654,10 +788,25 @@ registry APIs ─► hackage/pypi/npm/… collectors
   `pkg:upstreamRepository` on the identity. Any consumer of the old triple
   breaks. Grep found no consumers in `etl/` or `query/`; confirm before
   merging.
-- `pkg:upstreamPackageName` literals are **retained** at their current values
-  and subjects-as-corrected. `enrich_taxonomy.rs:88-92` and `seed.rs:16-47`
-  read them and must keep working; the seed mechanism in particular is what
-  makes §4.4 hold, so it cannot be broken by this change.
+- `pkg:upstreamPackageName` literals are **retained at their current values
+  and their current subjects** — no emitter changes altitude (§4.1).
+  `enrich_taxonomy.rs:88-92` and `seed.rs:16-47` read them and keep working
+  unchanged; the seed mechanism in particular is what makes §4.4 hold, so it
+  cannot be broken by this change.
+- The §2.4 domain widening is monotonic: it removes entailments rather than
+  adding them, so no currently-valid triple becomes invalid. Consumers that
+  relied on `upstreamPackageName` entailing `rdf:type :Package` lose that
+  inference — but that inference was the bug, and grep finds no consumer
+  depending on it.
+- **Ordering hazard.** The ontology release (§2.4) must precede the collector
+  changes. Emitting `pkg:bundles` / `pkg:upstreamPackageRelease` against the
+  currently-pinned ontology yields triples with undeclared predicates, which
+  `core.shacl.ttl` validation will flag and which no consumer can reason over.
+- **Prerequisite.** The `rpm.rs:1113` per-capability ecosystem fix (§4.4) must
+  land and a full RPM collection cycle must complete before the §4.4
+  losslessness argument holds. Landing this design first does not corrupt
+  anything, but the identity edges it emits for mixed-capability packages may
+  point at registry nodes that were never seeded.
 - Graph-size impact: these are additive triples on existing subjects. No new
   named graphs, no graph URI changes — the collision risk that has bitten
   before does not apply here.
@@ -679,12 +828,15 @@ Unit tests, per the existing `#[cfg(test)]` convention in each collector:
 5. `registry_identity_uri("cpan", …)` and `("conda", …)` return `None`.
 6. **Altitude tests** (the `45a0aaf` regression guard): assert
    `upstreamPackageIdentity` appears on the identity subject and *never* on
-   the versioned subject; assert `upstreamPackageName` appears on the
-   versioned subject and *never* on the identity subject. One such test per
-   affected collector.
+   the versioned subject, and that `pkg:bundles` does likewise. One per
+   affected collector. Assert also that no emitter's `upstreamPackageName`
+   subject *changed* — these are characterization tests locking in current
+   behaviour, since §4.1 deliberately moves nothing.
 7. `bundled(crate(nom))` parses to `("cargo", "nom")` and yields a `pkg:bundles`
    edge; `bundled(` with unbalanced parens yields no edge and no panic.
-8. npm `bundledDependencies` present / absent / empty-array.
+8. npm `bundledDependencies` as a name array, absent, empty array, and the
+   legacy boolean `true` form — the boolean emits nothing and does not panic.
+   Assert `npm:bundledDependency` is never emitted (§2.2).
 9. Each of the nine §6 collectors emits `pkg:upstreamRepository` on the
    identity for a forge URL, and nothing for a non-forge URL.
 10. `gomod` major-version suffix stripping: `github.com/go-chi/chi/v5` →
@@ -699,6 +851,17 @@ Integration:
 12. The §7 deriver emits an edge when versions match and **no** edge when the
     registry holds a different version, asserted against a fixture with a
     deliberate version mismatch.
+13. SHACL validation (`core.shacl.ttl`) passes over a graph containing every
+    new and corrected predicate from §2.2 and §2.4, run against the updated
+    ontology. This is the gate that would have caught the undeclared
+    `upstreamPackageVersion`.
+
+Prerequisite PR (§4.4), tested separately:
+
+14. An RPM providing both `python3dist(foo)` and `crate(bar)` emits two
+    `upstreamEcosystem` triples — one per ecosystem — and each
+    `upstreamPackageName` is attributable to the correct one. Currently this
+    emits one ecosystem and two names.
 
 ## 12. Follow-on sub-projects
 
@@ -723,13 +886,28 @@ dependency order:
 6. **Generalize beyond RPM** — Debian `dh-cargo`/`pybuild`/`dh_haskell`,
    `debian/copyright` `Files-Excluded`, Gentoo, Nix.
 
-Smaller items surfaced by this design and deliberately not fixed here:
+### Landing order
+
+```
+1. rpm.rs per-capability ecosystem fix        (§4.4 prerequisite, own PR)
+2. ontology PR + release + upload-ontology.sh (§2.4)
+3. this design's collector changes            (§3, §4, §5, §6)
+4. derive_upstream_release                    (§7, after a full collection cycle)
+```
+
+Steps 1 and 2 are independent of each other and can run in parallel; both
+gate step 3.
+
+### Smaller items surfaced and deliberately not fixed here
 
 - `cpan.rs`'s distribution-vs-module inconsistency (§3.3), which makes its
-  existing dependency edges dangle.
-- `pkg:upstreamEcosystem` subject altitude differs between `rpm.rs` and the
-  other four emitters (§4.2).
+  existing dependency edges dangle today.
 - No registry collector emits `pkg:partOfEcosystem`, so "all Hackage packages"
   is not traversable from the `Ecosystem` hub — only the distro side points at
   it.
 - Go `replace` directives as an identity-substitution relation.
+- `npm:bundledDependency` remains declared but unemitted until the
+  artifact-inspection tier can supply resolved versions (§2.2).
+- The `no-forge-match` DQ issue (collect_spec.rs:232-241) fires at `info` for
+  every registry-hosted `Source0`; consider demoting it where an ecosystem was
+  successfully resolved.
