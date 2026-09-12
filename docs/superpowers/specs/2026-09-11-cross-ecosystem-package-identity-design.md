@@ -483,7 +483,7 @@ guessable from the ecosystem token — two of them differ.
 | `hackage` | `hackage` | `hackage` | none | hackage.rs:278 |
 | `pypi` | `pypi` | `index` | **PEP 503 normalize** | pypi.rs:509 |
 | `npm` | `npm` | `registry` | none | npm.rs:194 |
-| `cargo` | `cargo` | `crates.io` | none | cargo_collect.rs:281 |
+| `cargo` | `cargo` | `crates.io` | **strip `/feature` suffix** | cargo_collect.rs:281 |
 | `rubygems` | `rubygems` | `org` | none | rubygems.rs:201 |
 | `gomod` | — | — | **excluded, see §3.4** | gomod.rs:309 |
 | `maven` | `maven` | `central` | **`g:a` → `g/a`** | maven.rs:907 |
@@ -505,6 +505,18 @@ get wrong, producing well-formed URIs that match nothing:
   exclusion must handle both the rename *and* module-root resolution.
 - **`maven` separator.** `rpm.rs` derives `"g:a"` from `mvn(group:artifact)`,
   while `maven.rs:907` mints the path segment `g/a`.
+- **`cargo` feature suffixes.** Fedora's `rust2rpm` emits one `Provides` per
+  Cargo feature — `crate(serde)`, `crate(serde/derive)`, `crate(serde/std)` —
+  and `rpm.rs:1056` strips only the `crate(` … `)` wrapper, yielding
+  `"serde/derive"`. Minting from that gives
+  `…/cargo/crates.io/any/serde%2Fderive`, while `cargo_collect.rs:281` mints
+  from the bare crate name `serde`. Everything after the first `/` must be
+  dropped, and the several feature capabilities on one package then collapse
+  to one assertion per crate rather than one per feature — which is correct,
+  since features are build variants of the same crate, not distinct upstreams.
+  Note `normalize_librust_crate_name` (collect_spec.rs:1016-1023) does **not**
+  do this: it handles Debian's `librust-foo+feature-dev` shape, splitting on
+  `+` and stripping `-dev`. Fedora's separator is `/`. Both are needed.
 - **`pypi` normalization.** The distro side strips a prefix without case
   folding — `strip_ecosystem_prefix` (collect_spec.rs:1000-1007) is a plain
   prefix strip — so `python3-Foo` yields `"Foo"`, while PyPI normalizes names
@@ -1169,6 +1181,10 @@ Unit tests, per the existing `#[cfg(test)]` convention in each collector:
    case.
 5. `registry_identity_uri` returns `None` for all three excluded ecosystems —
    `cpan`, `gomod`, `conda` — and a DQ issue is recorded for each.
+5b. `registry_identity_uri("cargo", "serde/derive")` produces
+   `…/cargo/crates.io/any/serde`, identical to `("cargo", "serde")`. A fixture
+   RPM with `crate(serde)`, `crate(serde/derive)`, and `crate(serde/std)`
+   yields exactly **one** assertion, not three.
 6. **Altitude tests** (the `45a0aaf` regression guard): assert
    `upstreamPackageIdentity` appears on the identity subject and *never* on
    the versioned subject, and that `pkg:bundles` does likewise. One per
