@@ -214,6 +214,11 @@ Three defects in the pinned ontology block this design. All are in the sibling
 `packagegraph/ontology` repository and must land and be released before the
 collector changes.
 
+> Filed as **packagegraph/ontology#9**. The two *new* terms in §2.2
+> (`:bundles`, `:upstreamPackageRelease`) are deliberately not in that issue —
+> they are contingent on this design being accepted, whereas the three defects
+> below are real regardless.
+
 **(a) `pkg:upstreamPackageVersion` is undeclared.** `rpm.rs:1130` has been
 emitting it, and the §7 deriver joins on it, but grep over `core.ttl` finds no
 declaration. Declare it. This property *is* genuinely version-specific, so it
