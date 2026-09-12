@@ -395,7 +395,7 @@ impl PypiCollector {
                     },
                     status => PypiOutcome {
                         was_network_hit: true,
-                        result: Err(FetchError::HttpStatus { url, status }),
+                        result: Err(FetchError::HttpStatus { url, status, body: None }),
                     },
                 },
                 Err(e) => PypiOutcome {

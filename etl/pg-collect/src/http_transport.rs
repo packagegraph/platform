@@ -190,6 +190,9 @@ impl HostLimiter {
     }
 }
 
+/// How much of a failing response body to keep for the error message.
+const ERROR_BODY_LIMIT: usize = 512;
+
 /// Default pacing between two requests to the same host.
 pub const DEFAULT_RATE_LIMIT: Duration = Duration::from_millis(200);
 
@@ -503,10 +506,21 @@ impl HttpTransport {
         }
 
         if !status.is_success() && status != StatusCode::NOT_MODIFIED {
+            // The response is still in hand here, so capture whatever
+            // explanation the server sent. Truncated, because an error page
+            // can be megabytes of HTML and this ends up in a log line.
+            let body = response.text().ok().map(|mut b| {
+                if b.len() > ERROR_BODY_LIMIT {
+                    b.truncate(ERROR_BODY_LIMIT);
+                    b.push_str("... (truncated)");
+                }
+                b
+            });
             return Attempt {
                 result: Err(FetchError::HttpStatus {
                     url: url.to_string(),
                     status: status.as_u16(),
+                    body,
                 }),
                 retry_after,
             };
@@ -1081,6 +1095,66 @@ mod tests {
         assert_eq!(snap.attempts, 1);
         assert_eq!(snap.successes, 1);
         assert_eq!(snap.failures, 0);
+    }
+
+    #[test]
+    fn failing_status_carries_the_server_explanation() {
+        // Fuseki puts the SPARQL parse error in the body of its 400. Without
+        // it the caller can only report "HTTP 400" and the operator has to
+        // reproduce the query by hand to find out what was wrong with it.
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("POST", "/update")
+            .with_status(400)
+            .with_body("Parse error: line 1, column 8: Unresolved prefixed name: pkg:foo")
+            .create();
+
+        let t = test_transport(fast_policy(1));
+        let err = t
+            .post(&format!("{}/update", server.url()), &[], b"bad".to_vec())
+            .unwrap_err();
+
+        match &err {
+            FetchError::HttpStatus { body, .. } => {
+                let body = body.as_deref().unwrap_or("");
+                assert!(
+                    body.contains("Unresolved prefixed name"),
+                    "body not captured, got {body:?}"
+                );
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+        assert!(
+            err.to_string().contains("Unresolved prefixed name"),
+            "Display should surface it too: {err}"
+        );
+    }
+
+    #[test]
+    fn failing_status_body_is_truncated() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("POST", "/update")
+            .with_status(500)
+            .with_body("x".repeat(10_000))
+            .create();
+
+        let t = test_transport(fast_policy(1));
+        let err = t
+            .post(&format!("{}/update", server.url()), &[], b"q".to_vec())
+            .unwrap_err();
+
+        match &err {
+            FetchError::HttpStatus { body, .. } => {
+                let body = body.as_deref().unwrap_or("");
+                assert!(
+                    body.len() <= 600,
+                    "a 10k HTML error page should not reach the log whole, got {}",
+                    body.len()
+                );
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
     }
 
     #[test]

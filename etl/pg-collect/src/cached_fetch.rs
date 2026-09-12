@@ -291,6 +291,7 @@ impl CachedFetcher {
                     result: Err(FetchError::HttpStatus {
                         url: url.to_string(),
                         status,
+                        body: None,
                     }),
                 }
             }
@@ -350,6 +351,7 @@ impl CachedFetcher {
                 result: Err(FetchError::HttpStatus {
                     url: url.to_string(),
                     status,
+                    body: None,
                 }),
             },
         }
@@ -962,6 +964,7 @@ mod tests {
                 Err(FetchError::HttpStatus {
                     url: url.to_string(),
                     status: 429,
+                    body: None,
                 })
             },
         );
@@ -1004,6 +1007,7 @@ mod tests {
                 Err(FetchError::HttpStatus {
                     url: url.to_string(),
                     status: 401,
+                    body: None,
                 })
             },
         );
