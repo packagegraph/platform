@@ -102,10 +102,6 @@ struct HostState {
     interval: Duration,
     /// Earliest instant at which the next request to this host may start.
     next_allowed: Instant,
-    /// Hard floor from a `Retry-After`. Separate from `next_allowed` because
-    /// a waiter that already holds a slot must re-check against it after
-    /// waking, and `next_allowed` has moved on by then.
-    not_before: Instant,
 }
 
 /// Paces requests per host. One instance is shared by every collector, so
@@ -142,7 +138,7 @@ impl HostLimiter {
         let now = Instant::now();
         guard
             .get(host)
-            .map(|s| s.next_allowed.max(now).max(s.not_before))
+            .map(|s| s.next_allowed.max(now))
             .unwrap_or(now)
     }
 
@@ -155,7 +151,6 @@ impl HostLimiter {
                 HostState {
                     interval,
                     next_allowed: Instant::now(),
-                    not_before: Instant::now(),
                 },
             );
         }
@@ -170,37 +165,38 @@ impl HostLimiter {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Block until this host's next slot, reserving it for this caller.
+    /// Block until this host is free, then claim it.
+    ///
+    /// The cursor is advanced by the caller that actually proceeds, never by
+    /// one that is about to sleep. An earlier version handed each waiter a
+    /// timestamp up front, which meant a `Retry-After` arriving mid-wait
+    /// could not reach the slots already given out: every waiter inside the
+    /// embargo woke on the same instant and sent together, handing the server
+    /// exactly the burst that got us rate limited. Re-reading the cursor on
+    /// each wake costs a few spurious wakeups and removes that whole class of
+    /// bug -- a waiter cannot hold a stale slot if it never holds one.
+    ///
+    /// Ordering between waiters is therefore not FIFO. That is deliberate:
+    /// what this guarantees is the spacing between requests, and no caller
+    /// depends on which worker goes first.
     pub fn wait_turn(&self, host: &str) {
-        let mut slot = {
-            let mut guard = self.lock();
-            let now = Instant::now();
-            let default_interval = self.default_interval;
-            let entry = guard.entry(host.to_string()).or_insert(HostState {
-                interval: default_interval,
-                next_allowed: now,
-                not_before: now,
-            });
-            let slot = entry.next_allowed.max(now).max(entry.not_before);
-            entry.next_allowed = slot + entry.interval;
-            slot
-        }; // lock released before sleeping
-
         loop {
-            let now = Instant::now();
-            if slot > now {
-                std::thread::sleep(slot - now);
-            }
-            // A `Retry-After` may have arrived while we slept, in which case
-            // the slot we hold was priced under the old pacing. Wait out the
-            // new floor rather than sending inside a window the server has
-            // explicitly closed. Re-checked rather than re-reserved, so a
-            // widen cannot multiply the queue's reservations.
-            let floor = self.lock().get(host).map(|s| s.not_before);
-            match floor {
-                Some(floor) if floor > Instant::now() => slot = floor,
-                _ => return,
-            }
+            let wait = {
+                let mut guard = self.lock();
+                let now = Instant::now();
+                let default_interval = self.default_interval;
+                let entry = guard.entry(host.to_string()).or_insert(HostState {
+                    interval: default_interval,
+                    next_allowed: now,
+                });
+                if entry.next_allowed <= now {
+                    entry.next_allowed = now + entry.interval;
+                    return;
+                }
+                entry.next_allowed - now
+            }; // lock released before sleeping
+
+            std::thread::sleep(wait);
         }
     }
 
@@ -213,18 +209,15 @@ impl HostLimiter {
         let entry = guard.entry(host.to_string()).or_insert(HostState {
             interval: default_interval,
             next_allowed: now,
-            not_before: now,
         });
         if at_least > entry.interval {
             entry.interval = at_least;
         }
-        // Raise the floor too. Widening only the interval left the very next
-        // reservation priced under the old pacing, so a `Retry-After: 60`
-        // could be followed immediately by another request.
+        // Push the cursor out too, or the next caller would be cleared to
+        // send immediately despite the server having just told us to wait.
+        // Waiters re-read this on each wake, so they re-space themselves at
+        // the widened interval rather than all resuming on the deadline.
         let floor = now + at_least;
-        if floor > entry.not_before {
-            entry.not_before = floor;
-        }
         if floor > entry.next_allowed {
             entry.next_allowed = floor;
         }
@@ -569,7 +562,7 @@ impl HttpTransport {
             // The response is still in hand here, so capture whatever
             // explanation the server sent. Truncated, because an error page
             // can be megabytes of HTML and this ends up in a log line.
-            let body = response.text().ok().map(|b| truncate_on_boundary(b));
+            let body = response.text().ok().map(truncate_on_boundary);
             return Attempt {
                 result: Err(FetchError::HttpStatus {
                     url: url.to_string(),
@@ -1208,6 +1201,50 @@ mod tests {
                 );
             }
             other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queued_waiters_do_not_burst_when_retry_after_expires() {
+        use std::sync::Arc;
+        // Three workers queue behind a host, then a `Retry-After` arrives.
+        // They must come out the far side spaced by the widened interval.
+        // Releasing them all on the deadline would hand the server the same
+        // burst that got us rate limited in the first place.
+        let limiter = Arc::new(HostLimiter::new(Duration::from_millis(100)));
+        limiter.wait_turn("example.org"); // occupy the host
+
+        let start = Instant::now();
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let l = Arc::clone(&limiter);
+                std::thread::spawn(move || {
+                    l.wait_turn("example.org");
+                    Instant::now()
+                })
+            })
+            .collect();
+
+        // Let all three park in wait_turn behind the occupied host, then
+        // land the embargo while they are still queued.
+        std::thread::sleep(Duration::from_millis(20));
+        limiter.widen("example.org", Duration::from_millis(400));
+
+        let mut times: Vec<Instant> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        times.sort();
+
+        assert!(
+            times[0].duration_since(start) >= Duration::from_millis(350),
+            "first waiter escaped the embargo after {:?}",
+            times[0].duration_since(start)
+        );
+        for pair in times.windows(2) {
+            let gap = pair[1].duration_since(pair[0]);
+            assert!(
+                gap >= Duration::from_millis(350),
+                "waiters burst together: only {:?} apart",
+                gap
+            );
         }
     }
 
