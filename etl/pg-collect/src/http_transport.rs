@@ -257,6 +257,15 @@ impl std::fmt::Display for StatsSnapshot {
     }
 }
 
+/// HTTP verbs the transport supports. Deliberately minimal: collectors
+/// read upstream data and, for query APIs like OSV and SPARQL, post a
+/// request document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Method {
+    Get,
+    Post,
+}
+
 /// One attempt's outcome, plus any `Retry-After` the server sent. The
 /// header has to travel separately because `FetchError` carries no
 /// headers.
@@ -327,6 +336,30 @@ impl HttpTransport {
         headers: &[(&str, &str)],
         if_none_match: Option<&str>,
     ) -> Result<HttpResponse, FetchError> {
+        self.execute(Method::Get, url, headers, if_none_match, None)
+    }
+
+    /// POST a body, with the same retry, backoff and pacing as `get`.
+    ///
+    /// The body is cloned per attempt rather than consumed, so a retry
+    /// resends it intact.
+    pub fn post(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Result<HttpResponse, FetchError> {
+        self.execute(Method::Post, url, headers, None, Some(body))
+    }
+
+    fn execute(
+        &self,
+        method: Method,
+        url: &str,
+        headers: &[(&str, &str)],
+        if_none_match: Option<&str>,
+        body: Option<Vec<u8>>,
+    ) -> Result<HttpResponse, FetchError> {
         let host = host_of(url);
         let mut attempt: u32 = 0;
 
@@ -337,7 +370,7 @@ impl HttpTransport {
             let Attempt {
                 result,
                 retry_after,
-            } = self.send_once(url, headers, if_none_match);
+            } = self.send_once(method, url, headers, if_none_match, body.clone());
 
             let err = match result {
                 Ok(response) => {
@@ -377,11 +410,19 @@ impl HttpTransport {
 
     fn send_once(
         &self,
+        method: Method,
         url: &str,
         headers: &[(&str, &str)],
         if_none_match: Option<&str>,
+        body: Option<Vec<u8>>,
     ) -> Attempt {
-        let mut request = self.client.get(url);
+        let mut request = match method {
+            Method::Get => self.client.get(url),
+            Method::Post => self.client.post(url),
+        };
+        if let Some(body) = body {
+            request = request.body(body);
+        }
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
@@ -873,7 +914,9 @@ mod tests {
             .create();
 
         let t = test_transport(fast_policy(5));
-        let resp = t.get(&format!("{}/archive.gz", server.url()), None).unwrap();
+        let resp = t
+            .get(&format!("{}/archive.gz", server.url()), None)
+            .unwrap();
 
         mock.assert();
         assert_eq!(
@@ -929,6 +972,52 @@ mod tests {
 
         // All three attempts matched the header matcher, so headers are not
         // lost on retry.
+        mock.assert();
+        assert!(matches!(err, FetchError::HttpStatus { status: 503, .. }));
+    }
+
+    #[test]
+    fn post_sends_the_body_and_returns_the_response() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/query")
+            .match_header("content-type", "application/json")
+            .match_body(r#"{"package":"curl"}"#)
+            .with_status(200)
+            .with_body(r#"{"vulns":[]}"#)
+            .expect(1)
+            .create();
+
+        let t = test_transport(fast_policy(5));
+        let resp = t
+            .post(
+                &format!("{}/query", server.url()),
+                &[("Content-Type", "application/json")],
+                br#"{"package":"curl"}"#.to_vec(),
+            )
+            .unwrap();
+
+        mock.assert();
+        assert_eq!(resp.bytes, br#"{"vulns":[]}"#);
+    }
+
+    #[test]
+    fn post_resends_the_body_on_every_retry() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/flaky")
+            .match_body("payload")
+            .with_status(503)
+            .expect(3)
+            .create();
+
+        let t = test_transport(fast_policy(3));
+        let err = t
+            .post(&format!("{}/flaky", server.url()), &[], b"payload".to_vec())
+            .unwrap_err();
+
+        // All three attempts matched the body matcher, so the body is not
+        // consumed by the first attempt.
         mock.assert();
         assert!(matches!(err, FetchError::HttpStatus { status: 503, .. }));
     }
