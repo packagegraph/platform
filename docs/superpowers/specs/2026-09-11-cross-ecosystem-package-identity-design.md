@@ -36,9 +36,29 @@ Revision 3 introduced that node but left it unable to bootstrap — its seed
 query read the upstream name off the target identity, which does not exist in
 the graph at the moment seeding runs — and under-constrained, admitting either
 a build or an identity as owner and requiring neither method nor confidence.
-Revision 4 adds `:assertionUpstreamName`, fixes the owner to exactly one
-`PackageIdentity`, and specifies the full SHACL shape plus the one integrity
-rule shapes cannot express (§11.15).
+Revision 4 added `:assertionUpstreamName`, fixed the owner to exactly one
+`PackageIdentity`, and specified the SHACL shape.
+
+**Revision 5**, after a fourth round, corrects three things that would each
+have failed silently rather than loudly:
+
+- `:assertionUpstreamName` is the **collector's seed input**, not the URI path
+  component. They differ for Maven (`g:a` vs `g/a`) and PyPI, and
+  `MavenCoord::parse` discards the URI form without an error (§2.2).
+- The assertion URI key now includes the source build and the relation kind.
+  Keying from the owner identity alone collided two builds of one package into
+  a node that then violated its own `sh:maxCount 1` on `:assertionSourceBuild`
+  — routine for npm (§2.2, "URI keying").
+- The SHACL shape used `sh:minValue`/`sh:maxValue`, which are not SHACL
+  vocabulary, so the confidence range was unenforced while appearing
+  enforced; and the source-build rule was written as a free-standing `SELECT`
+  rather than an `sh:sparql` constraint (§11.15).
+
+Revision 5 also blocks the `pypi` row on a `pypi.rs` fix (§3.5): that collector
+mints identity URIs from the server-returned `info.name` (`Flask`) while
+normalizing seeds and dependency targets locally (`flask`), so its own
+dependency edges already dangle. Eight ecosystems are supported at first
+release, nine once that lands.
 
 ## 1. Overview
 
@@ -141,8 +161,9 @@ deriver runs.
 - **CPAN, Go, and conda.** All three name things in a namespace the registry
   collector does not key by, so none can be resolved by string transform.
   Excluded from v1 (§3.3, §3.4, §3.5) rather than emitted as dangling
-  references. **Nine** ecosystems remain supported: hackage, pypi, npm, cargo,
-  rubygems, maven, cran, hex, nuget.
+  references. **Eight** ecosystems are supported at first release — hackage,
+  npm, cargo, rubygems, maven, cran, hex, nuget — becoming nine once the
+  `pypi.rs` URI fix in §3.5 lands.
 
 ## 2. Vocabulary
 
@@ -231,12 +252,13 @@ together:
     rdfs:isDefinedBy : .
 
 :assertionUpstreamName a owl:DatatypeProperty ;  # required, exactly one
-    IAO:0000115 "The canonical upstream package name in its native registry,
-      after all ecosystem-specific normalization has been applied — the exact
-      string the registry collector will use as its package name. Carried on
-      the assertion itself so that consumers, including seed generation, can
-      read it without dereferencing the target, which may not yet exist in the
-      graph."@en ;
+    IAO:0000115 "The canonical identifier for the upstream package in its
+      native registry, in the form that registry's collector accepts as seed
+      input — for Maven a groupId:artifactId coordinate, for PyPI a PEP
+      503-normalized name. This is deliberately NOT the URI path component,
+      which may differ. Carried on the assertion itself so that consumers,
+      including seed generation, can read it without dereferencing the target,
+      which may not yet exist in the graph."@en ;
     rdfs:domain :UpstreamAssertion ;
     rdfs:range xsd:string ;
     rdfs:isDefinedBy : .
@@ -306,12 +328,30 @@ query that reads the name off the target (as a previous revision's did) can
 only ever return names for packages already collected, which is precisely the
 set that does not need seeding. It would bootstrap nothing.
 
-Carrying the post-transform canonical name as a literal on the assertion makes
-it self-contained: the pairing, the ecosystem, and the fetchable name are all
-readable from one node with no dereference. It also means the name is recorded
-*after* the §3.2 transforms — PEP 503 normalization, Cargo feature stripping,
-Maven `g:a → g/a` — so what seeds the collector is exactly what the collector
-will key by.
+Carrying the name as a literal on the assertion makes it self-contained: the
+pairing, the ecosystem, and the fetchable name are all readable from one node
+with no dereference.
+
+**The literal is the collector's seed input, not the URI path component.**
+These are different strings for two ecosystems, and conflating them breaks
+seeding silently:
+
+| Ecosystem | `:assertionUpstreamName` (seed input) | URI path component |
+|---|---|---|
+| `maven` | `org.foo:bar` | `org.foo/bar`, encoded `org.foo%2Fbar` |
+| `pypi` | `flask` (PEP 503) | `Flask` — server-returned, see §3.5 |
+| all others | identical to the URI component | — |
+
+`MavenCoord::parse` (maven.rs:107-115) splits on `:` and returns `None` unless
+it finds a non-empty group *and* artifact, so a seed line `org.foo/bar` parses
+as a group with no artifact and is **silently discarded**. Seeding Maven with
+the URI form would drop every Maven seed with no error and no DQ record. The
+`g:a → g/a` rewrite therefore belongs to the resolver alone (§3.1); the
+assertion carries `g:a`.
+
+Cargo feature stripping and Go module-root resolution are *not* in this
+category — for those the seed input and the URI component are the same string;
+only Maven and PyPI diverge.
 
 Reverse-parsing the target IRI to recover the name is not an acceptable
 substitute: it would require every consumer to know and re-implement the
@@ -380,22 +420,41 @@ identity-only shortcut, so the §8 one-hop query keeps working. The invariant
 is: **every shortcut edge must have a backing assertion; no shortcut is ever
 emitted without one.**
 
-**URI keying.** The assertion node must be keyed on everything that
-distinguishes it, or distinct capabilities collide:
+**URI keying.** The assertion node must be keyed on every facet that can
+distinguish two legitimate assertions, or distinct ones silently collide into
+a node that then violates its own `sh:maxCount 1` constraints:
 
 ```rust
 // uris.rs — new
 pub fn upstream_assertion_uri(
-    source: &str,        // identity or build URI
+    owner_identity: &str,          // the asserting PackageIdentity
+    source_build: Option<&str>,    // MUST be in the key when present
     ecosystem: &str,
-    target_name: &str,
-    version: Option<&str>,
+    target_name: &str,             // seed-input form
+    relation: &str,                // repackages | bundles
+    upstream_version: Option<&str>,
 ) -> String
 ```
 
-Keying on `(source, target)` alone — as `package_relationship_uri` does — is
-what reintroduces the cross-product, and is the specific mistake this section
-exists to avoid.
+Every one of those six is load-bearing:
+
+- **`source_build` is not optional-in-the-key.** Ownership is identity-level
+  (§2.2), so keying from the owner alone means two builds of one identity that
+  declare the same target and version produce the *same* assertion IRI — while
+  each needs its own `:assertionSourceBuild`, of which SHACL permits exactly
+  one. The node becomes invalid and one build's evidence is lost. npm makes
+  this routine rather than exotic: `express@4.19.1` and `express@4.19.2` are
+  separate builds of one identity and can bundle different contents.
+- **`relation`** — a package may both repackage and bundle the same target
+  (a Rust crate vendored alongside being the package's own upstream). Without
+  it, the repackage and bundle assertions collide.
+- **`upstream_version`** — distinguishes a versioned from an unversioned
+  declaration of the same target.
+
+Keying on `(source, target)` alone — as `package_relationship_uri`
+(uris.rs:501) does — is what reintroduces the cross-product, and is the
+specific mistake this section exists to avoid. That helper must **not** be
+reused here.
 
 `npm:bundledDependency` (npm.ttl:9-14) is **not** emitted in v1. Its range is
 `npm:NpmPackage`, the versioned class, but `bundledDependencies` in a package
@@ -596,7 +655,7 @@ transform can bridge.
 | Ecosystem token | Distro seg | Release seg | Name transform | Verified at |
 |---|---|---|---|---|
 | `hackage` | `hackage` | `hackage` | none | hackage.rs:278 |
-| `pypi` | `pypi` | `index` | **PEP 503 normalize** | pypi.rs:509 |
+| `pypi` | `pypi` | `index` | **blocked, see §3.5** | pypi.rs:509 |
 | `npm` | `npm` | `registry` | none | npm.rs:194 |
 | `cargo` | `cargo` | `crates.io` | **strip `/feature` suffix** | cargo_collect.rs:281 |
 | `rubygems` | `rubygems` | `org` | none | rubygems.rs:201 |
@@ -606,7 +665,7 @@ transform can bridge.
 | `hex` | `hex` | `pm` | none | hex_collect.rs:266 |
 | `nuget` | `nuget` | `gallery` | none | nuget.rs:234 |
 | `cpan` | — | — | **excluded, see §3.3** | cpan.rs:195 |
-| `conda` | — | — | **excluded, see §3.5** | conda.rs:198 |
+| `conda` | — | — | **excluded, see §3.6** | conda.rs:198 |
 
 All identities are `package_identity_uri(distro_seg, release_seg, "any", transformed_name)`.
 
@@ -632,13 +691,15 @@ get wrong, producing well-formed URIs that match nothing:
   Note `normalize_librust_crate_name` (collect_spec.rs:1016-1023) does **not**
   do this: it handles Debian's `librust-foo+feature-dev` shape, splitting on
   `+` and stripping `-dev`. Fedora's separator is `/`. Both are needed.
-- **`pypi` normalization.** The distro side strips a prefix without case
-  folding — `strip_ecosystem_prefix` (collect_spec.rs:1000-1007) is a plain
-  prefix strip — so `python3-Foo` yields `"Foo"`, while PyPI normalizes names
-  to lowercase with runs of `-_.` collapsed to `-`. PEP 503 normalization must
-  be applied to the name before minting. Hackage, by contrast, is
-  case-sensitive and Fedora's Haskell guidelines preserve upstream case
-  (`ghc-HUnit` → `HUnit`), so it must **not** be normalized.
+- **`pypi` normalization, and why the row is blocked.** The distro side strips
+  a prefix without case folding — `strip_ecosystem_prefix`
+  (collect_spec.rs:1000-1007) is a plain prefix strip — so `python3-Foo`
+  yields `"Foo"`, while PEP 503 normalizes to lowercase with runs of `-_.`
+  collapsed to `-`. That normalization is correct for the *seed input*, but it
+  is **not** what `pypi.rs` uses for its URIs, which is why this row is blocked
+  rather than transformed — see §3.5. Hackage, by contrast, is case-sensitive
+  and Fedora's Haskell guidelines preserve upstream case (`ghc-HUnit` →
+  `HUnit`), so it must **not** be normalized.
 
 ### 3.3 CPAN is excluded, deliberately
 
@@ -712,12 +773,60 @@ issue under detector `go-import-path-unresolved`. A follow-up can lift
 issues is what should justify that work.
 
 Note this makes **three** exclusions — CPAN, Go, and conda — sharing one shape:
-the distro side names a thing in a namespace the registry collector does not key
-by. Only a lookup reconciles them. The nine remaining ecosystems in §3.2 are
-genuinely pure string transforms, and that distinction is the real content of
-the table.
+the distro side names a thing in a namespace the registry collector does not
+key by, and only a lookup reconciles them. PyPI (§3.5) is a fourth, blocked for
+a different reason: the registry collector keys by a server-returned name we
+cannot compute. The remaining eight are genuinely pure string transforms, and
+that distinction is the real content of the table.
 
-### 3.5 conda is excluded
+### 3.5 PyPI needs a `pypi.rs` fix first — and that fix repairs an existing bug
+
+The `pypi` row is the one place where the *seed input* and the *URI path
+component* diverge for a reason that is not a transform we control.
+
+`pypi.rs` normalizes seeds on the way in — `normalize_pypi_name` (pypi.rs:45-50)
+lowercases and collapses runs of `-_.` to `-`, applied to every seed at
+pypi.rs:158. But it mints identity URIs from `info.name`, the name the **PyPI
+API returns** (pypi.rs:508-509), which preserves the project's declared case.
+Verified against the live API:
+
+```
+GET https://pypi.org/pypi/Flask/json  →  info.name == "Flask"
+```
+
+So a seed of `flask` produces the identity `…/pypi/index/any/Flask`. A
+resolver applying PEP 503 normalization computes `…/pypi/index/any/flask` and
+dangles. The correct IRI is **not computable without a fetch**, which a pure
+resolver cannot do.
+
+**This is already a live bug in `pypi.rs`, independent of this design.** The
+same collector builds *dependency* target URIs from the normalized name
+(pypi.rs:295 and pypi.rs:602, both via `normalize_pypi_name`) while building
+*identity* URIs from `info.name`. Any PyPI package depending on `Flask`
+therefore emits a dependency edge to `…/any/flask`, while Flask's own identity
+is `…/any/Flask`. Those dependency edges dangle today. It is the same defect
+class as `cpan.rs`'s distribution-vs-module split (§3.3), in a far more
+heavily used collector.
+
+The fix belongs in `pypi.rs`, not in a workaround here: mint identity, package,
+and version URIs from `normalize_pypi_name(&info.name)`, and keep the
+server-returned `info.name` as the `pkg:packageName` literal for display. PEP
+503 normalization is *defined* as the canonical form precisely so that one
+project cannot have two identifiers; minting IRIs from a mutable display name
+means a project that restyles its capitalization silently acquires a second
+identity.
+
+This is a **breaking IRI change** for the PyPI graph and needs a backfill, so
+it is its own PR, sequenced before this design's collector work (§12). Until
+it lands, `registry_identity_uri("pypi", _)` must return `None` rather than
+emit a dangling reference — leaving **eight** supported ecosystems at first
+release and nine once the PyPI fix ships.
+
+`:assertionUpstreamName` is unaffected either way: it carries the PEP
+503-normalized seed input, which is what `pypi.rs:158` expects and what the
+PyPI API accepts.
+
+### 3.6 conda is excluded
 
 `conda.rs:198` takes its distro, release, and subdir from CLI arguments
 (`main.rs:352-365`), defaulting to `conda`/`conda-forge`/`linux-64`. The
@@ -1332,8 +1441,8 @@ registry APIs ─► hackage/pypi/npm/… collectors
 Unit tests, per the existing `#[cfg(test)]` convention in each collector:
 
 1. `registry_identity_uri` returns the exact URI minted by each collector, for
-   all nine supported ecosystems (twelve table rows minus the three
-   exclusions). Each assertion hard-codes the expected string
+   all eight supported ecosystems (twelve table rows minus three exclusions
+   and PyPI, which is blocked on §3.5). Each assertion hard-codes the expected string
    and is paired with a comment citing the collector line it mirrors. These
    are the regression tests for the §3.2 traps.
 2. `registry_identity_uri("gomod", "github.com/foo/bar/pkg/baz")` returns
@@ -1393,9 +1502,28 @@ Integration:
     `pypi/foo@1.0.0` is *not* linked from the `bar` assertion. This is the
     single most important test in the design; both previous revisions would
     have failed it.
-14. `seed.rs`'s rewritten query (§4.4) against the same fixture returns `foo`
-    for `pypi` and `bar` for `cargo`, and neither name for the other
-    ecosystem.
+14. `seed.rs`'s rewritten query (§4.4) against the same fixture returns each
+    name only under its own ecosystem, and neither under the other.
+
+14b. **Maven seed round-trip.** An assertion with
+    `assertionUpstreamName "org.foo:bar"` must produce a seed line that
+    `MavenCoord::parse` (maven.rs:107) accepts, yielding
+    `group_id == "org.foo"` and `artifact_id == "bar"`. Assert also that the
+    URI-component form `org.foo/bar` is **rejected** by that parser — this is
+    the regression guard for the §2.2 seed-input-vs-URI distinction, and the
+    failure it guards against is silent (the coordinate is dropped, not
+    errored).
+
+14c. **Assertion key collisions.** Three cases, each asserting two *distinct*
+    assertion IRIs are minted:
+    - two builds of one identity (`express@4.19.1`, `express@4.19.2`) bundling
+      the same target at the same declared version — the npm case from §2.2;
+    - one identity that both repackages and bundles the same target
+      (differing only in `:assertionRelation`);
+    - one identity asserting the same target with and without a declared
+      upstream version.
+    Then assert each resulting node validates against the §11.15 shape, which
+    is what would fail if the key collapsed them.
 
 **SHACL does not currently cover any of this, and a previous revision claimed
 otherwise.** `grep` over `core/core.shacl.ttl` for `sh:closed`,
@@ -1438,28 +1566,44 @@ additions are needed, filed against the ontology repo:
                       sh:minCount 1 ; sh:maxCount 1 ] ;
         sh:property [ sh:path pkg:matchConfidence ;
                       sh:datatype xsd:decimal ;
-                      sh:minValue 0.0 ; sh:maxValue 1.0 ;
-                      sh:minCount 1 ; sh:maxCount 1 ] ;
+                      sh:minInclusive 0.0 ; sh:maxInclusive 1.0 ;
+                      sh:minCount 1 ; sh:maxCount 1 ;
+                      sh:message "Match confidence must be between 0.0 and 1.0."@en ] ;
 
         # optional, but at most one each
         sh:property [ sh:path pkg:assertionUpstreamVersion ;
                       sh:datatype xsd:string ; sh:maxCount 1 ] ;
         sh:property [ sh:path pkg:assertionSourceBuild ;
-                      sh:class pkg:Package ; sh:maxCount 1 ] .
+                      sh:class pkg:Package ; sh:maxCount 1 ] ;
     ```
 
-15b. A **SPARQL-based constraint** for the one rule shape arithmetic cannot
-    express: where `:assertionSourceBuild` is present, it must be a build of
-    the owning identity. Without this an assertion could cite evidence from an
-    unrelated package and still validate.
+    Note the constraint names: SHACL's value-range terms are
+    **`sh:minInclusive` / `sh:maxInclusive`**. A draft of this item wrote
+    `sh:minValue` / `sh:maxValue`, which are not SHACL vocabulary — an engine
+    ignores unrecognized predicates rather than erroring, so the confidence
+    range would simply not have been enforced while appearing to be.
+    `core.shacl.ttl:472-474` already uses the correct terms for
+    `PackageRelationship`'s identical constraint.
 
-    ```sparql
-    # violation if this returns any rows
-    SELECT ?assertion WHERE {
-      ?owner     pkg:hasUpstreamAssertion ?assertion .
-      ?assertion pkg:assertionSourceBuild ?build .
-      FILTER NOT EXISTS { ?build pkg:isVersionOf ?owner }
-    }
+15b. The one rule shape arithmetic cannot express: where
+    `:assertionSourceBuild` is present, it must be a build of the owning
+    identity. Without this an assertion could cite evidence from an unrelated
+    package and still validate. It must be embedded as an `sh:sparql`
+    constraint on the node shape, using `$this` — a free-standing `SELECT`
+    is documentation, not an executable constraint. This follows the house
+    pattern at `core.shacl.ttl:477-483`:
+
+    ```turtle
+    pkg:UpstreamAssertionShape
+        sh:sparql [ sh:message "assertionSourceBuild must be a build of the identity that holds this assertion."@en ;
+                    sh:select """
+                        PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+                        SELECT $this WHERE {
+                            ?owner pkg:hasUpstreamAssertion $this .
+                            $this  pkg:assertionSourceBuild ?build .
+                            FILTER NOT EXISTS { ?build pkg:isVersionOf ?owner }
+                        }
+                    """ ] .
     ```
 16. A **term-existence test**: every predicate IRI emitted by any collector
     must have a declaration in the ontology. This is the general guard — it
@@ -1496,17 +1640,29 @@ dependency order:
 ```
 1. ontology PR A — defect repairs                      (§2.4, filed as ontology#9)
 2. ontology PR B — UpstreamAssertion + relation scheme (§2.2, to be filed)
-     + matchMethod/matchConfidence union domains
-     + UpstreamAssertion SHACL shape                   (§11.15)
+     + match-capability-declared concept               (§2.3)
+     + matchMethod/matchConfidence union domains       (REPLACING, not adding)
+     + UpstreamAssertion SHACL shape + sh:sparql       (§11.15)
 3. ontology release + upload-ontology.sh
 4. collector changes: assertions + shortcuts           (§3, §4, §5, §6)
 5. seed.rs query rewrite                               (§4.4)
 6. full collection cycle
 7. derive_upstream_release                             (§7)
+
+   independent, unblocks the pypi row whenever it lands:
+P. pypi.rs URI normalization fix + backfill            (§3.5)
 ```
 
 PRs A and B are independent and can be authored in parallel, but both must be
 in the same release before step 4. Steps 5 and 6 gate step 7.
+
+**PR P is not on the critical path.** The `pypi` row stays blocked until it
+lands, so the first release supports eight ecosystems; PyPI becomes the ninth
+afterwards with no change to this design. It is listed here because it is a
+prerequisite *for PyPI coverage specifically*, and because it repairs a live
+dangling-dependency bug in `pypi.rs` that exists independently of this work
+(§3.5) — which is reason enough to do it regardless of whether this design
+proceeds.
 
 The `rpm.rs` `HashSet` fix proposed in the previous revision is **dropped**.
 It would have emitted the missing `upstreamEcosystem` triples without making
