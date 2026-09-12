@@ -16,8 +16,16 @@ pub struct OsvCollector {
 
 impl OsvCollector {
     pub fn new() -> Self {
+        // 300s, not the transport's 60s default: a collect pulls a whole
+        // ecosystem's vulnerability archive as one ZIP.
+        let client = crate::enricher::http_client_builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .expect("Failed to create HTTP client");
+
         Self {
-            transport: HttpTransport::new(),
+            transport: HttpTransport::with_client(client),
             graph_uri: None,
         }
     }

@@ -48,6 +48,27 @@ pub struct CachedFetcher {
     refresh: bool,
 }
 
+/// Collapse the two ways a fetcher can report "upstream does not have it".
+///
+/// `HttpTransport` returns `Err(NotFound)`; the hand-rolled fetchers it
+/// replaced returned `Ok(HttpResponse { status: 404, .. })`. Only the `Ok`
+/// shape reaches the 404 arm below, so without this the negative cache is
+/// silently never written and every missing package re-hits the registry on
+/// every run -- exactly what the negative TTL exists to prevent.
+fn normalize_not_found(
+    r: std::result::Result<HttpResponse, FetchError>,
+) -> std::result::Result<HttpResponse, FetchError> {
+    match r {
+        Err(FetchError::NotFound { .. }) => Ok(HttpResponse {
+            status: 404,
+            bytes: Vec::new(),
+            etag: None,
+            last_modified: None,
+        }),
+        other => other,
+    }
+}
+
 impl CachedFetcher {
     /// Create a new cached fetcher.
     ///
@@ -125,7 +146,7 @@ impl CachedFetcher {
 
         // ── Step 3: Network request (conditional if we have an ETag) ─
         let was_conditional = stale_etag.is_some();
-        let net_result = http_get(url, stale_etag.as_deref());
+        let net_result = normalize_not_found(http_get(url, stale_etag.as_deref()));
 
         match net_result {
             Ok(response) => self.handle_response(
@@ -231,7 +252,7 @@ impl CachedFetcher {
                             } else {
                                 // Invalid stale body -- unconditional retry
                                 cache_evict(&self.cache, url);
-                                match http_get(url, None) {
+                                match normalize_not_found(http_get(url, None)) {
                                     Ok(retry) => self
                                         .handle_unconditional_response(url, ttl, validate, retry),
                                     Err(e) => FetchOutcome {
@@ -261,7 +282,7 @@ impl CachedFetcher {
                     },
                     None => {
                         // 304 but stale entry vanished (evicted between steps) -- retry
-                        match http_get(url, None) {
+                        match normalize_not_found(http_get(url, None)) {
                             Ok(retry) => {
                                 self.handle_unconditional_response(url, ttl, validate, retry)
                             }
@@ -276,7 +297,7 @@ impl CachedFetcher {
             304 => {
                 // Unsolicited 304 -- request had no If-None-Match, so
                 // the server returned 304 incorrectly. Do unconditional retry.
-                match http_get(url, None) {
+                match normalize_not_found(http_get(url, None)) {
                     Ok(retry) => self.handle_unconditional_response(url, ttl, validate, retry),
                     Err(e) => FetchOutcome {
                         was_network_hit: true,
@@ -689,6 +710,39 @@ mod tests {
         // Verify negative cache was stored
         let cached = fetcher.cache.get_fresh("http://example.com/gone").unwrap();
         assert!(cached.is_some());
+        assert_eq!(cached.unwrap().status_code, 404);
+    }
+
+    #[test]
+    fn test_negative_cache_written_when_fetcher_returns_not_found_error() {
+        // HttpTransport reports a 404 as Err(NotFound) rather than
+        // Ok(status: 404). Both mean "upstream does not have this", and both
+        // must populate the negative cache -- otherwise every missing package
+        // re-hits the registry on every run, which is exactly what the
+        // negative TTL exists to prevent.
+        let tmp = TempDir::new().unwrap();
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let fetcher = make_fetcher(&tmp, clock.clone(), Duration::from_secs(1800), false);
+
+        let outcome = fetcher.fetch(
+            "http://example.com/gone",
+            None,
+            &always_valid,
+            |url, _etag| {
+                Err(FetchError::NotFound {
+                    url: url.to_string(),
+                })
+            },
+        );
+
+        assert!(outcome.was_network_hit);
+        assert!(matches!(outcome.result, Err(FetchError::NotFound { .. })));
+
+        let cached = fetcher.cache.get_fresh("http://example.com/gone").unwrap();
+        assert!(
+            cached.is_some(),
+            "Err(NotFound) must populate the negative cache"
+        );
         assert_eq!(cached.unwrap().status_code, 404);
     }
 

@@ -102,6 +102,10 @@ struct HostState {
     interval: Duration,
     /// Earliest instant at which the next request to this host may start.
     next_allowed: Instant,
+    /// Hard floor from a `Retry-After`. Separate from `next_allowed` because
+    /// a waiter that already holds a slot must re-check against it after
+    /// waking, and `next_allowed` has moved on by then.
+    not_before: Instant,
 }
 
 /// Paces requests per host. One instance is shared by every collector, so
@@ -130,6 +134,18 @@ impl HostLimiter {
             .unwrap_or(self.default_interval)
     }
 
+    /// The instant the next caller to `wait_turn` would be granted, without
+    /// consuming the slot.
+    #[cfg(test)]
+    pub(crate) fn reserved_slot_for_test(&self, host: &str) -> Instant {
+        let guard = self.lock();
+        let now = Instant::now();
+        guard
+            .get(host)
+            .map(|s| s.next_allowed.max(now).max(s.not_before))
+            .unwrap_or(now)
+    }
+
     /// Builder-style per-host override, for known rate-sensitive hosts.
     pub fn with_host(self, host: &str, interval: Duration) -> Self {
         {
@@ -139,6 +155,7 @@ impl HostLimiter {
                 HostState {
                     interval,
                     next_allowed: Instant::now(),
+                    not_before: Instant::now(),
                 },
             );
         }
@@ -155,22 +172,35 @@ impl HostLimiter {
 
     /// Block until this host's next slot, reserving it for this caller.
     pub fn wait_turn(&self, host: &str) {
-        let slot = {
+        let mut slot = {
             let mut guard = self.lock();
             let now = Instant::now();
             let default_interval = self.default_interval;
             let entry = guard.entry(host.to_string()).or_insert(HostState {
                 interval: default_interval,
                 next_allowed: now,
+                not_before: now,
             });
-            let slot = entry.next_allowed.max(now);
+            let slot = entry.next_allowed.max(now).max(entry.not_before);
             entry.next_allowed = slot + entry.interval;
             slot
         }; // lock released before sleeping
 
-        let now = Instant::now();
-        if slot > now {
-            std::thread::sleep(slot - now);
+        loop {
+            let now = Instant::now();
+            if slot > now {
+                std::thread::sleep(slot - now);
+            }
+            // A `Retry-After` may have arrived while we slept, in which case
+            // the slot we hold was priced under the old pacing. Wait out the
+            // new floor rather than sending inside a window the server has
+            // explicitly closed. Re-checked rather than re-reserved, so a
+            // widen cannot multiply the queue's reservations.
+            let floor = self.lock().get(host).map(|s| s.not_before);
+            match floor {
+                Some(floor) if floor > Instant::now() => slot = floor,
+                _ => return,
+            }
         }
     }
 
@@ -183,11 +213,41 @@ impl HostLimiter {
         let entry = guard.entry(host.to_string()).or_insert(HostState {
             interval: default_interval,
             next_allowed: now,
+            not_before: now,
         });
         if at_least > entry.interval {
             entry.interval = at_least;
         }
+        // Raise the floor too. Widening only the interval left the very next
+        // reservation priced under the old pacing, so a `Retry-After: 60`
+        // could be followed immediately by another request.
+        let floor = now + at_least;
+        if floor > entry.not_before {
+            entry.not_before = floor;
+        }
+        if floor > entry.next_allowed {
+            entry.next_allowed = floor;
+        }
     }
+}
+
+/// Shorten `s` to at most `ERROR_BODY_LIMIT` bytes, cutting at a character
+/// boundary.
+///
+/// `String::truncate` panics when the index lands inside a multibyte
+/// character, so a localized error page could take the whole collector down
+/// in place of returning a `FetchError`.
+fn truncate_on_boundary(mut s: String) -> String {
+    if s.len() <= ERROR_BODY_LIMIT {
+        return s;
+    }
+    let mut end = ERROR_BODY_LIMIT;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s.push_str("... (truncated)");
+    s
 }
 
 /// How much of a failing response body to keep for the error message.
@@ -509,13 +569,7 @@ impl HttpTransport {
             // The response is still in hand here, so capture whatever
             // explanation the server sent. Truncated, because an error page
             // can be megabytes of HTML and this ends up in a log line.
-            let body = response.text().ok().map(|mut b| {
-                if b.len() > ERROR_BODY_LIMIT {
-                    b.truncate(ERROR_BODY_LIMIT);
-                    b.push_str("... (truncated)");
-                }
-                b
-            });
+            let body = response.text().ok().map(|b| truncate_on_boundary(b));
             return Attempt {
                 result: Err(FetchError::HttpStatus {
                     url: url.to_string(),
@@ -1095,6 +1149,85 @@ mod tests {
         assert_eq!(snap.attempts, 1);
         assert_eq!(snap.successes, 1);
         assert_eq!(snap.failures, 0);
+    }
+
+    #[test]
+    fn with_client_actually_uses_the_supplied_client() {
+        // The collectors that download whole-ecosystem archives build a
+        // client with a long timeout and hand it over. If `with_client` were
+        // ignored they would silently run on the 60s default and a large
+        // transfer could never finish, restarting on every retry.
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/slow")
+            .with_status(200)
+            .with_chunked_body(|_| {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(())
+            })
+            .create();
+
+        let impatient = crate::enricher::http_client_builder()
+            .timeout(Duration::from_millis(20))
+            .build()
+            .unwrap();
+        let t = HttpTransport::with_client(impatient)
+            .with_policy(fast_policy(1))
+            .with_limiter(HostLimiter::new(Duration::ZERO));
+
+        let err = t.get(&format!("{}/slow", server.url()), None).unwrap_err();
+        assert!(
+            matches!(err, FetchError::Transport { .. }),
+            "a 20ms client must time out on a 300ms body; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn error_body_truncation_respects_utf8_boundaries() {
+        // A localized error page can put a multibyte character across the
+        // truncation point. String::truncate panics there, which would take
+        // the whole collector down instead of returning a FetchError.
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/boom")
+            .with_status(400)
+            // 511 ASCII bytes, then a 3-byte character straddling byte 512.
+            .with_body(format!("{}\u{4e16}{}", "x".repeat(511), "y".repeat(200)))
+            .create();
+
+        let t = test_transport(fast_policy(1));
+        let err = t.get(&format!("{}/boom", server.url()), None).unwrap_err();
+
+        match &err {
+            FetchError::HttpStatus { body, .. } => {
+                let b = body.as_deref().unwrap_or("");
+                assert!(
+                    b.len() <= 600 && b.starts_with("xxx"),
+                    "got {} bytes",
+                    b.len()
+                );
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_after_delays_the_next_reservation() {
+        // widen() used to raise only the interval, leaving next_allowed
+        // untouched -- so right after a `Retry-After: 60` the very next
+        // caller still got a slot computed under the old 200ms pacing.
+        let limiter = HostLimiter::new(Duration::from_millis(1));
+        limiter.wait_turn("example.org");
+
+        limiter.widen("example.org", Duration::from_secs(60));
+
+        let start = Instant::now();
+        let next = limiter.reserved_slot_for_test("example.org");
+        assert!(
+            next.duration_since(start) > Duration::from_secs(50),
+            "next slot must fall inside the Retry-After window, was {:?} away",
+            next.duration_since(start)
+        );
     }
 
     #[test]

@@ -44,14 +44,14 @@ use std::collections::HashMap;
 
 impl FreebsdCollector {
     pub fn new(distro_name: String, mirror: String, release: String, arch: String) -> Self {
-        let _client = crate::enricher::http_client_builder()
+        let client = crate::enricher::http_client_builder()
             .timeout(Duration::from_secs(300))
             .build()
             .expect("Failed to create HTTP client");
 
         Self {
             distro_name,
-            transport: HttpTransport::new(),
+            transport: HttpTransport::with_client(client),
             mirror,
             release,
             arch,

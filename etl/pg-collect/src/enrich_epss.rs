@@ -24,9 +24,15 @@ pub struct EpssEnricher {
 impl EpssEnricher {
     pub fn new(endpoint: &str, min_score: f64, auth: SparqlAuth, backend: SparqlBackend) -> Self {
         let sparql = make_sparql_client(endpoint, &auth, backend);
+        // 120s, not the transport's 60s default: the EPSS feed is a single
+        // large gzipped CSV of every scored CVE.
+        let client = crate::enricher::http_client_builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .expect("Failed to create HTTP client");
         Self {
             sparql,
-            transport: HttpTransport::new(),
+            transport: HttpTransport::with_client(client),
             min_score,
             graph_uri: None,
         }

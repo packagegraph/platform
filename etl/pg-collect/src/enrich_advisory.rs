@@ -40,7 +40,6 @@ impl AdvisoryEnricher {
         auth: SparqlAuth,
         backend: SparqlBackend,
     ) -> Self {
-        let _client = crate::enricher::default_http_client();
         let sparql = make_sparql_client(endpoint, &auth, backend);
 
         let cache = cache_dir.map(|dir| {
@@ -153,7 +152,6 @@ impl AdvisoryEnricher {
                         detail_fetch_failures += 1;
                     }
                 }
-
             }
 
             page += 1;
