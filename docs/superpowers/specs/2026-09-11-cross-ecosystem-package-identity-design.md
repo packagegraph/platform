@@ -20,16 +20,25 @@ Investigation found that the ontology already declares the predicate for this
 join, with a docstring describing this exact case, and that nothing has ever
 emitted it.
 
-**Revision 3** (after two review rounds) establishes the one thing that is
-genuine invention rather than wiring: a per-capability `:UpstreamAssertion`.
+**Revision 4**, after three review rounds. The one thing here that is genuine
+invention rather than wiring is the per-capability `:UpstreamAssertion` (§2.2).
+
 Revisions 1 and 2 both tried to carry the association on the flat `upstream*`
 properties, and both were wrong for the same reason — those properties are
 independently multi-valued on a single subject, so they express two unordered
 sets rather than a set of pairs. Every join over them returns a cross-product.
 That defect cannot be fixed by changing which triples are emitted; it requires
-a node that binds target, ecosystem, version, method, and confidence together.
-§2.2 is that node, and §4.4, §5.1, and §7 are the three places the old model
-silently produced wrong answers.
+a node binding target, name, ecosystem, version, method, and confidence
+together. §4.4, §5.1, and §7 are the three places the old model silently
+produced wrong answers.
+
+Revision 3 introduced that node but left it unable to bootstrap — its seed
+query read the upstream name off the target identity, which does not exist in
+the graph at the moment seeding runs — and under-constrained, admitting either
+a build or an identity as owner and requiring neither method nor confidence.
+Revision 4 adds `:assertionUpstreamName`, fixes the owner to exactly one
+`PackageIdentity`, and specifies the full SHACL shape plus the one integrity
+rule shapes cannot express (§11.15).
 
 ## 1. Overview
 
