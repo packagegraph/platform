@@ -156,7 +156,8 @@ deriver runs.
   the precedent set in commit `45a0aaf`. Revisit only if blast-radius queries
   demonstrate a need.
 - **Version-aware seeding.** Making registry collectors fetch the specific
-  versions distros pin would change the seed format, touch 11 collectors, and
+  versions distros pin would change the seed format, touch the ten collectors
+  that call `discover_by_ecosystem`, and
   multiply collection volume. See §7 for why this design does not need it.
 - **CPAN, Go, and conda.** All three name things in a namespace the registry
   collector does not key by, so none can be resolved by string transform.
@@ -286,22 +287,71 @@ together:
     rdfs:range :Ecosystem ;
     rdfs:isDefinedBy : .
 
-:assertionRelation a owl:ObjectProperty ;   # required
+:assertionRelation a owl:ObjectProperty ;   # required, exactly one
     IAO:0000115 "Whether the source repackages the target (it is the target,
       restated for a distribution) or bundles it (it contains the target by
       value alongside its own code)."@en ;
     rdfs:domain :UpstreamAssertion ;
-    rdfs:range skos:Concept ;               # UpstreamRelationScheme, below
+    rdfs:range skos:Concept ;               # UpstreamRelationScheme
+    rdfs:isDefinedBy : .
+
+:assertionProducer a owl:DatatypeProperty ; # required, exactly one
+    IAO:0000115 "A stable token naming the evidence path that produced this
+      assertion — for example rpm-provides, spec-source0, debian-watch. Two
+      producers reporting the same association yield two assertions, so this
+      token is part of the assertion's identity and is recorded here to keep
+      that identity auditable rather than implicit in the IRI hash."@en ;
+    rdfs:domain :UpstreamAssertion ;
+    rdfs:range xsd:string ;
+    rdfs:isDefinedBy : .
+
+:assertionMethod a owl:ObjectProperty ;     # required, exactly one
+    IAO:0000115 "How the asserted relation was established, as a SKOS concept
+      from the AssertionMethodScheme. Distinct from :matchMethod, which
+      qualifies cross-ecosystem identity matching only; an assertion may
+      describe containment rather than identity."@en ;
+    rdfs:domain :UpstreamAssertion ;
+    rdfs:range skos:Concept ;
+    rdfs:isDefinedBy : .
+
+:assertionConfidence a owl:DatatypeProperty ;   # required, exactly one
+    IAO:0000115 "Confidence (0.0-1.0) in the asserted relation, given the
+      evidence recorded by :assertionMethod and :assertionProducer."@en ;
+    rdfs:domain :UpstreamAssertion ;
+    rdfs:range xsd:decimal ;
     rdfs:isDefinedBy : .
 ```
 
-A new SKOS scheme distinguishes the two relations, following the pattern of
-`MatchMethodScheme` (skos-schemes.ttl:369-407):
+#### The two SKOS schemes
+
+Both must be declared as full concept schemes, following the pattern of
+`MatchMethodScheme` (skos-schemes.ttl:369-407). A previous revision declared
+two bare `skos:Concept` nodes with no scheme, labels, definitions, or
+`skos:hasTopConcept` entries, which is not a usable controlled vocabulary and
+cannot be validated with `sh:in` against a scheme.
 
 ```turtle
-pkg:upstream-repackages  a skos:Concept .   # the source IS the target, redistributed
-pkg:upstream-bundles     a skos:Concept .   # the source CONTAINS the target by value
+pkg:UpstreamRelationScheme a skos:ConceptScheme ;
+    rdfs:label "Upstream Relation Scheme"@en ;
+    skos:hasTopConcept pkg:upstream-repackages, pkg:upstream-bundles .
+
+pkg:upstream-repackages a skos:Concept ;
+    skos:inScheme pkg:UpstreamRelationScheme ;
+    skos:prefLabel "repackages"@en ;
+    skos:definition "The source package is a redistribution of the target: the
+      same software, restated for a distribution. The two denote one upstream
+      work."@en .
+
+pkg:upstream-bundles a skos:Concept ;
+    skos:inScheme pkg:UpstreamRelationScheme ;
+    skos:prefLabel "bundles"@en ;
+    skos:definition "The source package contains the target by value —
+      vendored, statically linked, or embedded in the shipped artifact —
+      alongside its own distinct code. Containment, not identity."@en .
 ```
+
+The `AssertionMethodScheme`'s concepts are derived from the emitter/evidence
+matrix in §2.3 rather than invented here, and are listed there.
 
 #### Why the owner is exactly one `PackageIdentity`
 
@@ -358,40 +408,39 @@ substitute: it would require every consumer to know and re-implement the
 per-ecosystem URI shape and its percent-encoding, which is the coupling §3.1
 exists to eliminate.
 
-#### Method and confidence: reuse by domain *replacement*
+#### Why not reuse `matchMethod` / `matchConfidence`
 
-`:matchMethod` (core.ttl:1633) and `:matchConfidence` (core.ttl:1641) already
-model exactly this and are already emitted by `enrich_repology.rs`. Both
-currently declare `rdfs:domain :PackageRelationship`.
+A previous revision proposed widening `:matchMethod` (core.ttl:1633) and
+`:matchConfidence` (core.ttl:1641) to cover assertions via an `owl:unionOf`
+domain. That is rejected.
 
-That declaration must be **replaced**, not supplemented. Multiple `rdfs:domain`
-statements on one property are conjunctive — their *intersection* applies — so
-adding `rdfs:domain :UpstreamAssertion` alongside the existing one would entail
-that every subject of `:matchMethod` is both a `PackageRelationship` **and** an
-`UpstreamAssertion`, wrongly typing every assertion as a relationship and every
-existing Repology relationship as an assertion. This is the same gotcha called
-out in ontology issue #7, and it is a silent one: nothing fails, the data just
-becomes wrong under reasoning.
+Those properties are defined for cross-ecosystem **identity** matching —
+`:matchMethod`'s definition reads *"The method used to establish the
+cross-ecosystem identity relationship"* — and every concept in
+`MatchMethodScheme` is phrased in those terms. An `:UpstreamAssertion` may
+describe **containment** instead: npm `bundledDependencies` records that one
+package ships another *within the same ecosystem*, which is not an identity
+claim in any sense. Widening the domain would have made those triples legal
+while leaving their meaning wrong, which is worse than an outright error
+because nothing surfaces it.
 
-The ontology PR must therefore delete the existing line and write:
+`:assertionMethod` and `:assertionConfidence` are therefore separate
+properties over a separate `AssertionMethodScheme` (§2.3), and the published
+contract is preserved unchanged:
 
-```turtle
-# REPLACES  :matchMethod rdfs:domain :PackageRelationship .
-:matchMethod     rdfs:domain [ a owl:Class ;
-                               owl:unionOf ( :PackageRelationship :UpstreamAssertion ) ] .
-# REPLACES  :matchConfidence rdfs:domain :PackageRelationship .
-:matchConfidence rdfs:domain [ a owl:Class ;
-                               owl:unionOf ( :PackageRelationship :UpstreamAssertion ) ] .
-```
+| Class | Qualifies |
+|---|---|
+| `pkg:PackageRelationship` | identity / equivalence matching between packages |
+| `pkg:UpstreamAssertion` | evidence for an asserted **repackaging or containment** relation |
 
-This is the same monotonic widening argument as §2.4: it removes entailments,
-adds none. The alternative — minting `:assertionMethod` / `:assertionConfidence`
-— would leave two vocabularies for one concept and force every confidence
-consumer to query both.
+The cost is two "confidence" properties in the ontology. That is preferable to
+silently broadening an established published property into a materially
+different concept. Consumers already distinguish the two classes; querying the
+corresponding confidence property is a small and explicit consequence of a
+distinction they are already making.
 
-`pkg:match-repackage-detected` (skos-schemes.ttl:389) already exists and reads
-*"repackaging of another package under a different name"*, which is the
-correct `matchMethod` for the common case.
+No change to `:matchMethod` or `:matchConfidence` is required by this design,
+which also removes them from ontology PR B entirely.
 
 **Shortcuts derived from assertions.** Two convenience properties remain, both
 materialized *from* assertions and never emitted independently:
@@ -427,6 +476,8 @@ a node that then violates its own `sh:maxCount 1` constraints:
 ```rust
 // uris.rs — new
 pub fn upstream_assertion_uri(
+    producer: &str,                // evidence discriminator, e.g. "rpm-provides"
+    method: &str,                  // assertionMethod concept local name
     owner_identity: &str,          // the asserting PackageIdentity
     source_build: Option<&str>,    // MUST be in the key when present
     ecosystem: &str,
@@ -436,7 +487,22 @@ pub fn upstream_assertion_uri(
 ) -> String
 ```
 
-Every one of those six is load-bearing:
+An `UpstreamAssertion` is an evidence-bearing statement, so independently
+produced evidence must remain independently addressable. `rpm-provides`,
+`spec-source0`, `debian-watch`, and `debian-homepage` can each report the same
+association with different methods; without a producer in the key they mint
+the same IRI, merge into one node carrying several `:assertionMethod` values,
+and violate that property's `sh:maxCount 1`.
+
+The producer is also recorded **on** the assertion as `:assertionProducer`, so
+the IRI is auditable rather than depending on hidden key material — a reader
+can reconstruct why two assertions differ without knowing the hash inputs.
+
+**Confidence is deliberately not in the key.** Recalibrating a score must
+update the existing assertion in place, not mint a second one; an assertion's
+identity is its evidence, not its current score.
+
+Every other facet is load-bearing:
 
 - **`source_build` is not optional-in-the-key.** Ownership is identity-level
   (§2.2), so keying from the owner alone means two builds of one identity that
@@ -455,6 +521,51 @@ Keying on `(source, target)` alone — as `package_relationship_uri`
 (uris.rs:501) does — is what reintroduces the cross-product, and is the
 specific mistake this section exists to avoid. That helper must **not** be
 reused here.
+
+#### Normative key serialization
+
+The IRI must be stable across releases, across collector runs, and across
+machines. "Distinct URI" tests do not establish that; an under-specified
+serialization can produce different digests for the same logical assertion
+after an unrelated refactor. The construction is therefore normative:
+
+```
+digest_input :=
+    "pgav1" LEN(producer)        ":" producer
+            LEN(method)          ":" method
+            LEN(owner_identity)  ":" owner_identity
+            OPT(source_build)
+            LEN(ecosystem)       ":" ecosystem
+            LEN(target_name)     ":" target_name
+            LEN(relation)        ":" relation
+            OPT(upstream_version)
+
+OPT(None)     := "-"
+OPT(Some(s))  := "+" LEN(s) ":" s
+LEN(s)        := decimal byte length of s encoded as UTF-8, no padding
+
+uri := {DATA}assertion/ + lowercase_hex( SHA-256(digest_input) )[..32]
+```
+
+Requirements, each of which prevents a specific failure:
+
+- **`pgav1` version prefix** — lets a future key change be introduced without
+  silently colliding with, or silently orphaning, existing assertions.
+- **Length-delimited fields** — without them, `("ab", "c")` and `("a", "bc")`
+  serialize identically. Separator-only encoding is not sufficient because
+  every field here can legitimately contain `:` (Maven coordinates), `/` (Go
+  paths), and `%` (encoded URIs).
+- **Explicitly tagged optionals** — `-` for `None`, `+0:` for `Some("")`.
+  These must differ: "no version was declared" and "an empty version string
+  was declared" are different evidence.
+- **SHA-256, first 128 bits (32 hex chars)** — not `DefaultHasher`, whose
+  output is explicitly not guaranteed stable across Rust releases and which
+  `emit_dq_issue` (forge.rs:792) already uses for a non-durable purpose. 128
+  bits is collision-safe at any plausible corpus size.
+- **UTF-8 byte length, not char count** — so non-ASCII names cannot shift
+  field boundaries.
+
+Tests for this are enumerated in §11.14d.
 
 `npm:bundledDependency` (npm.ttl:9-14) is **not** emitted in v1. Its range is
 `npm:NpmPackage`, the versioned class, but `bundledDependencies` in a package
@@ -489,52 +600,65 @@ evidence model.
 Evidence rides on the assertion node from §2.2 instead, via the existing
 `:matchMethod` and `:matchConfidence`:
 
-| Evidence | `:matchMethod` | `:matchConfidence` | Source |
-|---|---|---|---|
-| versioned ecosystem `Provides` | `match-capability-declared` | `1.0` | `crate(X) = 1.2.3` — name *and* version emitted by the build system |
-| unversioned ecosystem `Provides` | `match-capability-declared` | `0.95` | `ghc-pkg(X)`, `python3dist(X)` |
-| `Provides: bundled(X)` | `match-capability-declared` | `0.9` | packager-declared per Fedora policy |
-| npm `bundledDependencies` | `match-capability-declared` | `0.9` | manifest-declared |
-| Source0 registry domain | `match-repackage-detected` | `0.8` | `collect_spec.rs:687-694` |
-| name prefix only | `match-name-heuristic` | `0.5` | `ghc-`, `python3-`, `rust-` (collect_spec.rs:757-764) |
+#### The emitter inventory
 
-**`match-upstream-verified` must not be used here**, although an earlier
-revision proposed it for the versioned-`Provides` row. Its definition
-(skos-schemes.ttl:372) is:
+A previous revision mapped **six** evidence paths. A full enumeration of the
+producers finds **57**, across seven files. The table below is the taxonomy;
+the per-path inventory lives in the implementation plan, since it is long and
+mechanical.
 
-> "Identity confirmed via upstream project metadata (e.g., PyPI project URL
-> matches RPM Source URL)."
+The decisive distinction is **how the target name was obtained**, not how the
+ecosystem was:
 
-That describes a *corroboration* between two independent sources. An RPM
-`Provides: crate(serde) = 1.0.200` is a single-source declaration generated by
-`rust2rpm` from the crate's own manifest — strong evidence, but nothing has
-been cross-checked against upstream project metadata. Labelling it
-`upstream-verified` would overstate it and would make genuinely corroborated
-matches indistinguishable from declared ones.
+| Name origin | Count | Producers |
+|---|---|---|
+| **(a) declared** — evidence names the upstream package directly | 13 | `rpm.rs:1055-1108` Provides capabilities; `collect_salsa.rs:459-555` d/watch registry URLs; `collect_sources.rs:235-265` `Go-Import-Path` |
+| **(b) inferred** — name is the *distro* name with a prefix stripped | 44 | every `collect_spec.rs` Source0-domain, BuildRequires-macro, homepage-domain, and name-prefix branch; all `conda.rs` paths |
 
-Nor is `match-repackage-detected` (skos-schemes.ttl:389, *"Package appears to
-be a repackaging…"*) right for it — "appears to be" understates a declaration
-the build system emitted mechanically.
+This is the point finding 4 raised, and the code confirms it in a stronger
+form than stated. `spec-buildrequires` *looks* like it reads the name from the
+macro — `PYTHON3DIST_RE` and `PERL_RE` (collect_spec.rs:51, :54) both have
+capture groups — but the code calls only `.is_match(br)` (collect_spec.rs:706,
+:714) and discards the capture. The name comes from
+`strip_ecosystem_prefix` on the distro name. The same is true of **every**
+Source0-domain and homepage-domain branch: the URL is domain-matched, never
+parsed for a name.
 
-One new SKOS concept is therefore added to `MatchMethodScheme`, and it is the
-correct home for four of the six rows:
+So a URL match and a prefix match establish the *ecosystem* with very
+different confidence but produce the *name* by the identical mechanism. An
+assertion is only as good as its weakest facet, and the name is what the join
+depends on.
 
-```turtle
-pkg:match-capability-declared a skos:Concept ;
-    skos:inScheme pkg:MatchMethodScheme ;
-    skos:prefLabel "capability declared"@en ;
-    skos:definition "Identity declared by the packaging system itself, via a
-      generated capability or manifest field that names the upstream package
-      directly — for example an RPM Provides: crate(name) emitted by rust2rpm,
-      or a bundledDependencies entry in an npm manifest. Stronger than
-      heuristic name matching because the packaging tooling asserted it, but
-      weaker than upstream-verified because nothing has been corroborated
-      against independent upstream project metadata."@en .
-```
+#### `AssertionMethodScheme`
 
-The remaining two rows use existing concepts. The numeric confidences replace
-the three-token ladder at `collect_spec.rs:453` for assertions; that ladder
-stays where it is for DQ records, which are a different thing.
+Four concepts, derived from the inventory rather than invented:
+
+| Concept | Confidence | Name origin | Ecosystem origin | Example producers |
+|---|---|---|---|---|
+| `assert-capability-declared` | `1.0` versioned / `0.95` not | (a) declared | declared | `rpm-provides-*`, `sources-go-import-path` |
+| `assert-manifest-declared` | `0.9` | (a) declared | declared | `rpm-bundled-*`, `npm-bundled-deps`, `salsa-watch-*` |
+| `assert-registry-url-detected` | `0.6` | **(b) inferred** | declared by URL | `spec-source0-*`, `debname-homepage-*`, `spec-buildrequires-*` |
+| `assert-name-heuristic` | `0.4` | (b) inferred | inferred from prefix | `spec-name-prefix-*`, `debname-prefix-*`, `conda-*` |
+
+`assert-registry-url-detected` is deliberately `0.6`, **not** the `high` that
+`collect_spec.rs:453` currently assigns `source0-domain`. A confident
+ecosystem paired with a guessed name is not a confident assertion, and the
+existing grading conflates the two axes. `spec-buildrequires` is grouped here
+rather than with capability-declared for the same reason: it proves the
+ecosystem and guesses the name.
+
+Concept definitions must describe **how the relation was established** without
+calling containment an identity match — `assert-manifest-declared` covers npm
+bundling *within* npm, where no identity claim is made at all.
+
+#### Two existing confidence mappings disagree
+
+`collect_spec.rs:452-456` grades `source0-domain` and `buildrequires-macro`
+`high` and `name-prefix` `medium`. `debian.rs:628-632` independently grades
+`homepage-domain` `high` and *everything else* `medium`. The two disagree, and
+`collect_spec.rs`'s `_ => "low"` arm is dead because `detect_ecosystem` never
+returns `homepage-domain`. The `AssertionMethodScheme` supersedes both for
+assertions; the existing DQ grading is left alone.
 
 `emit_dq_issue` retains its proper role in this design: recording *failures*
 (§10) — an unresolvable ecosystem token, a CPAN module that cannot be mapped
@@ -546,15 +670,27 @@ Three defects in the pinned ontology block this design. All are in the sibling
 `packagegraph/ontology` repository and must land and be released before the
 collector changes.
 
-> Filed as **packagegraph/ontology#9**. The two *new* terms in §2.2
-> (`:bundles`, `:upstreamPackageRelease`) are deliberately not in that issue —
-> they are contingent on this design being accepted, whereas the three defects
-> below are real regardless.
+> Filed as **packagegraph/ontology#9** (PR A). Everything *new* in §2.2 and
+> §2.3 — `:UpstreamAssertion` and its properties, both SKOS schemes, the
+> shortcuts — belongs to a separate PR B and is deliberately **not** in that
+> issue: those terms are contingent on this design being accepted, whereas the
+> defects below are real regardless. The `:PackageEntity` definition
+> broadening (core.ttl:1649-1654) is a **normative prerequisite** of PR A, not
+> an optional tidy-up: widening two domains onto a class whose definition says
+> it exists for dependency targeting would make the new domains read as a
+> misuse of the class. It was added to #9 as a comment and must be in the PR.
 
 **(a) `pkg:upstreamPackageVersion` is undeclared.** `rpm.rs:1130` has been
-emitting it, and the §7 deriver joins on it, but grep over `core.ttl` finds no
-declaration. Declare it. This property *is* genuinely version-specific, so it
-is the one member of the family that belongs on `:Package`:
+emitting it, but grep over `core.ttl` finds no declaration. Declare it. It is
+genuinely version-specific, so it is the one member of the family belonging on
+`:Package`.
+
+Note the §7 deriver does **not** read it — it reads
+`:assertionUpstreamVersion` off the assertion, because the flat literal is
+ambiguous on any package with more than one ecosystem capability (§7.2). An
+earlier revision said the deriver consumed this property; it does not. The
+declaration is needed because the triple is being emitted into production
+graphs today, not because this design depends on it:
 
 ```turtle
 :upstreamPackageVersion a owl:DatatypeProperty ;
@@ -648,9 +784,10 @@ Every row below was verified against the live `package_identity_uri(...)` call
 in the corresponding collector. The release segment is **not** guessable from
 the ecosystem token — `pypi`/`index`, `npm`/`registry`, `cargo`/`crates.io`,
 `rubygems`/`org`, `maven`/`central`, `hex`/`pm`, `nuget`/`gallery` all differ,
-and three ecosystems need a name transform on top. Nine of the twelve rows are
-supported; the three exclusions are each a namespace mismatch no string
-transform can bridge.
+and two ecosystems need a name transform on top. **Eight** of the twelve rows
+are supported at first release: three are excluded outright as namespace
+mismatches no string transform can bridge (§3.3, §3.4, §3.6), and PyPI is
+blocked on a `pypi.rs` fix (§3.5) that would make it the ninth.
 
 | Ecosystem token | Distro seg | Release seg | Name transform | Verified at |
 |---|---|---|---|---|
@@ -663,11 +800,30 @@ transform can bridge.
 | `maven` | `maven` | `central` | **`g:a` → `g/a`** | maven.rs:907 |
 | `cran` | `cran` | `cran` | none | cran.rs:209 |
 | `hex` | `hex` | `pm` | none | hex_collect.rs:266 |
-| `nuget` | `nuget` | `gallery` | none | nuget.rs:234 |
+| `nuget` | — | — | **dead row, see below** | nuget.rs:234 |
+| `bioconductor` | — | — | **no collector exists** | collect_spec.rs:873 |
+| `elpa` | — | — | **no collector exists** | collect_spec.rs:990 |
 | `cpan` | — | — | **excluded, see §3.3** | cpan.rs:195 |
 | `conda` | — | — | **excluded, see §3.6** | conda.rs:198 |
 
 All identities are `package_identity_uri(distro_seg, release_seg, "any", transformed_name)`.
+
+**Two rows are dead and two tokens were missing.** The full producer
+enumeration shows that:
+
+- **`nuget` and `conda` are never produced as upstream tokens by any
+  emitter.** Both have registry collectors, but nothing points *at* them.
+  `rpm.rs:1105-1106` explicitly skips `nuget(...)` Provides as ABI/arch
+  markers (`nuget(x86-64)`), and `conda` appears only as a distro pointing
+  outward at pypi/cran/cargo (conda.rs:341-371). Implementing resolver rows
+  for them would be dead code.
+- **`bioconductor` (collect_spec.rs:873, :960) and `elpa`
+  (collect_spec.rs:990) are produced but have no registry collector at all.**
+  They must return `None`. They also have no arm in
+  `enrich_taxonomy.rs:162-178`, so they already classify to nothing today.
+
+That leaves the supported set at **eight**: hackage, npm, cargo, rubygems,
+maven, cran, hex, and — after PR P — pypi.
 
 Three rows carry traps that a naive `token == segment` implementation would
 get wrong, producing well-formed URIs that match nothing:
@@ -869,8 +1025,9 @@ unchanged for backward compatibility:
     pkg:assertionRelation      pkg:upstream-repackages ;
     pkg:assertionSourceBuild   <d/pkg/fedora/43/x86_64/ghc-hoauth2/2.14.3-2.fc44> ;
     pkg:assertionUpstreamVersion "2.14.3" ;
-    pkg:matchMethod            pkg:match-capability-declared ;
-    pkg:matchConfidence        "1.0"^^xsd:decimal .
+    pkg:assertionProducer      "rpm-provides" ;
+    pkg:assertionMethod        pkg:assert-capability-declared ;
+    pkg:assertionConfidence    "1.0"^^xsd:decimal .
 
 # 2. identity-level — owner link plus the materialized one-hop shortcut
 <d/pkg/fedora/43/x86_64/ghc-hoauth2>
@@ -995,10 +1152,12 @@ collected — exactly the set that needs no seeding. The query would return a
 shrinking subset of what it returned before the rewrite, and new upstream
 packages would never be discovered.
 
-Reading the literal off the assertion also means the seed carries the
-*post-transform* name (§3.2) — PEP 503-normalized, feature-stripped,
-`g:a`-rewritten — which is what the registry collector will key by. The two
-sides therefore agree by construction rather than by coincidence.
+Reading the literal off the assertion means the seed carries the form the
+collector's own parser accepts — Cargo feature-stripped, and for Maven the
+**unrewritten** `g:a` coordinate, per §2.2. The `g:a → g/a` rewrite is applied
+only by the resolver when minting the target IRI; a seed carrying `g/a` is
+discarded by `MavenCoord::parse`. The two sides therefore agree by
+construction rather than by coincidence.
 
 This also removes the current string-matching `FILTER` over the ecosystem IRI,
 since the assertion points at the `Ecosystem` resource directly.
@@ -1099,8 +1258,9 @@ contradicted that invariant:
     pkg:assertionEcosystem    <d/ecosystem/npm> ;
     pkg:assertionRelation     pkg:upstream-bundles ;
     pkg:assertionSourceBuild  <d/pkg/npm/registry/any/express/4.19.2> ;
-    pkg:matchMethod           pkg:match-capability-declared ;
-    pkg:matchConfidence       "0.9"^^xsd:decimal .
+    pkg:assertionProducer     "npm-bundled-deps" ;
+    pkg:assertionMethod       pkg:assert-manifest-declared ;
+    pkg:assertionConfidence   "0.9"^^xsd:decimal .
 ```
 
 `:assertionSourceBuild` **is** available here and should be set: unlike the
@@ -1117,13 +1277,40 @@ construct, and supplying an identity URI would violate the range. Both
 subject and object here are identities, matching `pkg:bundles`'s declared
 domain and range.
 
-Note that the field is a JSON array of names, but npm also permits the
-legacy boolean `bundledDependencies: true` (meaning "bundle everything in
-`dependencies`"). Deserialization must tolerate both shapes and emit nothing
-for the boolean form, which carries no per-package information.
+#### Field shapes
 
-The registry document is already fetched; this reads a field already in the
-response body.
+`bundledDependencies` is polymorphic in npm, and a previous revision got the
+boolean case backwards — it said `true` should emit nothing "because it
+carries no per-package information". It does carry that information: `true`
+means *bundle every ordinary dependency*, and those names are already in hand.
+`NpmVersion.dependencies` (npm.rs:29) is an `Option<HashMap<String, String>>`
+deserialized from the same version object.
+
+| Value | Behaviour |
+|---|---|
+| array of names | one assertion per listed name |
+| `true` | one assertion per key of `dependencies` |
+| `false`, absent, or `[]` | emit nothing |
+
+Treating `true` as "nothing" would have silently dropped the *most* thorough
+bundling declaration npm offers — a package that bundles its entire dependency
+tree is precisely the case supply-chain analysis most needs to see.
+
+Two further shapes need defined behaviour rather than incidental behaviour:
+
+- **Alias specs.** A `dependencies` value may be `"npm:actual-package@^1.0.0"`
+  rather than a version range, meaning the key is a local alias for a
+  differently-named registry package. When expanding `true`, the assertion
+  target must be the **aliased-to** name (`actual-package`), not the key;
+  `:assertionUpstreamName` likewise. A key whose value is an alias spec but
+  which is not parseable must emit no assertion and a DQ record, never a
+  guess.
+- **Non-registry specs.** Values such as `file:`, `git+https:`, `link:`, or a
+  bare URL denote dependencies that are not registry packages at all. These
+  resolve to no registry identity and must emit nothing.
+
+The registry document is already fetched; all of this reads fields already in
+the response body.
 
 ### 5.3 Not in this design
 
@@ -1244,10 +1431,35 @@ WHERE {
              pkg:assertionSourceBuild     ?sourceBuild ;
              pkg:assertionTarget          ?upId ;
              pkg:assertionUpstreamVersion ?v .
-  ?upRelease pkg:isVersionOf   ?upId ;
-             pkg:versionString ?v .
+  ?upRelease  pkg:isVersionOf ?upId ;
+              pkg:hasVersion  ?upVersion .
+  ?upVersion  pkg:versionString ?v .
 }
 ```
+
+**The version string is on a separate `Version` node, not on the package.** A
+previous revision wrote `?upRelease pkg:versionString ?v` and would therefore
+have bound nothing at all — the deriver would have emitted **zero** edges
+while appearing to run correctly. Every registry collector uses the
+three-triple version-node shape:
+
+```rust
+// hackage.rs:296-298 — and identically in every other registry collector
+let ver_uri = version_uri("hackage", "hackage", &cabal.name, &cabal.version);
+writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
+writer.write_literal(&ver_uri, &format!("{PKG}versionString"), &cabal.version)?;
+writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
+```
+
+Verified at `hackage.rs:296-298`, `cargo_collect.rs:305`, `npm.rs:214`,
+`maven.rs:935`; the same shape holds in `cran.rs`, `hex_collect.rs`,
+`nuget.rs`, `pypi.rs`, and `rubygems.rs`. No collector writes
+`pkg:versionString` on a package URI.
+
+This failure mode — a query that is syntactically fine, runs without error,
+and silently returns nothing — is the reason §11 requires a *positive*
+deriver test against the real version-node shape rather than only the negative
+mismatch tests a previous revision specified.
 
 Every variable that must correspond is drawn from one assertion node, so no
 cross-product is possible. Assertions lacking `:assertionSourceBuild` or
@@ -1346,7 +1558,7 @@ excluding name-prefix guesses:
 SELECT ?source ?target ?conf WHERE {
   ?a a pkg:UpstreamAssertion ;
      pkg:assertionTarget ?target ;
-     pkg:matchConfidence ?conf .
+     pkg:assertionConfidence ?conf .
   ?source pkg:hasUpstreamAssertion ?a .
   FILTER(?conf >= 0.9)
 }
@@ -1404,9 +1616,12 @@ registry APIs ─► hackage/pypi/npm/… collectors
   merging.
 - `pkg:upstreamPackageName` literals are **retained at their current values
   and their current subjects** — no emitter changes altitude (§4.1).
-  `enrich_taxonomy.rs:88-92` and `seed.rs:16-47` read them and keep working
-  unchanged; the seed mechanism in particular is what makes §4.4 hold, so it
-  cannot be broken by this change.
+  `enrich_taxonomy.rs:88-92` continues to read them unchanged.
+  **`seed.rs` does not**: it is rewritten to read assertions (§4.4), and the
+  flat query is retired only after the coverage gate in §12. An earlier
+  revision claimed seed.rs kept working unchanged, which contradicted §4.4.
+  The literals stay regardless, because other consumers read them and because
+  retiring them is out of scope here.
 - The §2.4 domain widening is monotonic: it removes entailments rather than
   adding them, so no currently-valid triple becomes invalid. Consumers that
   relied on `upstreamPackageName` entailing `rdf:type :Package` lose that
@@ -1473,9 +1688,13 @@ Unit tests, per the existing `#[cfg(test)]` convention in each collector:
    behaviour, since §4.1 deliberately moves nothing.
 7. `bundled(crate(nom))` parses to `("cargo", "nom")` and yields a `pkg:bundles`
    edge; `bundled(` with unbalanced parens yields no edge and no panic.
-8. npm `bundledDependencies` as a name array, absent, empty array, and the
-   legacy boolean `true` form — the boolean emits nothing and does not panic.
-   Assert `npm:bundledDependency` is never emitted (§2.2).
+8. npm `bundledDependencies` across all shapes (§5.2): name array emits one
+   assertion per name; `true` emits one per key of `dependencies`; `false`,
+   absent, and `[]` emit none. Plus an alias case — `{"lodash":
+   "npm:lodash-es@^4"}` under `true` targets `lodash-es`, not `lodash`, in
+   both `:assertionTarget` and `:assertionUpstreamName` — an unparseable alias
+   emitting a DQ record and no assertion, and a `file:`/`git+https:` spec
+   emitting nothing. Assert `npm:bundledDependency` is never emitted (§2.2).
 9. Each of the nine §6 collectors emits `pkg:upstreamRepository` on the
    identity for a forge URL, and nothing for a non-forge URL.
 10. `gomod.rs`'s **forge wiring** (§6, unaffected by the §3.4 exclusion):
@@ -1562,20 +1781,53 @@ additions are needed, filed against the ontology repo:
         sh:property [ sh:path pkg:assertionRelation ;
                       sh:minCount 1 ; sh:maxCount 1 ;
                       sh:in ( pkg:upstream-repackages pkg:upstream-bundles ) ] ;
-        sh:property [ sh:path pkg:matchMethod ;
+        sh:property [ sh:path pkg:assertionProducer ;
+                      sh:datatype xsd:string ;
                       sh:minCount 1 ; sh:maxCount 1 ] ;
-        sh:property [ sh:path pkg:matchConfidence ;
+        sh:property [ sh:path pkg:assertionMethod ;
+                      sh:minCount 1 ; sh:maxCount 1 ;
+                      sh:class skos:Concept ;
+                      sh:message "Assertion method must be exactly one AssertionMethodScheme concept."@en ] ;
+        sh:property [ sh:path pkg:assertionConfidence ;
                       sh:datatype xsd:decimal ;
                       sh:minInclusive 0.0 ; sh:maxInclusive 1.0 ;
                       sh:minCount 1 ; sh:maxCount 1 ;
-                      sh:message "Match confidence must be between 0.0 and 1.0."@en ] ;
+                      sh:message "Assertion confidence must be between 0.0 and 1.0."@en ] ;
 
         # optional, but at most one each
         sh:property [ sh:path pkg:assertionUpstreamVersion ;
                       sh:datatype xsd:string ; sh:maxCount 1 ] ;
         sh:property [ sh:path pkg:assertionSourceBuild ;
                       sh:class pkg:Package ; sh:maxCount 1 ] ;
+
+        # controlled vocabularies, validated against their schemes
+        sh:sparql [ sh:message "assertionMethod must be a concept in AssertionMethodScheme."@en ;
+                    sh:select """
+                        PREFIX pkg:  <https://purl.org/packagegraph/ontology/core#>
+                        PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+                        SELECT $this WHERE {
+                            $this pkg:assertionMethod ?m .
+                            FILTER NOT EXISTS { ?m skos:inScheme pkg:AssertionMethodScheme }
+                        }
+                    """ ] ;
+        sh:sparql [ sh:message "assertionRelation must be a concept in UpstreamRelationScheme."@en ;
+                    sh:select """
+                        PREFIX pkg:  <https://purl.org/packagegraph/ontology/core#>
+                        PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+                        SELECT $this WHERE {
+                            $this pkg:assertionRelation ?r .
+                            FILTER NOT EXISTS { ?r skos:inScheme pkg:UpstreamRelationScheme }
+                        }
+                    """ ] .
     ```
+
+    Note the block above is complete and terminates with `.` — a previous
+    revision ended it on `;` immediately before closing the fence, which is not
+    parseable Turtle and would fail on a copy-paste into the ontology repo.
+    `sh:in` is deliberately *not* used for the two controlled vocabularies:
+    it would hard-code the concept list into the shape, so adding a method
+    concept would require editing the shape as well as the scheme. The
+    `skos:inScheme` check validates against the scheme itself.
 
     Note the constraint names: SHACL's value-range terms are
     **`sh:minInclusive` / `sh:maxInclusive`**. A draft of this item wrote
@@ -1605,6 +1857,65 @@ additions are needed, filed against the ontology repo:
                         }
                     """ ] .
     ```
+15c. **Shortcut-invariant validation.** §2.2 states that every shortcut has a
+    backing assertion and every assertion materializes its shortcut. Nothing
+    currently checks either direction, so a collector bug could emit orphan
+    shortcuts (unbacked claims) or assertions with no shortcut (silently
+    breaking the §8 one-hop query). Two `sh:sparql` constraints on
+    `pkg:PackageIdentityShape`:
+
+    ```sparql
+    # orphan shortcut: an edge with no backing assertion
+    SELECT $this WHERE {
+        $this pkg:upstreamPackageIdentity ?t .
+        FILTER NOT EXISTS {
+            $this pkg:hasUpstreamAssertion ?a .
+            ?a pkg:assertionTarget ?t ; pkg:assertionRelation pkg:upstream-repackages .
+        }
+    }
+    # ... and the mirror for pkg:bundles / upstream-bundles
+
+    # unmaterialized assertion: an assertion whose shortcut is missing
+    SELECT $this WHERE {
+        $this pkg:hasUpstreamAssertion ?a .
+        ?a pkg:assertionTarget ?t ; pkg:assertionRelation pkg:upstream-repackages .
+        FILTER NOT EXISTS { $this pkg:upstreamPackageIdentity ?t }
+    }
+    ```
+
+15d. **Negative SHACL fixtures.** Each must be asserted to *fail* validation,
+    since a shape that never rejects anything is untested. One fixture per
+    row: duplicate `:assertionTarget`; duplicate `:assertionUpstreamVersion`;
+    missing each of the six required facets in turn; an `:assertionMethod`
+    outside `AssertionMethodScheme`; an `:assertionRelation` outside
+    `UpstreamRelationScheme`; `:assertionConfidence` of `1.5` and of `-0.1`;
+    two owners via `:hasUpstreamAssertion`; zero owners; an
+    `:assertionSourceBuild` that is a build of a *different* identity; an
+    orphan `pkg:bundles` edge; and an assertion with no materialized shortcut.
+
+15e. **Production sampler fix** (ontology repo). `sample_class_instances`
+    (`scripts/production_shacl_validate.py:31-45`) issues
+    `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <g> { ?s a <class> . ?s ?p ?o } }` —
+    **outgoing triples only**. An `:UpstreamAssertion` sampled that way
+    arrives with no incoming `:hasUpstreamAssertion` edge, so the
+    exactly-one-owner constraint in §11.15 fails for *every* sampled
+    assertion. The sampler would report a corpus-wide violation that does not
+    exist. It must union in the inverse edge:
+
+    ```sparql
+    CONSTRUCT { ?s ?p ?o . ?owner ?ip ?s }
+    WHERE {
+      GRAPH <{graph}> {
+        ?s a <{class}> .
+        { ?s ?p ?o } UNION { ?owner ?ip ?s }
+      }
+    }
+    ```
+
+    and `pkg:UpstreamAssertion` must be added to its list of validated
+    classes. Without both changes the new shape cannot be exercised against
+    production at all.
+
 16. A **term-existence test**: every predicate IRI emitted by any collector
     must have a declaration in the ontology. This is the general guard — it
     would have caught `upstreamPackageVersion` when it was first emitted,
@@ -1639,22 +1950,70 @@ dependency order:
 
 ```
 1. ontology PR A — defect repairs                      (§2.4, filed as ontology#9)
-2. ontology PR B — UpstreamAssertion + relation scheme (§2.2, to be filed)
-     + match-capability-declared concept               (§2.3)
-     + matchMethod/matchConfidence union domains       (REPLACING, not adding)
+     + PackageEntity definition broadening             (normative prerequisite)
+2. ontology PR B — UpstreamAssertion + both schemes    (§2.2, to be filed)
+     + assertionMethod / assertionConfidence           (§2.3)
      + UpstreamAssertion SHACL shape + sh:sparql       (§11.15)
+     + production_shacl_validate.py sampler fix        (§11.17)
 3. ontology release + upload-ontology.sh
-4. collector changes: assertions + shortcuts           (§3, §4, §5, §6)
-5. seed.rs query rewrite                               (§4.4)
-6. full collection cycle
-7. derive_upstream_release                             (§7)
+
+   ── the migration window; order here is load-bearing ──
+4. deploy assertion-capable distro collectors,
+     KEEPING the existing flat seed query in place     (§3, §4, §5, §6)
+5. recollect / backfill EVERY contributing distro graph
+6. verify assertion coverage meets threshold           (gate, §12.2)
+7. switch seed.rs to the assertion query               (§4.4)
+8. run registry collectors
+9. run derive_upstream_release                         (§7)
 
    independent, unblocks the pypi row whenever it lands:
 P. pypi.rs URI normalization fix + backfill            (§3.5)
 ```
 
 PRs A and B are independent and can be authored in parallel, but both must be
-in the same release before step 4. Steps 5 and 6 gate step 7.
+in the same release before step 4.
+
+**Steps 4-7 cannot be reordered, and a previous revision had them wrong.** It
+switched `seed.rs` to the assertion query *before* the collection cycle that
+produces assertions. At that moment every existing distro graph contains flat
+properties and no assertions, so the assertion-only query matches nothing and
+returns an **empty seed set** — registry collection would quietly collect
+nothing new, and the failure presents as "no new packages" rather than as an
+error. The same shape of silent-empty-result bug as the §7 deriver defect.
+
+The old flat query therefore stays live through steps 4-6 and is retired only
+once coverage is verified. Note the old query is *wrong* (it returns the
+cross-product, §4.4) but it is wrong in the direction of returning too many
+seeds, which is safe for bootstrapping; the new one fails toward returning
+none, which is not.
+
+**A transitional query that falls back to the flat properties when no
+assertion exists is explicitly rejected.** It would reintroduce the
+cross-product for exactly the packages that have not yet been recollected —
+silently, and with no marker distinguishing a correct seed from a
+cross-product artefact. The cutover must be a clean switch gated on coverage,
+not a blend.
+
+#### Coverage gate (step 6)
+
+Before step 7, assert that assertions are present wherever the flat properties
+are, per contributing graph:
+
+```sparql
+SELECT ?g (COUNT(DISTINCT ?flat) AS ?flatOnly) WHERE {
+  GRAPH ?g {
+    ?flat pkg:upstreamPackageName ?n .
+    FILTER NOT EXISTS {
+      ?id pkg:hasUpstreamAssertion ?a .
+      { ?flat pkg:isVersionOf ?id } UNION { FILTER(?flat = ?id) }
+    }
+  }
+} GROUP BY ?g
+```
+
+Any graph with a non-zero count has not been recollected. Excluded ecosystems
+(§3.3-§3.6) will legitimately appear here, so the gate compares against the
+expected excluded population rather than requiring zero.
 
 **PR P is not on the critical path.** The `pypi` row stays blocked until it
 lands, so the first release supports eight ecosystems; PyPI becomes the ninth
@@ -1671,6 +2030,46 @@ than a correct pairing. The per-capability assertion supersedes it entirely.
 Fixing the latched boolean is still worthwhile for the flat properties' own
 completeness, but it is cosmetic once assertions exist and is not a
 prerequisite for anything.
+
+### Pre-existing bugs found while deriving the evidence matrix
+
+None of these are caused by this design, and all are live today. Each degrades
+the data this design would build on, so they are worth fixing whether or not it
+proceeds.
+
+1. **`strip_ecosystem_prefix` truncates real names.** It is first-match-wins
+   over an ordered prefix list (collect_spec.rs:1000-1007), and the PyPI lists
+   at collect_spec.rs:645 and :802 include the bare prefix `"py"`. So
+   `pytest` -> `test`, `pyyaml` -> `yaml`, `pygments` -> `gments`. Those garbage
+   names are written as `upstreamPackageName` **and** fed to the PyPI collector
+   by `seed.rs`. The CPAN homepage list at :840 has the same problem with a
+   bare `"lib"`.
+2. **`golang-` is never stripped for gomod names.** collect_spec.rs:765-771 and
+   :938-944 pass the distro name through verbatim, so the recorded upstream
+   name is `golang-foo`, which is not a Go module path and matches nothing.
+   Independent of the §3.4 exclusion.
+3. **CPAN names have two incompatible shapes under one token.**
+   `collect_salsa.rs:551` rewrites `-` to `::` (distribution -> module form)
+   while every `collect_spec.rs` CPAN path leaves the distribution form. This
+   compounds the §3.3 distribution-vs-module split.
+4. **npm alias specs are stored as if they were semver.** `emit_npm_deps`
+   (npm.rs:272-316) uses the dependency map key verbatim as the target name
+   (npm.rs:281) and writes the raw spec as a `"semver"` constraint
+   (npm.rs:302-311). `"string-width-cjs": "npm:string-width@^4.2.0"` mints an
+   identity for the alias, so the edge dangles; `file:`, `git+ssh:`,
+   `github:`, `workspace:`, and `link:` specs are stored as semver too.
+5. **The spec-collector dedup gate is a no-op.** `collect_spec.rs:296-299`
+   guards emission on `!existing_ecosystem_pkgs.contains(source_name)`, but
+   `main.rs:3613` passes a permanently empty set with a `// TODO: track from
+   RPM Provides` comment. Spec detection therefore duplicates and can
+   contradict the stronger RPM Provides facts for the same package.
+6. **`dev_dependencies` is parsed and never emitted** (npm.rs:32-33 vs
+   :242-253) — dead deserialization, or a missing edge, depending on intent.
+
+Items 1-3 directly produce wrong `upstreamPackageName` values, which is the
+input this design's assertions are built from. They must be fixed before or
+alongside step 4 of the landing order, or the assertions will faithfully record
+bad names.
 
 ### Smaller items surfaced and deliberately not fixed here
 
