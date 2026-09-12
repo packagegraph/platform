@@ -3,19 +3,17 @@
 //! Fetches debian/ files from salsa for authoritative upstream URLs and
 //! temporal maintainer data. Uses Vcs-Git URLs from Phase 1 (not constructed paths).
 
-use crate::enricher::rate_limit;
 use crate::forge::{emit_dq_issue, emit_upstream_repo, extract_forge_url_with_field};
+use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use regex::Regex;
-use reqwest::blocking::Client;
 use std::collections::{HashMap, HashSet};
 use std::io::Result;
-use std::time::Duration;
 
 pub struct SalsaCollector {
-    client: Client,
+    transport: HttpTransport,
     dist: String,
     source_cache: Option<SourceCache>,
     pub graph_uri: Option<String>,
@@ -23,10 +21,8 @@ pub struct SalsaCollector {
 
 impl SalsaCollector {
     pub fn new(dist: String) -> Self {
-        let client = crate::enricher::default_http_client();
-
         Self {
-            client,
+            transport: HttpTransport::new(),
             dist,
             source_cache: None,
             graph_uri: None,
@@ -107,7 +103,6 @@ impl SalsaCollector {
             src_count += 1;
 
             // Rate limit
-            rate_limit(Duration::from_millis(200));
 
             if src_count % 100 == 0 {
                 eprintln!(
@@ -167,11 +162,9 @@ impl SalsaCollector {
                         "https://salsa.debian.org/{}/{}/-/raw/{}/debian/control",
                         group, project, branch
                     );
-                    if let Ok(resp) = self.client.get(&test_url).send() {
-                        if resp.status().is_success() {
-                            found_branch = Some(branch.clone());
-                            break;
-                        }
+                    if self.transport.get(&test_url, None).is_ok() {
+                        found_branch = Some(branch.clone());
+                        break;
                     }
                 }
 
@@ -260,16 +253,11 @@ impl SalsaCollector {
 
         // Fallback to direct fetch
         let resp = self
-            .client
-            .get(&url)
-            .send()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .transport
+            .get(&url, None)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        if !resp.status().is_success() {
-            return Err(std::io::Error::other(format!("HTTP {}", resp.status())));
-        }
-
-        resp.text()
+        String::from_utf8(resp.bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 

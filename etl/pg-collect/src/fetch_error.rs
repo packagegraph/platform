@@ -11,7 +11,18 @@ pub enum FetchError {
     /// Transport-level failure (DNS, TLS, connection reset, timeout).
     Transport { url: String, source: reqwest::Error },
     /// Server returned a non-success status code (not 404).
-    HttpStatus { url: String, status: u16 },
+    ///
+    /// `body` carries the server's own explanation when it sent one, since
+    /// for several of our upstreams that is the whole diagnosis: Fuseki puts
+    /// the SPARQL parse error there, and a bare "HTTP 400" leaves an operator
+    /// re-running the query by hand to find out what was wrong with it. It is
+    /// truncated at the point of capture, and is None where no response body
+    /// was available (e.g. an error reconstructed from cache metadata).
+    HttpStatus {
+        url: String,
+        status: u16,
+        body: Option<String>,
+    },
     /// Server returned 404 Not Found.
     NotFound { url: String },
     /// A cached entry had an unexpected status code.
@@ -53,9 +64,12 @@ impl fmt::Display for FetchError {
             FetchError::Transport { url, source } => {
                 write!(f, "transport error fetching {}: {}", url, source)
             }
-            FetchError::HttpStatus { url, status } => {
-                write!(f, "HTTP {} from {}", status, url)
-            }
+            FetchError::HttpStatus { url, status, body } => match body {
+                Some(b) if !b.trim().is_empty() => {
+                    write!(f, "HTTP {} from {}: {}", status, url, b.trim())
+                }
+                _ => write!(f, "HTTP {} from {}", status, url),
+            },
             FetchError::NotFound { url } => {
                 write!(f, "not found: {}", url)
             }
@@ -102,6 +116,7 @@ mod tests {
         let fe = FetchError::HttpStatus {
             url: "http://example.com".into(),
             status: 429,
+            body: None,
         };
         assert!(fe.is_retryable());
         assert_eq!(fe.classification(), "http");
@@ -112,6 +127,7 @@ mod tests {
         let fe = FetchError::HttpStatus {
             url: "http://example.com".into(),
             status: 500,
+            body: None,
         };
         assert!(fe.is_retryable());
     }
@@ -121,6 +137,7 @@ mod tests {
         let fe = FetchError::HttpStatus {
             url: "http://example.com".into(),
             status: 503,
+            body: None,
         };
         assert!(fe.is_retryable());
     }
@@ -130,6 +147,7 @@ mod tests {
         let fe = FetchError::HttpStatus {
             url: "http://example.com".into(),
             status: 400,
+            body: None,
         };
         assert!(!fe.is_retryable());
     }
@@ -177,6 +195,7 @@ mod tests {
         let fe = FetchError::HttpStatus {
             url: "http://example.com/api".into(),
             status: 503,
+            body: None,
         };
         let msg = format!("{}", fe);
         assert!(msg.contains("503"));

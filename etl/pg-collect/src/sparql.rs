@@ -1,9 +1,11 @@
-use reqwest::blocking::Client;
+use crate::fetch_error::FetchError;
+use crate::http_transport::{HostLimiter, HttpTransport, RetryPolicy};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Error, ErrorKind, Result};
 use std::time::{Duration, Instant};
+use url::form_urlencoded;
 
 /// Optional SPARQL Basic Auth credentials (username, password).
 pub type SparqlAuth = Option<(String, String)>;
@@ -34,8 +36,76 @@ struct SparqlValue {
     value_type: Option<String>,
 }
 
+/// Retry schedule for the triplestore: 4 attempts at 5s, 10s, 20s.
+///
+/// Deliberately slower than the transport's default. A Fuseki returning 5xx
+/// is usually busy compacting or under load, and hammering it at 500ms
+/// intervals makes that worse rather than better. Unjittered because the
+/// loader is sequential -- there are no concurrent workers to spread out.
+fn triplestore_policy() -> RetryPolicy {
+    RetryPolicy {
+        max_attempts: 4,
+        base_delay: Duration::from_secs(5),
+        max_delay: Duration::from_secs(20),
+        jitter: false,
+    }
+}
+
+/// The policy a client actually runs with.
+///
+/// Identical to [`triplestore_policy`] except under `cargo test`, where the
+/// delays collapse to milliseconds. What the tests here pin is behaviour --
+/// how many attempts a failure costs, and that the error propagates -- while
+/// the wall-clock schedule is a production tuning constant covered by
+/// `RetryPolicy`'s own backoff tests and asserted directly below.
+///
+/// Without this every test whose SPARQL endpoint is not mocked pays the full
+/// 35s schedule, because mockito answers an unmatched request with 501 and
+/// 5xx is exactly what we retry.
+fn active_policy() -> RetryPolicy {
+    if cfg!(test) {
+        RetryPolicy {
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(4),
+            ..triplestore_policy()
+        }
+    } else {
+        triplestore_policy()
+    }
+}
+
+/// The triplestore is ours and is not rate limited; pacing bulk loads at the
+/// transport's default 200ms would add hours to a load of a few thousand
+/// batches.
+fn triplestore_limiter() -> HostLimiter {
+    HostLimiter::new(Duration::ZERO)
+}
+
+/// Render a transport failure as the io::Error the rest of the crate expects.
+///
+/// Keeps the wording the collectors' logs and tests already match on, and
+/// keeps the server's own explanation, which for Fuseki is the whole
+/// diagnosis on a malformed query.
+fn sparql_err(op: &str, e: FetchError) -> Error {
+    let msg = match &e {
+        FetchError::HttpStatus { status, body, .. } => format!(
+            "{} failed with status {}: {}",
+            op,
+            status,
+            body.as_deref().unwrap_or_default()
+        ),
+        FetchError::NotFound { url } => {
+            format!("{} failed with status 404: {}", op, url)
+        }
+        other => format!("{} failed: {}", op, other),
+    };
+    Error::new(ErrorKind::Other, msg)
+}
+
 pub struct SparqlClient {
-    client: Client,
+    transport: HttpTransport,
+    /// Single-attempt transport for [`update_no_retry`](SparqlClient::update_no_retry).
+    transport_once: HttpTransport,
     endpoint: String,
     auth: SparqlAuth,
     backend: SparqlBackend,
@@ -45,13 +115,35 @@ impl SparqlClient {
     /// Create a new SPARQL client with the given endpoint URL.
     /// Example: `SparqlClient::new("http://localhost:3030/packagegraph")`
     pub fn new(endpoint: &str) -> Self {
+        // 600s, not the transport default: a GSP load of a large .nt file is
+        // one request that legitimately runs for minutes.
         let client = crate::enricher::http_client_builder()
             .timeout(Duration::from_secs(600))
             .build()
             .expect("Failed to create HTTP client");
 
+        Self::with_transports(
+            HttpTransport::with_client(client.clone())
+                .with_policy(active_policy())
+                .with_limiter(triplestore_limiter()),
+            HttpTransport::with_client(client)
+                .with_policy(RetryPolicy {
+                    max_attempts: 1,
+                    ..active_policy()
+                })
+                .with_limiter(triplestore_limiter()),
+            endpoint,
+        )
+    }
+
+    fn with_transports(
+        transport: HttpTransport,
+        transport_once: HttpTransport,
+        endpoint: &str,
+    ) -> Self {
         Self {
-            client,
+            transport,
+            transport_once,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             auth: None,
             backend: SparqlBackend::Fuseki,
@@ -68,14 +160,42 @@ impl SparqlClient {
         self
     }
 
-    fn apply_auth(
-        &self,
-        req: reqwest::blocking::RequestBuilder,
-    ) -> reqwest::blocking::RequestBuilder {
-        match &self.auth {
-            Some((user, pass)) => req.basic_auth(user, Some(pass)),
-            None => req,
+    /// Pre-rendered `Authorization` value, or None when unauthenticated.
+    ///
+    /// Callers keep the returned String alive while they borrow it into a
+    /// header slice. Replaces the old `apply_auth`, which had to be
+    /// remembered at each call site and was missed at one of them.
+    fn auth_header(&self) -> Option<String> {
+        use base64::Engine;
+        self.auth.as_ref().map(|(user, pass)| {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass))
+            )
+        })
+    }
+
+    /// Build the header slice for a request, appending auth when configured.
+    fn headers<'a>(
+        base: &[(&'a str, &'a str)],
+        auth: &'a Option<String>,
+    ) -> Vec<(&'a str, &'a str)> {
+        let mut headers = base.to_vec();
+        if let Some(value) = auth {
+            headers.push(("Authorization", value.as_str()));
         }
+        headers
+    }
+
+    /// `application/x-www-form-urlencoded` body for a query, which is what
+    /// reqwest's `.form()` used to build for us.
+    fn form_body(&self, sparql: &str) -> Vec<u8> {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        ser.append_pair("query", sparql);
+        if let SparqlBackend::QLever { ref access_token } = self.backend {
+            ser.append_pair("access-token", access_token);
+        }
+        ser.finish().into_bytes()
     }
 
     fn query_url(&self) -> String {
@@ -83,14 +203,6 @@ impl SparqlClient {
             SparqlBackend::Fuseki => format!("{}/sparql", self.endpoint),
             SparqlBackend::QLever { .. } => format!("{}/", self.endpoint),
         }
-    }
-
-    fn query_form_params<'a>(&'a self, sparql: &'a str) -> Vec<(&'a str, &'a str)> {
-        let mut params = vec![("query", sparql)];
-        if let SparqlBackend::QLever { ref access_token } = self.backend {
-            params.push(("access-token", access_token));
-        }
-        params
     }
 
     fn guard_write(&self, op: &str) -> Result<()> {
@@ -107,52 +219,13 @@ impl SparqlClient {
     pub fn update(&self, sparql: &str) -> Result<()> {
         self.guard_write("SPARQL Update")?;
         let url = format!("{}/update", self.endpoint);
-        let max_retries = 3;
+        let auth = self.auth_header();
+        let headers = Self::headers(&[("Content-Type", "application/sparql-update")], &auth);
 
-        for attempt in 0..=max_retries {
-            match self
-                .apply_auth(
-                    self.client
-                        .post(&url)
-                        .header("Content-Type", "application/sparql-update")
-                        .body(sparql.to_string()),
-                )
-                .send()
-            {
-                Ok(response) if response.status().is_success() => return Ok(()),
-                Ok(response) if response.status().is_server_error() && attempt < max_retries => {
-                    let delay = 5 * (1 << attempt);
-                    eprintln!(
-                        "    SPARQL update failed ({}), retrying in {}s...",
-                        response.status(),
-                        delay
-                    );
-                    std::thread::sleep(Duration::from_secs(delay));
-                }
-                Ok(response) => {
-                    return Err(Error::new(
-                        ErrorKind::Other,
-                        format!(
-                            "SPARQL update failed with status {}: {}",
-                            response.status(),
-                            response.text().unwrap_or_default()
-                        ),
-                    ));
-                }
-                Err(e) if attempt < max_retries => {
-                    let delay = 5 * (1 << attempt);
-                    eprintln!("    SPARQL update error: {}, retrying in {}s...", e, delay);
-                    std::thread::sleep(Duration::from_secs(delay));
-                }
-                Err(e) => {
-                    return Err(Error::new(
-                        ErrorKind::Other,
-                        format!("SPARQL update failed: {}", e),
-                    ));
-                }
-            }
-        }
-        Ok(())
+        self.transport
+            .post(&url, &headers, sparql.as_bytes().to_vec())
+            .map(|_| ())
+            .map_err(|e| sparql_err("SPARQL update", e))
     }
 
     /// Send a SPARQL Update query string with a SINGLE attempt -- no retry.
@@ -169,27 +242,15 @@ impl SparqlClient {
     /// instead (e.g. a bare `DROP SILENT` is safe to retry: dropping an
     /// already-dropped graph is a no-op).
     pub fn update_no_retry(&self, sparql: &str) -> Result<()> {
+        self.guard_write("SPARQL Update")?;
         let url = format!("{}/update", self.endpoint);
-        let response = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/sparql-update")
-            .body(sparql.to_string())
-            .send()
-            .map_err(|e| Error::new(ErrorKind::Other, format!("SPARQL update failed: {}", e)))?;
+        let auth = self.auth_header();
+        let headers = Self::headers(&[("Content-Type", "application/sparql-update")], &auth);
 
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(Error::new(
-                ErrorKind::Other,
-                format!(
-                    "SPARQL update failed with status {}: {}",
-                    response.status(),
-                    response.text().unwrap_or_default()
-                ),
-            ))
-        }
+        self.transport_once
+            .post(&url, &headers, sparql.as_bytes().to_vec())
+            .map(|_| ())
+            .map_err(|e| sparql_err("SPARQL update", e))
     }
 
     /// Drop a named graph from the triplestore.
@@ -205,30 +266,21 @@ impl SparqlClient {
     /// are the string representations of the bound values (URIs or literals).
     pub fn query(&self, sparql: &str) -> Result<Vec<HashMap<String, String>>> {
         let url = self.query_url();
-        let form_params = self.query_form_params(sparql);
+        let auth = self.auth_header();
+        let headers = Self::headers(
+            &[
+                ("Accept", "application/sparql-results+json"),
+                ("Content-Type", "application/x-www-form-urlencoded"),
+            ],
+            &auth,
+        );
 
         let response = self
-            .apply_auth(
-                self.client
-                    .post(&url)
-                    .header("Accept", "application/sparql-results+json")
-                    .form(&form_params),
-            )
-            .send()
-            .map_err(|e| Error::new(ErrorKind::Other, format!("SPARQL query failed: {}", e)))?;
+            .transport
+            .post(&url, &headers, self.form_body(sparql))
+            .map_err(|e| sparql_err("SPARQL query", e))?;
 
-        if !response.status().is_success() {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!(
-                    "SPARQL query failed with status {}: {}",
-                    response.status(),
-                    response.text().unwrap_or_default()
-                ),
-            ));
-        }
-
-        let results: SparqlResults = response.json().map_err(|e| {
+        let results: SparqlResults = serde_json::from_slice(&response.bytes).map_err(|e| {
             Error::new(
                 ErrorKind::Other,
                 format!("Failed to parse SPARQL JSON: {}", e),
@@ -451,69 +503,26 @@ impl SparqlClient {
     /// as update() for transient failures.
     pub fn query_construct(&self, sparql: &str) -> Result<Vec<String>> {
         let url = self.query_url();
-        let form_params = self.query_form_params(sparql);
-        let max_retries = 3;
+        let auth = self.auth_header();
+        let headers = Self::headers(
+            &[
+                ("Accept", "application/n-triples"),
+                ("Content-Type", "application/x-www-form-urlencoded"),
+            ],
+            &auth,
+        );
 
-        for attempt in 0..=max_retries {
-            match self
-                .apply_auth(
-                    self.client
-                        .post(&url)
-                        .header("Accept", "application/n-triples")
-                        .form(&form_params),
-                )
-                .send()
-            {
-                Ok(response) if response.status().is_success() => {
-                    let body = response.text().map_err(|e| {
-                        Error::new(
-                            ErrorKind::Other,
-                            format!("Failed to read CONSTRUCT response: {}", e),
-                        )
-                    })?;
-                    return Ok(body
-                        .lines()
-                        .map(|l| l.trim())
-                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                        .map(|l| l.to_string())
-                        .collect());
-                }
-                Ok(response) if response.status().is_server_error() && attempt < max_retries => {
-                    let delay = 5 * (1 << attempt);
-                    eprintln!(
-                        "    CONSTRUCT query failed ({}), retrying in {}s...",
-                        response.status(),
-                        delay
-                    );
-                    std::thread::sleep(Duration::from_secs(delay));
-                }
-                Ok(response) => {
-                    return Err(Error::new(
-                        ErrorKind::Other,
-                        format!(
-                            "CONSTRUCT query failed with status {}: {}",
-                            response.status(),
-                            response.text().unwrap_or_default()
-                        ),
-                    ));
-                }
-                Err(e) if attempt < max_retries => {
-                    let delay = 5 * (1 << attempt);
-                    eprintln!(
-                        "    CONSTRUCT query error: {}, retrying in {}s...",
-                        e, delay
-                    );
-                    std::thread::sleep(Duration::from_secs(delay));
-                }
-                Err(e) => {
-                    return Err(Error::new(
-                        ErrorKind::Other,
-                        format!("CONSTRUCT query failed: {}", e),
-                    ));
-                }
-            }
-        }
-        Ok(vec![])
+        let response = self
+            .transport
+            .post(&url, &headers, self.form_body(sparql))
+            .map_err(|e| sparql_err("CONSTRUCT query", e))?;
+
+        Ok(String::from_utf8_lossy(&response.bytes)
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.to_string())
+            .collect())
     }
 
     /// Load an N-Triples file into a named graph via Fuseki's Graph Store Protocol.
@@ -620,54 +629,15 @@ impl SparqlClient {
     }
 
     fn gsp_post_chunk(&self, url: &str, data: &[u8]) -> Result<()> {
-        let max_retries = 3;
-        for attempt in 0..=max_retries {
-            match self
-                .apply_auth(
-                    self.client
-                        .post(url)
-                        .header("Content-Type", "application/n-triples")
-                        .body(data.to_vec()),
-                )
-                .send()
-            {
-                Ok(response) if response.status().is_success() => return Ok(()),
-                Ok(response) if response.status().is_server_error() && attempt < max_retries => {
-                    let delay = 5 * (1 << attempt);
-                    eprintln!(
-                        "    GSP chunk failed ({}), retrying in {}s...",
-                        response.status(),
-                        delay
-                    );
-                    std::thread::sleep(Duration::from_secs(delay));
-                }
-                Ok(response) => {
-                    return Err(Error::new(
-                        ErrorKind::Other,
-                        format!(
-                            "GSP upload failed with status {}: {}",
-                            response.status(),
-                            response.text().unwrap_or_default()
-                        ),
-                    ));
-                }
-                Err(e) if attempt < max_retries => {
-                    let delay = 5 * (1 << attempt);
-                    eprintln!("    GSP chunk error: {}, retrying in {}s...", e, delay);
-                    std::thread::sleep(Duration::from_secs(delay));
-                }
-                Err(e) => {
-                    return Err(Error::new(
-                        ErrorKind::Other,
-                        format!("GSP upload failed: {}", e),
-                    ));
-                }
-            }
-        }
-        Ok(())
+        let auth = self.auth_header();
+        let headers = Self::headers(&[("Content-Type", "application/n-triples")], &auth);
+
+        self.transport
+            .post(url, &headers, data.to_vec())
+            .map(|_| ())
+            .map_err(|e| sparql_err("GSP upload", e))
     }
 
-    /// Fallback: load via batched INSERT DATA.
     fn load_file_batched(
         &self,
         file_path: &str,
@@ -734,8 +704,10 @@ impl SparqlClient {
     /// splitting the source `versionString` ("VERSION-RELEASE") on the last '-'.
     ///
     /// Returns (name, node_uri, epoch, version, release) tuples.
-    pub fn query_source_builds(&self, graph: &str)
-        -> Result<Vec<(String, String, i64, String, String)>> {
+    pub fn query_source_builds(
+        &self,
+        graph: &str,
+    ) -> Result<Vec<(String, String, i64, String, String)>> {
         let rows = self.query(&source_builds_query(graph))?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
@@ -743,7 +715,10 @@ impl SparqlClient {
                 (Some(n), Some(s), Some(v)) => (n.clone(), s.clone(), v.clone()),
                 _ => continue,
             };
-            let epoch = r.get("epoch").and_then(|e| e.parse::<i64>().ok()).unwrap_or(0);
+            let epoch = r
+                .get("epoch")
+                .and_then(|e| e.parse::<i64>().ok())
+                .unwrap_or(0);
             // split versionString "VERSION-RELEASE" on the last '-'
             let (version, release) = match ver.rfind('-') {
                 Some(i) => (ver[..i].to_string(), ver[i + 1..].to_string()),
@@ -759,7 +734,10 @@ impl SparqlClient {
     /// Fails closed: errors if zero or more than one distinct distribution IRI is present.
     pub fn resolve_distribution(&self, graph: &str) -> Result<String> {
         let rows = self.query(&distribution_query(graph))?;
-        let dists: Vec<String> = rows.into_iter().filter_map(|r| r.get("d").cloned()).collect();
+        let dists: Vec<String> = rows
+            .into_iter()
+            .filter_map(|r| r.get("d").cloned())
+            .collect();
         match dists.len() {
             1 => Ok(dists.into_iter().next().unwrap()),
             n => Err(Error::new(ErrorKind::InvalidData,
@@ -769,19 +747,23 @@ impl SparqlClient {
 }
 
 pub(crate) fn source_builds_query(graph: &str) -> String {
-    format!(r#"PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+    format!(
+        r#"PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
 SELECT ?name ?src (COALESCE(?ep, 0) AS ?epoch) ?ver WHERE {{
   GRAPH <{graph}> {{
     ?src a pkg:SourcePackage ; pkg:packageName ?name ; pkg:hasVersion ?v .
     ?v pkg:versionString ?ver .
     OPTIONAL {{ ?bin pkg:builtFromSource ?src ; pkg:hasVersion ?bv . ?bv pkg:epoch ?ep . }}
   }}
-}}"#)
+}}"#
+    )
 }
 
 pub(crate) fn distribution_query(graph: &str) -> String {
-    format!(r#"PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
-SELECT DISTINCT ?d WHERE {{ GRAPH <{graph}> {{ ?p pkg:partOfDistribution ?d }} }}"#)
+    format!(
+        r#"PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
+SELECT DISTINCT ?d WHERE {{ GRAPH <{graph}> {{ ?p pkg:partOfDistribution ?d }} }}"#
+    )
 }
 
 pub fn make_sparql_client(
@@ -1130,14 +1112,14 @@ mod tests {
         assert!(q.contains("a pkg:SourcePackage"));
         assert!(q.contains("pkg:packageName"));
         assert!(q.contains("pkg:versionString"));
-        assert!(q.contains("pkg:builtFromSource"));   // epoch join through the binary
-        // epoch lives on the binary's VERSION node (pkg:epoch), NOT rpm:epoch on the
-        // binary itself — the latter is Fedora-IR-only and absent in RHEL/Alma/Rocky.
-        assert!(q.contains("pkg:hasVersion ?bv"));    // hop to the binary's version node
-        assert!(q.contains("?bv pkg:epoch ?ep"));     // epoch read from the version node
-        assert!(!q.contains("rpm:epoch"));            // must NOT rely on the Fedora shape
-        assert!(!q.contains("PREFIX rpm:"));          // unused prefix removed
-        assert!(q.contains("OPTIONAL"));              // epoch is optional, defaults 0
+        assert!(q.contains("pkg:builtFromSource")); // epoch join through the binary
+                                                    // epoch lives on the binary's VERSION node (pkg:epoch), NOT rpm:epoch on the
+                                                    // binary itself — the latter is Fedora-IR-only and absent in RHEL/Alma/Rocky.
+        assert!(q.contains("pkg:hasVersion ?bv")); // hop to the binary's version node
+        assert!(q.contains("?bv pkg:epoch ?ep")); // epoch read from the version node
+        assert!(!q.contains("rpm:epoch")); // must NOT rely on the Fedora shape
+        assert!(!q.contains("PREFIX rpm:")); // unused prefix removed
+        assert!(q.contains("OPTIONAL")); // epoch is optional, defaults 0
         assert!(q.contains("COALESCE(?ep, 0) AS ?epoch")); // epoch-0 packages default 0
         assert!(q.contains("GRAPH <https://packagegraph.github.io/graph/rhel/9>"));
     }
@@ -1224,6 +1206,55 @@ mod tests {
             SparqlClient::new(&server.url()).with_auth("testuser".into(), "testpass".into());
         let _ = client.update("INSERT DATA { <s> <p> <o> }");
         mock.assert();
+    }
+
+    #[test]
+    fn triplestore_policy_is_four_attempts_at_5s_10s_20s() {
+        // active_policy() collapses these under cfg(test), so assert the
+        // production constant directly -- otherwise the tuning that actually
+        // ships is pinned by nothing.
+        let p = triplestore_policy();
+        assert_eq!(p.max_attempts, 4);
+        assert!(!p.jitter, "a sequential loader has nothing to spread out");
+        assert_eq!(p.backoff_delay(0), Duration::from_secs(5));
+        assert_eq!(p.backoff_delay(1), Duration::from_secs(10));
+        assert_eq!(p.backoff_delay(2), Duration::from_secs(20));
+        assert_eq!(
+            p.backoff_delay(3),
+            Duration::from_secs(20),
+            "capped, not 40s"
+        );
+    }
+
+    #[test]
+    fn test_update_no_retry_sends_basic_auth_header() {
+        // Its one production caller is the derived-graph atomic swap. Without
+        // the header every swap 401s against an authenticated Fuseki, so the
+        // deriver can never publish.
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/update")
+            .match_header("Authorization", "Basic dGVzdHVzZXI6dGVzdHBhc3M=")
+            .with_status(200)
+            .create();
+        let client =
+            SparqlClient::new(&server.url()).with_auth("testuser".into(), "testpass".into());
+        let _ = client.update_no_retry("DROP SILENT GRAPH <urn:x>");
+        mock.assert();
+    }
+
+    #[test]
+    fn test_update_no_retry_refuses_to_write_to_qlever() {
+        // `update` guards writes against the read-only engine; the no-retry
+        // variant must not be a way around that guard.
+        let client =
+            SparqlClient::new("http://unused.invalid").with_backend(SparqlBackend::QLever {
+                access_token: "t".into(),
+            });
+        let err = client
+            .update_no_retry("DROP SILENT GRAPH <urn:x>")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
     }
 
     #[test]

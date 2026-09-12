@@ -4,14 +4,12 @@
 //! with CVE cross-references.
 
 use crate::cache::FileCache;
-use crate::enricher::rate_limit;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
-use reqwest::blocking::Client;
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 
 /// If more than this fraction of per-CVE RHSA detail fetches fail in a
 /// single run, abort rather than upload a graph that silently dropped
@@ -19,7 +17,7 @@ use std::time::Duration;
 const RHSA_DETAIL_FAILURE_THRESHOLD: f64 = 0.05;
 
 pub struct AdvisoryEnricher {
-    client: Client,
+    transport: HttpTransport,
     cache: Option<FileCache>,
     advisory_type: AdvisoryType,
     days_back: u32,
@@ -42,7 +40,6 @@ impl AdvisoryEnricher {
         auth: SparqlAuth,
         backend: SparqlBackend,
     ) -> Self {
-        let client = crate::enricher::default_http_client();
         let sparql = make_sparql_client(endpoint, &auth, backend);
 
         let cache = cache_dir.map(|dir| {
@@ -51,7 +48,7 @@ impl AdvisoryEnricher {
         });
 
         Self {
-            client,
+            transport: HttpTransport::new(),
             cache,
             advisory_type,
             days_back,
@@ -97,30 +94,26 @@ impl AdvisoryEnricher {
             let data = match self.cached_get(&cache_key) {
                 Some(d) => d,
                 None => {
+                    // Distinguish a genuine API/outage failure from legitimate
+                    // end-of-pagination. End-of-pagination is a 200 with an empty
+                    // array (handled below); a failed fetch -- after the
+                    // transport has exhausted its retries -- is an error and must
+                    // not be swallowed into a truncated "successful" result that
+                    // could feed a drop-and-replace load. Matches enrich_dsa.
                     let resp = self
-                        .client
-                        .get(&url)
-                        .header("Accept", "application/json")
-                        .send()
+                        .transport
+                        .get_with(&url, &[("Accept", "application/json")], None)
                         .map_err(|e| {
-                            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                            std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("RHSA API: {}", e),
+                            )
                         })?;
 
-                    if !resp.status().is_success() {
-                        // Distinguish a genuine API/outage failure from legitimate
-                        // end-of-pagination. End-of-pagination is a 200 with an empty
-                        // array (handled below); a non-success status is an error and
-                        // must not be swallowed into a truncated "successful" result
-                        // that could feed a drop-and-replace load. Matches enrich_dsa.
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("RHSA API returned {}", resp.status()),
-                        ));
-                    }
-
-                    let data: serde_json::Value = resp.json().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                    })?;
+                    let data: serde_json::Value =
+                        serde_json::from_slice(&resp.bytes).map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                        })?;
 
                     self.cache_put(&cache_key, &data);
                     data
@@ -159,12 +152,9 @@ impl AdvisoryEnricher {
                         detail_fetch_failures += 1;
                     }
                 }
-
-                rate_limit(Duration::from_millis(200));
             }
 
             page += 1;
-            rate_limit(Duration::from_millis(500));
         }
 
         if exceeds_failure_threshold(detail_fetch_failures, total_cves) {
@@ -196,21 +186,16 @@ impl AdvisoryEnricher {
                     cve_id
                 );
                 let resp = self
-                    .client
-                    .get(&url)
-                    .header("Accept", "application/json")
-                    .send()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    .transport
+                    .get_with(&url, &[("Accept", "application/json")], None)
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("RHSA detail API: {} for {}", e, cve_id),
+                        )
+                    })?;
 
-                if !resp.status().is_success() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("RHSA detail API returned {} for {}", resp.status(), cve_id),
-                    ));
-                }
-
-                let data: serde_json::Value = resp
-                    .json()
+                let data: serde_json::Value = serde_json::from_slice(&resp.bytes)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
                 self.cache_put(&cache_key, &data);
@@ -345,7 +330,10 @@ impl AdvisoryEnricher {
     ) -> Result<Vec<String>> {
         let query = build_nvr_match_query(graph_uri, name, version, release, epoch);
         let rows = self.sparql.query(&query)?;
-        Ok(rows.into_iter().filter_map(|row| row.get("pkg").cloned()).collect())
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row.get("pkg").cloned())
+            .collect())
     }
 
     fn enrich_dsa(&self, writer: &mut NTriplesWriter) -> Result<(usize, usize)> {
@@ -355,20 +343,11 @@ impl AdvisoryEnricher {
         let data = match self.cached_get(cache_key) {
             Some(d) => d,
             None => {
-                let resp =
-                    self.client.get(url).send().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                    })?;
+                let resp = self.transport.get(url, None).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::Other, format!("DSA tracker: {}", e))
+                })?;
 
-                if !resp.status().is_success() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("DSA tracker returned {}", resp.status()),
-                    ));
-                }
-
-                let data: serde_json::Value = resp
-                    .json()
+                let data: serde_json::Value = serde_json::from_slice(&resp.bytes)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
                 self.cache_put(cache_key, &data);
@@ -381,7 +360,7 @@ impl AdvisoryEnricher {
 
         // Debian tracker JSON: { "package_name": { "CVE-XXXX-YYYY": { ... } } }
         if let Some(packages) = data.as_object() {
-            for (pkg_name, cves) in packages {
+            for (_pkg_name, cves) in packages {
                 if let Some(cves_obj) = cves.as_object() {
                     for (cve_id, cve_data) in cves_obj {
                         if !cve_id.starts_with("CVE-") {
@@ -535,7 +514,12 @@ fn parse_nvr(nvr: &str) -> Option<(String, String, String, String)> {
         return None;
     }
 
-    Some((name.to_string(), epoch.to_string(), version.to_string(), release.to_string()))
+    Some((
+        name.to_string(),
+        epoch.to_string(),
+        version.to_string(),
+        release.to_string(),
+    ))
 }
 
 /// Escape a string for embedding in a SPARQL string literal.
@@ -643,7 +627,10 @@ mod tests {
             .unwrap();
         writer.flush().unwrap();
 
-        assert_eq!(advisories, 1, "One distinct RHSA should produce one advisory node");
+        assert_eq!(
+            advisories, 1,
+            "One distinct RHSA should produce one advisory node"
+        );
         assert!(triples >= 5, "Should emit at least 5 triples");
 
         let mut content = String::new();
@@ -725,7 +712,10 @@ mod tests {
             .unwrap();
         writer.flush().unwrap();
 
-        assert_eq!(advisories, 2, "Two distinct RHSAs must produce two advisory nodes");
+        assert_eq!(
+            advisories, 2,
+            "Two distinct RHSAs must produce two advisory nodes"
+        );
 
         let mut content = String::new();
         temp_file
@@ -823,7 +813,12 @@ mod tests {
         // Non-zero epoch.
         assert_eq!(
             parse_nvr("foo-2:1.0-1.el9"),
-            Some(("foo".to_string(), "2".to_string(), "1.0".to_string(), "1.el9".to_string()))
+            Some((
+                "foo".to_string(),
+                "2".to_string(),
+                "1.0".to_string(),
+                "1.el9".to_string()
+            ))
         );
         // Missing epoch (no ':') -- must not default to "0", must skip.
         assert_eq!(parse_nvr("kernel-5.14.0-427.13.1.el9_4"), None);
@@ -881,16 +876,30 @@ mod tests {
         );
         assert_ne!(short.days_back_date(), long.days_back_date());
 
-        let expected = (chrono::Utc::now() - chrono::Duration::days(3)).format("%Y-%m-%d").to_string();
+        let expected = (chrono::Utc::now() - chrono::Duration::days(3))
+            .format("%Y-%m-%d")
+            .to_string();
         assert_eq!(short.days_back_date(), expected);
     }
 
     #[test]
     fn test_exceeds_failure_threshold() {
-        assert!(!exceeds_failure_threshold(0, 0), "empty run is not degraded");
-        assert!(!exceeds_failure_threshold(4, 100), "4% is under the 5% threshold");
-        assert!(exceeds_failure_threshold(6, 100), "6% exceeds the 5% threshold");
-        assert!(exceeds_failure_threshold(1, 1), "100% failure always exceeds threshold");
+        assert!(
+            !exceeds_failure_threshold(0, 0),
+            "empty run is not degraded"
+        );
+        assert!(
+            !exceeds_failure_threshold(4, 100),
+            "4% is under the 5% threshold"
+        );
+        assert!(
+            exceeds_failure_threshold(6, 100),
+            "6% exceeds the 5% threshold"
+        );
+        assert!(
+            exceeds_failure_threshold(1, 1),
+            "100% failure always exceeds threshold"
+        );
     }
 
     #[test]

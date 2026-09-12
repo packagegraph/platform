@@ -1,19 +1,24 @@
+use crate::fetch_error::FetchError;
+use crate::http_transport::{HttpTransport, StatsSnapshot};
 use crate::npm::read_seed_file;
 use crate::ntriples::NTriplesWriter;
 use crate::uris::*;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 use crate::emit::rdf::write_package_identity;
 
 pub struct FlatpakCollector {
     distro_name: String,
     release_name: String,
-    client: Client,
+    transport: HttpTransport,
+    /// Flathub API base. Injectable so the fetch paths can be tested.
+    api_base: String,
     pub graph_uri: Option<String>,
 }
+
+/// Production Flathub API base URL.
+const FLATHUB_API_BASE: &str = "https://flathub.org/api/v2";
 
 #[derive(Debug, Deserialize)]
 struct FlatpakAppResponse {
@@ -30,16 +35,24 @@ struct FlatpakBundle {
 
 impl FlatpakCollector {
     pub fn new(distro_name: String, release_name: String) -> Self {
-        let client = crate::enricher::http_client_builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .expect("Failed to create HTTP client");
         Self {
             distro_name,
             release_name,
-            client,
+            transport: HttpTransport::new(),
+            api_base: FLATHUB_API_BASE.to_string(),
             graph_uri: None,
         }
+    }
+
+    /// Point the collector at a different Flathub base (tests).
+    pub fn with_api_base(mut self, api_base: String) -> Self {
+        self.api_base = api_base;
+        self
+    }
+
+    /// One-line fetch summary for the end of a run.
+    pub fn transport_stats(&self) -> StatsSnapshot {
+        self.transport.stats()
     }
 
     /// Set the graph URI for N-Quads output.
@@ -65,22 +78,12 @@ impl FlatpakCollector {
     /// Query the Flathub appstream index for all app IDs.
     fn discover_apps(&self) -> Result<Vec<String>> {
         eprintln!("Discovering Flatpak apps from Flathub...");
-        let url = "https://flathub.org/api/v2/appstream";
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let url = format!("{}/appstream", self.api_base);
+        let response = self.transport.get(&url, None).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("Flathub API: {}", e))
+        })?;
 
-        if !response.status().is_success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Flathub API returned {}", response.status()),
-            ));
-        }
-
-        let app_ids: Vec<String> = response
-            .json()
+        let app_ids: Vec<String> = serde_json::from_slice(&response.bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         Ok(app_ids)
@@ -106,7 +109,6 @@ impl FlatpakCollector {
                 }
                 Err(e) => eprintln!("  Error fetching {}: {}", app_id, e),
             }
-            std::thread::sleep(Duration::from_millis(200));
         }
 
         writer.flush()?;
@@ -128,15 +130,15 @@ impl FlatpakCollector {
     }
 
     fn fetch_app_metadata(&self, app_id: &str) -> std::result::Result<FlatpakAppResponse, String> {
-        let url = format!("https://flathub.org/api/v2/appstream/{}", app_id);
-        let response = self.client.get(&url).send().map_err(|e| e.to_string())?;
+        let url = format!("{}/appstream/{}", self.api_base, app_id);
+        let response = match self.transport.get(&url, None) {
+            Ok(r) => r,
+            Err(FetchError::NotFound { .. }) => return Err(format!("HTTP 404: {}", app_id)),
+            Err(e) => return Err(e.to_string()),
+        };
 
-        if !response.status().is_success() {
-            return Err(format!("HTTP {}: {}", response.status(), app_id));
-        }
-
-        let text = response.text().map_err(|e| e.to_string())?;
-        serde_json::from_str(&text).map_err(|e| e.to_string())
+        let text = std::str::from_utf8(&response.bytes).map_err(|e| e.to_string())?;
+        serde_json::from_str(text).map_err(|e| e.to_string())
     }
 
     fn emit_app_triples(
@@ -285,5 +287,46 @@ mod tests {
         assert!(content.contains("flatpak#runtimeVersion"));
         assert!(content.contains("\"50\""));
         assert!(triples > 10);
+    }
+
+    // ── Characterization: fetch_app_metadata, pre-migration ────────────
+
+    #[test]
+    fn characterize_flatpak_returns_metadata_on_200() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/appstream/org.gimp.GIMP")
+            .with_status(200)
+            .with_body(r#"{"id":"org.gimp.GIMP","name":"GIMP"}"#)
+            .expect(1)
+            .create();
+
+        let c = FlatpakCollector::new("flatpak".to_string(), "flathub".to_string())
+            .with_api_base(server.url());
+        let app = c
+            .fetch_app_metadata("org.gimp.GIMP")
+            .expect("200 should yield metadata");
+
+        mock.assert();
+        assert_eq!(app.id, "org.gimp.GIMP");
+    }
+
+    #[test]
+    fn characterize_flatpak_non_success_is_an_error() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/appstream/nope")
+            .with_status(404)
+            .expect(1)
+            .create();
+
+        let c = FlatpakCollector::new("flatpak".to_string(), "flathub".to_string())
+            .with_api_base(server.url());
+        let err = c
+            .fetch_app_metadata("nope")
+            .expect_err("404 should be an error");
+
+        mock.assert();
+        assert!(err.contains("404"), "got: {err}");
     }
 }

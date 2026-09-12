@@ -5,18 +5,16 @@
 //! (osv.rs) which downloads ecosystem ZIPs from GCS.
 
 use crate::cache::FileCache;
-use crate::enricher::rate_limit;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::osv::{emit_vulnerability_triples, OsvVulnerability};
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
-use reqwest::blocking::Client;
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 
 pub struct SecurityEnricher {
     sparql: SparqlClient,
-    client: Client,
+    transport: HttpTransport,
     cache: Option<FileCache>,
     ecosystem: String,
     pub graph_uri: Option<String>,
@@ -31,8 +29,6 @@ impl SecurityEnricher {
         backend: SparqlBackend,
     ) -> Self {
         let sparql = make_sparql_client(endpoint, &auth, backend);
-        let client = crate::enricher::default_http_client();
-
         let cache = cache_dir.map(|dir| {
             FileCache::new(dir, &format!("security-{}", ecosystem), 24, None)
                 .expect("Failed to create cache")
@@ -40,7 +36,7 @@ impl SecurityEnricher {
 
         Self {
             sparql,
-            client,
+            transport: HttpTransport::new(),
             cache,
             ecosystem: ecosystem.to_string(),
             graph_uri: None,
@@ -100,7 +96,6 @@ impl SecurityEnricher {
                 Err(e) => eprintln!("  Error checking {}: {}", name, e),
             }
 
-            rate_limit(Duration::from_millis(500));
         }
 
         writer.flush()?;
@@ -118,17 +113,19 @@ impl SecurityEnricher {
                     "package": {"name": name, "ecosystem": self.osv_ecosystem_name()},
                 });
 
+                let body = serde_json::to_vec(&payload)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
                 let resp =
-                    self.client.post(url).json(&payload).send().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                    })?;
+                    match self
+                        .transport
+                        .post(url, &[("Content-Type", "application/json")], body)
+                    {
+                        Ok(r) => r,
+                        // A package OSV has never heard of is not an error.
+                        Err(_) => return Ok(0),
+                    };
 
-                if !resp.status().is_success() {
-                    return Ok(0);
-                }
-
-                let data: serde_json::Value = resp
-                    .json()
+                let data: serde_json::Value = serde_json::from_slice(&resp.bytes)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
                 let vulns_data = data

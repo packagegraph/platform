@@ -1,19 +1,19 @@
+use crate::emit::rdf::write_package_identity;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
-use crate::source_cache::{CacheResult, CacheScope, SourceCache};
+use crate::source_cache::SourceCache;
 use crate::uris::*;
 use brotli::Decompressor;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Result};
 use std::time::Duration;
-use crate::emit::rdf::write_package_identity;
 
 pub struct NixCollector {
     distro_name: String,
     release_name: String,
-    client: Client,
+    transport: HttpTransport,
     channel_url: String,
     source_cache: Option<SourceCache>,
     pub graph_uri: Option<String>,
@@ -54,7 +54,7 @@ impl NixCollector {
         Self {
             distro_name,
             release_name,
-            client,
+            transport: HttpTransport::with_client(client),
             channel_url,
             source_cache: None,
             graph_uri: None,
@@ -79,22 +79,11 @@ impl NixCollector {
         );
         eprintln!("Fetching packages.json.br from: {}", url);
 
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-
-        if !response.status().is_success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("HTTP {}", response.status()),
-            ));
-        }
-
-        let bytes = response
-            .bytes()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let bytes = self
+            .transport
+            .get(&url, None)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .bytes;
 
         // Decompress brotli
         let mut decompressor = Decompressor::new(&bytes[..], 4096);

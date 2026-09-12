@@ -1,17 +1,16 @@
+use crate::fetch_error::FetchError;
+use crate::http_transport::{HttpTransport, StatsSnapshot};
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{SparqlAuth, SparqlBackend};
 use crate::uris::*;
-use reqwest::blocking::Client;
-use reqwest::StatusCode;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
-use std::time::Duration;
 use crate::emit::rdf::write_package_identity;
 
 pub struct HexCollector {
-    client: Client,
+    transport: HttpTransport,
     api_base: String,
     pub graph_uri: Option<String>,
 }
@@ -63,10 +62,8 @@ struct HexMeta {
 
 impl HexCollector {
     pub fn new(api_base: String) -> Self {
-        let client = crate::enricher::default_http_client();
-
         Self {
-            client,
+            transport: HttpTransport::new(),
             api_base,
             graph_uri: None,
         }
@@ -76,6 +73,11 @@ impl HexCollector {
     pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
         self.graph_uri = graph_uri;
         self
+    }
+
+    /// One-line fetch summary for the end of a run.
+    pub fn transport_stats(&self) -> StatsSnapshot {
+        self.transport.stats()
     }
 
     pub fn collect_discover(
@@ -119,9 +121,9 @@ impl HexCollector {
                 }
                 Err(e) => eprintln!("  Error fetching {}: {}", name, e),
             }
-
-            std::thread::sleep(Duration::from_millis(base_delay_ms));
         }
+
+        eprintln!("  {}", self.transport_stats());
 
         writer.flush()?;
         Ok((total_packages, total_triples))
@@ -163,9 +165,6 @@ impl HexCollector {
             .version
             .clone();
 
-        // Small delay before the release detail request
-        std::thread::sleep(Duration::from_millis(200));
-
         // Fetch individual release details for requirements/checksum
         let release_detail = self.fetch_release_detail(name, &version, base_delay_ms)?;
 
@@ -173,88 +172,51 @@ impl HexCollector {
             .map_err(|e| e.to_string())
     }
 
+    /// Fetch one package listing. Retry, backoff, `Retry-After` and pacing
+    /// live in `HttpTransport`; `_base_delay_ms` is vestigial.
     fn fetch_package_with_retry(
         &self,
         name: &str,
-        base_delay_ms: &mut u64,
+        _base_delay_ms: &mut u64,
     ) -> std::result::Result<HexPackageResponse, String> {
         let url = format!("{}/api/packages/{}", self.api_base, name);
-        let max_attempts = 5;
 
-        for attempt in 0..max_attempts {
-            match self.client.get(&url).send() {
-                Ok(response) => {
-                    if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                        let retry_secs = 2u64.pow(attempt as u32);
-                        eprintln!("  Rate limited on {}, waiting {}s...", name, retry_secs);
-                        std::thread::sleep(Duration::from_secs(retry_secs));
-                        *base_delay_ms = (*base_delay_ms * 2).min(5000);
-                        continue;
-                    }
-
-                    if response.status() == StatusCode::NOT_FOUND {
-                        return Err(format!("404: {}", name));
-                    }
-
-                    let text = response.text().map_err(|e| e.to_string())?;
-                    return serde_json::from_str(&text).map_err(|e| e.to_string());
-                }
-                Err(e) => {
-                    if attempt < max_attempts - 1 {
-                        let delay = Duration::from_millis(1000 * 2u64.pow(attempt as u32));
-                        eprintln!("  Network error on {}, retrying in {:?}...", name, delay);
-                        std::thread::sleep(delay);
-                        continue;
-                    }
-                    return Err(e.to_string());
-                }
+        match self.transport.get(&url, None) {
+            Ok(response) => {
+                let text = std::str::from_utf8(&response.bytes).map_err(|e| e.to_string())?;
+                serde_json::from_str(text).map_err(|e| e.to_string())
             }
+            Err(FetchError::NotFound { .. }) => Err(format!("404: {}", name)),
+            Err(e) => Err(e.to_string()),
         }
-
-        Err(format!("Max retries exceeded for {}", name))
     }
 
+    /// Fetch one release's detail.
+    ///
+    /// Pre-migration this had no 404 check at all -- unlike
+    /// `fetch_package_with_retry` above -- so a missing release was handed
+    /// to serde_json and surfaced as "EOF while parsing a value". The
+    /// transport classifies it, so it now reports as a 404 like every
+    /// other missing resource.
     fn fetch_release_detail(
         &self,
         name: &str,
         version: &str,
-        base_delay_ms: &mut u64,
+        _base_delay_ms: &mut u64,
     ) -> std::result::Result<HexReleaseDetail, String> {
         let url = format!(
             "{}/api/packages/{}/releases/{}",
             self.api_base, name, version
         );
-        let max_attempts = 5;
 
-        for attempt in 0..max_attempts {
-            match self.client.get(&url).send() {
-                Ok(response) => {
-                    if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                        let retry_secs = 2u64.pow(attempt as u32);
-                        eprintln!(
-                            "  Rate limited on {}/{}, waiting {}s...",
-                            name, version, retry_secs
-                        );
-                        std::thread::sleep(Duration::from_secs(retry_secs));
-                        *base_delay_ms = (*base_delay_ms * 2).min(5000);
-                        continue;
-                    }
-
-                    let text = response.text().map_err(|e| e.to_string())?;
-                    return serde_json::from_str(&text).map_err(|e| e.to_string());
-                }
-                Err(e) => {
-                    if attempt < max_attempts - 1 {
-                        let delay = Duration::from_millis(1000 * 2u64.pow(attempt as u32));
-                        std::thread::sleep(delay);
-                        continue;
-                    }
-                    return Err(e.to_string());
-                }
+        match self.transport.get(&url, None) {
+            Ok(response) => {
+                let text = std::str::from_utf8(&response.bytes).map_err(|e| e.to_string())?;
+                serde_json::from_str(text).map_err(|e| e.to_string())
             }
+            Err(FetchError::NotFound { .. }) => Err(format!("404: {}/{}", name, version)),
+            Err(e) => Err(e.to_string()),
         }
-
-        Err(format!("Max retries exceeded for {}/{}", name, version))
     }
 
     fn emit_package_triples(
@@ -492,5 +454,89 @@ mod tests {
             "Should emit checksum from release detail"
         );
         assert!(triples > 10);
+    }
+
+    // ── Characterization: hex fetch paths, pre-migration ───────────────
+
+    #[test]
+    fn characterize_hex_returns_package_on_200() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/api/packages/phoenix")
+            .with_status(200)
+            .with_body(r#"{"name":"phoenix"}"#)
+            .expect(1)
+            .create();
+
+        let c = HexCollector::new(server.url());
+        let mut base = 200u64;
+        let pkg = c
+            .fetch_package_with_retry("phoenix", &mut base)
+            .expect("200 should yield a package");
+
+        mock.assert();
+        assert_eq!(pkg.name, "phoenix");
+    }
+
+    #[test]
+    fn characterize_hex_404_is_terminal() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/api/packages/nope")
+            .with_status(404)
+            .expect(1)
+            .create();
+
+        let c = HexCollector::new(server.url());
+        let mut base = 200u64;
+        let err = c
+            .fetch_package_with_retry("nope", &mut base)
+            .expect_err("404 should be an error");
+
+        mock.assert();
+        assert_eq!(err, "404: nope");
+    }
+
+    #[test]
+    fn migrated_hex_release_detail_404_is_reported_as_a_404() {
+        // Pre-migration fetch_release_detail had no NOT_FOUND check and
+        // handed the empty 404 body to serde_json, surfacing as "EOF while
+        // parsing a value". The transport classifies it.
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/api/packages/phoenix/releases/9.9.9")
+            .with_status(404)
+            .expect(1)
+            .create();
+
+        let c = HexCollector::new(server.url());
+        let mut base = 200u64;
+        let err = c
+            .fetch_release_detail("phoenix", "9.9.9", &mut base)
+            .expect_err("a missing release should be an error");
+
+        mock.assert();
+        assert!(
+            err.starts_with("404:"),
+            "a missing release should now report as a 404, got: {err}"
+        );
+    }
+
+    #[test]
+    fn characterize_hex_malformed_body_is_a_parse_error() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/api/packages/bad")
+            .with_status(200)
+            .with_body("{not json")
+            .expect(1)
+            .create();
+
+        let c = HexCollector::new(server.url());
+        let mut base = 200u64;
+        let err = c.fetch_package_with_retry("bad", &mut base).unwrap_err();
+
+        mock.assert();
+        assert!(!err.starts_with("404:"), "got: {err}");
     }
 }

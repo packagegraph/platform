@@ -1,16 +1,15 @@
+use crate::fetch_error::FetchError;
+use crate::http_transport::{HttpTransport, StatsSnapshot};
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{SparqlAuth, SparqlBackend};
 use crate::uris::*;
-use reqwest::blocking::Client;
-use reqwest::StatusCode;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
-use std::time::Duration;
 use crate::emit::rdf::write_package_identity;
 
 pub struct HackageCollector {
-    client: Client,
+    transport: HttpTransport,
     base_url: String,
     pub graph_uri: Option<String>,
 }
@@ -38,10 +37,8 @@ struct CabalMetadata {
 
 impl HackageCollector {
     pub fn new(base_url: String) -> Self {
-        let client = crate::enricher::default_http_client();
-
         Self {
-            client,
+            transport: HttpTransport::new(),
             base_url,
             graph_uri: None,
         }
@@ -51,6 +48,11 @@ impl HackageCollector {
     pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
         self.graph_uri = graph_uri;
         self
+    }
+
+    /// One-line fetch summary for the end of a run.
+    pub fn transport_stats(&self) -> StatsSnapshot {
+        self.transport.stats()
     }
 
     pub fn collect_discover(
@@ -94,9 +96,9 @@ impl HackageCollector {
                 }
                 Err(e) => eprintln!("  Error fetching {}: {}", name, e),
             }
-
-            std::thread::sleep(Duration::from_millis(base_delay_ms));
         }
+
+        eprintln!("  {}", self.transport_stats());
 
         writer.flush()?;
         Ok((total_packages, total_triples))
@@ -119,82 +121,47 @@ impl HackageCollector {
         Ok(triples)
     }
 
+    /// Resolve the preferred version, then fetch that version's .cabal.
+    ///
+    /// Retry, backoff, `Retry-After` and pacing live in `HttpTransport`;
+    /// `_base_delay_ms` is vestigial.
     fn fetch_package_with_retry(
         &self,
         name: &str,
-        base_delay_ms: &mut u64,
+        _base_delay_ms: &mut u64,
     ) -> std::result::Result<CabalMetadata, String> {
         let preferred_url = format!("{}/package/{}/preferred", self.base_url, name);
-        let max_attempts = 5;
 
-        // Get preferred version
-        let mut version = String::new();
-        for attempt in 0..max_attempts {
+        let pref: PreferredInfo =
             match self
-                .client
-                .get(&preferred_url)
-                .header("Accept", "application/json")
-                .send()
+                .transport
+                .get_with(&preferred_url, &[("Accept", "application/json")], None)
             {
                 Ok(response) => {
-                    if response.status() == StatusCode::NOT_FOUND {
-                        return Err(format!("404: {}", name));
-                    }
-                    let text = response.text().map_err(|e| e.to_string())?;
-                    let pref: PreferredInfo =
-                        serde_json::from_str(&text).map_err(|e| e.to_string())?;
-                    if let Some(ver) = pref.normal.first() {
-                        version = ver.clone();
-                        break;
-                    } else {
-                        return Err(format!("No versions for {}", name));
-                    }
+                    let text = std::str::from_utf8(&response.bytes).map_err(|e| e.to_string())?;
+                    serde_json::from_str(text).map_err(|e| e.to_string())?
                 }
-                Err(e) => {
-                    if attempt < max_attempts - 1 {
-                        std::thread::sleep(Duration::from_millis(1000 * 2u64.pow(attempt as u32)));
-                        continue;
-                    }
-                    return Err(e.to_string());
-                }
-            }
-        }
+                Err(FetchError::NotFound { .. }) => return Err(format!("404: {}", name)),
+                Err(e) => return Err(e.to_string()),
+            };
 
-        if version.is_empty() {
-            return Err(format!("Failed to get version for {}", name));
-        }
+        let version = pref
+            .normal
+            .first()
+            .ok_or_else(|| format!("No versions for {}", name))?
+            .clone();
 
-        // Fetch .cabal file
         let cabal_url = format!(
             "{}/package/{}-{}/{}.cabal",
             self.base_url, name, version, name
         );
 
-        for attempt in 0..max_attempts {
-            match self.client.get(&cabal_url).send() {
-                Ok(response) => {
-                    if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                        let retry_secs = 2u64.pow(attempt as u32);
-                        eprintln!("  Rate limited, waiting {}s...", retry_secs);
-                        std::thread::sleep(Duration::from_secs(retry_secs));
-                        *base_delay_ms = (*base_delay_ms * 2).min(5000);
-                        continue;
-                    }
-
-                    let text = response.text().map_err(|e| e.to_string())?;
-                    return self.parse_cabal(&text, name, &version);
-                }
-                Err(e) => {
-                    if attempt < max_attempts - 1 {
-                        std::thread::sleep(Duration::from_millis(1000 * 2u64.pow(attempt as u32)));
-                        continue;
-                    }
-                    return Err(e.to_string());
-                }
-            }
-        }
-
-        Err(format!("Max retries exceeded for {}", name))
+        let response = self
+            .transport
+            .get(&cabal_url, None)
+            .map_err(|e| e.to_string())?;
+        let text = std::str::from_utf8(&response.bytes).map_err(|e| e.to_string())?;
+        self.parse_cabal(text, name, &version)
     }
 
     fn parse_cabal(
@@ -438,5 +405,75 @@ mod tests {
         let json = r#"{"normal-version":["2.2.1.0","2.1.0.0"],"deprecated-version":["0.8.0.0"]}"#;
         let pref: PreferredInfo = serde_json::from_str(json).unwrap();
         assert_eq!(pref.normal, vec!["2.2.1.0", "2.1.0.0"]);
+    }
+
+    // ── Characterization: fetch_package_with_retry, pre-migration ──────
+
+    #[test]
+    fn characterize_hackage_sends_accept_json_on_the_preferred_lookup() {
+        let mut server = mockito::Server::new();
+        let preferred = server
+            .mock("GET", "/package/aeson/preferred")
+            .match_header("accept", "application/json")
+            .with_status(200)
+            .with_body(r#"{"normal-version":["2.2.1.0"]}"#)
+            .expect(1)
+            .create();
+        let cabal = server
+            .mock("GET", "/package/aeson-2.2.1.0/aeson.cabal")
+            .with_status(200)
+            .with_body("name: aeson\nversion: 2.2.1.0\n")
+            .expect(1)
+            .create();
+
+        let c = HackageCollector::new(server.url());
+        let mut base = 200u64;
+        let meta = c
+            .fetch_package_with_retry("aeson", &mut base)
+            .expect("200 on both requests should yield metadata");
+
+        preferred.assert();
+        cabal.assert();
+        assert_eq!(meta.name, "aeson");
+        assert_eq!(meta.version, "2.2.1.0");
+    }
+
+    #[test]
+    fn characterize_hackage_404_on_preferred_is_terminal() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/package/nope/preferred")
+            .with_status(404)
+            .expect(1)
+            .create();
+
+        let c = HackageCollector::new(server.url());
+        let mut base = 200u64;
+        let err = c
+            .fetch_package_with_retry("nope", &mut base)
+            .expect_err("404 should be an error");
+
+        mock.assert();
+        assert_eq!(err, "404: nope");
+    }
+
+    #[test]
+    fn characterize_hackage_empty_version_list_is_an_error() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/package/empty/preferred")
+            .with_status(200)
+            .with_body(r#"{"normal-version":[]}"#)
+            .expect(1)
+            .create();
+
+        let c = HackageCollector::new(server.url());
+        let mut base = 200u64;
+        let err = c
+            .fetch_package_with_retry("empty", &mut base)
+            .expect_err("no versions should be an error");
+
+        mock.assert();
+        assert!(err.contains("No versions"), "got: {err}");
     }
 }

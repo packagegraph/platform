@@ -1,16 +1,15 @@
+use crate::fetch_error::FetchError;
+use crate::http_transport::{HttpTransport, StatsSnapshot};
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{SparqlAuth, SparqlBackend};
 use crate::uris::*;
-use reqwest::blocking::Client;
-use reqwest::StatusCode;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
-use std::time::Duration;
 use crate::emit::rdf::write_package_identity;
 
 pub struct CpanCollector {
-    client: Client,
+    transport: HttpTransport,
     api_base: String,
     pub graph_uri: Option<String>,
 }
@@ -50,10 +49,8 @@ struct MetaCpanRepo {
 
 impl CpanCollector {
     pub fn new(api_base: String) -> Self {
-        let client = crate::enricher::default_http_client();
-
         Self {
-            client,
+            transport: HttpTransport::new(),
             api_base,
             graph_uri: None,
         }
@@ -63,6 +60,11 @@ impl CpanCollector {
     pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
         self.graph_uri = graph_uri;
         self
+    }
+
+    /// One-line fetch summary for the end of a run.
+    pub fn transport_stats(&self) -> StatsSnapshot {
+        self.transport.stats()
     }
 
     pub fn collect_discover(
@@ -106,9 +108,9 @@ impl CpanCollector {
                 }
                 Err(e) => eprintln!("  Error fetching {}: {}", name, e),
             }
-
-            std::thread::sleep(Duration::from_millis(base_delay_ms));
         }
+
+        eprintln!("  {}", self.transport_stats());
 
         writer.flush()?;
         Ok((total_packages, total_triples))
@@ -131,54 +133,23 @@ impl CpanCollector {
         Ok(triples)
     }
 
+    /// Fetch one MetaCPAN release. Retry, backoff, `Retry-After` and
+    /// pacing live in `HttpTransport`; `_base_delay_ms` is vestigial.
     fn fetch_release_with_retry(
         &self,
         name: &str,
-        base_delay_ms: &mut u64,
+        _base_delay_ms: &mut u64,
     ) -> std::result::Result<MetaCpanRelease, String> {
         let url = format!("{}/v1/release/{}", self.api_base, name);
-        let max_attempts = 5;
 
-        for attempt in 0..max_attempts {
-            match self.client.get(&url).send() {
-                Ok(response) => {
-                    if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                        let retry_after_secs = response
-                            .headers()
-                            .get("retry-after")
-                            .and_then(|h| h.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or_else(|| 2u64.pow(attempt as u32));
-
-                        eprintln!(
-                            "  Rate limited on {}, waiting {}s...",
-                            name, retry_after_secs
-                        );
-                        std::thread::sleep(Duration::from_secs(retry_after_secs));
-                        *base_delay_ms = (*base_delay_ms * 2).min(5000);
-                        continue;
-                    }
-
-                    if response.status() == StatusCode::NOT_FOUND {
-                        return Err(format!("404: {}", name));
-                    }
-
-                    let text = response.text().map_err(|e| e.to_string())?;
-                    return serde_json::from_str(&text).map_err(|e| e.to_string());
-                }
-                Err(e) => {
-                    if attempt < max_attempts - 1 {
-                        let delay = Duration::from_millis(1000 * 2u64.pow(attempt as u32));
-                        eprintln!("  Network error on {}, retrying in {:?}...", name, delay);
-                        std::thread::sleep(delay);
-                        continue;
-                    }
-                    return Err(e.to_string());
-                }
+        match self.transport.get(&url, None) {
+            Ok(response) => {
+                let text = std::str::from_utf8(&response.bytes).map_err(|e| e.to_string())?;
+                serde_json::from_str(text).map_err(|e| e.to_string())
             }
+            Err(FetchError::NotFound { .. }) => Err(format!("404: {}", name)),
+            Err(e) => Err(e.to_string()),
         }
-
-        Err(format!("Max retries exceeded for {}", name))
     }
 
     fn emit_distribution_triples(
@@ -374,5 +345,92 @@ mod tests {
         assert!(content.contains("cpan#authorPAUSEID"));
         assert!(content.contains("\"TIMB\""));
         assert!(triples > 10);
+    }
+
+    // ── Characterization: fetch_release_with_retry, pre-migration ──────
+
+    #[test]
+    fn characterize_cpan_returns_release_on_200() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/release/Try-Tiny")
+            .with_status(200)
+            .with_body(r#"{"distribution":"Try-Tiny","version":"0.31","author":"ETHER"}"#)
+            .expect(1)
+            .create();
+
+        let c = CpanCollector::new(server.url());
+        let mut base = 200u64;
+        let rel = c
+            .fetch_release_with_retry("Try-Tiny", &mut base)
+            .expect("200 should yield a release");
+
+        mock.assert();
+        assert_eq!(rel.distribution, "Try-Tiny");
+        assert_eq!(rel.version, "0.31");
+    }
+
+    #[test]
+    fn characterize_cpan_404_is_terminal() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/release/No-Such-Dist")
+            .with_status(404)
+            .expect(1)
+            .create();
+
+        let c = CpanCollector::new(server.url());
+        let mut base = 200u64;
+        let err = c
+            .fetch_release_with_retry("No-Such-Dist", &mut base)
+            .expect_err("404 should be an error");
+
+        mock.assert();
+        assert_eq!(err, "404: No-Such-Dist");
+    }
+
+    #[test]
+    fn characterize_cpan_429_is_retried_then_succeeds() {
+        let mut server = mockito::Server::new();
+        let limited = server
+            .mock("GET", "/v1/release/Slow-Dist")
+            .with_status(429)
+            .with_header("retry-after", "1")
+            .expect(1)
+            .create();
+        let ok = server
+            .mock("GET", "/v1/release/Slow-Dist")
+            .with_status(200)
+            .with_body(r#"{"distribution":"Slow-Dist","version":"1.0","author":"X"}"#)
+            .expect(1)
+            .create();
+
+        let c = CpanCollector::new(server.url());
+        let mut base = 200u64;
+        let rel = c.fetch_release_with_retry("Slow-Dist", &mut base).unwrap();
+
+        limited.assert();
+        ok.assert();
+        assert_eq!(rel.distribution, "Slow-Dist");
+    }
+
+    #[test]
+    fn characterize_cpan_malformed_body_is_a_parse_error() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/release/Bad-Dist")
+            .with_status(200)
+            .with_body("{not json")
+            .expect(1)
+            .create();
+
+        let c = CpanCollector::new(server.url());
+        let mut base = 200u64;
+        let err = c
+            .fetch_release_with_retry("Bad-Dist", &mut base)
+            .unwrap_err();
+
+        mock.assert();
+        assert!(!err.starts_with("404:"), "got: {err}");
     }
 }

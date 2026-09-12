@@ -1,19 +1,18 @@
-use crate::cached_fetch::{CachedFetcher, HttpResponse};
+use crate::cached_fetch::CachedFetcher;
+use crate::emit::rdf::write_package_identity;
 use crate::fetch_error::FetchError;
 use crate::http_cache::HttpCache;
+use crate::http_transport::HttpTransport;
 use crate::npm::read_seed_file;
 use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::uris::*;
 use regex::Regex;
-use reqwest::blocking::Client;
-use reqwest::StatusCode;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Result;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
-use crate::emit::rdf::write_package_identity;
 
 /// Number of worker threads used to fetch PyPI packages in parallel.
 const FETCH_THREADS: usize = 8;
@@ -52,7 +51,7 @@ pub fn normalize_pypi_name(name: &str) -> String {
 }
 
 pub struct PypiCollector {
-    client: Client,
+    transport: HttpTransport,
     http_cache: Option<HttpCache>,
     cache_ttl_hours: u64,
     base_url: String,
@@ -82,18 +81,10 @@ struct PypiOutcome {
     result: std::result::Result<PypiProjectResponse, FetchError>,
 }
 
-/// Whether a rate-limit delay should be applied after this fetch.
-/// True only when a network request was actually made (cache hits skip delay).
-fn should_delay(outcome: &PypiOutcome) -> bool {
-    outcome.was_network_hit
-}
-
 impl PypiCollector {
     pub fn new() -> Self {
-        let client = crate::enricher::default_http_client();
-
         Self {
-            client,
+            transport: HttpTransport::new(),
             http_cache: None,
             cache_ttl_hours: 24,
             base_url: "https://pypi.org".to_string(),
@@ -140,7 +131,13 @@ impl PypiCollector {
         self.collect(seed_path, max_depth, max_packages, output_path)
     }
 
-    pub fn collect(&self, packages_file: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
+    pub fn collect(
+        &self,
+        packages_file: &str,
+        max_depth: u32,
+        max_packages: usize,
+        output_path: &str,
+    ) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
@@ -225,10 +222,6 @@ impl PypiCollector {
         state: &Mutex<CollectState>,
         idle: &Condvar,
     ) {
-        // Per-worker rate-limit backoff, kept off the shared state so the
-        // fetch/retry path needs no lock.
-        let mut base_delay_ms = 0u64;
-
         loop {
             // ── Acquire work (or exit) under the lock ──────────────────
             let (name, depth) = {
@@ -276,8 +269,7 @@ impl PypiCollector {
             };
 
             // ── Fetch outside the lock (the expensive, parallel part) ──
-            let outcome = self.fetch_package(&name, &mut base_delay_ms, cached_fetcher);
-            let needs_delay = should_delay(&outcome);
+            let outcome = self.fetch_package(&name, cached_fetcher);
 
             // ── Commit results under the lock ──────────────────────────
             {
@@ -330,10 +322,6 @@ impl PypiCollector {
                     idle.notify_all();
                 }
             }
-
-            if needs_delay {
-                std::thread::sleep(Duration::from_millis(base_delay_ms));
-            }
         }
     }
 
@@ -360,12 +348,7 @@ impl PypiCollector {
 
     /// Fetch a package, using CachedFetcher when available.
     /// Returns a FetchOutcome containing was_network_hit and the parsed response or error.
-    fn fetch_package(
-        &self,
-        name: &str,
-        base_delay_ms: &mut u64,
-        cached_fetcher: &Option<CachedFetcher>,
-    ) -> PypiOutcome {
+    fn fetch_package(&self, name: &str, cached_fetcher: &Option<CachedFetcher>) -> PypiOutcome {
         let url = format!("{}/pypi/{}/json", self.base_url, name);
         let ttl = Duration::from_secs(self.cache_ttl_hours * 3600);
 
@@ -377,7 +360,7 @@ impl PypiCollector {
 
         if let Some(fetcher) = cached_fetcher {
             let outcome = fetcher.fetch(&url, Some(ttl), &pypi_validator, |req_url, etag| {
-                self.http_get_with_retry(req_url, etag, base_delay_ms)
+                self.transport.get(req_url, etag)
             });
 
             PypiOutcome {
@@ -393,7 +376,7 @@ impl PypiCollector {
             }
         } else {
             // No cache -- direct fetch with retry (no etag for uncached requests)
-            match self.http_get_with_retry(&url, None, base_delay_ms) {
+            match self.transport.get(&url, None) {
                 Ok(response) => match response.status {
                     200 => {
                         let result = serde_json::from_slice::<PypiProjectResponse>(&response.bytes)
@@ -412,7 +395,7 @@ impl PypiCollector {
                     },
                     status => PypiOutcome {
                         was_network_hit: true,
-                        result: Err(FetchError::HttpStatus { url, status }),
+                        result: Err(FetchError::HttpStatus { url, status, body: None }),
                     },
                 },
                 Err(e) => PypiOutcome {
@@ -423,83 +406,6 @@ impl PypiCollector {
         }
     }
 
-    /// HTTP GET with retry and 429 backoff. Returns raw HttpResponse for
-    /// the CachedFetcher's http_get closure. When `etag` is provided, sends
-    /// an `If-None-Match` header for conditional GET (enabling 304 responses).
-    fn http_get_with_retry(
-        &self,
-        url: &str,
-        etag: Option<&str>,
-        base_delay_ms: &mut u64,
-    ) -> std::result::Result<HttpResponse, FetchError> {
-        let max_attempts = 5;
-
-        for attempt in 0..max_attempts {
-            let mut request = self.client.get(url);
-            if let Some(etag_val) = etag {
-                request = request.header("If-None-Match", etag_val);
-            }
-            match request.send() {
-                Ok(response) => {
-                    if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                        let retry_after_secs = response
-                            .headers()
-                            .get("retry-after")
-                            .and_then(|h| h.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or_else(|| 2u64.pow(attempt as u32));
-
-                        let delay_ms = retry_after_secs * 1000;
-                        eprintln!(
-                            "  Rate limited on {}, waiting {}s...",
-                            url, retry_after_secs
-                        );
-                        std::thread::sleep(Duration::from_millis(delay_ms));
-                        *base_delay_ms = (*base_delay_ms * 2).min(5000);
-                        continue;
-                    }
-
-                    let status = response.status().as_u16();
-                    let etag = response
-                        .headers()
-                        .get("etag")
-                        .and_then(|h| h.to_str().ok())
-                        .map(|s| s.to_string());
-                    let bytes = response
-                        .bytes()
-                        .map_err(|e| FetchError::Transport {
-                            url: url.to_string(),
-                            source: e,
-                        })?
-                        .to_vec();
-
-                    return Ok(HttpResponse {
-                        status,
-                        bytes,
-                        etag,
-                    });
-                }
-                Err(e) => {
-                    if attempt < max_attempts - 1 {
-                        let delay = Duration::from_millis(1000 * 2u64.pow(attempt as u32));
-                        std::thread::sleep(delay);
-                        continue;
-                    }
-                    return Err(FetchError::Transport {
-                        url: url.to_string(),
-                        source: e,
-                    });
-                }
-            }
-        }
-
-        Err(FetchError::HttpStatus {
-            url: url.to_string(),
-            status: 429,
-        })
-    }
-
-    /// Emit package triples and return (triple_count, dep_names) for spidering.
     fn emit_package_triples(
         &self,
         writer: &mut NTriplesWriter,
@@ -910,59 +816,6 @@ mod tests {
         assert!(validator(b"").is_err());
     }
 
-    // ── should_delay tests ─────────────────────────────────────────
-
-    #[test]
-    fn test_should_delay_false_on_cache_hit() {
-        let outcome = PypiOutcome {
-            was_network_hit: false,
-            result: Ok(PypiProjectResponse {
-                info: PypiInfo {
-                    name: "cached".into(),
-                    version: "1.0".into(),
-                    summary: None,
-                    license: None,
-                    home_page: None,
-                    requires_python: None,
-                    requires_dist: None,
-                    classifiers: None,
-                },
-            }),
-        };
-        assert!(!should_delay(&outcome), "cache hit should not delay");
-    }
-
-    #[test]
-    fn test_should_delay_true_on_network_fetch() {
-        let outcome = PypiOutcome {
-            was_network_hit: true,
-            result: Ok(PypiProjectResponse {
-                info: PypiInfo {
-                    name: "fetched".into(),
-                    version: "1.0".into(),
-                    summary: None,
-                    license: None,
-                    home_page: None,
-                    requires_python: None,
-                    requires_dist: None,
-                    classifiers: None,
-                },
-            }),
-        };
-        assert!(should_delay(&outcome), "network fetch should delay");
-    }
-
-    #[test]
-    fn test_should_delay_true_on_network_error() {
-        let outcome = PypiOutcome {
-            was_network_hit: true,
-            result: Err(FetchError::NotFound {
-                url: "https://pypi.org/pypi/gone/json".into(),
-            }),
-        };
-        assert!(should_delay(&outcome), "network error should still delay");
-    }
-
     // ── Collector-level acceptance tests (mockito) ─────────────────
 
     fn valid_pypi_json(name: &str, version: &str) -> String {
@@ -1011,7 +864,7 @@ mod tests {
         let cached_fetcher = make_cached_fetcher(&collector);
 
         let mut base_delay = 200u64;
-        let outcome = collector.fetch_package("requests", &mut base_delay, &cached_fetcher);
+        let outcome = collector.fetch_package("requests", &cached_fetcher);
 
         assert!(
             !outcome.was_network_hit,
@@ -1044,7 +897,7 @@ mod tests {
         let cached_fetcher = make_cached_fetcher(&collector);
 
         let mut base_delay = 200u64;
-        let outcome = collector.fetch_package("flask", &mut base_delay, &cached_fetcher);
+        let outcome = collector.fetch_package("flask", &cached_fetcher);
 
         assert!(outcome.was_network_hit, "cache miss should hit network");
         let pkg = outcome.result.expect("should parse response");
@@ -1053,7 +906,7 @@ mod tests {
 
         // Verify response was cached -- second fetch should NOT hit network
         let cached_fetcher2 = make_cached_fetcher(&collector);
-        let outcome2 = collector.fetch_package("flask", &mut base_delay, &cached_fetcher2);
+        let outcome2 = collector.fetch_package("flask", &cached_fetcher2);
         assert!(
             !outcome2.was_network_hit,
             "second fetch should be cache hit"
@@ -1093,14 +946,17 @@ mod tests {
         let cached_fetcher = make_cached_fetcher(&collector);
 
         let mut base_delay = 200u64;
-        let outcome = collector.fetch_package("retry-pkg", &mut base_delay, &cached_fetcher);
+        let outcome = collector.fetch_package("retry-pkg", &cached_fetcher);
 
         assert!(outcome.was_network_hit);
         let pkg = outcome.result.expect("should succeed after retry");
         assert_eq!(pkg.info.name, "retry-pkg");
         mock_429.assert();
         mock_200.assert();
-        assert!(base_delay > 200, "base_delay should increase after 429");
+        // Pre-migration this also asserted base_delay grew past 200. That
+        // described pypi's manual inter-request pacing, which the
+        // transport's per-host limiter replaces; the 429-then-200 retry
+        // this test exists to pin is unchanged, as both mocks above show.
     }
 
     #[test]
@@ -1127,13 +983,13 @@ mod tests {
         let mut base_delay = 200u64;
 
         // First fetch -- malformed response
-        let outcome1 = collector.fetch_package("broken", &mut base_delay, &cached_fetcher);
+        let outcome1 = collector.fetch_package("broken", &cached_fetcher);
         assert!(outcome1.was_network_hit);
         assert!(outcome1.result.is_err(), "malformed JSON should fail");
 
         // Second fetch -- should hit network again (not cached)
         let cached_fetcher2 = make_cached_fetcher(&collector);
-        let outcome2 = collector.fetch_package("broken", &mut base_delay, &cached_fetcher2);
+        let outcome2 = collector.fetch_package("broken", &cached_fetcher2);
         assert!(
             outcome2.was_network_hit,
             "malformed response should not be cached -- second fetch must hit network"
@@ -1188,7 +1044,7 @@ mod tests {
         ));
 
         let mut base_delay = 200u64;
-        let outcome = collector.fetch_package("etag-pkg", &mut base_delay, &cached_fetcher);
+        let outcome = collector.fetch_package("etag-pkg", &cached_fetcher);
 
         assert!(outcome.was_network_hit, "304 counts as network hit");
         let pkg = outcome.result.expect("304 should serve stale body");
@@ -1212,7 +1068,7 @@ mod tests {
         let collector = PypiCollector::new().with_base_url(&server.url());
 
         let mut base_delay = 200u64;
-        let outcome = collector.fetch_package("direct-pkg", &mut base_delay, &None);
+        let outcome = collector.fetch_package("direct-pkg", &None);
 
         assert!(outcome.was_network_hit);
         let pkg = outcome.result.expect("direct fetch should work");

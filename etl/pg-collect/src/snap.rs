@@ -1,20 +1,24 @@
+use crate::fetch_error::FetchError;
+use crate::http_transport::{HttpTransport, StatsSnapshot};
 use crate::npm::read_seed_file;
 use crate::ntriples::NTriplesWriter;
 use crate::uris::*;
-use reqwest::blocking::Client;
-use reqwest::StatusCode;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 use crate::emit::rdf::write_package_identity;
 
 pub struct SnapCollector {
     distro_name: String,
     release_name: String,
-    client: Client,
+    transport: HttpTransport,
+    /// Snap Store base. Injectable so the fetch paths can be tested.
+    api_base: String,
     pub graph_uri: Option<String>,
 }
+
+/// Production Snap Store base URL.
+const SNAP_API_BASE: &str = "https://api.snapcraft.io";
 
 #[derive(Debug, Deserialize)]
 struct SnapSearchResponse {
@@ -79,16 +83,24 @@ struct SnapChannelInfo {
 
 impl SnapCollector {
     pub fn new(distro_name: String, release_name: String) -> Self {
-        let client = crate::enricher::http_client_builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .expect("Failed to create HTTP client");
         Self {
             distro_name,
             release_name,
-            client,
+            transport: HttpTransport::new(),
+            api_base: SNAP_API_BASE.to_string(),
             graph_uri: None,
         }
+    }
+
+    /// Point the collector at a different Snap Store base (tests).
+    pub fn with_api_base(mut self, api_base: String) -> Self {
+        self.api_base = api_base;
+        self
+    }
+
+    /// One-line fetch summary for the end of a run.
+    pub fn transport_stats(&self) -> StatsSnapshot {
+        self.transport.stats()
     }
 
     /// Set the graph URI for N-Quads output.
@@ -120,28 +132,26 @@ impl SnapCollector {
 
         loop {
             let url = format!(
-                "https://api.snapcraft.io/api/v1/snaps/search?fields=package_name&page={}&size={}",
-                page, page_size
+                "{}/api/v1/snaps/search?fields=package_name&page={}&size={}",
+                self.api_base, page, page_size
             );
-            let response = self
-                .client
-                .get(&url)
-                .header("X-Ubuntu-Series", "16")
-                .send()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-
-            if !response.status().is_success() {
-                if response.status().as_u16() == 404 {
-                    break;
+            let response = match self
+                .transport
+                .get_with(&url, &[("X-Ubuntu-Series", "16")], None)
+            {
+                Ok(r) => r,
+                // The search endpoint signals "past the last page" with a
+                // 404; anything else is a real failure.
+                Err(FetchError::NotFound { .. }) => break,
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Snap Store API: {}", e),
+                    ))
                 }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Snap Store API returned {}", response.status()),
-                ));
-            }
+            };
 
-            let data: serde_json::Value = response
-                .json()
+            let data: serde_json::Value = serde_json::from_slice(&response.bytes)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
             let packages = match data["_embedded"]["clickindex:package"].as_array() {
@@ -168,7 +178,6 @@ impl SnapCollector {
                 break;
             }
             page += 1;
-            std::thread::sleep(Duration::from_millis(200));
         }
 
         Ok(names)
@@ -194,7 +203,6 @@ impl SnapCollector {
                 }
                 Err(e) => eprintln!("  Error fetching {}: {}", name, e),
             }
-            std::thread::sleep(Duration::from_millis(200));
         }
 
         writer.flush()?;
@@ -216,20 +224,18 @@ impl SnapCollector {
     }
 
     fn fetch_snap_info(&self, name: &str) -> std::result::Result<SnapInfoResponse, String> {
-        let url = format!("https://api.snapcraft.io/v2/snaps/info/{}", name);
-        let response = self
-            .client
-            .get(&url)
-            .header("Snap-Device-Series", "16")
-            .send()
-            .map_err(|e| e.to_string())?;
+        let url = format!("{}/v2/snaps/info/{}", self.api_base, name);
+        let response = match self
+            .transport
+            .get_with(&url, &[("Snap-Device-Series", "16")], None)
+        {
+            Ok(r) => r,
+            Err(FetchError::NotFound { .. }) => return Err(format!("404: {}", name)),
+            Err(e) => return Err(e.to_string()),
+        };
 
-        if response.status() == StatusCode::NOT_FOUND {
-            return Err(format!("404: {}", name));
-        }
-
-        let text = response.text().map_err(|e| e.to_string())?;
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let text = std::str::from_utf8(&response.bytes).map_err(|e| e.to_string())?;
+        let v: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
 
         // Parse manually to handle API response variations
         let snap_name = v["name"].as_str().unwrap_or(name).to_string();
@@ -439,5 +445,45 @@ mod tests {
         assert!(content.contains("licenseName"));
         assert!(content.contains("\"MPL-2.0\""));
         assert!(triples > 10);
+    }
+
+    // ── Characterization: fetch_snap_info, pre-migration ───────────────
+
+    #[test]
+    fn characterize_snap_sends_the_device_series_header() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v2/snaps/info/hello")
+            .match_header("snap-device-series", "16")
+            .with_status(200)
+            .with_body(r#"{"name":"hello","snap-id":"abc123"}"#)
+            .expect(1)
+            .create();
+
+        let c =
+            SnapCollector::new("snap".to_string(), "store".to_string()).with_api_base(server.url());
+        let info = c.fetch_snap_info("hello").expect("200 should yield info");
+
+        mock.assert();
+        assert_eq!(info.name, "hello");
+    }
+
+    #[test]
+    fn characterize_snap_404_is_terminal() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v2/snaps/info/nope")
+            .with_status(404)
+            .expect(1)
+            .create();
+
+        let c =
+            SnapCollector::new("snap".to_string(), "store".to_string()).with_api_base(server.url());
+        let err = c
+            .fetch_snap_info("nope")
+            .expect_err("404 should be an error");
+
+        mock.assert();
+        assert_eq!(err, "404: nope");
     }
 }

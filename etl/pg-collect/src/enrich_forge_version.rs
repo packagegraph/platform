@@ -4,17 +4,17 @@
 //! vcs:ForgeSoftwareVersion + vcs:ForgeVersionObservation triples.
 
 use crate::cache::FileCache;
-use crate::enricher::{rate_limit, SLOW_RATE_LIMIT};
+use crate::fetch_error::FetchError;
+use crate::http_transport::{HostLimiter, HttpTransport, SLOW_RATE_LIMIT};
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
-use reqwest::blocking::Client;
 use std::fs::File;
 use std::io::Result;
 
 pub struct ForgeVersionEnricher {
     sparql: SparqlClient,
-    client: Client,
+    transport: HttpTransport,
     // TODO: Wire up caching in probe_forge_version() to avoid re-probing recently-checked forges
     #[allow(dead_code)]
     cache: Option<FileCache>,
@@ -31,8 +31,6 @@ impl ForgeVersionEnricher {
         backend: SparqlBackend,
     ) -> Self {
         let sparql = make_sparql_client(endpoint, &auth, backend);
-        let client = crate::enricher::default_http_client();
-
         let cache = cache_dir.map(|dir| {
             FileCache::new(dir, "forge-versions", 24, None) // 24h TTL
                 .expect("Failed to create cache")
@@ -40,7 +38,11 @@ impl ForgeVersionEnricher {
 
         Self {
             sparql,
-            client,
+            // This enricher probes whatever forge a package happens to name,
+            // mostly small self-hosted GitLab and Savannah instances. There is
+            // no host list to pace from a table, so the caution lives in the
+            // default interval instead.
+            transport: HttpTransport::new().with_limiter(HostLimiter::new(SLOW_RATE_LIMIT)),
             cache,
             gitlab_token,
             graph_uri: None,
@@ -90,7 +92,6 @@ impl ForgeVersionEnricher {
                 Err(e) => eprintln!("  Error probing {}: {}", host, e),
             }
 
-            rate_limit(SLOW_RATE_LIMIT);
         }
 
         writer.flush()?;
@@ -187,34 +188,27 @@ impl ForgeVersionEnricher {
             _ => return Ok(None), // Unsupported forge software
         };
 
-        let mut req = self.client.get(&api_url);
-
         // Add GitLab token if available and this is a GitLab instance
+        let mut headers: Vec<(&str, &str)> = Vec::new();
         if software_uri.contains("GitLab") {
             if let Some(ref token) = self.gitlab_token {
-                req = req.header("PRIVATE-TOKEN", token);
+                headers.push(("PRIVATE-TOKEN", token));
             }
         }
 
-        let response = match req.send() {
+        let response = match self.transport.get_with(&api_url, &headers, None) {
             Ok(r) => r,
+            Err(FetchError::HttpStatus { status, .. }) if status == 401 || status == 403 => {
+                eprintln!("  Auth required for {}, skipping", api_url);
+                return Ok(None);
+            }
             Err(e) => {
-                eprintln!("  Request failed for {}: {}", api_url, e);
+                eprintln!("  {} for {}, skipping", e, api_url);
                 return Ok(None);
             }
         };
 
-        let status = response.status();
-        if !status.is_success() {
-            if status.as_u16() == 401 || status.as_u16() == 403 {
-                eprintln!("  Auth required for {}, skipping", api_url);
-            } else {
-                eprintln!("  HTTP {} for {}, skipping", status, api_url);
-            }
-            return Ok(None);
-        }
-
-        let json: serde_json::Value = match response.json() {
+        let json: serde_json::Value = match serde_json::from_slice(&response.bytes) {
             Ok(j) => j,
             Err(e) => {
                 eprintln!("  Failed to parse JSON from {}: {}", api_url, e);
@@ -280,7 +274,7 @@ mod tests {
     fn test_is_saas_forge() {
         let enricher = ForgeVersionEnricher {
             sparql: SparqlClient::new("http://localhost:3030/packagegraph"),
-            client: Client::new(),
+            transport: HttpTransport::new(),
             cache: None,
             gitlab_token: None,
             graph_uri: None,
@@ -319,7 +313,7 @@ mod tests {
 
         let enricher = ForgeVersionEnricher {
             sparql: SparqlClient::new("http://localhost:3030/packagegraph"),
-            client: Client::new(),
+            transport: HttpTransport::new(),
             cache: None,
             gitlab_token: None,
             graph_uri: None,
@@ -340,7 +334,7 @@ mod tests {
     fn test_fetch_version_unsupported_software() {
         let enricher = ForgeVersionEnricher {
             sparql: SparqlClient::new("http://localhost:3030/packagegraph"),
-            client: Client::new(),
+            transport: HttpTransport::new(),
             cache: None,
             gitlab_token: None,
             graph_uri: None,
@@ -367,7 +361,7 @@ mod tests {
 
         let enricher = ForgeVersionEnricher {
             sparql: SparqlClient::new("http://localhost:3030/packagegraph"),
-            client: Client::new(),
+            transport: HttpTransport::new(),
             cache: None,
             gitlab_token: None,
             graph_uri: None,
@@ -395,7 +389,7 @@ mod tests {
 
         let enricher = ForgeVersionEnricher {
             sparql: SparqlClient::new("http://localhost:3030/packagegraph"),
-            client: Client::new(),
+            transport: HttpTransport::new(),
             cache: None,
             gitlab_token: None,
             graph_uri: None,
@@ -423,7 +417,7 @@ mod tests {
 
         let enricher = ForgeVersionEnricher {
             sparql: SparqlClient::new("http://localhost:3030/packagegraph"),
-            client: Client::new(),
+            transport: HttpTransport::new(),
             cache: None,
             gitlab_token: None,
             graph_uri: None,
@@ -451,7 +445,7 @@ mod tests {
 
         let enricher = ForgeVersionEnricher {
             sparql: SparqlClient::new("http://localhost:3030/packagegraph"),
-            client: Client::new(),
+            transport: HttpTransport::new(),
             cache: None,
             gitlab_token: None,
             graph_uri: None,

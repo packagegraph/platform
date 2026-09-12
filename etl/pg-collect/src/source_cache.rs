@@ -7,8 +7,9 @@
 //! API responses with TTL + Minio sync. `SourceCache` is for binary artifacts with HTTP
 //! validators and no TTL. They serve different purposes and must remain separate.
 
-use reqwest::blocking::{Client, Response};
-use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+use crate::cached_fetch::HttpResponse;
+use crate::fetch_error::FetchError;
+use crate::http_transport::HttpTransport;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -70,7 +71,7 @@ pub enum CacheResult {
 pub struct SourceCache {
     cache_dir: PathBuf,
     collector_name: String,
-    client: Client,
+    transport: HttpTransport,
 }
 
 impl SourceCache {
@@ -78,12 +79,7 @@ impl SourceCache {
     ///
     /// Creates the cache directory if it doesn't exist.
     pub fn new(cache_dir: &str, collector_name: &str) -> io::Result<Self> {
-        let client = crate::enricher::http_client_builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
-        Self::with_client(cache_dir, collector_name, client)
+        Self::with_transport(cache_dir, collector_name, HttpTransport::new())
     }
 
     /// Create a source cache that fetches through a caller-supplied client
@@ -94,14 +90,18 @@ impl SourceCache {
     /// here, so plugging in `--cache-dir` on a TLS-authenticated collector
     /// made every request hit cdn.redhat.com without the client cert,
     /// failing outright (confirmed live 2026-09-11).
-    pub fn with_client(cache_dir: &str, collector_name: &str, client: Client) -> io::Result<Self> {
+    pub fn with_transport(
+        cache_dir: &str,
+        collector_name: &str,
+        transport: HttpTransport,
+    ) -> io::Result<Self> {
         let dir = Path::new(cache_dir).join(collector_name);
         fs::create_dir_all(&dir)?;
 
         Ok(Self {
             cache_dir: dir,
             collector_name: collector_name.to_string(),
-            client,
+            transport,
         })
     }
 
@@ -122,36 +122,35 @@ impl SourceCache {
 
         // Check if cached artifact exists with valid manifest
         if let Some(meta) = self.read_manifest(&manifest_path, logical_name)? {
-            // Attempt conditional GET
-            let mut req = self.client.get(url);
-            if let Some(ref etag) = meta.etag {
-                req = req.header(IF_NONE_MATCH, etag);
-            }
+            // Conditional GET on whichever validators the server gave us.
+            let mut headers: Vec<(&str, &str)> = Vec::new();
             if let Some(ref lm) = meta.last_modified {
-                req = req.header(IF_MODIFIED_SINCE, lm);
+                headers.push(("If-Modified-Since", lm));
             }
 
-            match req.send() {
-                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {
+            match self
+                .transport
+                .get_with(url, &headers, meta.etag.as_deref())
+            {
+                Ok(resp) if resp.status == 304 => {
                     // 304 Not Modified — use cached version
                     return Ok(CacheResult::NotModified(artifact_path));
                 }
-                Ok(resp) if resp.status().is_success() => {
+                Ok(resp) => {
                     // Content changed — download and cache
                     return self.download_and_cache(resp, url, scope, logical_name);
                 }
-                Ok(resp) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("HTTP {}", resp.status()),
-                    ));
-                }
-                Err(e) => {
-                    // Network error — if cache exists, use it as fallback
+                Err(FetchError::Transport { source, .. }) => {
+                    // Network error, after the transport exhausted its
+                    // retries — if a cached copy exists, prefer it to
+                    // failing the run.
                     if artifact_path.exists() {
-                        eprintln!("Warning: network error, using cached version: {}", e);
+                        eprintln!("Warning: network error, using cached version: {}", source);
                         return Ok(CacheResult::Cached(artifact_path));
                     }
+                    return Err(io::Error::new(io::ErrorKind::Other, source.to_string()));
+                }
+                Err(e) => {
                     return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
                 }
             }
@@ -159,43 +158,23 @@ impl SourceCache {
 
         // No cache — fresh download
         let resp = self
-            .client
-            .get(url)
-            .send()
+            .transport
+            .get(url, None)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("HTTP {}", resp.status()),
-            ));
-        }
 
         self.download_and_cache(resp, url, scope, logical_name)
     }
 
     fn download_and_cache(
         &self,
-        resp: Response,
+        resp: HttpResponse,
         url: &str,
         scope: &CacheScope,
         logical_name: &str,
     ) -> io::Result<CacheResult> {
-        let etag = resp
-            .headers()
-            .get(ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        let last_modified = resp
-            .headers()
-            .get(LAST_MODIFIED)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        let bytes = resp
-            .bytes()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
-            .to_vec();
+        let etag = resp.etag;
+        let last_modified = resp.last_modified;
+        let bytes = resp.bytes;
 
         // Compute content hash
         let mut hasher = Sha256::new();

@@ -9,18 +9,18 @@
 //! Replaces 4 Python enrichers: github.py, vcs_activity.py, metrics.py, license.py
 
 use crate::cache::{FileCache, MinioConfig};
-use crate::enricher::{github_owner_repo, rate_limit, DEFAULT_RATE_LIMIT};
+use crate::enricher::github_owner_repo;
+use crate::fetch_error::FetchError;
 use crate::forge;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use chrono::Utc;
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 
 /// GraphQL API v4 response wrapper. rateLimit is inside `data` (GraphQL top-level field).
 #[derive(Debug, Serialize, Deserialize)]
@@ -285,7 +285,7 @@ struct GitHubContributor {
 
 pub struct GitHubEnricher {
     sparql: SparqlClient,
-    client: Client,
+    transport: HttpTransport,
     cache: Option<FileCache>,
     token: Option<String>,
     github_api_base: String,
@@ -302,14 +302,12 @@ impl GitHubEnricher {
         backend: SparqlBackend,
     ) -> Self {
         let sparql = make_sparql_client(endpoint, &auth, backend);
-        let client = crate::enricher::default_http_client();
-
         let cache = cache_dir
             .map(|dir| FileCache::new(dir, "github", 24, minio).expect("Failed to create cache"));
 
         Self {
             sparql,
-            client,
+            transport: HttpTransport::new(),
             cache,
             token: github_token,
             github_api_base: "https://api.github.com".to_string(),
@@ -380,7 +378,6 @@ impl GitHubEnricher {
                 Err(e) => eprintln!("  Error processing {}/{}: {}", owner, repo, e),
             }
 
-            rate_limit(DEFAULT_RATE_LIMIT);
         }
 
         writer.flush()?;
@@ -502,7 +499,6 @@ impl GitHubEnricher {
                 }
             }
 
-            rate_limit(DEFAULT_RATE_LIMIT);
         }
 
         if total_repos > 0 && total_errors as f64 / total_repos as f64 > 0.5 {
@@ -808,26 +804,20 @@ impl GitHubEnricher {
     }
 
     fn api_get(&self, url: &str) -> std::result::Result<serde_json::Value, String> {
-        let mut req = self
-            .client
-            .get(url)
-            .header("Accept", "application/vnd.github+json");
-
+        let auth;
+        let mut headers: Vec<(&str, &str)> = vec![("Accept", "application/vnd.github+json")];
         if let Some(ref token) = self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            auth = format!("Bearer {}", token);
+            headers.push(("Authorization", &auth));
         }
 
-        let response = req.send().map_err(|e| e.to_string())?;
+        let response = match self.transport.get_with(url, &headers, None) {
+            Ok(r) => r,
+            Err(FetchError::NotFound { .. }) => return Err("404 Not Found".to_string()),
+            Err(e) => return Err(e.to_string()),
+        };
 
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err("404 Not Found".to_string());
-        }
-
-        if !response.status().is_success() {
-            return Err(format!("HTTP {}", response.status()));
-        }
-
-        response.json().map_err(|e| e.to_string())
+        serde_json::from_slice(&response.bytes).map_err(|e| e.to_string())
     }
 
     fn cached_get(&self, url: &str) -> Option<serde_json::Value> {
@@ -1252,25 +1242,24 @@ impl GitHubEnricher {
         });
 
         let graphql_url = format!("{}/graphql", self.github_api_base);
-        let mut req = self
-            .client
-            .post(&graphql_url)
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/json")
-            .json(&graphql_body);
-
+        let auth;
+        let mut headers: Vec<(&str, &str)> = vec![
+            ("Accept", "application/json"),
+            ("Content-Type", "application/json"),
+        ];
         if let Some(ref token) = self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            auth = format!("Bearer {}", token);
+            headers.push(("Authorization", &auth));
         }
 
-        let response = req.send().map_err(|e| format!("Request error: {}", e))?;
+        let body = serde_json::to_vec(&graphql_body)
+            .map_err(|e| format!("JSON serialize error: {}", e))?;
+        let response = self
+            .transport
+            .post(&graphql_url, &headers, body)
+            .map_err(|e| format!("Request error: {}", e))?;
 
-        if !response.status().is_success() {
-            return Err(format!("HTTP {}", response.status()));
-        }
-
-        let graphql_resp: GraphQlResponse = response
-            .json()
+        let graphql_resp: GraphQlResponse = serde_json::from_slice(&response.bytes)
             .map_err(|e| format!("JSON parse error: {}", e))?;
 
         // Check for GraphQL-level errors
@@ -1320,28 +1309,16 @@ impl GitHubEnricher {
             self.github_api_base, owner, repo
         );
 
-        let mut req = self
-            .client
-            .get(&url)
-            .header("Accept", "application/vnd.github+json");
-
+        let auth;
+        let mut headers: Vec<(&str, &str)> = vec![("Accept", "application/vnd.github+json")];
         if let Some(ref token) = self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            auth = format!("Bearer {}", token);
+            headers.push(("Authorization", &auth));
         }
 
-        match req.send() {
+        match self.transport.get_with(&url, &headers, None) {
             Ok(response) => {
-                if !response.status().is_success() {
-                    eprintln!(
-                        "  Contributors fetch failed for {}/{}: HTTP {}",
-                        owner,
-                        repo,
-                        response.status()
-                    );
-                    return Vec::new();
-                }
-
-                match response.json::<Vec<GitHubContributor>>() {
+                match serde_json::from_slice::<Vec<GitHubContributor>>(&response.bytes) {
                     Ok(contributors) => {
                         // Cache the response
                         if let Ok(value) = serde_json::to_value(&contributors) {
@@ -1411,10 +1388,7 @@ mod tests {
 
         let enricher = GitHubEnricher {
             sparql: SparqlClient::new(&server.url()),
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             cache: None,
             token: None,
             github_api_base: server.url(),
@@ -1515,10 +1489,7 @@ mod tests {
 
         let enricher = GitHubEnricher {
             sparql: SparqlClient::new(&server.url()),
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             cache: None,
             token: None,
             github_api_base: server.url(),
@@ -1798,10 +1769,7 @@ mod tests {
 
         let enricher = GitHubEnricher {
             sparql: SparqlClient::new(&server.url()),
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             cache: None,
             token: Some("test-token".to_string()),
             github_api_base: server.url(),
@@ -1848,10 +1816,7 @@ mod tests {
 
         let enricher = GitHubEnricher {
             sparql: SparqlClient::new(&server.url()),
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             cache: None,
             token: None,
             github_api_base: server.url(),
@@ -1885,10 +1850,7 @@ mod tests {
 
         let enricher = GitHubEnricher {
             sparql: SparqlClient::new(&server.url()),
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             cache: Some(cache),
             token: Some("test-token".to_string()),
             github_api_base: server.url(),
@@ -2001,10 +1963,7 @@ mod tests {
 
         let enricher = GitHubEnricher {
             sparql: SparqlClient::new(&server.url()),
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             cache: None,
             token: None,
             github_api_base: server.url(),
@@ -2178,10 +2137,7 @@ mod tests {
 
         let enricher = GitHubEnricher {
             sparql: SparqlClient::new(&server.url()),
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             cache: None,
             token: None,
             github_api_base: server.url(),
@@ -2210,10 +2166,7 @@ mod tests {
 
         let enricher = GitHubEnricher {
             sparql: SparqlClient::new(&server.url()),
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             cache: None,
             token: None,
             github_api_base: server.url(),
@@ -2293,10 +2246,7 @@ mod tests {
 
         let enricher = GitHubEnricher {
             sparql: SparqlClient::new(&server.url()),
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             cache: Some(cache),
             token: Some("test-token".to_string()),
             github_api_base: server.url(),
@@ -2339,10 +2289,7 @@ mod tests {
 
         let enricher = GitHubEnricher {
             sparql: SparqlClient::new(&server.url()),
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             cache: Some(cache),
             token: Some("test-token".to_string()),
             github_api_base: server.url(),
@@ -2380,10 +2327,7 @@ mod tests {
 
         let enricher = GitHubEnricher {
             sparql: SparqlClient::new(&server.url()),
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             cache: Some(cache),
             token: None,
             github_api_base: server.url(),

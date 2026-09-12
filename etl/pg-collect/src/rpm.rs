@@ -1,4 +1,6 @@
+use crate::emit::rdf::{write_package_identity, write_package_identity_once};
 use crate::forge::emit_dq_issue;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
@@ -12,7 +14,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Result};
 use std::time::Duration;
-use crate::emit::rdf::{write_package_identity, write_package_identity_once};
 
 /// CVE identifier regex: CVE-YYYY-NNNNN
 static CVE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"CVE-\d{4}-\d{4,}").unwrap());
@@ -53,6 +54,9 @@ pub struct RpmPackageData {
 
 pub struct RpmCollector {
     client: Client,
+    /// Transport wrapping `client`, so RHEL CDN requests keep the TLS
+    /// client-cert while gaining shared retry, backoff and pacing.
+    transport: HttpTransport,
     repo_url: String,
     distro_name: String,
     release_name: String,
@@ -110,6 +114,7 @@ impl RpmCollector {
         );
 
         Self {
+            transport: HttpTransport::with_client(client.clone()),
             client,
             repo_url,
             distro_name,
@@ -120,14 +125,15 @@ impl RpmCollector {
         }
     }
 
-    /// Reuses `self.client` rather than `SourceCache::new`'s plain default
-    /// client -- essential when this collector was built with
+    /// Wraps `self.client` in a transport rather than letting `SourceCache`
+    /// build its own -- essential when this collector was built with
     /// `new_with_tls`/`new_with_tls_and_repo_type`, since `SourceCache`
-    /// downloads every cached fetch through its own client, and a plain
-    /// client silently has no TLS client-cert for RHEL CDN auth (see
-    /// `SourceCache::with_client`'s doc comment).
+    /// downloads every cached fetch through the transport it is given, and
+    /// a default one silently has no TLS client-cert for RHEL CDN auth
+    /// (see `SourceCache::with_transport`'s doc comment).
     pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
-        self.source_cache = Some(SourceCache::with_client(cache_dir, "rpm", self.client.clone())?);
+        let transport = HttpTransport::with_client(self.client.clone());
+        self.source_cache = Some(SourceCache::with_transport(cache_dir, "rpm", transport)?);
         Ok(self)
     }
 
@@ -187,6 +193,7 @@ impl RpmCollector {
         let repo_type = repo_type_override.unwrap_or_else(|| infer_repo_type(&repo_url));
 
         Self {
+            transport: HttpTransport::with_client(client.clone()),
             client,
             repo_url,
             distro_name,
@@ -374,7 +381,7 @@ impl RpmCollector {
                             if let Some(arch) = fields.get("arch") {
                                 let ver = fields.get("ver").map(|s| s.as_str()).unwrap_or("");
                                 let rel = fields.get("rel").map(|s| s.as_str()).unwrap_or("");
-                                let version_str = format!("{}-{}.{}", ver, rel, arch);
+                                let _version_str = format!("{}-{}.{}", ver, rel, arch);
                                 let identity = package_identity_uri(
                                     &self.distro_name,
                                     release_name,
@@ -422,46 +429,19 @@ impl RpmCollector {
         Ok((total_packages, total_triples))
     }
 
+    /// Fetch a URL, retrying transient failures.
+    ///
+    /// `max_retries` is retained for call-site compatibility; the transport
+    /// owns the policy now. It wraps this collector's own client, so TLS
+    /// client-cert auth against the RHEL CDN is preserved.
     fn client_get_with_retry(
         &self,
         url: &str,
-        max_retries: u32,
-    ) -> Result<reqwest::blocking::Response> {
-        let mut retries = 0;
-        loop {
-            match self.client.get(url).send() {
-                Ok(response) if response.status().is_success() => return Ok(response),
-                Ok(response) if response.status().is_server_error() && retries < max_retries => {
-                    eprintln!(
-                        "Server error {}, retrying... ({}/{})",
-                        response.status(),
-                        retries + 1,
-                        max_retries
-                    );
-                    retries += 1;
-                    std::thread::sleep(Duration::from_millis(1000 * (1 << retries)));
-                }
-                Ok(response) => {
-                    return Err(std::io::Error::other(format!(
-                        "HTTP error: {}",
-                        response.status()
-                    )));
-                }
-                Err(e) if retries < max_retries => {
-                    eprintln!(
-                        "Network error: {}, retrying... ({}/{})",
-                        e,
-                        retries + 1,
-                        max_retries
-                    );
-                    retries += 1;
-                    std::thread::sleep(Duration::from_millis(1000 * (1 << retries)));
-                }
-                Err(e) => {
-                    return Err(std::io::Error::other(e));
-                }
-            }
-        }
+        _max_retries: u32,
+    ) -> Result<crate::cached_fetch::HttpResponse> {
+        self.transport
+            .get(url, None)
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     fn get_metadata_url(&self, metadata_type: &str) -> Result<String> {
@@ -551,10 +531,7 @@ impl RpmCollector {
             // Direct download (backward compat)
             eprintln!("Downloading {}", url);
             let response = self.client_get_with_retry(url, 3)?;
-            let content = response
-                .bytes()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            Ok(content.to_vec())
+            Ok(response.bytes)
         }
     }
 
@@ -2068,6 +2045,7 @@ mod tests {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap(),
+            transport: HttpTransport::new(),
             repo_url: "https://example.com".to_string(),
             distro_name: "fedora".to_string(),
             release_name: "43".to_string(),
@@ -2108,8 +2086,8 @@ mod tests {
 
     #[test]
     fn shared_capability_definition_is_emitted_once() {
-        use tempfile::NamedTempFile;
         use std::io::Read;
+        use tempfile::NamedTempFile;
 
         // Two distinct packages that both provide the SAME capability.
         // The capability's definition triples (rdf:type + capabilityName) are a pure
@@ -2139,7 +2117,11 @@ mod tests {
         let mut writer = NTriplesWriter::new(file);
 
         let collector = RpmCollector {
-            client: Client::builder().timeout(Duration::from_secs(10)).build().unwrap(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
+            transport: HttpTransport::new(),
             repo_url: "https://example.com".to_string(),
             distro_name: "rhel".to_string(),
             release_name: "9".to_string(),
@@ -2148,7 +2130,8 @@ mod tests {
             graph_uri: None,
         };
 
-        let mut emitted_packages: HashSet<(String, String, String, String, String)> = HashSet::new();
+        let mut emitted_packages: HashSet<(String, String, String, String, String)> =
+            HashSet::new();
         collector
             .emit_package_triples(&mut writer, &make_pkg("pkg-a"), None, &mut emitted_packages)
             .unwrap();
@@ -2196,7 +2179,10 @@ mod tests {
         fields.insert("arch".to_string(), "x86_64".to_string());
         fields.insert("ver".to_string(), "1.0".to_string());
         fields.insert("rel".to_string(), "1".to_string());
-        fields.insert("url".to_string(), "https://github.com/owner/repo".to_string());
+        fields.insert(
+            "url".to_string(),
+            "https://github.com/owner/repo".to_string(),
+        );
 
         let pkg_data = RpmPackageData {
             fields,
@@ -2213,10 +2199,20 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
-        assert!(content.contains("upstreamRepository"), "existing triple must still be emitted");
-        assert!(content.contains(&format!("{VCS}Repository")), "existing repo typing must be preserved");
+        assert!(
+            content.contains("upstreamRepository"),
+            "existing triple must still be emitted"
+        );
+        assert!(
+            content.contains(&format!("{VCS}Repository")),
+            "existing repo typing must be preserved"
+        );
         assert!(content.contains("UpstreamProject"), "new hub triple");
         assert!(
             content.contains("\"owner/repo\""),

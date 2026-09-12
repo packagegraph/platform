@@ -1,21 +1,25 @@
 use crate::cached_fetch::{CachedFetcher, HttpResponse};
+use crate::emit::rdf::write_package_identity;
 use crate::fetch_error::FetchError;
 use crate::http_cache::HttpCache;
+use crate::http_transport::{HttpTransport, RetryPolicy};
 use crate::maven_version::{classify_version, VersionClass};
 use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::uris::*;
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
 use std::time::Duration;
-use crate::emit::rdf::write_package_identity;
 
 pub struct MavenCollector {
-    client: Client,
+    transport: HttpTransport,
+    /// Fewer attempts for the search API, so the circuit breaker trips and
+    /// falls back to maven-metadata.xml promptly instead of burning the
+    /// full budget on an endpoint that is already known to rate-limit.
+    search_transport: HttpTransport,
     search_base: String,
     repo_base: String,
     http_cache: Option<HttpCache>,
@@ -189,10 +193,12 @@ pub(crate) struct ResolvedDependency {
 
 impl MavenCollector {
     pub fn new(search_base: String, repo_base: String) -> Self {
-        let client = crate::enricher::default_http_client();
-
         Self {
-            client,
+            transport: HttpTransport::new(),
+            search_transport: HttpTransport::new().with_policy(RetryPolicy {
+                max_attempts: 3,
+                ..RetryPolicy::default()
+            }),
             search_base,
             repo_base,
             http_cache: None,
@@ -726,155 +732,43 @@ impl MavenCollector {
     /// Retries on 429 (rate limit) and 5xx (server errors), matching
     /// `FetchError::is_retryable()`. Tracks the last status so the
     /// fallthrough error carries a real status code, not a fabricated 0.
+    /// Fetch through the shared transport.
+    ///
+    /// Retry, backoff, `Retry-After` and per-host pacing used to be a
+    /// 60-line loop here, duplicated in pypi. `max_attempts` is honoured by
+    /// building a policy for this call; `_base_delay_ms` is vestigial.
     fn http_get_with_retry(
         &self,
         url: &str,
         etag: Option<&str>,
-        base_delay_ms: &mut u64,
+        _base_delay_ms: &mut u64,
         max_attempts: u32,
     ) -> std::result::Result<HttpResponse, FetchError> {
-        let mut last_status: Option<u16> = None;
-
-        for attempt in 0..max_attempts {
-            let mut request = self.client.get(url);
-            if let Some(etag_val) = etag {
-                request = request.header("If-None-Match", etag_val);
-            }
-
-            match request.send() {
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    last_status = Some(status);
-
-                    // Retryable: 429 and 5xx
-                    if status == 429 || status >= 500 {
-                        if attempt < max_attempts - 1 {
-                            let delay_secs = if status == 429 {
-                                response
-                                    .headers()
-                                    .get("retry-after")
-                                    .and_then(|h| h.to_str().ok())
-                                    .and_then(|s| s.parse::<u64>().ok())
-                                    .unwrap_or_else(|| 2u64.pow(attempt))
-                            } else {
-                                2u64.pow(attempt + 1)
-                            };
-                            eprintln!("  HTTP {}, backing off {}s...", status, delay_secs);
-                            std::thread::sleep(Duration::from_secs(delay_secs));
-                            *base_delay_ms = (*base_delay_ms * 2).min(5000);
-                            continue;
-                        }
-                        // Last attempt exhausted -- fall through to return error
-                        return Err(FetchError::HttpStatus {
-                            url: url.to_string(),
-                            status,
-                        });
-                    }
-
-                    let resp_etag = response
-                        .headers()
-                        .get("etag")
-                        .and_then(|h| h.to_str().ok())
-                        .map(|s| s.to_string());
-
-                    let bytes = response.bytes().map_err(|e| FetchError::Transport {
-                        url: url.to_string(),
-                        source: e,
-                    })?;
-
-                    return Ok(HttpResponse {
-                        status,
-                        bytes: bytes.to_vec(),
-                        etag: resp_etag,
-                    });
-                }
-                Err(e) => {
-                    if attempt < max_attempts - 1 {
-                        let delay = Duration::from_secs(2u64.pow(attempt));
-                        eprintln!("  Network error, retrying in {:?}...", delay);
-                        std::thread::sleep(delay);
-                        continue;
-                    }
-                    return Err(FetchError::Transport {
-                        url: url.to_string(),
-                        source: e,
-                    });
-                }
-            }
-        }
-
-        // Should not reach here, but if it does, use tracked status
-        Err(FetchError::HttpStatus {
-            url: url.to_string(),
-            status: last_status.unwrap_or(0),
-        })
+        self.transport_for(max_attempts).get(url, etag)
     }
 
-    /// Direct fetch without cache (used when http_cache is None).
+    /// Direct fetch, bypassing the cache. Returns (bytes, was_network_hit).
+    ///
+    /// Retry and backoff are the transport's; `_base_delay_ms` is vestigial.
     fn direct_fetch_with_retry(
         &self,
         url: &str,
-        base_delay_ms: &mut u64,
+        _base_delay_ms: &mut u64,
         max_attempts: u32,
     ) -> std::result::Result<(Vec<u8>, bool), FetchError> {
-        let mut last_status: Option<u16> = None;
+        self.transport_for(max_attempts)
+            .get(url, None)
+            .map(|resp| (resp.bytes, true))
+    }
 
-        for attempt in 0..max_attempts {
-            match self.client.get(url).send() {
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    last_status = Some(status);
-
-                    if status == 429 || status >= 500 {
-                        if attempt < max_attempts - 1 {
-                            let delay = 2u64.pow(attempt + 1);
-                            eprintln!("  HTTP {}, backing off {}s...", status, delay);
-                            std::thread::sleep(Duration::from_secs(delay));
-                            *base_delay_ms = (*base_delay_ms * 2).min(5000);
-                            continue;
-                        }
-                        return Err(FetchError::HttpStatus {
-                            url: url.to_string(),
-                            status,
-                        });
-                    }
-
-                    if status == 404 {
-                        return Err(FetchError::NotFound {
-                            url: url.to_string(),
-                        });
-                    }
-
-                    if !response.status().is_success() {
-                        return Err(FetchError::HttpStatus {
-                            url: url.to_string(),
-                            status,
-                        });
-                    }
-
-                    let bytes = response.bytes().map_err(|e| FetchError::Transport {
-                        url: url.to_string(),
-                        source: e,
-                    })?;
-                    return Ok((bytes.to_vec(), true));
-                }
-                Err(e) => {
-                    if attempt < max_attempts - 1 {
-                        std::thread::sleep(Duration::from_secs(2u64.pow(attempt)));
-                        continue;
-                    }
-                    return Err(FetchError::Transport {
-                        url: url.to_string(),
-                        source: e,
-                    });
-                }
-            }
+    /// Pick the transport matching this call's attempt budget. Maven uses
+    /// 3 attempts for the search API and 5 for repository fetches.
+    fn transport_for(&self, max_attempts: u32) -> &HttpTransport {
+        if max_attempts <= 3 {
+            &self.search_transport
+        } else {
+            &self.transport
         }
-
-        Err(FetchError::HttpStatus {
-            url: url.to_string(),
-            status: last_status.unwrap_or(0),
-        })
     }
 
     fn build_pom_url(&self, group_id: &str, artifact_id: &str, version: &str) -> String {
@@ -979,7 +873,11 @@ impl MavenCollector {
 
                 if let Some(conn) = &pom.scm_connection {
                     let clone_url = conn.strip_prefix("scm:git:").unwrap_or(conn);
-                    writer.write_literal(&upstream_repo_iri, &format!("{VCS}cloneUrl"), clone_url)?;
+                    writer.write_literal(
+                        &upstream_repo_iri,
+                        &format!("{VCS}cloneUrl"),
+                        clone_url,
+                    )?;
                     triples += 1;
                 }
             }
@@ -2493,7 +2391,8 @@ mod tests {
             .create();
 
         let collector = MavenCollector {
-            client: crate::enricher::default_http_client(),
+            transport: HttpTransport::new(),
+            search_transport: HttpTransport::new(),
             search_base: server.url(),
             repo_base: format!("{}/maven2", server.url()),
             http_cache: Some(HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap()),
@@ -2539,7 +2438,8 @@ mod tests {
             .create();
 
         let collector = MavenCollector {
-            client: crate::enricher::default_http_client(),
+            transport: HttpTransport::new(),
+            search_transport: HttpTransport::new(),
             search_base: server.url(),
             repo_base: format!("{}/maven2", server.url()),
             http_cache: Some(HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap()),
@@ -2589,7 +2489,8 @@ mod tests {
             .create();
 
         let collector = MavenCollector {
-            client: crate::enricher::default_http_client(),
+            transport: HttpTransport::new(),
+            search_transport: HttpTransport::new(),
             search_base: server.url(),
             repo_base: format!("{}/maven2", server.url()),
             http_cache: Some(HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap()),
@@ -2717,6 +2618,7 @@ mod tests {
                     status: 200,
                     bytes: b"fresh-from-network".to_vec(),
                     etag: None,
+                    last_modified: None,
                 })
             },
         );
@@ -3139,7 +3041,8 @@ mod tests {
             .create();
 
         let collector = MavenCollector {
-            client: crate::enricher::default_http_client(),
+            transport: HttpTransport::new(),
+            search_transport: HttpTransport::new(),
             search_base: server.url(),
             repo_base: format!("{}/maven2", server.url()),
             http_cache: Some(HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap()),
@@ -3293,7 +3196,8 @@ mod tests {
             .create();
 
         let collector = MavenCollector {
-            client: crate::enricher::default_http_client(),
+            transport: HttpTransport::new(),
+            search_transport: HttpTransport::new(),
             search_base: server.url(),
             repo_base: format!("{}/maven2", server.url()),
             http_cache: Some(HttpCache::with_clock(cache_dir, "maven", clock.clone()).unwrap()),
@@ -5945,7 +5849,8 @@ mod tests {
             .create();
 
         let collector = MavenCollector {
-            client: crate::enricher::default_http_client(),
+            transport: HttpTransport::new(),
+            search_transport: HttpTransport::new(),
             // Port 1: nothing listens there, so this fails fast with a
             // real transport-level connection error rather than a slow
             // timeout, exercising the same FetchError::Transport path
@@ -5984,7 +5889,8 @@ mod tests {
             .create();
 
         let collector = MavenCollector {
-            client: crate::enricher::default_http_client(),
+            transport: HttpTransport::new(),
+            search_transport: HttpTransport::new(),
             search_base: "http://127.0.0.1:1".to_string(),
             repo_base: format!("{}/maven2", server.url()),
             http_cache: None,
@@ -6010,7 +5916,8 @@ mod tests {
         let repo_base = collector.repo_base.clone();
         std::thread::spawn(move || {
             let collector2 = MavenCollector {
-                client: crate::enricher::default_http_client(),
+                transport: HttpTransport::new(),
+                search_transport: HttpTransport::new(),
                 search_base: "http://127.0.0.1:1".to_string(),
                 repo_base,
                 http_cache: None,
@@ -6062,7 +5969,8 @@ mod tests {
             .create();
 
         let collector = MavenCollector {
-            client: crate::enricher::default_http_client(),
+            transport: HttpTransport::new(),
+            search_transport: HttpTransport::new(),
             search_base: server.url(),
             repo_base: format!("{}/maven2", server.url()),
             http_cache: Some(HttpCache::new(tmp.path().to_str().unwrap(), "maven").unwrap()),
@@ -6230,7 +6138,8 @@ mod tests {
             .create();
 
         let collector = MavenCollector {
-            client: crate::enricher::default_http_client(),
+            transport: HttpTransport::new(),
+            search_transport: HttpTransport::new(),
             search_base: server.url(),
             repo_base: format!("{}/maven2", server.url()),
             http_cache: None,
@@ -6281,7 +6190,8 @@ mod tests {
             .create();
 
         let collector = MavenCollector {
-            client: crate::enricher::default_http_client(),
+            transport: HttpTransport::new(),
+            search_transport: HttpTransport::new(),
             search_base: server.url(),
             repo_base: format!("{}/maven2", server.url()),
             http_cache: None,
@@ -6328,7 +6238,11 @@ mod tests {
         writer.flush().unwrap();
 
         let mut content = String::new();
-        temp_file.reopen().unwrap().read_to_string(&mut content).unwrap();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
 
         assert!(content.contains("upstreamRepository"));
         assert!(content.contains(&format!("{VCS}Repository")));

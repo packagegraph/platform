@@ -1,9 +1,7 @@
 use crate::cache::{FileCache, MinioConfig};
 use crate::ntriples::NTriplesWriter;
-use crate::uris::*;
 use std::collections::HashMap;
 use std::io::Result;
-use std::time::Duration;
 
 /// GitHub SLSA attestation enricher for OpenWrt binary packages
 pub struct OpenwrtAttestationEnricher {
@@ -36,10 +34,10 @@ impl OpenwrtAttestationEnricher {
 
     pub fn enrich(
         &self,
-        writer: &mut NTriplesWriter,
-        digest_map: &HashMap<String, String>,
+        _writer: &mut NTriplesWriter,
+        _digest_map: &HashMap<String, String>,
     ) -> Result<usize> {
-        let mut total_triples = 0;
+        let total_triples = 0;
 
         eprintln!("GitHub Attestation Check: OpenWrt does not publish attestations yet (verified 2026-04-27).");
         eprintln!(
@@ -61,9 +59,9 @@ impl OpenwrtAttestationEnricher {
     #[allow(dead_code)]
     fn fetch_and_emit_attestation(
         &self,
-        writer: &mut NTriplesWriter,
-        sha256_hex: &str,
-        binary_uri: &str,
+        _writer: &mut NTriplesWriter,
+        _sha256_hex: &str,
+        _binary_uri: &str,
     ) -> Result<usize> {
         // Will implement: GET /repos/openwrt/openwrt/attestations/sha256:<hex>
         // Parse attestations array, decode DSSE, emit ProvenanceAttestation + BuildActivity chain

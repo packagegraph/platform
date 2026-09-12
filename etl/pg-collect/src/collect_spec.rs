@@ -6,17 +6,16 @@
 //! extraction. Ecosystem correlation uses Source0 domain matching and
 //! BuildRequires macro detection.
 
-use crate::enricher::rate_limit;
+use crate::fetch_error::FetchError;
 use crate::forge::{emit_dq_issue, emit_forge_triples, extract_forge_url_with_field};
+use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use reqwest::blocking::Client;
 use std::collections::{HashMap, HashSet};
 use std::io::Result;
-use std::time::Duration;
 
 /// Regex for extracting Source0 URL from spec file.
 static SOURCE0_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?im)^Source0?\s*:\s*(.+)$").unwrap());
@@ -88,7 +87,7 @@ pub struct ChangelogEntry {
 
 /// Spec file collector for Fedora/CentOS Stream dist-git.
 pub struct SpecCollector {
-    client: Client,
+    transport: HttpTransport,
     distro: String,
     release: String,
     cache: Option<SourceCache>,
@@ -96,15 +95,13 @@ pub struct SpecCollector {
 
 impl SpecCollector {
     pub fn new(distro: &str, release: &str, cache_dir: Option<&str>) -> Result<Self> {
-        let client = crate::enricher::default_http_client();
-
         let cache = match cache_dir {
             Some(dir) => Some(SourceCache::new(dir, "spec")?),
             None => None,
         };
 
         Ok(Self {
-            client,
+            transport: HttpTransport::new(),
             distro: distro.to_string(),
             release: release.to_string(),
             cache,
@@ -154,7 +151,6 @@ impl SpecCollector {
                 );
             }
 
-            rate_limit(Duration::from_millis(200));
         }
 
         eprintln!(
@@ -406,20 +402,21 @@ impl SpecCollector {
             }
         }
 
-        // Direct download
-        let resp = self
-            .client
-            .get(url)
-            .send()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(std::io::Error::new(
+        // Direct download. Only a real 404 maps to NotFound; every other
+        // failure keeps its own kind so the caller can tell "this branch
+        // has no spec" from "the server was unhappy".
+        match self.transport.get(url, None) {
+            Ok(resp) => String::from_utf8(resp.bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            Err(FetchError::NotFound { .. }) => Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("HTTP {} for {}", resp.status(), url),
-            ));
+                format!("no spec at {}", url),
+            )),
+            Err(e) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("{} for {}", e, url),
+            )),
         }
-        resp.text()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
     }
 
     fn emit_ecosystem_triples(

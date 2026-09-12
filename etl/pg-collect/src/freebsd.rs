@@ -1,7 +1,7 @@
+use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
-use crate::source_cache::{CacheResult, CacheScope, SourceCache};
+use crate::source_cache::SourceCache;
 use crate::uris::*;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
@@ -11,7 +11,7 @@ use xz2::read::XzDecoder;
 
 pub struct FreebsdCollector {
     distro_name: String,
-    client: Client,
+    transport: HttpTransport,
     mirror: String,
     release: String,
     arch: String,
@@ -39,8 +39,8 @@ struct DependencyInfo {
     version: Option<String>,
 }
 
-use std::collections::HashMap;
 use crate::emit::rdf::write_package_identity;
+use std::collections::HashMap;
 
 impl FreebsdCollector {
     pub fn new(distro_name: String, mirror: String, release: String, arch: String) -> Self {
@@ -51,7 +51,7 @@ impl FreebsdCollector {
 
         Self {
             distro_name,
-            client,
+            transport: HttpTransport::with_client(client),
             mirror,
             release,
             arch,
@@ -86,45 +86,24 @@ impl FreebsdCollector {
             self.arch
         );
 
-        let (url, use_zstd) = {
-            eprintln!("Fetching packagesite.pkg from: {}", pkg_url);
-            let resp = self
-                .client
-                .get(&pkg_url)
-                .send()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            if resp.status().is_success() {
-                (pkg_url, true)
-            } else {
+        // Probe .pkg first; fall back to .txz. The probe now keeps the body
+        // it already fetched instead of re-downloading the archive.
+        eprintln!("Fetching packagesite.pkg from: {}", pkg_url);
+        let (response, use_zstd) = match self.transport.get(&pkg_url, None) {
+            Ok(resp) => (resp, true),
+            Err(_) => {
                 eprintln!("  .pkg not found, trying .txz...");
-                (txz_url, false)
+                let resp = self.transport.get(&txz_url, None).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("{} for both .pkg and .txz", e),
+                    )
+                })?;
+                (resp, false)
             }
         };
 
-        let response = if use_zstd {
-            // Re-fetch since we consumed the first response checking status
-            self.client
-                .get(&url)
-                .send()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
-        } else {
-            let resp = self
-                .client
-                .get(&url)
-                .send()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            if !resp.status().is_success() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("HTTP {} for both .pkg and .txz", resp.status()),
-                ));
-            }
-            resp
-        };
-
-        let bytes = response
-            .bytes()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let bytes = response.bytes;
 
         // Decompress to memory then parse tar (handles both zstd and xz)
         let tar_bytes: Vec<u8> = if use_zstd {

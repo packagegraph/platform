@@ -1,17 +1,17 @@
+use crate::fetch_error::FetchError;
+use crate::http_transport::{HttpTransport, StatsSnapshot};
 use crate::ntriples::NTriplesWriter;
 use crate::uris::*;
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use reqwest::blocking::Client;
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 use crate::emit::rdf::write_package_identity;
 
 pub struct ChocolateyCollector {
     distro_name: String,
     release_name: String,
-    client: Client,
+    transport: HttpTransport,
     api_url: String,
     pub graph_uri: Option<String>,
 }
@@ -32,15 +32,24 @@ struct ChocolateyPackage {
 
 impl ChocolateyCollector {
     pub fn new(distro_name: String, release_name: String, api_url: String) -> Self {
-        let client = crate::enricher::default_http_client();
-
         Self {
             distro_name,
             release_name,
-            client,
+            transport: HttpTransport::new(),
             api_url,
             graph_uri: None,
         }
+    }
+
+    /// Override the transport, for tests that need fast retries.
+    pub fn with_transport(mut self, transport: HttpTransport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// One-line fetch summary for the end of a run.
+    pub fn transport_stats(&self) -> StatsSnapshot {
+        self.transport.stats()
     }
 
     /// Set the graph URI for N-Quads output.
@@ -74,9 +83,9 @@ impl ChocolateyCollector {
             }
 
             skip += packages.len();
-            std::thread::sleep(Duration::from_millis(200));
         }
 
+        eprintln!("  {}", self.transport_stats());
         eprintln!("Collected {} Chocolatey packages", total_packages);
 
         writer.flush()?;
@@ -108,29 +117,25 @@ impl ChocolateyCollector {
             skip
         );
 
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-
-        if !response.status().is_success() {
-            // 406 = Chocolatey OData pagination limit (~10K); treat as end of results
-            if response.status().as_u16() == 406 {
+        let response = match self.transport.get(&url, None) {
+            Ok(r) => r,
+            // 406 = Chocolatey OData pagination limit (~10K); end of results
+            Err(FetchError::HttpStatus { status: 406, .. }) => {
                 eprintln!("  HTTP 406 — reached Chocolatey pagination limit, stopping");
                 return Ok(vec![]);
             }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("HTTP {}", response.status()),
-            ));
-        }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            }
+        };
 
-        let xml = response
-            .text()
+        let xml = std::str::from_utf8(&response.bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-        self.parse_odata_feed(&xml)
+        self.parse_odata_feed(xml)
     }
 
     fn parse_odata_feed(&self, xml: &str) -> Result<Vec<ChocolateyPackage>> {
@@ -286,6 +291,7 @@ impl ChocolateyCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http_transport::RetryPolicy;
 
     #[test]
     fn test_parse_odata_feed() {
@@ -362,5 +368,58 @@ mod tests {
         assert!(content.contains("\"7zip\""));
         assert!(content.contains("chocolatey#downloadCount"));
         assert!(triples > 10);
+    }
+
+    // ── Characterization: fetch_page, pre-migration ────────────────────
+
+    #[test]
+    fn characterize_chocolatey_406_means_end_of_pagination() {
+        // Chocolatey's OData endpoint returns 406 past ~10K results. That
+        // is a sentinel for "stop", not a failure.
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(406)
+            .expect(1)
+            .create();
+
+        let c = ChocolateyCollector::new(
+            "chocolatey".to_string(),
+            "community".to_string(),
+            server.url(),
+        );
+        let page = c.fetch_page(0, 40).expect("406 should be an empty page");
+
+        mock.assert();
+        assert!(page.is_empty());
+    }
+
+    #[test]
+    fn migrated_chocolatey_500_is_retried_then_reported() {
+        // Pre-migration chocolatey made exactly one request and failed.
+        // It had no retry of any kind; is_retryable() now treats 5xx as
+        // transient.
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(500)
+            .expect(3)
+            .create();
+
+        let c = ChocolateyCollector::new(
+            "chocolatey".to_string(),
+            "community".to_string(),
+            server.url(),
+        )
+        .with_transport(HttpTransport::new().with_policy(RetryPolicy {
+            max_attempts: 3,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(4),
+            jitter: false,
+        }));
+        let err = c.fetch_page(0, 40).expect_err("500 should be an error");
+
+        mock.assert();
+        assert!(err.to_string().contains("500"), "got: {err}");
     }
 }

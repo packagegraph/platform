@@ -1,19 +1,19 @@
+use crate::emit::rdf::write_package_identity;
+use crate::http_transport::HttpTransport;
 use crate::npm::read_seed_file;
 use crate::ntriples::{bnode_id, NTriplesWriter};
-use crate::source_cache::{CacheResult, CacheScope, SourceCache};
+use crate::source_cache::SourceCache;
 use crate::uris::*;
 use regex::Regex;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Result;
-use crate::emit::rdf::write_package_identity;
 
 pub struct CondaCollector {
     distro_name: String,
     release_name: String,
-    client: Client,
+    transport: HttpTransport,
     channel_url: String,
     subdir: String,
     source_cache: Option<SourceCache>,
@@ -49,11 +49,10 @@ impl CondaCollector {
         channel_url: String,
         subdir: String,
     ) -> Self {
-        let client = crate::enricher::default_http_client();
         Self {
             distro_name,
             release_name,
-            client,
+            transport: HttpTransport::new(),
             channel_url,
             subdir,
             source_cache: None,
@@ -85,11 +84,10 @@ impl CondaCollector {
         eprintln!("Fetching {}", url);
 
         let response = self
-            .client
-            .get(&url)
-            .send()
+            .transport
+            .get(&url, None)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        let reader = std::io::BufReader::new(response);
+        let reader = std::io::BufReader::new(&response.bytes[..]);
         let repodata: RepodataJson = serde_json::from_reader(reader)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
@@ -135,11 +133,10 @@ impl CondaCollector {
         eprintln!("Fetching {}", url);
 
         let response = self
-            .client
-            .get(&url)
-            .send()
+            .transport
+            .get(&url, None)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        let reader = std::io::BufReader::new(response);
+        let reader = std::io::BufReader::new(&response.bytes[..]);
         let repodata: RepodataJson = serde_json::from_reader(reader)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 

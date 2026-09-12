@@ -1,16 +1,15 @@
+use crate::fetch_error::FetchError;
+use crate::http_transport::{HttpTransport, StatsSnapshot};
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{SparqlAuth, SparqlBackend};
 use crate::uris::*;
-use reqwest::blocking::Client;
-use reqwest::StatusCode;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
-use std::time::Duration;
 use crate::emit::rdf::write_package_identity;
 
 pub struct NugetCollector {
-    client: Client,
+    transport: HttpTransport,
     registration_base: String,
     pub graph_uri: Option<String>,
 }
@@ -78,15 +77,16 @@ struct NugetDependency {
 
 impl NugetCollector {
     pub fn new_from_service_index(service_index_url: &str) -> std::result::Result<Self, String> {
-        let client = crate::enricher::default_http_client();
+        let transport = HttpTransport::new();
 
-        let response = client
-            .get(service_index_url)
-            .send()
+        // The bootstrap fetch now retries too; a transient 5xx on the
+        // service index used to abort the whole collector run.
+        let response = transport
+            .get(service_index_url, None)
             .map_err(|e| e.to_string())?;
 
-        let text = response.text().map_err(|e| e.to_string())?;
-        let index: ServiceIndex = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let text = std::str::from_utf8(&response.bytes).map_err(|e| e.to_string())?;
+        let index: ServiceIndex = serde_json::from_str(text).map_err(|e| e.to_string())?;
 
         let registration_base = index
             .resources
@@ -96,7 +96,7 @@ impl NugetCollector {
             .ok_or("RegistrationsBaseUrl not found in service index")?;
 
         Ok(Self {
-            client,
+            transport,
             registration_base,
             graph_uri: None,
         })
@@ -105,6 +105,11 @@ impl NugetCollector {
     pub fn with_graph(mut self, graph_uri: Option<String>) -> Self {
         self.graph_uri = graph_uri;
         self
+    }
+
+    /// One-line fetch summary for the end of a run.
+    pub fn transport_stats(&self) -> StatsSnapshot {
+        self.transport.stats()
     }
 
     pub fn collect_discover(
@@ -148,9 +153,9 @@ impl NugetCollector {
                 }
                 Err(e) => eprintln!("  Error fetching {}: {}", name, e),
             }
-
-            std::thread::sleep(Duration::from_millis(base_delay_ms));
         }
+
+        eprintln!("  {}", self.transport_stats());
 
         writer.flush()?;
         Ok((total_packages, total_triples))
@@ -176,54 +181,30 @@ impl NugetCollector {
     fn fetch_package_with_retry(
         &self,
         package_id: &str,
-        base_delay_ms: &mut u64,
+        _base_delay_ms: &mut u64,
     ) -> std::result::Result<CatalogEntry, String> {
         let url = format!(
             "{}/{}/index.json",
             self.registration_base,
             package_id.to_lowercase()
         );
-        let max_attempts = 5;
+        let response = match self.transport.get(&url, None) {
+            Ok(r) => r,
+            Err(FetchError::NotFound { .. }) => return Err(format!("404: {}", package_id)),
+            Err(e) => return Err(e.to_string()),
+        };
 
-        for attempt in 0..max_attempts {
-            match self.client.get(&url).send() {
-                Ok(response) => {
-                    if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                        let retry_secs = 2u64.pow(attempt as u32);
-                        eprintln!("  Rate limited, waiting {}s...", retry_secs);
-                        std::thread::sleep(Duration::from_secs(retry_secs));
-                        *base_delay_ms = (*base_delay_ms * 2).min(5000);
-                        continue;
-                    }
+        let text = std::str::from_utf8(&response.bytes).map_err(|e| e.to_string())?;
+        let reg: RegistrationIndex = serde_json::from_str(text).map_err(|e| e.to_string())?;
 
-                    if response.status() == StatusCode::NOT_FOUND {
-                        return Err(format!("404: {}", package_id));
-                    }
-
-                    let text = response.text().map_err(|e| e.to_string())?;
-                    let reg: RegistrationIndex =
-                        serde_json::from_str(&text).map_err(|e| e.to_string())?;
-
-                    // Get latest version (last item in last page)
-                    if let Some(page) = reg.items.last() {
-                        if let Some(leaf) = page.items.last() {
-                            return Ok(leaf.catalog_entry.clone());
-                        }
-                    }
-
-                    return Err(format!("No versions found for {}", package_id));
-                }
-                Err(e) => {
-                    if attempt < max_attempts - 1 {
-                        std::thread::sleep(Duration::from_millis(1000 * 2u64.pow(attempt as u32)));
-                        continue;
-                    }
-                    return Err(e.to_string());
-                }
+        // Get latest version (last item in last page)
+        if let Some(page) = reg.items.last() {
+            if let Some(leaf) = page.items.last() {
+                return Ok(leaf.catalog_entry.clone());
             }
         }
 
-        Err(format!("Max retries exceeded for {}", package_id))
+        Err(format!("No versions found for {}", package_id))
     }
 
     fn emit_package_triples(
@@ -340,6 +321,100 @@ mod tests {
     use std::io::{Read, Write};
     use tempfile::NamedTempFile;
 
+    /// Build a collector pointed at a mock registration base. Only this
+    /// helper knows how the collector is wired, so the behavioural
+    /// assertions below survive the transport migration untouched.
+    fn collector_for(registration_base: String) -> NugetCollector {
+        NugetCollector {
+            transport: crate::http_transport::HttpTransport::new(),
+            registration_base,
+            graph_uri: None,
+        }
+    }
+
+    const ONE_VERSION: &str =
+        r#"{"items":[{"items":[{"catalogEntry":{"id":"Demo.Pkg","version":"1.2.3"}}]}]}"#;
+
+    // ── Characterization: fetch_package_with_retry ──────────────────────
+
+    #[test]
+    fn characterize_nuget_returns_latest_catalog_entry_on_200() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/demo.pkg/index.json")
+            .with_status(200)
+            .with_body(ONE_VERSION)
+            .expect(1)
+            .create();
+
+        let c = collector_for(server.url());
+        let mut base = 200u64;
+        let entry = c
+            .fetch_package_with_retry("Demo.Pkg", &mut base)
+            .expect("200 should yield the catalog entry");
+
+        mock.assert();
+        assert_eq!(entry.id, "Demo.Pkg");
+        assert_eq!(entry.version, "1.2.3");
+    }
+
+    #[test]
+    fn characterize_nuget_lowercases_the_package_id_in_the_url() {
+        let mut server = mockito::Server::new();
+        // The mock only matches the lowercased path.
+        let mock = server
+            .mock("GET", "/demo.pkg/index.json")
+            .with_status(200)
+            .with_body(ONE_VERSION)
+            .expect(1)
+            .create();
+
+        let c = collector_for(server.url());
+        let mut base = 200u64;
+        c.fetch_package_with_retry("DEMO.PKG", &mut base).unwrap();
+
+        mock.assert();
+    }
+
+    #[test]
+    fn characterize_nuget_404_is_terminal() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/missing.pkg/index.json")
+            .with_status(404)
+            .expect(1)
+            .create();
+
+        let c = collector_for(server.url());
+        let mut base = 200u64;
+        let err = c
+            .fetch_package_with_retry("Missing.Pkg", &mut base)
+            .expect_err("404 should be an error");
+
+        mock.assert();
+        assert_eq!(err, "404: Missing.Pkg");
+    }
+
+    #[test]
+    fn characterize_nuget_empty_index_is_an_error_not_a_panic() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/empty.pkg/index.json")
+            .with_status(200)
+            .with_body(r#"{"items":[]}"#)
+            .expect(1)
+            .create();
+
+        let c = collector_for(server.url());
+        let mut base = 200u64;
+        let err = c
+            .fetch_package_with_retry("Empty.Pkg", &mut base)
+            .expect_err("an index with no versions should error");
+
+        mock.assert();
+        assert!(err.contains("No versions found"), "got: {err}");
+    }
+
     #[test]
     fn test_read_nuget_seed_file() {
         let mut temp = NamedTempFile::new().unwrap();
@@ -392,7 +467,7 @@ mod tests {
 
         // Create a minimal collector instance just for testing emit
         let collector = NugetCollector {
-            client: Client::new(),
+            transport: HttpTransport::new(),
             registration_base: "https://api.nuget.org/v3/registration5-gz-semver2".to_string(),
             graph_uri: None,
         };
