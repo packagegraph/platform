@@ -4,10 +4,10 @@
 //! already in the graph. Produces sec:EPSSAssessment entities with score,
 //! percentile, and assessment date.
 
+use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
-use reqwest::blocking::Client;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Result;
@@ -16,7 +16,7 @@ const EPSS_API_URL: &str = "https://api.first.org/data/v1/epss";
 
 pub struct EpssEnricher {
     sparql: SparqlClient,
-    client: Client,
+    transport: HttpTransport,
     min_score: f64,
     pub graph_uri: Option<String>,
 }
@@ -24,14 +24,9 @@ pub struct EpssEnricher {
 impl EpssEnricher {
     pub fn new(endpoint: &str, min_score: f64, auth: SparqlAuth, backend: SparqlBackend) -> Self {
         let sparql = make_sparql_client(endpoint, &auth, backend);
-        let client = Client::builder()
-            .user_agent("pg-collect/1.0 (packagegraph.github.io)")
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .expect("Failed to build HTTP client");
         Self {
             sparql,
-            client,
+            transport: HttpTransport::new(),
             min_score,
             graph_uri: None,
         }
@@ -127,27 +122,15 @@ impl EpssEnricher {
             let limit_str = PAGE_SIZE.to_string();
             let offset_str = offset.to_string();
 
-            let resp = self
-                .client
-                .get(EPSS_API_URL)
-                .query(&[
-                    ("envelope", "true"),
-                    ("pretty", "false"),
-                    ("limit", &limit_str),
-                    ("offset", &offset_str),
-                ])
-                .send()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            let url = format!(
+                "{}?envelope=true&pretty=false&limit={}&offset={}",
+                EPSS_API_URL, limit_str, offset_str
+            );
+            let resp = self.transport.get(&url, None).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, format!("EPSS API: {}", e))
+            })?;
 
-            if !resp.status().is_success() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("EPSS API returned {}", resp.status()),
-                ));
-            }
-
-            let body: serde_json::Value = resp
-                .json()
+            let body: serde_json::Value = serde_json::from_slice(&resp.bytes)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
             let data = match body.get("data").and_then(|d| d.as_array()) {

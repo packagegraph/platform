@@ -1,30 +1,24 @@
+use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::uris::{
     cve_entity_uri, cve_uri, cvss_score_uri, cwe_uri, ecosystem_uri, event_type_uri,
     package_identity_uri, range_type_uri, version_uri, vuln_uri, DATA, PKG, RDFS_LABEL, RDF_TYPE,
     SEC, VCS,
 };
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Cursor, Result};
 use std::time::Duration;
 
 pub struct OsvCollector {
-    client: Client,
+    transport: HttpTransport,
     pub graph_uri: Option<String>,
 }
 
 impl OsvCollector {
     pub fn new() -> Self {
-        let client = crate::enricher::http_client_builder()
-            .timeout(Duration::from_secs(300))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .expect("Failed to create HTTP client");
-
         Self {
-            client,
+            transport: HttpTransport::new(),
             graph_uri: None,
         }
     }
@@ -39,7 +33,8 @@ impl OsvCollector {
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
-        let (vuln_count, triple_count) = process_ecosystem(&self.client, ecosystem, &mut writer)?;
+        let (vuln_count, triple_count) =
+            process_ecosystem(&self.transport, ecosystem, &mut writer)?;
 
         writer.flush()?;
         Ok((vuln_count, triple_count))
@@ -578,7 +573,7 @@ pub struct OsvReference {
 ///
 /// Returns `(vuln_count, triple_count)`.
 pub fn process_ecosystem(
-    client: &Client,
+    transport: &HttpTransport,
     ecosystem: &str,
     writer: &mut NTriplesWriter,
 ) -> Result<(usize, usize)> {
@@ -590,7 +585,7 @@ pub fn process_ecosystem(
     eprintln!("Downloading {} from {}...", ecosystem, url);
 
     // Download with retry logic
-    let zip_bytes = download_with_retry(client, &url)?;
+    let zip_bytes = download_with_retry(transport, &url)?;
 
     eprintln!("Downloaded {:.2} MB", zip_bytes.len() as f64 / 1_048_576.0);
 
@@ -599,33 +594,20 @@ pub fn process_ecosystem(
 }
 
 /// Download a URL with retry logic (single retry on transient failure).
-fn download_with_retry(client: &Client, url: &str) -> std::io::Result<Vec<u8>> {
-    match download_bytes(client, url) {
-        Ok(bytes) => Ok(bytes),
-        Err(e) => {
-            eprintln!("Download failed ({}), retrying after 5s...", e);
-            std::thread::sleep(Duration::from_secs(5));
-            download_bytes(client, url)
-        }
-    }
+/// Download an OSV archive.
+///
+/// The retry-once-after-5s loop this used to carry is gone: the transport
+/// retries transient failures with shared backoff and per-host pacing.
+fn download_with_retry(transport: &HttpTransport, url: &str) -> std::io::Result<Vec<u8>> {
+    download_bytes(transport, url)
 }
 
 /// Download bytes from a URL.
-fn download_bytes(client: &Client, url: &str) -> std::io::Result<Vec<u8>> {
-    let response = client
-        .get(url)
-        .send()
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-    if !response.status().is_success() {
-        return Err(std::io::Error::other(format!("HTTP {}", response.status())));
-    }
-
-    let bytes = response
-        .bytes()
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-    Ok(bytes.to_vec())
+fn download_bytes(transport: &HttpTransport, url: &str) -> std::io::Result<Vec<u8>> {
+    transport
+        .get(url, None)
+        .map(|response| response.bytes)
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Process a ZIP archive from bytes, extracting and emitting triples for each OSV JSON entry.

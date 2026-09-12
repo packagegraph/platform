@@ -1,11 +1,12 @@
 use crate::cached_fetch::{CachedFetcher, HttpResponse};
+use crate::emit::rdf::write_package_identity;
 use crate::fetch_error::FetchError;
 use crate::http_cache::HttpCache;
+use crate::http_transport::HttpTransport;
 use crate::npm::read_seed_file;
 use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::uris::*;
 use regex::Regex;
-use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -13,7 +14,6 @@ use std::fs::File;
 use std::io::Result;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
-use crate::emit::rdf::write_package_identity;
 
 /// Number of worker threads used to fetch PyPI packages in parallel.
 const FETCH_THREADS: usize = 8;
@@ -52,7 +52,7 @@ pub fn normalize_pypi_name(name: &str) -> String {
 }
 
 pub struct PypiCollector {
-    client: Client,
+    transport: HttpTransport,
     http_cache: Option<HttpCache>,
     cache_ttl_hours: u64,
     base_url: String,
@@ -90,10 +90,8 @@ fn should_delay(outcome: &PypiOutcome) -> bool {
 
 impl PypiCollector {
     pub fn new() -> Self {
-        let client = crate::enricher::default_http_client();
-
         Self {
-            client,
+            transport: HttpTransport::new(),
             http_cache: None,
             cache_ttl_hours: 24,
             base_url: "https://pypi.org".to_string(),
@@ -140,7 +138,13 @@ impl PypiCollector {
         self.collect(seed_path, max_depth, max_packages, output_path)
     }
 
-    pub fn collect(&self, packages_file: &str, max_depth: u32, max_packages: usize, output_path: &str) -> Result<(usize, usize)> {
+    pub fn collect(
+        &self,
+        packages_file: &str,
+        max_depth: u32,
+        max_packages: usize,
+        output_path: &str,
+    ) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
@@ -426,81 +430,19 @@ impl PypiCollector {
     /// HTTP GET with retry and 429 backoff. Returns raw HttpResponse for
     /// the CachedFetcher's http_get closure. When `etag` is provided, sends
     /// an `If-None-Match` header for conditional GET (enabling 304 responses).
+    /// Fetch through the shared transport.
+    ///
+    /// Retry, backoff, `Retry-After` and pacing were a duplicate of maven's
+    /// loop; both now delegate. `_base_delay_ms` is vestigial.
     fn http_get_with_retry(
         &self,
         url: &str,
         etag: Option<&str>,
-        base_delay_ms: &mut u64,
+        _base_delay_ms: &mut u64,
     ) -> std::result::Result<HttpResponse, FetchError> {
-        let max_attempts = 5;
-
-        for attempt in 0..max_attempts {
-            let mut request = self.client.get(url);
-            if let Some(etag_val) = etag {
-                request = request.header("If-None-Match", etag_val);
-            }
-            match request.send() {
-                Ok(response) => {
-                    if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                        let retry_after_secs = response
-                            .headers()
-                            .get("retry-after")
-                            .and_then(|h| h.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or_else(|| 2u64.pow(attempt as u32));
-
-                        let delay_ms = retry_after_secs * 1000;
-                        eprintln!(
-                            "  Rate limited on {}, waiting {}s...",
-                            url, retry_after_secs
-                        );
-                        std::thread::sleep(Duration::from_millis(delay_ms));
-                        *base_delay_ms = (*base_delay_ms * 2).min(5000);
-                        continue;
-                    }
-
-                    let status = response.status().as_u16();
-                    let etag = response
-                        .headers()
-                        .get("etag")
-                        .and_then(|h| h.to_str().ok())
-                        .map(|s| s.to_string());
-                    let bytes = response
-                        .bytes()
-                        .map_err(|e| FetchError::Transport {
-                            url: url.to_string(),
-                            source: e,
-                        })?
-                        .to_vec();
-
-                    return Ok(HttpResponse {
-                        status,
-                        bytes,
-                        etag,
-                        last_modified: None,
-                    });
-                }
-                Err(e) => {
-                    if attempt < max_attempts - 1 {
-                        let delay = Duration::from_millis(1000 * 2u64.pow(attempt as u32));
-                        std::thread::sleep(delay);
-                        continue;
-                    }
-                    return Err(FetchError::Transport {
-                        url: url.to_string(),
-                        source: e,
-                    });
-                }
-            }
-        }
-
-        Err(FetchError::HttpStatus {
-            url: url.to_string(),
-            status: 429,
-        })
+        self.transport.get(url, etag)
     }
 
-    /// Emit package triples and return (triple_count, dep_names) for spidering.
     fn emit_package_triples(
         &self,
         writer: &mut NTriplesWriter,
@@ -1101,7 +1043,10 @@ mod tests {
         assert_eq!(pkg.info.name, "retry-pkg");
         mock_429.assert();
         mock_200.assert();
-        assert!(base_delay > 200, "base_delay should increase after 429");
+        // Pre-migration this also asserted base_delay grew past 200. That
+        // described pypi's manual inter-request pacing, which the
+        // transport's per-host limiter replaces; the 429-then-200 retry
+        // this test exists to pin is unchanged, as both mocks above show.
     }
 
     #[test]
