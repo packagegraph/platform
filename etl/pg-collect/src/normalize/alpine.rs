@@ -2,8 +2,6 @@
 
 use crate::ir::*;
 use std::collections::{BTreeMap, HashMap};
-use std::io::{BufRead, BufReader, Result};
-use std::path::Path;
 
 /// Normalize an Alpine APKINDEX entry into a PackageIr.
 pub fn normalize_alpine_package(

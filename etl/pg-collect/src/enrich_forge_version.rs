@@ -4,9 +4,8 @@
 //! vcs:ForgeSoftwareVersion + vcs:ForgeVersionObservation triples.
 
 use crate::cache::FileCache;
-use crate::enricher::{rate_limit, SLOW_RATE_LIMIT};
 use crate::fetch_error::FetchError;
-use crate::http_transport::HttpTransport;
+use crate::http_transport::{HostLimiter, HttpTransport, SLOW_RATE_LIMIT};
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
@@ -39,7 +38,11 @@ impl ForgeVersionEnricher {
 
         Self {
             sparql,
-            transport: HttpTransport::new(),
+            // This enricher probes whatever forge a package happens to name,
+            // mostly small self-hosted GitLab and Savannah instances. There is
+            // no host list to pace from a table, so the caution lives in the
+            // default interval instead.
+            transport: HttpTransport::new().with_limiter(HostLimiter::new(SLOW_RATE_LIMIT)),
             cache,
             gitlab_token,
             graph_uri: None,
@@ -89,7 +92,6 @@ impl ForgeVersionEnricher {
                 Err(e) => eprintln!("  Error probing {}: {}", host, e),
             }
 
-            rate_limit(SLOW_RATE_LIMIT);
         }
 
         writer.flush()?;

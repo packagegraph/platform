@@ -381,7 +381,7 @@ impl RpmCollector {
                             if let Some(arch) = fields.get("arch") {
                                 let ver = fields.get("ver").map(|s| s.as_str()).unwrap_or("");
                                 let rel = fields.get("rel").map(|s| s.as_str()).unwrap_or("");
-                                let version_str = format!("{}-{}.{}", ver, rel, arch);
+                                let _version_str = format!("{}-{}.{}", ver, rel, arch);
                                 let identity = package_identity_uri(
                                     &self.distro_name,
                                     release_name,

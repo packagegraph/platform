@@ -6,7 +6,6 @@ use crate::uris::*;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
-use std::time::Duration;
 use crate::emit::rdf::write_package_identity;
 
 pub struct HackageCollector {

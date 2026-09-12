@@ -9,7 +9,7 @@
 //! Replaces 4 Python enrichers: github.py, vcs_activity.py, metrics.py, license.py
 
 use crate::cache::{FileCache, MinioConfig};
-use crate::enricher::{github_owner_repo, rate_limit, DEFAULT_RATE_LIMIT};
+use crate::enricher::github_owner_repo;
 use crate::fetch_error::FetchError;
 use crate::forge;
 use crate::http_transport::HttpTransport;
@@ -21,7 +21,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 
 /// GraphQL API v4 response wrapper. rateLimit is inside `data` (GraphQL top-level field).
 #[derive(Debug, Serialize, Deserialize)]
@@ -379,7 +378,6 @@ impl GitHubEnricher {
                 Err(e) => eprintln!("  Error processing {}/{}: {}", owner, repo, e),
             }
 
-            rate_limit(DEFAULT_RATE_LIMIT);
         }
 
         writer.flush()?;
@@ -501,7 +499,6 @@ impl GitHubEnricher {
                 }
             }
 
-            rate_limit(DEFAULT_RATE_LIMIT);
         }
 
         if total_repos > 0 && total_errors as f64 / total_repos as f64 > 0.5 {

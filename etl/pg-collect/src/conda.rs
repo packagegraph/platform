@@ -2,7 +2,7 @@ use crate::emit::rdf::write_package_identity;
 use crate::http_transport::HttpTransport;
 use crate::npm::read_seed_file;
 use crate::ntriples::{bnode_id, NTriplesWriter};
-use crate::source_cache::{CacheResult, CacheScope, SourceCache};
+use crate::source_cache::SourceCache;
 use crate::uris::*;
 use regex::Regex;
 use serde::Deserialize;

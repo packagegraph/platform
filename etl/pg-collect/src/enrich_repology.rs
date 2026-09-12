@@ -6,7 +6,6 @@
 //! non-transitive correspondence (symmetric but NOT transitive).
 
 use crate::cache::FileCache;
-use crate::enricher::{rate_limit, SLOW_RATE_LIMIT};
 use crate::fetch_error::FetchError;
 use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
@@ -125,7 +124,6 @@ impl RepologyEnricher {
                 }
             }
 
-            rate_limit(SLOW_RATE_LIMIT);
         }
 
         if total_checked > 0 && total_errors as f64 / total_checked as f64 > 0.5 {

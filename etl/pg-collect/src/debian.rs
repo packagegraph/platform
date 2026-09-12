@@ -11,7 +11,6 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
-use std::time::Duration;
 
 /// Normalize an architecture argument to (repo_path, rdf_identity).
 ///
@@ -517,7 +516,7 @@ impl DebianCollector {
         let pkg_name = pkg_data.get("Package").unwrap();
         let pkg_version = pkg_data.get("Version").unwrap();
 
-        let pkg_uri = package_uri(
+        let _pkg_uri = package_uri(
             &self.distro_name,
             codename,
             arch_name,
@@ -527,7 +526,7 @@ impl DebianCollector {
         let identity_uri = package_identity_uri(&self.distro_name, codename, arch_name, pkg_name);
 
         // First emit all the package triples (delegates to existing method)
-        let mut triples =
+        let triples =
             self.emit_package_triples(writer, pkg_data, codename, suite, arch_name)?;
 
         // Then populate source tracking sets

@@ -12,8 +12,6 @@
 //! SPARQL-level filtering. See plan for follow-on PVR comparison task.
 
 use crate::cache::FileCache;
-use crate::enricher::rate_limit;
-use crate::fetch_error::FetchError;
 use crate::http_transport::HttpTransport;
 use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
@@ -25,7 +23,6 @@ use regex::Regex;
 use serde_json;
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 
 /// CVE identifier regex: CVE-YYYY-NNNNN
 static CVE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"CVE-\d{4}-\d{4,}").unwrap());
@@ -204,7 +201,6 @@ impl GlsaCollector {
             total_advisories += 1;
             total_triples += advisory_triples;
 
-            rate_limit(Duration::from_secs(1)); // 1 request/second
         }
 
         writer.flush()?;
@@ -380,7 +376,7 @@ SELECT ?pkg WHERE {{
         triples += 4;
 
         // Fixed events: from unaffected ranges
-        for (idx, (range_op, version)) in affected_pkg.unaffected_ranges.iter().enumerate() {
+        for (idx, (_range_op, version)) in affected_pkg.unaffected_ranges.iter().enumerate() {
             let fix_bnode = format!("{}_fix{}", range_bnode, idx);
             writer.write_bnode_to_bnode(
                 &range_bnode,

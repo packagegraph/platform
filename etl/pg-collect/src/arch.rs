@@ -1,7 +1,7 @@
 use crate::emit::rdf::write_package_identity;
 use crate::http_transport::HttpTransport;
 use crate::ntriples::{bnode_id, NTriplesWriter};
-use crate::source_cache::{CacheResult, CacheScope, SourceCache};
+use crate::source_cache::SourceCache;
 use crate::uris::*;
 use flate2::read::GzDecoder;
 use regex::Regex;
@@ -9,7 +9,6 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Result};
-use std::time::Duration;
 use tar::Archive;
 
 pub struct ArchCollector {
@@ -431,9 +430,6 @@ impl ArchCollector {
                 }
                 Err(e) => eprintln!("  AUR batch error: {}", e),
             }
-
-            // Rate limiting
-            std::thread::sleep(Duration::from_secs(1));
 
             if total_packages % 1000 == 0 && total_packages > 0 {
                 eprintln!("  AUR progress: {} packages", total_packages);

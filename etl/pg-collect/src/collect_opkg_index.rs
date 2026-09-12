@@ -81,7 +81,7 @@ impl OpkgIndexCollector {
         writer: &mut NTriplesWriter,
         identity_map: &HashMap<String, String>,
         digest_map: &mut HashMap<String, String>,
-        cache: Option<&SourceCache>,
+        _cache: Option<&SourceCache>,
     ) -> Result<usize> {
         // Fetch Packages.gz
         let resp = reqwest::blocking::get(url)

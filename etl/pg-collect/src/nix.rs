@@ -1,7 +1,7 @@
 use crate::emit::rdf::write_package_identity;
 use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
-use crate::source_cache::{CacheResult, CacheScope, SourceCache};
+use crate::source_cache::SourceCache;
 use crate::uris::*;
 use brotli::Decompressor;
 use serde::Deserialize;
@@ -46,7 +46,7 @@ struct NixMeta {
 
 impl NixCollector {
     pub fn new(distro_name: String, release_name: String, channel_url: String) -> Self {
-        let client = crate::enricher::http_client_builder()
+        let _client = crate::enricher::http_client_builder()
             .timeout(Duration::from_secs(300))
             .build()
             .expect("Failed to create HTTP client");

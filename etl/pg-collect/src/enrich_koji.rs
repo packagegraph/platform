@@ -4,8 +4,6 @@
 //! and emits BuildActivity + SLSA attestation triples.
 
 use crate::cache::FileCache;
-use crate::enricher::rate_limit;
-use crate::fetch_error::FetchError;
 use crate::forge::emit_dq_issue;
 use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
@@ -16,7 +14,6 @@ use quick_xml::Reader;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 
 pub struct KojiEnricher {
     sparql: Option<SparqlClient>,
@@ -177,7 +174,6 @@ impl KojiEnricher {
                 Err(e) => eprintln!("  {} → error: {}", nvr, e),
             }
 
-            rate_limit(Duration::from_millis(500));
         }
 
         writer.flush()?;
@@ -227,7 +223,6 @@ impl KojiEnricher {
                 Err(e) => eprintln!("  {} → error: {}", nvr, e),
             }
 
-            rate_limit(Duration::from_millis(500));
         }
 
         writer.flush()?;
@@ -380,7 +375,6 @@ impl KojiEnricher {
         };
 
         // Step 2: queryRPMSigs(rpm_id) → get sigkeys
-        rate_limit(Duration::from_millis(200));
 
         let query_sigs_xml = format!(
             r#"<?xml version="1.0"?>

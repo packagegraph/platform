@@ -4,14 +4,12 @@
 //! with CVE cross-references.
 
 use crate::cache::FileCache;
-use crate::enricher::rate_limit;
 use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 
 /// If more than this fraction of per-CVE RHSA detail fetches fail in a
 /// single run, abort rather than upload a graph that silently dropped
@@ -42,7 +40,7 @@ impl AdvisoryEnricher {
         auth: SparqlAuth,
         backend: SparqlBackend,
     ) -> Self {
-        let client = crate::enricher::default_http_client();
+        let _client = crate::enricher::default_http_client();
         let sparql = make_sparql_client(endpoint, &auth, backend);
 
         let cache = cache_dir.map(|dir| {
@@ -156,11 +154,9 @@ impl AdvisoryEnricher {
                     }
                 }
 
-                rate_limit(Duration::from_millis(200));
             }
 
             page += 1;
-            rate_limit(Duration::from_millis(500));
         }
 
         if exceeds_failure_threshold(detail_fetch_failures, total_cves) {
@@ -366,7 +362,7 @@ impl AdvisoryEnricher {
 
         // Debian tracker JSON: { "package_name": { "CVE-XXXX-YYYY": { ... } } }
         if let Some(packages) = data.as_object() {
-            for (pkg_name, cves) in packages {
+            for (_pkg_name, cves) in packages {
                 if let Some(cves_obj) = cves.as_object() {
                     for (cve_id, cve_data) in cves_obj {
                         if !cve_id.starts_with("CVE-") {

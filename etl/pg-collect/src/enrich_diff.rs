@@ -1,6 +1,5 @@
 use crate::cache::FileCache;
-use crate::enricher::{github_owner_repo, rate_limit};
-use crate::fetch_error::FetchError;
+use crate::enricher::github_owner_repo;
 use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
@@ -10,7 +9,6 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 
 pub struct DiffEnricher {
     sparql: SparqlClient,
@@ -337,7 +335,6 @@ impl DiffEnricher {
                 }
             }
 
-            rate_limit(Duration::from_millis(500));
         }
 
         Ok(triples)

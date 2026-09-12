@@ -10,7 +10,6 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::blocking::Client;
-use std::time::Duration;
 
 /// Regex for extracting owner/repo from GitHub URLs.
 ///
@@ -39,17 +38,6 @@ pub fn github_owner_repo(url: &str) -> Option<(String, String)> {
         caps.get(2)?.as_str().to_string(),
     ))
 }
-
-/// Sleep for rate limiting between API calls.
-pub fn rate_limit(duration: Duration) {
-    std::thread::sleep(duration);
-}
-
-/// Default rate limit for most APIs (200ms between calls).
-pub const DEFAULT_RATE_LIMIT: Duration = Duration::from_millis(200);
-
-/// Rate limit for rate-sensitive APIs like Repology (1s between calls).
-pub const SLOW_RATE_LIMIT: Duration = Duration::from_secs(1);
 
 /// User-Agent sent by every pg-collect HTTP client. Some mirror CDNs
 /// (e.g. mirror.stream.centos.org's CloudFront front-end) return 403 for

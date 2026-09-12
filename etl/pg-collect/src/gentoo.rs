@@ -1,5 +1,5 @@
 use crate::ntriples::NTriplesWriter;
-use crate::source_cache::{CacheResult, CacheScope, SourceCache};
+use crate::source_cache::SourceCache;
 use crate::uris::*;
 use once_cell::sync::Lazy;
 use regex::Regex;

@@ -2,7 +2,7 @@ use crate::emit::rdf::write_package_identity;
 use crate::forge::emit_dq_issue;
 use crate::http_transport::HttpTransport;
 use crate::ntriples::{bnode_id, NTriplesWriter};
-use crate::source_cache::{CacheResult, CacheScope, SourceCache};
+use crate::source_cache::SourceCache;
 use crate::uris::*;
 use serde::Deserialize;
 use std::fs::File;
@@ -58,7 +58,7 @@ pub struct Cask {
 
 impl HomebrewCollector {
     pub fn new(api_base: String, distro_name: String, release_name: String) -> Self {
-        let client = crate::enricher::http_client_builder()
+        let _client = crate::enricher::http_client_builder()
             .timeout(Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()

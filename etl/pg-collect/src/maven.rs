@@ -8,7 +8,6 @@ use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::uris::*;
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;

@@ -1,5 +1,5 @@
 use crate::fetch_error::FetchError;
-use crate::http_transport::{HttpTransport, StatsSnapshot};
+use crate::http_transport::HttpTransport;
 use crate::npm::read_seed_file;
 use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::sparql::{SparqlAuth, SparqlBackend};

@@ -8,7 +8,6 @@ use crate::uris::{
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Cursor, Result};
-use std::time::Duration;
 
 pub struct OsvCollector {
     transport: HttpTransport,

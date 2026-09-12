@@ -5,15 +5,12 @@
 //! (osv.rs) which downloads ecosystem ZIPs from GCS.
 
 use crate::cache::FileCache;
-use crate::enricher::rate_limit;
-use crate::fetch_error::FetchError;
 use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::osv::{emit_vulnerability_triples, OsvVulnerability};
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 
 pub struct SecurityEnricher {
     sparql: SparqlClient,
@@ -99,7 +96,6 @@ impl SecurityEnricher {
                 Err(e) => eprintln!("  Error checking {}: {}", name, e),
             }
 
-            rate_limit(Duration::from_millis(500));
         }
 
         writer.flush()?;

@@ -1,5 +1,4 @@
-use crate::fetch_error::FetchError;
-use crate::http_transport::{HttpTransport, RetryPolicy, StatsSnapshot};
+use crate::http_transport::{HttpTransport, StatsSnapshot};
 use crate::ntriples::NTriplesWriter;
 use crate::uris::*;
 use flate2::read::GzDecoder;
@@ -301,6 +300,7 @@ impl CranCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http_transport::RetryPolicy;
 
     #[test]
     fn test_parse_dep_list() {

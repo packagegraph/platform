@@ -6,7 +6,6 @@
 //! extraction. Ecosystem correlation uses Source0 domain matching and
 //! BuildRequires macro detection.
 
-use crate::enricher::rate_limit;
 use crate::fetch_error::FetchError;
 use crate::forge::{emit_dq_issue, emit_forge_triples, extract_forge_url_with_field};
 use crate::http_transport::HttpTransport;
@@ -17,7 +16,6 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::io::Result;
-use std::time::Duration;
 
 /// Regex for extracting Source0 URL from spec file.
 static SOURCE0_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?im)^Source0?\s*:\s*(.+)$").unwrap());
@@ -153,7 +151,6 @@ impl SpecCollector {
                 );
             }
 
-            rate_limit(Duration::from_millis(200));
         }
 
         eprintln!(

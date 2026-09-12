@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use zstd::stream::{read::Decoder, write::Encoder};
 
 /// IR schema version for invalidation tracking.
@@ -154,7 +154,7 @@ impl IrWriter {
     }
 
     /// Finish writing and return the record count.
-    pub fn finish(mut self) -> io::Result<usize> {
+    pub fn finish(self) -> io::Result<usize> {
         self.encoder
             .finish()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;

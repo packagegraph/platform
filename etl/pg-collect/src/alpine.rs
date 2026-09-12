@@ -2,7 +2,7 @@ use crate::emit::rdf::write_package_identity;
 use crate::forge::emit_dq_issue;
 use crate::http_transport::HttpTransport;
 use crate::ntriples::{bnode_id, NTriplesWriter};
-use crate::source_cache::{CacheResult, CacheScope, SourceCache};
+use crate::source_cache::SourceCache;
 use crate::uris::*;
 use flate2::read::MultiGzDecoder;
 use regex::Regex;

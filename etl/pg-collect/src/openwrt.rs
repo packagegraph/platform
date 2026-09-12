@@ -3,7 +3,7 @@ use crate::uris::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
 use std::path::Path;
 use walkdir::WalkDir;
@@ -305,7 +305,7 @@ impl OpenWrtCollector {
         &self,
         writer: &mut NTriplesWriter,
         pkg: &OpenWrtPackage,
-        is_secondary: bool,
+        _is_secondary: bool,
     ) -> Result<usize> {
         let default_version = "0".to_string();
         let version = pkg.version.as_ref().unwrap_or(&default_version);
@@ -451,6 +451,7 @@ impl OpenWrtCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::{Read, Write};
     use tempfile::{NamedTempFile, TempDir};
 

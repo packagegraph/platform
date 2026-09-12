@@ -3,7 +3,7 @@ use crate::uris::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
 use std::path::Path;
 use walkdir::WalkDir;
@@ -493,6 +493,7 @@ impl YoctoCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::{Read, Write};
     use tempfile::{NamedTempFile, TempDir};
 

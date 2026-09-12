@@ -121,6 +121,15 @@ impl HostLimiter {
         }
     }
 
+    /// The interval this limiter enforces for `host`. Exposed so the pacing
+    /// policy can be asserted on directly instead of by timing a request.
+    pub fn interval_for(&self, host: &str) -> Duration {
+        self.lock()
+            .get(host)
+            .map(|s| s.interval)
+            .unwrap_or(self.default_interval)
+    }
+
     /// Builder-style per-host override, for known rate-sensitive hosts.
     pub fn with_host(self, host: &str, interval: Duration) -> Self {
         {
@@ -181,9 +190,43 @@ impl HostLimiter {
     }
 }
 
+/// Default pacing between two requests to the same host.
+pub const DEFAULT_RATE_LIMIT: Duration = Duration::from_millis(200);
+
+/// Pacing for hosts that need a gentler hand than the default.
+pub const SLOW_RATE_LIMIT: Duration = Duration::from_secs(1);
+
+/// Hosts that need to be paced slower than `DEFAULT_RATE_LIMIT`.
+///
+/// This is the one place the project records how hard a given host may be
+/// hit. Before the shared transport each collector slept for itself, so the
+/// same host could be paced three different ways depending on which
+/// collector reached it, and a new collector hitting a known-touchy host
+/// got no pacing at all unless its author remembered. Now pacing comes with
+/// the transport: there is nothing to remember and nothing to forget.
+///
+/// Intervals are the slowest of what the collectors previously used, since
+/// widening is always the safe direction.
+const HOST_INTERVALS: &[(&str, Duration)] = &[
+    // Small community-run infrastructure, previously SLOW_RATE_LIMIT.
+    ("repology.org", SLOW_RATE_LIMIT),
+    ("bodhi.fedoraproject.org", SLOW_RATE_LIMIT),
+    ("security.gentoo.org", SLOW_RATE_LIMIT),
+    ("aur.archlinux.org", SLOW_RATE_LIMIT),
+    // Quota'd APIs, previously a 500ms sleep per loop iteration.
+    ("api.github.com", Duration::from_millis(500)),
+    ("api.osv.dev", Duration::from_millis(500)),
+    ("access.redhat.com", Duration::from_millis(500)),
+    ("koji.fedoraproject.org", Duration::from_millis(500)),
+];
+
 impl Default for HostLimiter {
     fn default() -> Self {
-        Self::new(crate::enricher::DEFAULT_RATE_LIMIT)
+        HOST_INTERVALS
+            .iter()
+            .fold(Self::new(DEFAULT_RATE_LIMIT), |l, &(h, i)| {
+                l.with_host(h, i)
+            })
     }
 }
 
@@ -1038,5 +1081,59 @@ mod tests {
         assert_eq!(snap.attempts, 1);
         assert_eq!(snap.successes, 1);
         assert_eq!(snap.failures, 0);
+    }
+
+    #[test]
+    fn test_default_limiter_paces_rate_sensitive_hosts() {
+        let limiter = HostLimiter::default();
+
+        // Hosts that used to be paced by a hand-rolled `rate_limit(SLOW_RATE_LIMIT)`
+        // in their collector.
+        for host in [
+            "repology.org",
+            "bodhi.fedoraproject.org",
+            "security.gentoo.org",
+            "aur.archlinux.org",
+        ] {
+            assert_eq!(
+                limiter.interval_for(host),
+                Duration::from_secs(1),
+                "{host} should be paced at 1s"
+            );
+        }
+
+        // Hosts whose collectors slept 500ms per iteration.
+        for host in [
+            "api.github.com",
+            "api.osv.dev",
+            "access.redhat.com",
+            "koji.fedoraproject.org",
+        ] {
+            assert_eq!(
+                limiter.interval_for(host),
+                Duration::from_millis(500),
+                "{host} should be paced at 500ms"
+            );
+        }
+
+        // Anything unlisted falls back to the default.
+        assert_eq!(
+            limiter.interval_for("registry.npmjs.org"),
+            DEFAULT_RATE_LIMIT
+        );
+    }
+
+    #[test]
+    fn test_widen_still_overrides_a_table_entry() {
+        let limiter = HostLimiter::default();
+        limiter.widen("api.github.com", Duration::from_secs(30));
+        assert_eq!(
+            limiter.interval_for("api.github.com"),
+            Duration::from_secs(30),
+            "a Retry-After should still be able to slow a table-listed host"
+        );
+        // ...but never speed one up.
+        limiter.widen("repology.org", Duration::from_millis(1));
+        assert_eq!(limiter.interval_for("repology.org"), Duration::from_secs(1));
     }
 }

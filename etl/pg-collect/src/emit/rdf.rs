@@ -6,7 +6,6 @@
 use crate::ir::{MaintainerIr, PackageIr};
 use crate::ntriples::NTriplesWriter;
 use crate::uris::*;
-use std::collections::HashSet;
 use std::io::Result;
 
 /// Policy configuration for RDF emission.

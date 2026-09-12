@@ -3,7 +3,6 @@
 //! Queries Fuseki for npm packages, checks the npm registry for attestation
 //! bundles (--provenance flag), and emits SLSA provenance triples.
 
-use crate::enricher::rate_limit;
 use crate::fetch_error::FetchError;
 use crate::forge::emit_dq_issue;
 use crate::http_transport::HttpTransport;
@@ -12,7 +11,6 @@ use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient}
 use crate::uris::*;
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 
 pub struct NpmProvenanceEnricher {
     sparql: SparqlClient,
@@ -87,7 +85,6 @@ impl NpmProvenanceEnricher {
                 }
             }
 
-            rate_limit(Duration::from_millis(200));
         }
 
         if total_checked > 0 && total_errors as f64 / total_checked as f64 > 0.5 {

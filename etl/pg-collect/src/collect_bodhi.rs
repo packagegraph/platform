@@ -4,8 +4,6 @@
 //! and extracts NVRs and CVE references for package resolution.
 
 use crate::cache::FileCache;
-use crate::enricher::rate_limit;
-use crate::fetch_error::FetchError;
 use crate::forge::emit_dq_issue;
 use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
@@ -18,7 +16,6 @@ use regex::Regex;
 use serde_json;
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 
 /// CVE identifier regex: CVE-YYYY-NNNNN
 static CVE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"CVE-\d{4}-\d{4,}").unwrap());
@@ -232,7 +229,6 @@ impl BodhiCollector {
             }
 
             page += 1;
-            rate_limit(Duration::from_secs(1)); // 1 request/second
         }
 
         writer.flush()?;

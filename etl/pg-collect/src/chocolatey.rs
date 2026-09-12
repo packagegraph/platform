@@ -1,12 +1,11 @@
 use crate::fetch_error::FetchError;
-use crate::http_transport::{HttpTransport, RetryPolicy, StatsSnapshot};
+use crate::http_transport::{HttpTransport, StatsSnapshot};
 use crate::ntriples::NTriplesWriter;
 use crate::uris::*;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 use crate::emit::rdf::write_package_identity;
 
 pub struct ChocolateyCollector {
@@ -292,6 +291,7 @@ impl ChocolateyCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http_transport::RetryPolicy;
 
     #[test]
     fn test_parse_odata_feed() {

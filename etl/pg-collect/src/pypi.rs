@@ -1,4 +1,4 @@
-use crate::cached_fetch::{CachedFetcher, HttpResponse};
+use crate::cached_fetch::CachedFetcher;
 use crate::emit::rdf::write_package_identity;
 use crate::fetch_error::FetchError;
 use crate::http_cache::HttpCache;
@@ -7,7 +7,6 @@ use crate::npm::read_seed_file;
 use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::uris::*;
 use regex::Regex;
-use reqwest::StatusCode;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -80,12 +79,6 @@ struct PypiInfo {
 struct PypiOutcome {
     was_network_hit: bool,
     result: std::result::Result<PypiProjectResponse, FetchError>,
-}
-
-/// Whether a rate-limit delay should be applied after this fetch.
-/// True only when a network request was actually made (cache hits skip delay).
-fn should_delay(outcome: &PypiOutcome) -> bool {
-    outcome.was_network_hit
 }
 
 impl PypiCollector {
@@ -229,10 +222,6 @@ impl PypiCollector {
         state: &Mutex<CollectState>,
         idle: &Condvar,
     ) {
-        // Per-worker rate-limit backoff, kept off the shared state so the
-        // fetch/retry path needs no lock.
-        let mut base_delay_ms = 0u64;
-
         loop {
             // ── Acquire work (or exit) under the lock ──────────────────
             let (name, depth) = {
@@ -280,8 +269,7 @@ impl PypiCollector {
             };
 
             // ── Fetch outside the lock (the expensive, parallel part) ──
-            let outcome = self.fetch_package(&name, &mut base_delay_ms, cached_fetcher);
-            let needs_delay = should_delay(&outcome);
+            let outcome = self.fetch_package(&name, cached_fetcher);
 
             // ── Commit results under the lock ──────────────────────────
             {
@@ -334,10 +322,6 @@ impl PypiCollector {
                     idle.notify_all();
                 }
             }
-
-            if needs_delay {
-                std::thread::sleep(Duration::from_millis(base_delay_ms));
-            }
         }
     }
 
@@ -364,12 +348,7 @@ impl PypiCollector {
 
     /// Fetch a package, using CachedFetcher when available.
     /// Returns a FetchOutcome containing was_network_hit and the parsed response or error.
-    fn fetch_package(
-        &self,
-        name: &str,
-        base_delay_ms: &mut u64,
-        cached_fetcher: &Option<CachedFetcher>,
-    ) -> PypiOutcome {
+    fn fetch_package(&self, name: &str, cached_fetcher: &Option<CachedFetcher>) -> PypiOutcome {
         let url = format!("{}/pypi/{}/json", self.base_url, name);
         let ttl = Duration::from_secs(self.cache_ttl_hours * 3600);
 
@@ -381,7 +360,7 @@ impl PypiCollector {
 
         if let Some(fetcher) = cached_fetcher {
             let outcome = fetcher.fetch(&url, Some(ttl), &pypi_validator, |req_url, etag| {
-                self.http_get_with_retry(req_url, etag, base_delay_ms)
+                self.transport.get(req_url, etag)
             });
 
             PypiOutcome {
@@ -397,7 +376,7 @@ impl PypiCollector {
             }
         } else {
             // No cache -- direct fetch with retry (no etag for uncached requests)
-            match self.http_get_with_retry(&url, None, base_delay_ms) {
+            match self.transport.get(&url, None) {
                 Ok(response) => match response.status {
                     200 => {
                         let result = serde_json::from_slice::<PypiProjectResponse>(&response.bytes)
@@ -425,22 +404,6 @@ impl PypiCollector {
                 },
             }
         }
-    }
-
-    /// HTTP GET with retry and 429 backoff. Returns raw HttpResponse for
-    /// the CachedFetcher's http_get closure. When `etag` is provided, sends
-    /// an `If-None-Match` header for conditional GET (enabling 304 responses).
-    /// Fetch through the shared transport.
-    ///
-    /// Retry, backoff, `Retry-After` and pacing were a duplicate of maven's
-    /// loop; both now delegate. `_base_delay_ms` is vestigial.
-    fn http_get_with_retry(
-        &self,
-        url: &str,
-        etag: Option<&str>,
-        _base_delay_ms: &mut u64,
-    ) -> std::result::Result<HttpResponse, FetchError> {
-        self.transport.get(url, etag)
     }
 
     fn emit_package_triples(
@@ -853,59 +816,6 @@ mod tests {
         assert!(validator(b"").is_err());
     }
 
-    // ── should_delay tests ─────────────────────────────────────────
-
-    #[test]
-    fn test_should_delay_false_on_cache_hit() {
-        let outcome = PypiOutcome {
-            was_network_hit: false,
-            result: Ok(PypiProjectResponse {
-                info: PypiInfo {
-                    name: "cached".into(),
-                    version: "1.0".into(),
-                    summary: None,
-                    license: None,
-                    home_page: None,
-                    requires_python: None,
-                    requires_dist: None,
-                    classifiers: None,
-                },
-            }),
-        };
-        assert!(!should_delay(&outcome), "cache hit should not delay");
-    }
-
-    #[test]
-    fn test_should_delay_true_on_network_fetch() {
-        let outcome = PypiOutcome {
-            was_network_hit: true,
-            result: Ok(PypiProjectResponse {
-                info: PypiInfo {
-                    name: "fetched".into(),
-                    version: "1.0".into(),
-                    summary: None,
-                    license: None,
-                    home_page: None,
-                    requires_python: None,
-                    requires_dist: None,
-                    classifiers: None,
-                },
-            }),
-        };
-        assert!(should_delay(&outcome), "network fetch should delay");
-    }
-
-    #[test]
-    fn test_should_delay_true_on_network_error() {
-        let outcome = PypiOutcome {
-            was_network_hit: true,
-            result: Err(FetchError::NotFound {
-                url: "https://pypi.org/pypi/gone/json".into(),
-            }),
-        };
-        assert!(should_delay(&outcome), "network error should still delay");
-    }
-
     // ── Collector-level acceptance tests (mockito) ─────────────────
 
     fn valid_pypi_json(name: &str, version: &str) -> String {
@@ -954,7 +864,7 @@ mod tests {
         let cached_fetcher = make_cached_fetcher(&collector);
 
         let mut base_delay = 200u64;
-        let outcome = collector.fetch_package("requests", &mut base_delay, &cached_fetcher);
+        let outcome = collector.fetch_package("requests", &cached_fetcher);
 
         assert!(
             !outcome.was_network_hit,
@@ -987,7 +897,7 @@ mod tests {
         let cached_fetcher = make_cached_fetcher(&collector);
 
         let mut base_delay = 200u64;
-        let outcome = collector.fetch_package("flask", &mut base_delay, &cached_fetcher);
+        let outcome = collector.fetch_package("flask", &cached_fetcher);
 
         assert!(outcome.was_network_hit, "cache miss should hit network");
         let pkg = outcome.result.expect("should parse response");
@@ -996,7 +906,7 @@ mod tests {
 
         // Verify response was cached -- second fetch should NOT hit network
         let cached_fetcher2 = make_cached_fetcher(&collector);
-        let outcome2 = collector.fetch_package("flask", &mut base_delay, &cached_fetcher2);
+        let outcome2 = collector.fetch_package("flask", &cached_fetcher2);
         assert!(
             !outcome2.was_network_hit,
             "second fetch should be cache hit"
@@ -1036,7 +946,7 @@ mod tests {
         let cached_fetcher = make_cached_fetcher(&collector);
 
         let mut base_delay = 200u64;
-        let outcome = collector.fetch_package("retry-pkg", &mut base_delay, &cached_fetcher);
+        let outcome = collector.fetch_package("retry-pkg", &cached_fetcher);
 
         assert!(outcome.was_network_hit);
         let pkg = outcome.result.expect("should succeed after retry");
@@ -1073,13 +983,13 @@ mod tests {
         let mut base_delay = 200u64;
 
         // First fetch -- malformed response
-        let outcome1 = collector.fetch_package("broken", &mut base_delay, &cached_fetcher);
+        let outcome1 = collector.fetch_package("broken", &cached_fetcher);
         assert!(outcome1.was_network_hit);
         assert!(outcome1.result.is_err(), "malformed JSON should fail");
 
         // Second fetch -- should hit network again (not cached)
         let cached_fetcher2 = make_cached_fetcher(&collector);
-        let outcome2 = collector.fetch_package("broken", &mut base_delay, &cached_fetcher2);
+        let outcome2 = collector.fetch_package("broken", &cached_fetcher2);
         assert!(
             outcome2.was_network_hit,
             "malformed response should not be cached -- second fetch must hit network"
@@ -1134,7 +1044,7 @@ mod tests {
         ));
 
         let mut base_delay = 200u64;
-        let outcome = collector.fetch_package("etag-pkg", &mut base_delay, &cached_fetcher);
+        let outcome = collector.fetch_package("etag-pkg", &cached_fetcher);
 
         assert!(outcome.was_network_hit, "304 counts as network hit");
         let pkg = outcome.result.expect("304 should serve stale body");
@@ -1158,7 +1068,7 @@ mod tests {
         let collector = PypiCollector::new().with_base_url(&server.url());
 
         let mut base_delay = 200u64;
-        let outcome = collector.fetch_package("direct-pkg", &mut base_delay, &None);
+        let outcome = collector.fetch_package("direct-pkg", &None);
 
         assert!(outcome.was_network_hit);
         let pkg = outcome.result.expect("direct fetch should work");

@@ -1,6 +1,6 @@
 use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
-use crate::source_cache::{CacheResult, CacheScope, SourceCache};
+use crate::source_cache::SourceCache;
 use crate::uris::*;
 use serde::Deserialize;
 use std::fs::File;
@@ -44,7 +44,7 @@ use std::collections::HashMap;
 
 impl FreebsdCollector {
     pub fn new(distro_name: String, mirror: String, release: String, arch: String) -> Self {
-        let client = crate::enricher::http_client_builder()
+        let _client = crate::enricher::http_client_builder()
             .timeout(Duration::from_secs(300))
             .build()
             .expect("Failed to create HTTP client");
