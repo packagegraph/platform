@@ -18,7 +18,18 @@ repackages, even though `pg-collect-hackage` runs in production and collects
 
 Investigation found that the ontology already declares the predicate for this
 join, with a docstring describing this exact case, and that nothing has ever
-emitted it. Most of this design is therefore wiring, not invention.
+emitted it.
+
+**Revision 3** (after two review rounds) establishes the one thing that is
+genuine invention rather than wiring: a per-capability `:UpstreamAssertion`.
+Revisions 1 and 2 both tried to carry the association on the flat `upstream*`
+properties, and both were wrong for the same reason — those properties are
+independently multi-valued on a single subject, so they express two unordered
+sets rather than a set of pairs. Every join over them returns a cross-product.
+That defect cannot be fixed by changing which triples are emitted; it requires
+a node that binds target, ecosystem, version, method, and confidence together.
+§2.2 is that node, and §4.4, §5.1, and §7 are the three places the old model
+silently produced wrong answers.
 
 ## 1. Overview
 
@@ -72,10 +83,12 @@ not because §5 resolves it.
 
 ### Goals
 
-1. Emit a traversable edge from a distribution package identity to the
-   upstream registry package identity it repackages, for every ecosystem
-   where the identifiers resolve deterministically.
-2. Emit bundled-component edges from evidence already present in data we
+1. Model each distro→upstream association as a qualified per-capability
+   `:UpstreamAssertion` (§2.2) that binds target, ecosystem, optional version,
+   method, and confidence together — and materialize
+   `pkg:upstreamPackageIdentity` from it as the one-hop shortcut, for every
+   ecosystem where the identifiers resolve deterministically.
+2. Emit bundled-component assertions from evidence already present in data we
    already fetch — no new artifact downloads.
 3. Complete the `distro → registry → forge` chain by wiring the nine registry
    collectors that currently discard upstream repository URLs into the
@@ -85,8 +98,9 @@ not because §5 resolves it.
    and `upstreamPackageName` that makes four current emitters illegal.
 5. Add version-level links where, and only where, both endpoints exist.
 
-The landing order in §12 is load-bearing: an ontology release and a
-prerequisite `rpm.rs` fix must both precede the collector work.
+The landing order in §12 is load-bearing: two ontology PRs must be released
+before any collector change, and `seed.rs` must be rewritten before the §7
+deriver runs.
 
 ### Non-goals (this design)
 
@@ -144,31 +158,161 @@ upstreamPackageIdentity for new data."*
 **This design uses those terms as-is.** The identity join itself needs no new
 vocabulary; §2.4 covers the separate corrections required to existing terms.
 
-### 2.2 New terms
+### 2.2 New terms: the per-capability assertion
 
-Two additions to `core.ttl`, both following the existing `upstream*` naming
-family.
+**Why a reified assertion is unavoidable.** The flat `upstream*` properties are
+each independently multi-valued on a single subject. An RPM providing both
+`python3dist(foo)` and `crate(bar)` yields:
+
+```turtle
+<pkg> pkg:upstreamEcosystem   <d/ecosystem/pypi>, <d/ecosystem/cargo> ;
+      pkg:upstreamPackageName "foo", "bar" .
+```
+
+There is no pairing here — only two unordered sets. Any query joining the two
+properties returns the full cross-product, so `cargo`/`foo` and `pypi`/`bar`
+are as well-supported as the true pairs. This is why §4.4's seeding argument
+and §7's deriver were both wrong in the previous revision: no amount of fixing
+*which* triples are emitted can recover an association the model cannot
+express.
+
+**Why `:PackageRelationship` cannot be reused.** The existing reification
+(core.ttl:1610-1647, emitted today by `enrich_repology.rs:231-253`) hangs off
+an identity: `:hasPackageRelationship` has `rdfs:domain :PackageIdentity`
+(core.ttl:1621) and `uris.rs:501` keys the node on `(identity_a, identity_b)`.
+A `PackageIdentity` has many builds, so every build of `ghc-hoauth2` would
+share one relationship node and the version cross-product would return in a
+different shape. The declared upstream version belongs to a *build*, not to an
+identity.
+
+**The dedicated assertion.** One node per capability, binding all five facets
+together:
+
+```turtle
+:UpstreamAssertion a owl:Class ;
+    rdfs:label "Upstream Assertion"@en ;
+    IAO:0000115 "A qualified, single-capability assertion that a distribution
+      package derives from one specific upstream ecosystem package. Binds the
+      source identity, optionally the specific source build, the target
+      upstream identity, optionally the upstream version as declared by that
+      capability, and the method and confidence by which the association was
+      established. Exists because the flat upstream* properties are
+      independently multi-valued on a single subject and therefore cannot
+      express which name belongs to which ecosystem or version."@en ;
+    rdfs:isDefinedBy : ;
+    rdfs:subClassOf owl:Thing .
+
+:hasUpstreamAssertion a owl:ObjectProperty ;
+    rdfs:domain :PackageEntity ;            # identity or build may carry it
+    rdfs:range :UpstreamAssertion ;
+    rdfs:isDefinedBy : .
+
+:assertionTarget a owl:ObjectProperty ;     # required
+    rdfs:domain :UpstreamAssertion ;
+    rdfs:range :PackageIdentity ;
+    rdfs:isDefinedBy : .
+
+:assertionSourceBuild a owl:ObjectProperty ;    # optional
+    IAO:0000115 "The specific versioned build this assertion was derived
+      from, when the evidence is build-specific (e.g. a versioned RPM
+      Provides). Absent when the evidence is version-independent."@en ;
+    rdfs:domain :UpstreamAssertion ;
+    rdfs:range :Package ;
+    rdfs:isDefinedBy : .
+
+:assertionUpstreamVersion a owl:DatatypeProperty ;  # optional
+    IAO:0000115 "The upstream version as declared by this capability. Bound
+      to this assertion's target, never to the subject as a whole."@en ;
+    rdfs:domain :UpstreamAssertion ;
+    rdfs:range xsd:string ;
+    rdfs:isDefinedBy : .
+
+:assertionEcosystem a owl:ObjectProperty ;  # required
+    rdfs:domain :UpstreamAssertion ;
+    rdfs:range :Ecosystem ;
+    rdfs:isDefinedBy : .
+
+:assertionRelation a owl:ObjectProperty ;   # required
+    IAO:0000115 "Whether the source repackages the target (it is the target,
+      restated for a distribution) or bundles it (it contains the target by
+      value alongside its own code)."@en ;
+    rdfs:domain :UpstreamAssertion ;
+    rdfs:range skos:Concept ;               # UpstreamRelationScheme, below
+    rdfs:isDefinedBy : .
+```
+
+A new SKOS scheme distinguishes the two relations, following the pattern of
+`MatchMethodScheme` (skos-schemes.ttl:369-407):
+
+```turtle
+pkg:upstream-repackages  a skos:Concept .   # the source IS the target, redistributed
+pkg:upstream-bundles     a skos:Concept .   # the source CONTAINS the target by value
+```
+
+**Method and confidence reuse existing terms.** `:matchMethod` (core.ttl:1633)
+and `:matchConfidence` (core.ttl:1641) already model exactly this and are
+already emitted by `enrich_repology.rs`. Both currently declare
+`rdfs:domain :PackageRelationship`. A second `rdfs:domain` is an
+*intersection*, not a union — the gotcha called out in ontology issue #7 — so
+reuse requires an explicit union:
+
+```turtle
+:matchMethod     rdfs:domain [ owl:unionOf ( :PackageRelationship :UpstreamAssertion ) ] .
+:matchConfidence rdfs:domain [ owl:unionOf ( :PackageRelationship :UpstreamAssertion ) ] .
+```
+
+This is the same monotonic widening argument as §2.4: it removes entailments,
+adds none. The alternative — minting `:assertionMethod` / `:assertionConfidence`
+— would leave two vocabularies for one concept and force every confidence
+consumer to query both.
+
+`pkg:match-repackage-detected` (skos-schemes.ttl:389) already exists and reads
+*"repackaging of another package under a different name"*, which is the
+correct `matchMethod` for the common case.
+
+**Shortcuts derived from assertions.** Two convenience properties remain, both
+materialized *from* assertions and never emitted independently:
 
 ```turtle
 :bundles a owl:ObjectProperty ;
-    rdfs:label "bundles"@en ;
     IAO:0000115 "The subject package contains, by value, code from the object
-      package — vendored, statically linked, or embedded in the shipped
-      artifact rather than resolved as an external dependency. Distinct from
-      :directlyDependsOn, which describes a resolved external requirement."@en ;
+      package. Shortcut for an :UpstreamAssertion whose :assertionRelation is
+      upstream-bundles; carries no method, confidence, or version."@en ;
     rdfs:domain :PackageIdentity ;
     rdfs:range :PackageIdentity ;
     rdfs:isDefinedBy : .
 
 :upstreamPackageRelease a owl:ObjectProperty ;
-    rdfs:label "upstream package release"@en ;
-    IAO:0000115 "Links a specific distribution package build to the specific
-      upstream registry release it repackages. Version-level counterpart to
-      :upstreamPackageIdentity."@en ;
+    IAO:0000115 "Links a specific distribution build to the specific upstream
+      registry release it repackages. Derived only from an :UpstreamAssertion
+      that binds both, never by joining independently multi-valued
+      properties."@en ;
     rdfs:domain :Package ;
     rdfs:range :Package ;
     rdfs:isDefinedBy : .
 ```
+
+`pkg:upstreamPackageIdentity` (§2.1) is likewise retained as the materialized
+identity-only shortcut, so the §8 one-hop query keeps working. The invariant
+is: **every shortcut edge must have a backing assertion; no shortcut is ever
+emitted without one.**
+
+**URI keying.** The assertion node must be keyed on everything that
+distinguishes it, or distinct capabilities collide:
+
+```rust
+// uris.rs — new
+pub fn upstream_assertion_uri(
+    source: &str,        // identity or build URI
+    ecosystem: &str,
+    target_name: &str,
+    version: Option<&str>,
+) -> String
+```
+
+Keying on `(source, target)` alone — as `package_relationship_uri` does — is
+what reintroduces the cross-product, and is the specific mistake this section
+exists to avoid.
 
 `npm:bundledDependency` (npm.ttl:9-14) is **not** emitted in v1. Its range is
 `npm:NpmPackage`, the versioned class, but `bundledDependencies` in a package
@@ -188,25 +332,39 @@ A `bundles` edge derived from an RPM `Provides: bundled(...)` (packager-
 declared, frequently stale) must not be indistinguishable from one derived
 from `vendor/modules.txt` (exact, machine-generated) when that tier arrives.
 
-Reuse the existing confidence ladder rather than inventing one.
-`collect_spec.rs:453` already grades detection methods:
+**`emit_dq_issue` cannot carry this, and the previous revision was wrong to
+say it could.** Its signature (forge.rs:784-791) is:
 
 ```rust
-"source0-domain" | "buildrequires-macro" => "high",
-// name-prefix => "medium"
+pub fn emit_dq_issue(writer, detector, field, raw_value, issue_type, severity)
 ```
 
-Every `bundles` edge and every `upstreamPackageIdentity` edge records its
-derivation method via the existing `emit_dq_issue` mechanism
-(`forge.rs::emit_dq_issue`), with these method tokens:
+It takes **no subject**, so the `dq:DataQualityIssue` node it mints
+(forge.rs:800-806) is unlinked from the package it concerns, and it has no
+confidence parameter at all. It is a logging facility for bad input, not an
+evidence model.
 
-| Method | Confidence | Source |
-|---|---|---|
-| `rpm-bundled-provides` | high | `Provides: bundled(X)` in primary.xml |
-| `npm-bundled-deps` | high | `bundledDependencies` in registry JSON |
-| `ecosystem-provides` | high | `ghc-pkg(X)`, `crate(X)`, `python3dist(X)` etc. |
-| `source0-domain` | high | Source0 URL domain (existing) |
-| `name-prefix` | medium | `ghc-`, `python3-`, `rust-` prefix (existing) |
+Evidence rides on the assertion node from §2.2 instead, via the existing
+`:matchMethod` and `:matchConfidence`:
+
+| Evidence | `:matchMethod` | `:matchConfidence` | Source |
+|---|---|---|---|
+| versioned ecosystem `Provides` | `match-upstream-verified` | `1.0` | `crate(X) = 1.2.3` — name *and* version declared by the build system |
+| unversioned ecosystem `Provides` | `match-repackage-detected` | `0.9` | `ghc-pkg(X)`, `python3dist(X)` |
+| `Provides: bundled(X)` | `match-repackage-detected` | `0.9` | packager-declared per Fedora policy |
+| npm `bundledDependencies` | `match-repackage-detected` | `0.9` | manifest-declared |
+| Source0 registry domain | `match-repackage-detected` | `0.8` | `collect_spec.rs:687-694` |
+| name prefix only | `match-name-heuristic` | `0.5` | `ghc-`, `python3-`, `rust-` (collect_spec.rs:757-764) |
+
+All six `matchMethod` values come from the existing `MatchMethodScheme`
+(skos-schemes.ttl:369-407) — no new method concepts are needed. The numeric
+confidences replace the existing three-token ladder at `collect_spec.rs:453`
+for these assertions; that ladder stays where it is for DQ records, which are
+a different thing.
+
+`emit_dq_issue` retains its proper role in this design: recording *failures*
+(§10) — an unresolvable ecosystem token, a CPAN module that cannot be mapped
+to a distribution. It is never used to record a successful association.
 
 ### 2.4 Corrections to existing ontology terms
 
@@ -466,7 +624,7 @@ upstream ecosystem and name:
 (uris.rs:405-407). The output is byte-identical; consolidate onto the helper
 while touching the function.
 
-### 4.4 Why this join is lossless — and the prerequisite that makes it so
+### 4.4 Seeding: why the flat properties cannot make this join reliable
 
 `seed.rs::discover_by_ecosystem` (seed.rs:16-47) queries Fuseki for
 `upstreamPackageName` literals filtered by ecosystem and writes them to a seed
@@ -475,39 +633,72 @@ file; `hackage.rs:62-65` and its ten siblings feed that file straight into
 string the distro run recorded** — byte-identical by construction, for the 11
 collectors wired this way (`cran.rs` and `conda.rs` are not).
 
-**This argument does not hold against the current `rpm.rs`, and this design
-depends on a prerequisite fix.** `rpm.rs::emit_ecosystem_triples` latches a
-single `emitted_ecosystem` boolean on the *first* matching `Provides:`
-capability (rpm.rs:1113-1119) while writing `upstreamPackageName` for *every*
-matching capability in the same loop (rpm.rs:1120-1126). A package providing
-both `python3dist(foo)` and `crate(bar)` therefore emits one
-`upstreamEcosystem → pypi` alongside two names, and `seed.rs`'s join hands
-`bar` — a crate name — to the PyPI collector.
+**That argument is false against the current data model, and a previous
+revision of this spec proposed a fix that does not work.** The defect is not
+which triples are emitted — it is that the flat properties cannot express
+pairing at all (§2.2).
 
-That is a live data-quality bug independent of this design: seeded registry
-collectors have been receiving wrong-ecosystem names for as long as this has
-shipped. It is fixed in its own PR, landing **before** this work:
+`rpm.rs::emit_ecosystem_triples` latches a single `emitted_ecosystem` boolean
+on the *first* matching capability (rpm.rs:1113-1119) while writing
+`upstreamPackageName` for *every* matching capability in the same loop
+(rpm.rs:1120-1126). A package providing both `python3dist(foo)` and
+`crate(bar)` emits one `upstreamEcosystem → pypi` alongside two names.
 
-> Move the ecosystem emission inside the per-capability branch, keyed on the
-> capability's own `ecosystem` value and de-duplicated with a
-> `HashSet<&str>` of already-emitted ecosystems rather than a single bool, so
-> a package that genuinely spans ecosystems emits one `upstreamEcosystem` per
-> ecosystem and each name is attributable to the right one.
+Replacing that boolean with a `HashSet` — as the previous revision proposed —
+emits the *missing* `upstreamEcosystem → cargo` triple, and changes nothing
+about attribution. The subject then carries two ecosystems and two names as
+two unordered sets, and `seed.rs`'s join returns all four combinations.
+`cargo`/`foo` is exactly as well-supported as `cargo`/`bar`. **A set-valued
+fix cannot recover a pairing the model never stored.**
 
-Only once that lands is the seeded registry node guaranteed to correspond to
-the ecosystem it was filed under, and only then is the join deterministic
-rather than heuristic. The resolver in §3 is unaffected either way — it is
-called inside the per-capability branch with that branch's own `ecosystem`
-value, so it pairs names and ecosystems correctly regardless. What the
-prerequisite protects is the *pre-existence* of the target node.
+The real fix is the per-capability assertion (§2.2), and it changes what
+`seed.rs` must read.
 
-The size of the existing pollution is measurable before fixing, with:
+#### `seed.rs` rewrite
+
+`discover_by_ecosystem` (seed.rs:16-47) currently joins the two independent
+properties:
 
 ```sparql
-SELECT ?pkg (COUNT(DISTINCT ?name) AS ?names) WHERE {
-  ?pkg pkg:upstreamPackageName ?name ; pkg:upstreamEcosystem ?eco .
-} GROUP BY ?pkg HAVING (COUNT(DISTINCT ?name) > 1)
+?pkg pkg:upstreamPackageName ?name .
+?pkg pkg:upstreamEcosystem ?eco .
+FILTER(STR(?eco) = "{ecosystem}" || CONTAINS(STR(?eco), "ecosystem/{ecosystem}"))
 ```
+
+It must instead read the pairing off a single assertion node, where ecosystem
+and name are bound together by construction:
+
+```sparql
+SELECT DISTINCT ?name WHERE {
+  GRAPH ?g {
+    ?assertion a pkg:UpstreamAssertion ;
+               pkg:assertionEcosystem <d/ecosystem/{ecosystem}> ;
+               pkg:assertionTarget    ?target .
+    ?target pkg:packageName ?name .
+  }
+} ORDER BY ?name
+```
+
+This also removes the current string-matching `FILTER` over the ecosystem IRI,
+since the assertion points at the `Ecosystem` resource directly.
+
+Only once both the assertion emission and this query land is the seeded
+registry node guaranteed to correspond to the ecosystem it was filed under.
+Until then, seeding remains best-effort and §3's join may reference registry
+nodes that were never collected — which is tolerable (an unresolvable IRI is
+inert) but is not the "lossless" property this section originally claimed.
+
+The size of the existing pollution is measurable before fixing:
+
+```sparql
+SELECT ?pkg (COUNT(DISTINCT ?name) AS ?names) (COUNT(DISTINCT ?eco) AS ?ecos)
+WHERE { ?pkg pkg:upstreamPackageName ?name ; pkg:upstreamEcosystem ?eco . }
+GROUP BY ?pkg
+HAVING (COUNT(DISTINCT ?name) > 1 || COUNT(DISTINCT ?eco) > 1)
+```
+
+Every row is a package whose upstream association is currently ambiguous, and
+whose names may have been seeded into the wrong registry collector.
 
 ## 5. Bundled components
 
@@ -538,14 +729,24 @@ sub-projects 3 and 4. What §5.1 does cover in v1 is the large population of
 `rust2rpm`- and `go2rpm`-generated packages, where `bundled(crate(...))` and
 `bundled(golang(...))` are the standard and widely-populated declaration.
 
-`bundled()` capabilities frequently carry no version. That is expected:
-`pkg:bundles` is identity-level, so no version is required. Versions on
-bundled components are **not** modelled in v1 — a package bundling several
-components cannot attribute a flat `pkg:upstreamPackageVersion` literal to any
-one of them, so version-bearing bundles need a qualified (reified) structure.
-The §7 deriver therefore covers repackaging only, not bundling. Deferred with
-the artifact-inspection tier (sub-project 2, §12), where exact per-component versions
-arrive anyway.
+`bundled()` capabilities frequently carry no version, and where they do, the
+version belongs to that specific component. Under the §2.2 assertion model
+this is expressible from day one: each bundled component gets its own
+`:UpstreamAssertion` with `:assertionRelation pkg:upstream-bundles` and, when
+declared, its own `:assertionUpstreamVersion` bound to that component's
+target. A package bundling three components produces three assertions, and no
+version is ever attributable to the wrong one.
+
+This is the case that previously forced a deferral. The earlier revision kept
+bundled versions out of v1 because a flat `pkg:upstreamPackageVersion` literal
+on the bundling package cannot say *which* component it describes. That
+limitation belonged to the flat model, not to the data — the assertion removes
+it.
+
+What remains deferred is the §7 `upstreamPackageRelease` edge for bundles: it
+is scoped to `upstream-repackages` only, because a release-level identity edge
+would misrepresent containment as identity. The bundled version is recorded on
+the assertion and is queryable there.
 
 `primary.xml` is already parsed and already carries the full `Provides:` list
 (`rpm.rs::parse_primary_metadata`, rpm.rs:575), so this adds **no fetching**.
@@ -663,36 +864,70 @@ prevent.
 
 ### 7.2 The deriver
 
-A new `derive_upstream_release` stage, following the existing pattern of
-`derive_comparison.rs` / `derive_releases.rs`, runs after collection and emits
-an edge **only where both endpoints are present**:
+#### The cross-product defect, and why the deriver reads assertions only
+
+A previous revision proposed this query:
+
+```sparql
+# WRONG — do not implement
+?distroPkg pkg:upstreamPackageVersion  ?v ; pkg:isVersionOf ?distroId .
+?distroId  pkg:upstreamPackageIdentity ?upId .
+?upRelease pkg:isVersionOf ?upId ; pkg:versionString ?v .
+```
+
+`?v` and `?upId` come from two independently multi-valued properties. A
+package with two upstream identities and two declared versions produces up to
+four candidate pairs, and a false pair binds whenever the wrong registry
+package happens to publish the same version string — which for common versions
+like `1.0.0` or `2.0.0` is not rare. It would emit confidently wrong
+`upstreamPackageRelease` edges, which is worse than emitting none.
+
+The deriver therefore reads **only** from `:UpstreamAssertion`, where target
+and version are bound to each other by construction:
 
 ```sparql
 CONSTRUCT {
-  ?distroPkg pkg:upstreamPackageRelease ?upRelease .
+  ?sourceBuild pkg:upstreamPackageRelease ?upRelease .
 }
 WHERE {
-  ?distroPkg  pkg:upstreamPackageVersion  ?v ;
-              pkg:isVersionOf             ?distroId .
-  ?distroId   pkg:upstreamPackageIdentity ?upId .
-  ?upRelease  pkg:isVersionOf             ?upId ;
-              pkg:versionString           ?v .
+  ?assertion a pkg:UpstreamAssertion ;
+             pkg:assertionRelation        pkg:upstream-repackages ;
+             pkg:assertionSourceBuild     ?sourceBuild ;
+             pkg:assertionTarget          ?upId ;
+             pkg:assertionUpstreamVersion ?v .
+  ?upRelease pkg:isVersionOf   ?upId ;
+             pkg:versionString ?v .
 }
 ```
+
+Every variable that must correspond is drawn from one assertion node, so no
+cross-product is possible. Assertions lacking `:assertionSourceBuild` or
+`:assertionUpstreamVersion` simply do not bind and emit nothing — the absence
+of a version is expressed by the pattern failing, not by a guess.
+
+`:assertionRelation` is pinned to `upstream-repackages`. Bundled components
+are excluded here: a bundled version, where declared, is bound on its own
+assertion and is version-modelled from day one (§5.1), but a
+`upstreamPackageRelease` edge would misrepresent containment as identity.
 
 Properties of this approach:
 
 - Dangling references are structurally impossible — `?upRelease` must already
   exist to bind.
+- False pairings are structurally impossible — every correspondence comes from
+  a single node.
 - Zero additional fetching.
-- No collector changes; it consumes `pkg:upstreamPackageVersion`, which
-  `rpm.rs:1128-1131` already emits from versioned ecosystem `Provides`.
 - Coverage improves automatically as registry version coverage improves,
   with no code change.
 
-Version-string equality is exact-match on `pkg:versionString`. RPM
-version normalization (epochs, tilde/caret ordering) is deliberately *not*
-applied: a mismatch should surface as a missing edge and a DQ record, not as a
+The flat `pkg:upstreamPackageVersion` literal (rpm.rs:1130) is **not** read by
+the deriver. It remains emitted and, per ontology issue #9, finally declared,
+for backward compatibility with existing consumers — but it is not an
+authoritative binding and this design treats it as advisory only.
+
+Version-string equality is exact-match on `pkg:versionString`. RPM version
+normalization (epochs, tilde/caret ordering) is deliberately *not* applied: a
+mismatch should surface as a missing edge and a DQ record, not as a
 speculative match. `rpmver.rs` exists if a later pass wants fuzzy matching, but
 it is out of scope here.
 
@@ -755,23 +990,48 @@ SELECT ?origin WHERE {
 }
 ```
 
+Evidence-filtered querying — only associations the build system declared,
+excluding name-prefix guesses:
+
+```sparql
+SELECT ?source ?target ?conf WHERE {
+  ?a a pkg:UpstreamAssertion ;
+     pkg:assertionTarget ?target ;
+     pkg:matchConfidence ?conf .
+  ?source pkg:hasUpstreamAssertion ?a .
+  FILTER(?conf >= 0.9)
+}
+```
+
+This is the query the shortcut properties cannot answer, and the reason the
+assertion is worth its triple cost.
+
 ## 9. Data flow
+
+Every association is emitted as an assertion first; the shortcut edges are
+materialized from it in the same pass, never independently.
 
 ```
 primary.xml  ─┬─► rpm.rs::emit_ecosystem_triples
-              │     ├─ Provides: ghc-pkg(X)     → registry_identity_uri → upstreamPackageIdentity
-              │     └─ Provides: bundled(...)   → registry_identity_uri → bundles
-              │
-dist-git spec ─► collect_spec.rs::emit_ecosystem_triples
-              │     └─ detect_ecosystem          → registry_identity_uri → upstreamPackageIdentity
+              │     ├─ Provides: crate(X) = 1.2.3  ─┐
+              │     ├─ Provides: ghc-pkg(X)        ─┼─► one UpstreamAssertion per capability
+              │     └─ Provides: bundled(...)      ─┘   (target + ecosystem + version?
+              │                                          + matchMethod + matchConfidence)
+              │                                              │
+dist-git spec ─► collect_spec.rs::emit_ecosystem_triples ────┤
+              │     └─ detect_ecosystem                      │
+              │                                              ▼
+              │                                    materialized shortcuts:
+              │                                    upstreamPackageIdentity, bundles
               │
 registry APIs ─► hackage/pypi/npm/… collectors
                     ├─ package identity + version nodes  (existing)
                     ├─ repo URL → forge::emit_upstream_repo → UpstreamProject hub   (§6, new)
-                    └─ npm bundledDependencies → bundles                            (§5.2, new)
+                    └─ npm bundledDependencies → UpstreamAssertion + bundles        (§5.2, new)
 
                          ▼ (after all collection)
-                    derive_upstream_release  →  upstreamPackageRelease   (§7, new)
+                    seed.rs reads assertions, not flat properties        (§4.4, changed)
+                    derive_upstream_release reads assertions only        (§7, new)
 ```
 
 ## 10. Error handling and data quality
@@ -803,15 +1063,26 @@ registry APIs ─► hackage/pypi/npm/… collectors
   relied on `upstreamPackageName` entailing `rdf:type :Package` lose that
   inference — but that inference was the bug, and grep finds no consumer
   depending on it.
-- **Ordering hazard.** The ontology release (§2.4) must precede the collector
-  changes. Emitting `pkg:bundles` / `pkg:upstreamPackageRelease` against the
-  currently-pinned ontology yields triples with undeclared predicates, which
-  `core.shacl.ttl` validation will flag and which no consumer can reason over.
-- **Prerequisite.** The `rpm.rs:1113` per-capability ecosystem fix (§4.4) must
-  land and a full RPM collection cycle must complete before the §4.4
-  losslessness argument holds. Landing this design first does not corrupt
-  anything, but the identity edges it emits for mixed-capability packages may
-  point at registry nodes that were never seeded.
+- **Ordering hazard.** The ontology release (§2.4 and §2.2) must precede the
+  collector changes. Emitting `:UpstreamAssertion`, `pkg:bundles`, or
+  `pkg:upstreamPackageRelease` against the currently-pinned ontology yields
+  triples with undeclared predicates that no consumer can reason over. Note
+  that current `core.shacl.ttl` would **not** flag this — it has no closed
+  shape and no constraint on these terms (§11.15-16); the ordering discipline
+  is the only protection until those shapes exist.
+- **Seeding is best-effort until §4.4 lands in full.** The assertion emission
+  and the `seed.rs` query rewrite must both ship, and a full collection cycle
+  must complete, before seeds correspond reliably to their ecosystem. Landing
+  the emission alone corrupts nothing — an unresolvable IRI is inert — but
+  identity edges for mixed-capability packages may reference registry nodes
+  that were never collected.
+- **The flat `upstream*` properties remain ambiguous by construction** and no
+  amount of collector change fixes that (§2.2). They are retained for
+  backward compatibility only. Any consumer needing a trustworthy
+  name↔ecosystem or target↔version pairing must read `:UpstreamAssertion`;
+  consumers joining the flat properties are reading a cross-product whether
+  or not they realize it. This is worth stating in the ontology docstrings
+  when #9 lands.
 - Graph-size impact: these are additive triples on existing subjects. No new
   named graphs, no graph URI changes — the collision risk that has bitten
   before does not apply here.
@@ -826,7 +1097,14 @@ Unit tests, per the existing `#[cfg(test)]` convention in each collector:
    are the regression tests for the §3.2 traps.
 2. `registry_identity_uri("gomod", …)` produces a `/go/modules/` path, **not**
    `/gomod/`.
-3. `registry_identity_uri("maven", "g:a")` produces `…/maven/central/any/g/a`.
+3. `registry_identity_uri("maven", "g:a")` produces
+   `…/maven/central/any/g%2Fa` — **percent-encoded, not a path separator**.
+   `encode()` (uris.rs:82-85) matches Python's `quote(component, safe="")`, so
+   the `/` produced by the `g:a → g/a` name transform is escaped by
+   `package_identity_uri`. `maven.rs:905` builds the same `g/a` name and gets
+   the same encoding, which is what makes the two sides match. An expectation
+   ending in a literal `g/a` would pass against a hand-built string and fail
+   against the collector.
 4. `registry_identity_uri("pypi", "Foo.Bar")` produces `…/any/foo-bar`
    (PEP 503), while `registry_identity_uri("hackage", "HUnit")` preserves
    case.
@@ -856,17 +1134,39 @@ Integration:
 12. The §7 deriver emits an edge when versions match and **no** edge when the
     registry holds a different version, asserted against a fixture with a
     deliberate version mismatch.
-13. SHACL validation (`core.shacl.ttl`) passes over a graph containing every
-    new and corrected predicate from §2.2 and §2.4, run against the updated
-    ontology. This is the gate that would have caught the undeclared
-    `upstreamPackageVersion`.
+13. **The cross-product regression test.** A fixture RPM providing
+    `python3dist(foo) = 1.0.0` and `crate(bar) = 1.0.0` — deliberately the
+    same version string, which is what makes a false pair bind — must yield
+    exactly two `UpstreamAssertion` nodes, exactly two
+    `upstreamPackageIdentity` shortcuts, and from §7 exactly **two**
+    `upstreamPackageRelease` edges (`foo→pypi/foo@1.0.0`,
+    `bar→cargo/bar@1.0.0`) and never four. Assert explicitly that
+    `pypi/foo@1.0.0` is *not* linked from the `bar` assertion. This is the
+    single most important test in the design; both previous revisions would
+    have failed it.
+14. `seed.rs`'s rewritten query (§4.4) against the same fixture returns `foo`
+    for `pypi` and `bar` for `cargo`, and neither name for the other
+    ecosystem.
 
-Prerequisite PR (§4.4), tested separately:
+**SHACL does not currently cover any of this, and a previous revision claimed
+otherwise.** `grep` over `core/core.shacl.ttl` for `sh:closed`,
+`upstreamEcosystem`, `upstreamPackageName`, `upstreamPackageVersion`, and
+`upstreamPackageIdentity` returns **nothing** — there is no closed shape and
+no constraint on the family. Existing validation would not have caught the
+undeclared `upstreamPackageVersion` and will not catch a recurrence. Two
+additions are needed, filed against the ontology repo:
 
-14. An RPM providing both `python3dist(foo)` and `crate(bar)` emits two
-    `upstreamEcosystem` triples — one per ecosystem — and each
-    `upstreamPackageName` is attributable to the correct one. Currently this
-    emits one ecosystem and two names.
+15. An explicit `sh:NodeShape` for `:UpstreamAssertion` requiring exactly one
+    `:assertionTarget`, exactly one `:assertionEcosystem`, exactly one
+    `:assertionRelation`, at most one `:assertionUpstreamVersion`, and at most
+    one `:assertionSourceBuild`. The `sh:maxCount 1` constraints are what
+    mechanically enforce the pairing this whole revision is about.
+16. A **term-existence test**: every predicate IRI emitted by any collector
+    must have a declaration in the ontology. This is the general guard — it
+    would have caught `upstreamPackageVersion` when it was first emitted,
+    rather than at design-review time years later. Implementable as a test
+    that extracts `{PKG}`-prefixed format strings from
+    `etl/pg-collect/src/**` and checks each against the released `core.ttl`.
 
 ## 12. Follow-on sub-projects
 
@@ -894,14 +1194,27 @@ dependency order:
 ### Landing order
 
 ```
-1. rpm.rs per-capability ecosystem fix        (§4.4 prerequisite, own PR)
-2. ontology PR + release + upload-ontology.sh (§2.4)
-3. this design's collector changes            (§3, §4, §5, §6)
-4. derive_upstream_release                    (§7, after a full collection cycle)
+1. ontology PR A — defect repairs                      (§2.4, filed as ontology#9)
+2. ontology PR B — UpstreamAssertion + relation scheme (§2.2, to be filed)
+     + matchMethod/matchConfidence union domains
+     + UpstreamAssertion SHACL shape                   (§11.15)
+3. ontology release + upload-ontology.sh
+4. collector changes: assertions + shortcuts           (§3, §4, §5, §6)
+5. seed.rs query rewrite                               (§4.4)
+6. full collection cycle
+7. derive_upstream_release                             (§7)
 ```
 
-Steps 1 and 2 are independent of each other and can run in parallel; both
-gate step 3.
+PRs A and B are independent and can be authored in parallel, but both must be
+in the same release before step 4. Steps 5 and 6 gate step 7.
+
+The `rpm.rs` `HashSet` fix proposed in the previous revision is **dropped**.
+It would have emitted the missing `upstreamEcosystem` triples without making
+any name attributable (§4.4), producing a more complete cross-product rather
+than a correct pairing. The per-capability assertion supersedes it entirely.
+Fixing the latched boolean is still worthwhile for the flat properties' own
+completeness, but it is cosmetic once assertions exist and is not a
+prerequisite for anything.
 
 ### Smaller items surfaced and deliberately not fixed here
 
