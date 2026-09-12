@@ -1,17 +1,17 @@
+use crate::emit::rdf::write_package_identity;
 use crate::forge::{
     emit_dq_issue, emit_forge_triples, emit_upstream_repo, extract_forge_url_with_field,
 };
+use crate::http_transport::HttpTransport;
 use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use flate2::read::GzDecoder;
 use regex::Regex;
-use reqwest::blocking::Client;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
 use std::time::Duration;
-use crate::emit::rdf::write_package_identity;
 
 /// Normalize an architecture argument to (repo_path, rdf_identity).
 ///
@@ -38,7 +38,7 @@ fn distro_display_name(distro_id: &str) -> &str {
 }
 
 pub struct DebianCollector {
-    client: Client,
+    transport: HttpTransport,
     repo_url: String,
     distro_name: String,
     distribution: String,
@@ -77,10 +77,8 @@ impl DebianCollector {
         let repo_type = infer_repo_type_debian(&repo_url);
 
         // HTTP client with timeout and retry configuration
-        let client = crate::enricher::default_http_client();
-
         Self {
-            client,
+            transport: HttpTransport::new(),
             repo_url,
             distro_name,
             distribution,
@@ -231,10 +229,7 @@ impl DebianCollector {
         } else {
             eprintln!("Downloading {}", url);
             let response = self.client_get_with_retry(url, 3)?;
-            let bytes = response
-                .bytes()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            Ok(bytes.to_vec())
+            Ok(response.bytes)
         }
     }
 
@@ -278,46 +273,20 @@ impl DebianCollector {
         }
     }
 
+    /// Fetch a URL, retrying transient failures.
+    ///
+    /// `max_retries` is retained for call-site compatibility but the
+    /// transport owns the policy now, so a server error, 429 or connection
+    /// reset is retried with shared backoff and per-host pacing instead of
+    /// this collector's private loop.
     fn client_get_with_retry(
         &self,
         url: &str,
-        max_retries: u32,
-    ) -> Result<reqwest::blocking::Response> {
-        let mut retries = 0;
-        loop {
-            match self.client.get(url).send() {
-                Ok(response) if response.status().is_success() => return Ok(response),
-                Ok(response) if response.status().is_server_error() && retries < max_retries => {
-                    eprintln!(
-                        "Server error {}, retrying... ({}/{})",
-                        response.status(),
-                        retries + 1,
-                        max_retries
-                    );
-                    retries += 1;
-                    std::thread::sleep(Duration::from_millis(1000 * (1 << retries)));
-                }
-                Ok(response) => {
-                    return Err(std::io::Error::other(format!(
-                        "HTTP error: {}",
-                        response.status()
-                    )));
-                }
-                Err(e) if retries < max_retries => {
-                    eprintln!(
-                        "Network error: {}, retrying... ({}/{})",
-                        e,
-                        retries + 1,
-                        max_retries
-                    );
-                    retries += 1;
-                    std::thread::sleep(Duration::from_millis(1000 * (1 << retries)));
-                }
-                Err(e) => {
-                    return Err(std::io::Error::other(e));
-                }
-            }
-        }
+        _max_retries: u32,
+    ) -> Result<crate::cached_fetch::HttpResponse> {
+        self.transport
+            .get(url, None)
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     pub fn emit_distribution_metadata(

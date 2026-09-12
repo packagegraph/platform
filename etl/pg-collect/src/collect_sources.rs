@@ -4,18 +4,18 @@
 //! from Sources.gz index files. Build dependencies are emitted on SourcePackage URIs
 //! per the ontology (deb.ttl:40).
 
+use crate::emit::rdf::write_package_identity;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use flate2::read::GzDecoder;
 use regex::Regex;
-use reqwest::blocking::Client;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Result};
-use crate::emit::rdf::write_package_identity;
 
 pub struct SourcesCollector {
-    client: Client,
+    transport: HttpTransport,
     repo_url: String,
     distro: String,
     distribution: String,
@@ -26,10 +26,8 @@ pub struct SourcesCollector {
 
 impl SourcesCollector {
     pub fn new(repo_url: String, distro: String, distribution: String, component: String) -> Self {
-        let client = crate::enricher::default_http_client();
-
         Self {
-            client,
+            transport: HttpTransport::new(),
             repo_url,
             distro,
             distribution,
@@ -194,17 +192,10 @@ impl SourcesCollector {
             }
         } else {
             let response = self
-                .client
-                .get(url)
-                .send()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            if !response.status().is_success() {
-                return Err(std::io::Error::other(format!("HTTP {}", response.status())));
-            }
-            let bytes = response
-                .bytes()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            Ok(bytes.to_vec())
+                .transport
+                .get(url, None)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            Ok(response.bytes)
         }
     }
 

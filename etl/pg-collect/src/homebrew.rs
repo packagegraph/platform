@@ -1,16 +1,16 @@
+use crate::emit::rdf::write_package_identity;
 use crate::forge::emit_dq_issue;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::Result;
 use std::time::Duration;
-use crate::emit::rdf::write_package_identity;
 
 pub struct HomebrewCollector {
-    client: Client,
+    transport: HttpTransport,
     api_base: String,
     distro_name: String,
     release_name: String,
@@ -65,7 +65,7 @@ impl HomebrewCollector {
             .expect("Failed to create HTTP client");
 
         Self {
-            client,
+            transport: HttpTransport::new(),
             api_base,
             distro_name,
             release_name,
@@ -165,15 +165,15 @@ impl HomebrewCollector {
 
     fn fetch_formulae(&self) -> std::result::Result<Vec<Formula>, String> {
         let url = format!("{}/formula.json", self.api_base);
-        let response = self.client.get(&url).send().map_err(|e| e.to_string())?;
-        let text = response.text().map_err(|e| e.to_string())?;
+        let response = self.transport.get(&url, None).map_err(|e| e.to_string())?;
+        let text = String::from_utf8(response.bytes).map_err(|e| e.to_string())?;
         serde_json::from_str(&text).map_err(|e| e.to_string())
     }
 
     fn fetch_casks(&self) -> std::result::Result<Vec<Cask>, String> {
         let url = format!("{}/cask.json", self.api_base);
-        let response = self.client.get(&url).send().map_err(|e| e.to_string())?;
-        let text = response.text().map_err(|e| e.to_string())?;
+        let response = self.transport.get(&url, None).map_err(|e| e.to_string())?;
+        let text = String::from_utf8(response.bytes).map_err(|e| e.to_string())?;
         serde_json::from_str(&text).map_err(|e| e.to_string())
     }
 

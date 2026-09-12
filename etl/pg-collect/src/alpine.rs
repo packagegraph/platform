@@ -1,19 +1,19 @@
+use crate::emit::rdf::write_package_identity;
 use crate::forge::emit_dq_issue;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use flate2::read::MultiGzDecoder;
 use regex::Regex;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Result};
 use tar::Archive;
-use crate::emit::rdf::write_package_identity;
 
 pub struct AlpineCollector {
-    client: Client,
+    transport: HttpTransport,
     mirror_url: String,
     distro_name: String,
     branch: String,
@@ -31,10 +31,8 @@ impl AlpineCollector {
         repos: Vec<String>,
         arch: String,
     ) -> Self {
-        let client = crate::enricher::default_http_client();
-
         Self {
-            client,
+            transport: HttpTransport::new(),
             mirror_url,
             distro_name,
             branch,
@@ -152,15 +150,11 @@ impl AlpineCollector {
 
         eprintln!("  Fetching {}", url);
 
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-
-        let bytes = response
-            .bytes()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let bytes = self
+            .transport
+            .get(&url, None)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .bytes;
 
         // Decompress gzip to memory (MultiGzDecoder handles concatenated gzip members
         // used by Alpine's signed APKINDEX archives), then parse tar
@@ -534,9 +528,9 @@ impl AlpineCollector {
     }
 
     fn fetch_secdb(&self, url: &str) -> std::result::Result<SecdbDistro, String> {
-        let response = self.client.get(url).send().map_err(|e| e.to_string())?;
+        let response = self.transport.get(url, None).map_err(|e| e.to_string())?;
 
-        let text = response.text().map_err(|e| e.to_string())?;
+        let text = String::from_utf8(response.bytes).map_err(|e| e.to_string())?;
         serde_json::from_str(&text).map_err(|e| e.to_string())
     }
 

@@ -1,19 +1,19 @@
+use crate::emit::rdf::write_package_identity;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use flate2::read::GzDecoder;
 use regex::Regex;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Result};
 use std::time::Duration;
 use tar::Archive;
-use crate::emit::rdf::write_package_identity;
 
 pub struct ArchCollector {
-    client: Client,
+    transport: HttpTransport,
     mirror_url: String,
     repos: Vec<String>,
     include_aur: bool,
@@ -33,10 +33,8 @@ impl ArchCollector {
         repos: Vec<String>,
         include_aur: bool,
     ) -> Self {
-        let client = crate::enricher::default_http_client();
-
         Self {
-            client,
+            transport: HttpTransport::new(),
             mirror_url,
             repos,
             include_aur,
@@ -133,15 +131,11 @@ impl ArchCollector {
 
         eprintln!("  Fetching {}", url);
 
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-
-        let bytes = response
-            .bytes()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let bytes = self
+            .transport
+            .get(&url, None)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .bytes;
 
         let gz = GzDecoder::new(&bytes[..]);
         let mut archive = Archive::new(gz);
@@ -453,15 +447,11 @@ impl ArchCollector {
         let url = "https://aur.archlinux.org/packages.gz";
         eprintln!("  Fetching AUR package list from {}", url);
 
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-
-        let bytes = response
-            .bytes()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let bytes = self
+            .transport
+            .get(url, None)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .bytes;
 
         let mut gz = GzDecoder::new(&bytes[..]);
         let mut content = String::new();
@@ -485,8 +475,8 @@ impl ArchCollector {
             url.push_str(&format!("arg[]={}", name));
         }
 
-        let response = self.client.get(&url).send().map_err(|e| e.to_string())?;
-        let text = response.text().map_err(|e| e.to_string())?;
+        let response = self.transport.get(&url, None).map_err(|e| e.to_string())?;
+        let text = String::from_utf8(response.bytes).map_err(|e| e.to_string())?;
         let rpc: AurRpcResponse = serde_json::from_str(&text).map_err(|e| e.to_string())?;
         Ok(rpc.results)
     }
