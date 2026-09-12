@@ -169,12 +169,15 @@ impl SparqlClient {
     /// instead (e.g. a bare `DROP SILENT` is safe to retry: dropping an
     /// already-dropped graph is a no-op).
     pub fn update_no_retry(&self, sparql: &str) -> Result<()> {
+        self.guard_write("SPARQL Update")?;
         let url = format!("{}/update", self.endpoint);
         let response = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/sparql-update")
-            .body(sparql.to_string())
+            .apply_auth(
+                self.client
+                    .post(&url)
+                    .header("Content-Type", "application/sparql-update")
+                    .body(sparql.to_string()),
+            )
             .send()
             .map_err(|e| Error::new(ErrorKind::Other, format!("SPARQL update failed: {}", e)))?;
 
@@ -1224,6 +1227,38 @@ mod tests {
             SparqlClient::new(&server.url()).with_auth("testuser".into(), "testpass".into());
         let _ = client.update("INSERT DATA { <s> <p> <o> }");
         mock.assert();
+    }
+
+    #[test]
+    fn test_update_no_retry_sends_basic_auth_header() {
+        // Its one production caller is the derived-graph atomic swap. Without
+        // the header every swap 401s against an authenticated Fuseki, so the
+        // deriver can never publish.
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/update")
+            .match_header("Authorization", "Basic dGVzdHVzZXI6dGVzdHBhc3M=")
+            .with_status(200)
+            .create();
+        let client =
+            SparqlClient::new(&server.url()).with_auth("testuser".into(), "testpass".into());
+        let _ = client.update_no_retry("DROP SILENT GRAPH <urn:x>");
+        mock.assert();
+    }
+
+    #[test]
+    fn test_update_no_retry_refuses_to_write_to_qlever() {
+        // `update` guards writes against the read-only engine; the no-retry
+        // variant must not be a way around that guard.
+        let client = SparqlClient::new("http://unused.invalid").with_backend(
+            SparqlBackend::QLever {
+                access_token: "t".into(),
+            },
+        );
+        let err = client
+            .update_no_retry("DROP SILENT GRAPH <urn:x>")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
     }
 
     #[test]
