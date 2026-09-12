@@ -3,11 +3,12 @@
 //! Queries Fuseki for advisory-linked CVE IDs, paginates through NVD 2.0 REST API,
 //! and emits sec:publishedDate, sec:hasCVSSScore, and sec:hasCWE triples for matched CVEs.
 
+use crate::fetch_error::FetchError;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::{escape_literal, NTriplesWriter};
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use flate2::read::GzDecoder;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -18,7 +19,7 @@ use std::time::Duration;
 const NVD_API_BASE: &str = "https://services.nvd.nist.gov/rest/json/cves/2.0";
 
 pub struct NvdEnricher {
-    client: Client,
+    transport: HttpTransport,
     sparql: SparqlClient,
     api_key: Option<String>,
     cache_dir: Option<PathBuf>,
@@ -33,8 +34,6 @@ impl NvdEnricher {
         auth: SparqlAuth,
         backend: SparqlBackend,
     ) -> Result<Self> {
-        let client = crate::enricher::default_http_client();
-
         let cache_path = if let Some(dir) = cache_dir {
             let p = Path::new(dir).join("nvd");
             fs::create_dir_all(&p)?;
@@ -44,7 +43,7 @@ impl NvdEnricher {
         };
 
         Ok(Self {
-            client,
+            transport: HttpTransport::new(),
             sparql: make_sparql_client(endpoint, &auth, backend),
             api_key,
             cache_dir: cache_path,
@@ -64,11 +63,8 @@ impl NvdEnricher {
             "https://nvd.nist.gov/feeds/json/cve/2.0/nvdcve-2.0-{}.meta",
             feed_name
         );
-        let resp = self.client.get(&url).send().ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let text = resp.text().ok()?;
+        let resp = self.transport.get(&url, None).ok()?;
+        let text = String::from_utf8(resp.bytes).ok()?;
         // META format: key:value lines. Find sha256:XXXX
         for line in text.lines() {
             if let Some(hash) = line.strip_prefix("sha256:") {
@@ -104,20 +100,16 @@ impl NvdEnricher {
 
                 // Cache miss or SHA mismatch — download
                 eprintln!("  Downloading {} ({})...", feed_name, url);
-                let resp =
-                    self.client.get(&url).send().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                    })?;
-                if !resp.status().is_success() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("NVD feed {} returned {}", feed_name, resp.status()),
-                    ));
-                }
-                let bytes = resp
-                    .bytes()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
-                    .to_vec();
+                let bytes = self
+                    .transport
+                    .get(&url, None)
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("NVD feed {}: {}", feed_name, e),
+                        )
+                    })?
+                    .bytes;
 
                 // Save to cache
                 let mut f = File::create(&cached_gz)?;
@@ -130,25 +122,16 @@ impl NvdEnricher {
         }
 
         // No cache — direct download
-        let resp = match self.client.get(&url).send() {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(std::io::Error::new(
+        let bytes = self
+            .transport
+            .get(&url, None)
+            .map_err(|e| {
+                std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("Failed to fetch {}: {}", feed_name, e),
-                ));
-            }
-        };
-        if !resp.status().is_success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("NVD feed {} returned {}", feed_name, resp.status()),
-            ));
-        }
-        let bytes = resp
-            .bytes()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
-            .to_vec();
+                )
+            })?
+            .bytes;
         Ok(bytes)
     }
 
@@ -448,22 +431,25 @@ SELECT DISTINCT ?vuln WHERE {{
         let url = format!("{}?cveId={}", base_url, cve_id);
         let max_retries = 3;
 
+        // The transport already retries transport errors, 429 and 5xx. This
+        // loop survives only for NVD's own quirk: it answers 403 when an
+        // unkeyed caller is being rate limited, which is_retryable() rightly
+        // does not treat as transient for APIs in general.
         for attempt in 0..=max_retries {
-            let mut request = self.client.get(&url);
-
-            // Add API key header if present
+            let mut headers: Vec<(&str, &str)> = Vec::new();
             if let Some(ref key) = self.api_key {
-                request = request.header("apiKey", key);
+                headers.push(("apiKey", key));
             }
 
-            match request.send() {
-                Ok(response) if response.status().is_success() => {
-                    let nvd_response: NvdResponse = response.json().map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to parse NVD response: {}", e),
-                        )
-                    })?;
+            match self.transport.get_with(&url, &headers, None) {
+                Ok(response) => {
+                    let nvd_response: NvdResponse = serde_json::from_slice(&response.bytes)
+                        .map_err(|e| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("Failed to parse NVD response: {}", e),
+                            )
+                        })?;
 
                     // If totalResults=0, CVE doesn't exist
                     if nvd_response.total_results == 0 || nvd_response.vulnerabilities.is_empty() {
@@ -472,41 +458,13 @@ SELECT DISTINCT ?vuln WHERE {{
 
                     return Ok(Some(nvd_response.vulnerabilities[0].cve.clone()));
                 }
-                Ok(response)
-                    if (response.status() == 429
-                        || response.status() == 403
-                        || response.status() == 503)
-                        && attempt < max_retries =>
-                {
+                // CVE not found in NVD
+                Err(FetchError::NotFound { .. }) => return Ok(None),
+                Err(FetchError::HttpStatus { status: 403, .. }) if attempt < max_retries => {
                     let backoff = Duration::from_secs(2 * (1 << attempt)); // 2s, 4s, 8s
                     eprintln!(
-                        "    NVD API {} for {}, retrying in {}s...",
-                        response.status(),
+                        "    NVD API 403 (unkeyed rate limit) for {}, retrying in {}s...",
                         cve_id,
-                        backoff.as_secs()
-                    );
-                    std::thread::sleep(backoff);
-                }
-                Ok(response) if response.status() == 404 => {
-                    // CVE not found in NVD
-                    return Ok(None);
-                }
-                Ok(response) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!(
-                            "NVD API request failed for {}: {}",
-                            cve_id,
-                            response.status()
-                        ),
-                    ));
-                }
-                Err(e) if attempt < max_retries => {
-                    let backoff = Duration::from_secs(2 * (1 << attempt));
-                    eprintln!(
-                        "    NVD API error for {}: {}, retrying in {}s...",
-                        cve_id,
-                        e,
                         backoff.as_secs()
                     );
                     std::thread::sleep(backoff);
@@ -833,10 +791,7 @@ mod tests {
         };
 
         let enricher = NvdEnricher {
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             sparql: SparqlClient::new("http://localhost:3030/packagegraph"),
             api_key: None,
             cache_dir: None,
@@ -948,10 +903,7 @@ mod tests {
             .create();
 
         let enricher = NvdEnricher {
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             sparql: SparqlClient::new(&server.url()),
             api_key: None,
             cache_dir: None,
@@ -979,10 +931,7 @@ mod tests {
             .create();
 
         let enricher = NvdEnricher {
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             sparql: SparqlClient::new(&server.url()),
             api_key: None,
             cache_dir: None,
@@ -1032,10 +981,7 @@ mod tests {
             .create();
 
         let enricher = NvdEnricher {
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             sparql: SparqlClient::new("http://localhost:3030/test"),
             api_key: None,
             cache_dir: None,
@@ -1071,10 +1017,7 @@ mod tests {
             .create();
 
         let enricher = NvdEnricher {
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             sparql: SparqlClient::new("http://localhost:3030/test"),
             api_key: None,
             cache_dir: None,
@@ -1100,10 +1043,7 @@ mod tests {
             .create();
 
         let enricher = NvdEnricher {
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap(),
+            transport: HttpTransport::new(),
             sparql: SparqlClient::new(&server.url()),
             api_key: None,
             cache_dir: None,

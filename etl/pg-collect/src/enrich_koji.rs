@@ -5,13 +5,14 @@
 
 use crate::cache::FileCache;
 use crate::enricher::rate_limit;
+use crate::fetch_error::FetchError;
 use crate::forge::emit_dq_issue;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use reqwest::blocking::Client;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Result;
@@ -19,7 +20,7 @@ use std::time::Duration;
 
 pub struct KojiEnricher {
     sparql: Option<SparqlClient>,
-    client: Client,
+    transport: HttpTransport,
     cache: Option<FileCache>,
     koji_hub: String,
     pub distro: String,
@@ -39,8 +40,6 @@ impl KojiEnricher {
         backend: SparqlBackend,
     ) -> Self {
         let sparql = Some(make_sparql_client(endpoint, &auth, backend));
-        let client = crate::enricher::default_http_client();
-
         let cache = cache_dir.map(|dir| {
             FileCache::new(dir, "koji", 720, None) // 30 days TTL
                 .expect("Failed to create cache")
@@ -58,7 +57,7 @@ impl KojiEnricher {
 
         Self {
             sparql,
-            client,
+            transport: HttpTransport::new(),
             cache,
             koji_hub: koji_hub.to_string(),
             distro: distro.to_string(),
@@ -94,8 +93,6 @@ impl KojiEnricher {
         cache_dir: Option<&str>,
         minio: Option<crate::cache::MinioConfig>,
     ) -> Self {
-        let client = crate::enricher::default_http_client();
-
         let cache = cache_dir
             .map(|dir| FileCache::new(dir, "koji", 720, minio).expect("Failed to create cache"));
 
@@ -110,7 +107,7 @@ impl KojiEnricher {
 
         Self {
             sparql: None,
-            client,
+            transport: HttpTransport::new(),
             cache,
             koji_hub: koji_hub.to_string(),
             distro: distro.to_string(),
@@ -255,29 +252,30 @@ impl KojiEnricher {
                     nvr
                 );
 
-                let resp = self
-                    .client
-                    .post(&self.koji_hub)
-                    .header("Content-Type", "text/xml")
-                    .body(xml_body)
-                    .send()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let resp = self.transport.post(
+                    &self.koji_hub,
+                    &[("Content-Type", "text/xml")],
+                    xml_body.into_bytes(),
+                );
 
-                if !resp.status().is_success() {
-                    emit_dq_issue(
-                        writer,
-                        "koji-enricher",
-                        "getBuild",
-                        nvr,
-                        "koji-api-error",
-                        "warning",
-                    )?;
-                    return Ok(0);
-                }
+                let resp = match resp {
+                    Ok(r) => r,
+                    Err(_) => {
+                        emit_dq_issue(
+                            writer,
+                            "koji-enricher",
+                            "getBuild",
+                            nvr,
+                            "koji-api-error",
+                            "warning",
+                        )?;
+                        return Ok(0);
+                    }
+                };
 
-                let body = resp
-                    .text()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let body = String::from_utf8(resp.bytes).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?;
 
                 let data = parse_xmlrpc_struct(&body);
                 if data.is_empty() {
@@ -344,29 +342,29 @@ impl KojiEnricher {
             build_id
         );
 
-        let resp = self
-            .client
-            .post(&self.koji_hub)
-            .header("Content-Type", "text/xml")
-            .body(list_rpms_xml)
-            .send()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let resp = self.transport.post(
+            &self.koji_hub,
+            &[("Content-Type", "text/xml")],
+            list_rpms_xml.into_bytes(),
+        );
 
-        if !resp.status().is_success() {
-            emit_dq_issue(
-                writer,
-                "koji-enricher",
-                "listBuildRPMs",
-                build_id,
-                "koji-api-error",
-                "warning",
-            )?;
-            return Ok(0);
-        }
+        let resp = match resp {
+            Ok(r) => r,
+            Err(_) => {
+                emit_dq_issue(
+                    writer,
+                    "koji-enricher",
+                    "listBuildRPMs",
+                    build_id,
+                    "koji-api-error",
+                    "warning",
+                )?;
+                return Ok(0);
+            }
+        };
 
-        let body = resp
-            .text()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let body = String::from_utf8(resp.bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
         let rpms = parse_xmlrpc_array(&body);
         // Find first non-src RPM with an id
@@ -395,29 +393,29 @@ impl KojiEnricher {
             rpm_id
         );
 
-        let resp = self
-            .client
-            .post(&self.koji_hub)
-            .header("Content-Type", "text/xml")
-            .body(query_sigs_xml)
-            .send()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let resp = self.transport.post(
+            &self.koji_hub,
+            &[("Content-Type", "text/xml")],
+            query_sigs_xml.into_bytes(),
+        );
 
-        if !resp.status().is_success() {
-            emit_dq_issue(
-                writer,
-                "koji-enricher",
-                "queryRPMSigs",
-                &rpm_id,
-                "koji-api-error",
-                "warning",
-            )?;
-            return Ok(0);
-        }
+        let resp = match resp {
+            Ok(r) => r,
+            Err(_) => {
+                emit_dq_issue(
+                    writer,
+                    "koji-enricher",
+                    "queryRPMSigs",
+                    &rpm_id,
+                    "koji-api-error",
+                    "warning",
+                )?;
+                return Ok(0);
+            }
+        };
 
-        let body = resp
-            .text()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let body = String::from_utf8(resp.bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
         let sigs = parse_xmlrpc_array(&body);
         // Find first entry with a non-empty sigkey
