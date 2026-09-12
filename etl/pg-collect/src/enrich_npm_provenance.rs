@@ -4,29 +4,28 @@
 //! bundles (--provenance flag), and emits SLSA provenance triples.
 
 use crate::enricher::rate_limit;
+use crate::fetch_error::FetchError;
 use crate::forge::emit_dq_issue;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
-use reqwest::blocking::Client;
 use std::fs::File;
 use std::io::Result;
 use std::time::Duration;
 
 pub struct NpmProvenanceEnricher {
     sparql: SparqlClient,
-    client: Client,
+    transport: HttpTransport,
     pub graph_uri: Option<String>,
 }
 
 impl NpmProvenanceEnricher {
     pub fn new(endpoint: &str, auth: SparqlAuth, backend: SparqlBackend) -> Self {
         let sparql = make_sparql_client(endpoint, &auth, backend);
-        let client = crate::enricher::default_http_client();
-
         Self {
             sparql,
-            client,
+            transport: HttpTransport::new(),
             graph_uri: None,
         }
     }
@@ -120,30 +119,21 @@ impl NpmProvenanceEnricher {
             name, version
         );
 
-        let response = self
-            .client
-            .get(&url)
-            .header("Accept", "application/json")
-            .send();
-
-        let resp = match response {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => return Ok(0),
-            Ok(r) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("HTTP {} for {}", r.status(), name),
-                ));
-            }
+        let resp = match self
+            .transport
+            .get_with(&url, &[("Accept", "application/json")], None)
+        {
+            Ok(r) => r,
+            Err(FetchError::NotFound { .. }) => return Ok(0),
             Err(e) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!("Network error for {}: {}", name, e),
+                    format!("{} for {}", e, name),
                 ));
             }
         };
 
-        let data: serde_json::Value = match resp.json() {
+        let data: serde_json::Value = match serde_json::from_slice(&resp.bytes) {
             Ok(d) => d,
             Err(e) => {
                 return Err(std::io::Error::new(

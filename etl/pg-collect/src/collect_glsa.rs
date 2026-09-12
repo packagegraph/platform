@@ -13,6 +13,8 @@
 
 use crate::cache::FileCache;
 use crate::enricher::rate_limit;
+use crate::fetch_error::FetchError;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
@@ -20,7 +22,6 @@ use once_cell::sync::Lazy;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use regex::Regex;
-use reqwest::blocking::Client;
 use serde_json;
 use std::fs::File;
 use std::io::Result;
@@ -31,7 +32,7 @@ static CVE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"CVE-\d{4}-\d{4,}").unwrap
 
 /// GLSA advisory collector with SPARQL-based atom resolution.
 pub struct GlsaCollector {
-    client: Client,
+    transport: HttpTransport,
     sparql: SparqlClient,
     since: Option<String>,
     cache: Option<FileCache>,
@@ -51,14 +52,12 @@ impl GlsaCollector {
         auth: SparqlAuth,
         backend: SparqlBackend,
     ) -> Result<Self> {
-        let client = crate::enricher::default_http_client();
-
         let cache = cache_dir
             .map(|dir| FileCache::new(dir, "glsa", 168, None))
             .transpose()?;
 
         Ok(Self {
-            client,
+            transport: HttpTransport::new(),
             sparql: make_sparql_client(endpoint, &auth, backend),
             since,
             cache,
@@ -226,21 +225,13 @@ impl GlsaCollector {
         let xml = match self.cached_get(cache_key) {
             Some(data) => data,
             None => {
-                let resp =
-                    self.client.get(url).send().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                    })?;
+                let resp = self.transport.get(url, None).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::Other, format!("GLSA RSS index: {}", e))
+                })?;
 
-                if !resp.status().is_success() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("GLSA RSS index returned {}", resp.status()),
-                    ));
-                }
-
-                let xml = resp
-                    .text()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let xml = String::from_utf8(resp.bytes).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?;
 
                 self.cache_put(cache_key, &xml);
                 xml
@@ -295,21 +286,16 @@ impl GlsaCollector {
         match self.cached_get(&cache_key) {
             Some(data) => Ok(data),
             None => {
-                let resp =
-                    self.client.get(&url).send().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                    })?;
-
-                if !resp.status().is_success() {
-                    return Err(std::io::Error::new(
+                let resp = self.transport.get(&url, None).map_err(|e| {
+                    std::io::Error::new(
                         std::io::ErrorKind::Other,
-                        format!("GLSA {} returned {}", glsa_id, resp.status()),
-                    ));
-                }
+                        format!("GLSA {}: {}", glsa_id, e),
+                    )
+                })?;
 
-                let xml = resp
-                    .text()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let xml = String::from_utf8(resp.bytes).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?;
 
                 self.cache_put(&cache_key, &xml);
                 Ok(xml)

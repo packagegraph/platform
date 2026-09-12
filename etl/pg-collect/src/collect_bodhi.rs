@@ -5,7 +5,9 @@
 
 use crate::cache::FileCache;
 use crate::enricher::rate_limit;
+use crate::fetch_error::FetchError;
 use crate::forge::emit_dq_issue;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
@@ -13,7 +15,6 @@ use once_cell::sync::Lazy;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use regex::Regex;
-use reqwest::blocking::Client;
 use serde_json;
 use std::fs::File;
 use std::io::Result;
@@ -24,7 +25,7 @@ static CVE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"CVE-\d{4}-\d{4,}").unwrap
 
 /// Bodhi advisory collector with SPARQL-based package resolution.
 pub struct BodhiCollector {
-    client: Client,
+    transport: HttpTransport,
     sparql: SparqlClient,
     /// Bodhi release tag for API queries (e.g., "F43")
     release: String,
@@ -50,8 +51,6 @@ impl BodhiCollector {
         auth: SparqlAuth,
         backend: SparqlBackend,
     ) -> Result<Self> {
-        let client = crate::enricher::default_http_client();
-
         let cache = cache_dir
             .map(|dir| FileCache::new(dir, "bodhi", 168, None))
             .transpose()?;
@@ -65,7 +64,7 @@ impl BodhiCollector {
             .to_string();
 
         Ok(Self {
-            client,
+            transport: HttpTransport::new(),
             sparql: make_sparql_client(endpoint, &auth, backend),
             release,
             graph_release,
@@ -106,19 +105,12 @@ impl BodhiCollector {
             let xml = match self.cached_get(&cache_key) {
                 Some(data) => data,
                 None => {
-                    let resp = self.client.get(&url).send().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    let resp = self.transport.get(&url, None).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, format!("Bodhi RSS: {}", e))
                     })?;
 
-                    if !resp.status().is_success() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Bodhi RSS returned {}", resp.status()),
-                        ));
-                    }
-
-                    let xml = resp.text().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    let xml = String::from_utf8(resp.bytes).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
                     })?;
 
                     self.cache_put(&cache_key, &xml);

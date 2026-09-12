@@ -1,10 +1,11 @@
 use crate::cache::FileCache;
 use crate::enricher::{github_owner_repo, rate_limit};
+use crate::fetch_error::FetchError;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
 use percent_encoding::percent_decode_str;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -13,7 +14,7 @@ use std::time::Duration;
 
 pub struct DiffEnricher {
     sparql: SparqlClient,
-    client: Client,
+    transport: HttpTransport,
     cache: Option<FileCache>,
     token: Option<String>,
     pub graph_uri: Option<String>,
@@ -55,14 +56,12 @@ impl DiffEnricher {
         backend: SparqlBackend,
     ) -> Self {
         let sparql = make_sparql_client(endpoint, &auth, backend);
-        let client = crate::enricher::default_http_client();
-
         let cache = cache_dir
             .map(|dir| FileCache::new(dir, "diff", 168, None).expect("Failed to create cache"));
 
         Self {
             sparql,
-            client,
+            transport: HttpTransport::new(),
             cache,
             token: github_token,
             graph_uri: None,
@@ -391,22 +390,19 @@ impl DiffEnricher {
     }
 
     fn api_get(&self, url: &str) -> std::result::Result<serde_json::Value, String> {
-        let mut req = self
-            .client
-            .get(url)
-            .header("Accept", "application/vnd.github+json");
-
+        let auth;
+        let mut headers: Vec<(&str, &str)> = vec![("Accept", "application/vnd.github+json")];
         if let Some(ref token) = self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            auth = format!("Bearer {}", token);
+            headers.push(("Authorization", &auth));
         }
 
-        let resp = req.send().map_err(|e| e.to_string())?;
+        let resp = self
+            .transport
+            .get_with(url, &headers, None)
+            .map_err(|e| format!("{}: {}", e, url))?;
 
-        if !resp.status().is_success() {
-            return Err(format!("HTTP {}: {}", resp.status(), url));
-        }
-
-        resp.json().map_err(|e| e.to_string())
+        serde_json::from_slice(&resp.bytes).map_err(|e| e.to_string())
     }
 
     fn extract_github_from_repo_uri(repo_uri: &str) -> Option<(String, String)> {

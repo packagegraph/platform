@@ -7,10 +7,11 @@
 
 use crate::cache::FileCache;
 use crate::enricher::{rate_limit, SLOW_RATE_LIMIT};
+use crate::fetch_error::FetchError;
+use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
-use reqwest::blocking::Client;
 use std::fs::File;
 use std::io::Result;
 
@@ -36,7 +37,7 @@ fn repo_mapping(repo: &str) -> Option<(&str, &str)> {
 
 pub struct RepologyEnricher {
     sparql: SparqlClient,
-    client: Client,
+    transport: HttpTransport,
     cache: Option<FileCache>,
     pub graph_uri: Option<String>,
 }
@@ -49,8 +50,6 @@ impl RepologyEnricher {
         backend: SparqlBackend,
     ) -> Self {
         let sparql = make_sparql_client(endpoint, &auth, backend);
-        let client = crate::enricher::default_http_client();
-
         let cache = cache_dir.map(|dir| {
             FileCache::new(dir, "repology", 168, None) // 7 days TTL
                 .expect("Failed to create cache")
@@ -58,7 +57,7 @@ impl RepologyEnricher {
 
         Self {
             sparql,
-            client,
+            transport: HttpTransport::new(),
             cache,
             graph_uri: None,
         }
@@ -152,24 +151,18 @@ impl RepologyEnricher {
             Some(d) => d,
             None => {
                 let url = format!("https://repology.org/api/v1/project/{}", name);
-                let resp =
-                    self.client.get(&url).send().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                    })?;
+                let resp = match self.transport.get(&url, None) {
+                    Ok(r) => r,
+                    Err(FetchError::NotFound { .. }) => return Ok(0),
+                    Err(e) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Repology API: {}", e),
+                        ))
+                    }
+                };
 
-                if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                    return Ok(0);
-                }
-
-                if !resp.status().is_success() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Repology API returned {}", resp.status()),
-                    ));
-                }
-
-                let data: serde_json::Value = resp
-                    .json()
+                let data: serde_json::Value = serde_json::from_slice(&resp.bytes)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
                 self.cache_put(&cache_key, &data);
