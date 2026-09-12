@@ -58,7 +58,8 @@ while the Hackage collector independently mints:
 
 Nothing joins them. A consumer must know to string-match a literal against a
 `packageName`, guess the URI shape of the registry side, and know that the
-ecosystem token `gomod` corresponds to the URI segment `go`.
+name `g:a` the distro side records is written `g/a` in the registry
+collector's URI — then percent-encoded.
 
 Separately, a package can contain upstream code it does not declare as a
 dependency. The `ghc-hoauth2` spec file vendors a second Hackage package:
@@ -76,10 +77,11 @@ RPM has a standard declaration for this class of fact —
 
 Note that resolving *this particular* `Source1` requires recursive `%global`
 macro expansion, which is sub-project 3. What this design delivers on bundling
-is the declaration-based path (§5), which covers the large `rust2rpm` /
-`go2rpm` population today; the Haskell subpackage path is sub-project 4 (§12). The example
-is used here because it makes the shape of the missing relationship legible,
-not because §5 resolves it.
+is the declaration-based path (§5), which covers the `rust2rpm` population
+today; the Haskell subpackage path is sub-project 4 and the `go2rpm` population
+needs §3.4's Go exclusion lifted first. The example is used here because it
+makes the shape of the missing relationship legible, not because §5 resolves
+it.
 
 ### Goals
 
@@ -127,8 +129,10 @@ deriver runs.
 - **Version-aware seeding.** Making registry collectors fetch the specific
   versions distros pin would change the seed format, touch 11 collectors, and
   multiply collection volume. See §7 for why this design does not need it.
-- **CPAN.** See §3.3 — CPAN cannot be resolved by string transform and is
-  explicitly excluded from v1 rather than emitted as dangling references.
+- **CPAN, Go, and conda.** All three name things in a namespace the registry
+  collector does not key by, so none can be resolved by string transform.
+  Excluded from v1 (§3.3, §3.4, §3.5) rather than emitted as dangling
+  references. Eight ecosystems remain.
 
 ## 2. Vocabulary
 
@@ -481,22 +485,24 @@ guessable from the ecosystem token — two of them differ.
 | `npm` | `npm` | `registry` | none | npm.rs:194 |
 | `cargo` | `cargo` | `crates.io` | none | cargo_collect.rs:281 |
 | `rubygems` | `rubygems` | `org` | none | rubygems.rs:201 |
-| `gomod` | **`go`** | `modules` | none | gomod.rs:309 |
+| `gomod` | — | — | **excluded, see §3.4** | gomod.rs:309 |
 | `maven` | `maven` | `central` | **`g:a` → `g/a`** | maven.rs:907 |
 | `cran` | `cran` | `cran` | none | cran.rs:209 |
 | `hex` | `hex` | `pm` | none | hex_collect.rs:266 |
 | `nuget` | `nuget` | `gallery` | none | nuget.rs:234 |
 | `cpan` | — | — | **excluded, see §3.3** | cpan.rs:195 |
-| `conda` | — | — | **excluded, see §3.4** | conda.rs:198 |
+| `conda` | — | — | **excluded, see §3.5** | conda.rs:198 |
 
 All identities are `package_identity_uri(distro_seg, release_seg, "any", transformed_name)`.
 
 Three rows carry traps that a naive `token == segment` implementation would
 get wrong, producing well-formed URIs that match nothing:
 
-- **`gomod` → `go`.** The distro side writes `pkg:upstreamEcosystem
-  <d/ecosystem/gomod>` (rpm.rs maps `golang(X)` to the token `gomod`), but
-  `gomod.rs:309` mints identities under the segment `go`.
+- **`gomod` → `go` was a trap, and is now moot.** The distro side writes
+  `pkg:upstreamEcosystem <d/ecosystem/gomod>` while `gomod.rs:309` mints under
+  the segment `go`. That rename is real, but it is not the reason Go is
+  excluded — §3.4 is. Recorded here because a future implementer lifting the
+  exclusion must handle both the rename *and* module-root resolution.
 - **`maven` separator.** `rpm.rs` derives `"g:a"` from `mvn(group:artifact)`,
   while `maven.rs:907` mints the path segment `g/a`.
 - **`pypi` normalization.** The distro side strips a prefix without case
@@ -538,7 +544,53 @@ detector `cpan-module-distribution-unresolved` records each skipped case, so
 the cost of the gap is measurable and the follow-up is scoped by real data.
 Fixing `cpan.rs`'s own inconsistency is filed as follow-on work (§12).
 
-### 3.4 conda is excluded
+### 3.4 Go is excluded: import paths are not module paths
+
+The `gomod` row looks like the simplest case — the module path *is* the
+repository — and the previous revision treated it as a plain string mapping
+with only the `gomod`→`go` segment rename to watch for. That is wrong.
+
+RPM's `golang(X)` capabilities are **import paths**: `go-rpm-macros` emits one
+per package directory, so a single module yields many, e.g.
+`golang(github.com/foo/bar)`, `golang(github.com/foo/bar/pkg/baz)`,
+`golang(github.com/foo/bar/internal/qux)`.
+
+`gomod.rs` keys identities by **module root**, and does so deliberately —
+`gomod.rs:162` routes every path through `resolve_module_root` before minting:
+
+```rust
+// gomod.rs:51-69 (abridged)
+fn resolve_module_root(&self, import_path: &str) -> Option<String> {
+    // known-module prefix cache, then negative cache, then:
+    // "Try progressively shorter prefixes" against the Go proxy
+}
+```
+
+So `github.com/foo/bar/pkg/baz` collapses to the identity
+`…/go/modules/any/github.com%2Ffoo%2Fbar`. A resolver that mints from the raw
+import path produces `…/github.com%2Ffoo%2Fbar%2Fpkg%2Fbaz`, which matches
+nothing — and it does so for the *majority* of `golang()` capabilities, since
+only the module-root package shares a name with its module.
+
+This cannot be fixed by a string transform. `resolve_module_root` is
+network-dependent (Go proxy lookups over shortening prefixes) and stateful (two
+caches). Reusing it would change `registry_identity_uri` from a pure function
+into one performing I/O, which is a different contract and a different
+testing story.
+
+`registry_identity_uri("gomod", _)` therefore returns `None` in v1, with a DQ
+issue under detector `go-import-path-unresolved`. A follow-up can lift
+`resolve_module_root` into a shared, cache-backed resolver used by both
+`gomod.rs` and this path; the volume of skipped capabilities recorded by the DQ
+issues is what should justify that work.
+
+Note this makes **three** exclusions — CPAN, Go, and conda — sharing one shape:
+the distro side names a thing in a namespace the registry collector does not key
+by. Only a lookup reconciles them. The eight remaining ecosystems in §3.2 are
+genuinely pure string transforms, and that distinction is the real content of
+the table.
+
+### 3.5 conda is excluded
 
 `conda.rs:198` takes its distro, release, and subdir from CLI arguments
 (`main.rs:352-365`), defaulting to `conda`/`conda-forge`/`linux-64`. The
@@ -709,10 +761,10 @@ Fedora packaging policy requires bundled code to be declared as
 format that `rpm.rs::emit_ecosystem_triples` (rpm.rs:1054-1110) already parses:
 
 ```
-bundled(crate(nom))           → cargo / nom
-bundled(golang(github.com/…)) → gomod / github.com/…
-bundled(npm(lodash))          → npm / lodash
-bundled(python3dist(six))     → pypi / six
+bundled(crate(nom))           → cargo / nom          → assertion emitted
+bundled(npm(lodash))          → npm   / lodash       → assertion emitted
+bundled(python3dist(six))     → pypi  / six          → assertion emitted
+bundled(golang(github.com/…)) → gomod / …            → None (§3.4), DQ issue only
 ```
 
 The extractor is therefore small: strip the `bundled(` … `)` wrapper, pass the
@@ -725,9 +777,15 @@ claimed to.** Fedora's Haskell packaging uses `%ghc_lib_subpackage` (which
 emits a real subpackage providing `ghc-pkg(binary-instances)`) rather than a
 `bundled()` declaration, so the vendored `Source1` component in that spec is
 discoverable only through subpackage structure and spec macro expansion —
-sub-projects 3 and 4. What §5.1 does cover in v1 is the large population of
-`rust2rpm`- and `go2rpm`-generated packages, where `bundled(crate(...))` and
-`bundled(golang(...))` are the standard and widely-populated declaration.
+sub-projects 3 and 4.
+
+What §5.1 covers in v1 is the `rust2rpm` population, where
+`bundled(crate(...))` is the standard and widely-populated declaration. The
+`go2rpm` population is **not** covered despite `bundled(golang(...))` being
+equally standard, because Go import paths cannot be resolved to module
+identities without the lookup described in §3.4 — those capabilities are
+detected and recorded as DQ issues rather than dropped silently, so the volume
+is measurable and can justify lifting the exclusion.
 
 `bundled()` capabilities frequently carry no version, and where they do, the
 version belongs to that specific component. Under the §2.2 assertion model
@@ -1095,8 +1153,9 @@ Unit tests, per the existing `#[cfg(test)]` convention in each collector:
    all ten supported ecosystems. Each assertion hard-codes the expected string
    and is paired with a comment citing the collector line it mirrors. These
    are the regression tests for the §3.2 traps.
-2. `registry_identity_uri("gomod", …)` produces a `/go/modules/` path, **not**
-   `/gomod/`.
+2. `registry_identity_uri("gomod", "github.com/foo/bar/pkg/baz")` returns
+   `None` (§3.4) — it must **not** mint `…/go/modules/any/…pkg%2Fbaz`, which
+   matches no node `gomod.rs` produces.
 3. `registry_identity_uri("maven", "g:a")` produces
    `…/maven/central/any/g%2Fa` — **percent-encoded, not a path separator**.
    `encode()` (uris.rs:82-85) matches Python's `quote(component, safe="")`, so
@@ -1108,7 +1167,8 @@ Unit tests, per the existing `#[cfg(test)]` convention in each collector:
 4. `registry_identity_uri("pypi", "Foo.Bar")` produces `…/any/foo-bar`
    (PEP 503), while `registry_identity_uri("hackage", "HUnit")` preserves
    case.
-5. `registry_identity_uri("cpan", …)` and `("conda", …)` return `None`.
+5. `registry_identity_uri` returns `None` for all three excluded ecosystems —
+   `cpan`, `gomod`, `conda` — and a DQ issue is recorded for each.
 6. **Altitude tests** (the `45a0aaf` regression guard): assert
    `upstreamPackageIdentity` appears on the identity subject and *never* on
    the versioned subject, and that `pkg:bundles` does likewise. One per
@@ -1122,8 +1182,10 @@ Unit tests, per the existing `#[cfg(test)]` convention in each collector:
    Assert `npm:bundledDependency` is never emitted (§2.2).
 9. Each of the nine §6 collectors emits `pkg:upstreamRepository` on the
    identity for a forge URL, and nothing for a non-forge URL.
-10. `gomod` major-version suffix stripping: `github.com/go-chi/chi/v5` →
-    `github.com/go-chi/chi`.
+10. `gomod.rs`'s **forge wiring** (§6, unaffected by the §3.4 exclusion):
+    major-version suffix stripping `github.com/go-chi/chi/v5` →
+    `github.com/go-chi/chi`, and no emission for `golang.org/x/…` or vanity
+    domains that match no forge.
 
 Integration:
 
