@@ -477,6 +477,7 @@ impl PypiCollector {
                         status,
                         bytes,
                         etag,
+                        last_modified: None,
                     });
                 }
                 Err(e) => {

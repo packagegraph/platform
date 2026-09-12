@@ -18,6 +18,9 @@ pub struct HttpResponse {
     pub status: u16,
     pub bytes: Vec<u8>,
     pub etag: Option<String>,
+    /// `Last-Modified`, for callers whose conditional GET uses it as well
+    /// as (or instead of) an ETag -- `SourceCache` sends both.
+    pub last_modified: Option<String>,
 }
 
 /// Outcome of a cached fetch operation.
@@ -516,6 +519,7 @@ mod tests {
                     status: 200,
                     bytes: b"also-invalid".to_vec(),
                     etag: None,
+                    last_modified: None,
                 })
             },
         );
@@ -585,6 +589,7 @@ mod tests {
                     status: 404,
                     bytes: vec![],
                     etag: None,
+                    last_modified: None,
                 })
             },
         );
@@ -640,6 +645,7 @@ mod tests {
                     status: 200,
                     bytes: b"fresh-from-network".to_vec(),
                     etag: Some("\"new-etag\"".to_string()),
+                    last_modified: None,
                 })
             },
         );
@@ -670,6 +676,7 @@ mod tests {
                     status: 404,
                     bytes: vec![],
                     etag: None,
+                    last_modified: None,
                 })
             },
         );
@@ -715,6 +722,7 @@ mod tests {
                     status: 304,
                     bytes: vec![],
                     etag: Some("\"etag-1\"".to_string()),
+                    last_modified: None,
                 })
             },
         );
@@ -762,6 +770,7 @@ mod tests {
                         status: 304,
                         bytes: vec![],
                         etag: Some("\"etag-old\"".to_string()),
+                        last_modified: None,
                     })
                 } else {
                     assert!(etag.is_none(), "retry should be unconditional");
@@ -769,6 +778,7 @@ mod tests {
                         status: 200,
                         bytes: b"fresh-valid-body".to_vec(),
                         etag: Some("\"etag-new\"".to_string()),
+                        last_modified: None,
                     })
                 }
             },
@@ -799,12 +809,14 @@ mod tests {
                         status: 304,
                         bytes: vec![],
                         etag: None,
+                        last_modified: None,
                     })
                 } else {
                     Ok(HttpResponse {
                         status: 200,
                         bytes: b"actual-body".to_vec(),
                         etag: None,
+                        last_modified: None,
                     })
                 }
             },
@@ -1023,6 +1035,7 @@ mod tests {
                     status: 503,
                     bytes: b"service unavailable".to_vec(),
                     etag: None,
+                    last_modified: None,
                 })
             },
         );
@@ -1053,6 +1066,7 @@ mod tests {
                     status: 429,
                     bytes: b"rate limited".to_vec(),
                     etag: None,
+                    last_modified: None,
                 })
             },
         );
@@ -1085,6 +1099,7 @@ mod tests {
                     status: 200,
                     bytes: b"invalid-data".to_vec(),
                     etag: None,
+                    last_modified: None,
                 })
             },
         );
@@ -1138,6 +1153,7 @@ mod tests {
                 status: 200,
                 bytes: b"from-network".to_vec(),
                 etag: None,
+                last_modified: None,
             })
         });
 
@@ -1175,6 +1191,7 @@ mod tests {
                     status: 200,
                     bytes: b"refreshed-data".to_vec(),
                     etag: Some("\"new-etag\"".to_string()),
+                    last_modified: None,
                 })
             },
         );
@@ -1226,6 +1243,7 @@ mod tests {
                     status: 200,
                     bytes: b"<pom>content</pom>".to_vec(),
                     etag: None,
+                    last_modified: None,
                 })
             },
         );
@@ -1292,6 +1310,7 @@ mod tests {
                         status: 200,
                         bytes: b"from-network".to_vec(),
                         etag: None,
+                        last_modified: None,
                     })
                 },
             );
@@ -1318,6 +1337,7 @@ mod tests {
                         status: 200,
                         bytes: b"from-network".to_vec(),
                         etag: None,
+                        last_modified: None,
                     })
                 },
             );
@@ -1364,6 +1384,7 @@ mod tests {
                         status: 304,
                         bytes: vec![],
                         etag: None,
+                        last_modified: None,
                     })
                 } else {
                     // Retry must also be unconditional
@@ -1372,6 +1393,7 @@ mod tests {
                         status: 200,
                         bytes: b"proper-response".to_vec(),
                         etag: None,
+                        last_modified: None,
                     })
                 }
             },
@@ -1416,6 +1438,7 @@ mod tests {
                     status: 304,
                     bytes: vec![],
                     etag: Some("\"404-etag\"".to_string()),
+                    last_modified: None,
                 })
             },
         );
@@ -1511,6 +1534,7 @@ mod tests {
                     status: 304,
                     bytes: vec![],
                     etag: Some("\"etag\"".to_string()),
+                    last_modified: None,
                 })
             },
         );
@@ -1537,6 +1561,7 @@ mod tests {
                     status: 403,
                     bytes: b"forbidden".to_vec(),
                     etag: None,
+                    last_modified: None,
                 })
             },
         );

@@ -786,6 +786,7 @@ impl MavenCollector {
                         status,
                         bytes: bytes.to_vec(),
                         etag: resp_etag,
+                        last_modified: None,
                     });
                 }
                 Err(e) => {
@@ -2717,6 +2718,7 @@ mod tests {
                     status: 200,
                     bytes: b"fresh-from-network".to_vec(),
                     etag: None,
+                    last_modified: None,
                 })
             },
         );

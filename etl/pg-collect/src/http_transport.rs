@@ -6,7 +6,7 @@ use crate::enricher::default_http_client;
 use crate::fetch_error::FetchError;
 use once_cell::sync::Lazy;
 use reqwest::blocking::Client;
-use reqwest::header::{ETAG, IF_NONE_MATCH, RETRY_AFTER};
+use reqwest::header::{ETAG, IF_NONE_MATCH, LAST_MODIFIED, RETRY_AFTER};
 use reqwest::StatusCode;
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
@@ -428,10 +428,15 @@ impl HttpTransport {
             };
         }
 
-        // Take an owned ETag before `bytes()` consumes the response.
+        // Take owned validators before `bytes()` consumes the response.
         let etag = response
             .headers()
             .get(ETAG)
+            .and_then(|h| h.to_str().ok())
+            .map(String::from);
+        let last_modified = response
+            .headers()
+            .get(LAST_MODIFIED)
             .and_then(|h| h.to_str().ok())
             .map(String::from);
 
@@ -441,6 +446,7 @@ impl HttpTransport {
                     status: status.as_u16(),
                     bytes: body.to_vec(),
                     etag,
+                    last_modified,
                 }),
                 retry_after,
             },
@@ -852,6 +858,29 @@ mod tests {
             "Retry-After must be obeyed verbatim, not jittered down"
         );
         assert_eq!(t.stats().rate_limited, 1);
+    }
+
+    #[test]
+    fn get_captures_last_modified_for_conditional_reuse() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/archive.gz")
+            .with_status(200)
+            .with_header("last-modified", "Wed, 10 Sep 2026 12:00:00 GMT")
+            .with_header("etag", "\"abc\"")
+            .with_body("payload")
+            .expect(1)
+            .create();
+
+        let t = test_transport(fast_policy(5));
+        let resp = t.get(&format!("{}/archive.gz", server.url()), None).unwrap();
+
+        mock.assert();
+        assert_eq!(
+            resp.last_modified.as_deref(),
+            Some("Wed, 10 Sep 2026 12:00:00 GMT")
+        );
+        assert_eq!(resp.etag.as_deref(), Some("\"abc\""));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::forge::emit_dq_issue;
 use crate::ntriples::{bnode_id, NTriplesWriter};
+use crate::http_transport::HttpTransport;
 use crate::source_cache::{CacheResult, CacheScope, SourceCache};
 use crate::uris::*;
 use flate2::read::GzDecoder;
@@ -120,14 +121,15 @@ impl RpmCollector {
         }
     }
 
-    /// Reuses `self.client` rather than `SourceCache::new`'s plain default
-    /// client -- essential when this collector was built with
+    /// Wraps `self.client` in a transport rather than letting `SourceCache`
+    /// build its own -- essential when this collector was built with
     /// `new_with_tls`/`new_with_tls_and_repo_type`, since `SourceCache`
-    /// downloads every cached fetch through its own client, and a plain
-    /// client silently has no TLS client-cert for RHEL CDN auth (see
-    /// `SourceCache::with_client`'s doc comment).
+    /// downloads every cached fetch through the transport it is given, and
+    /// a default one silently has no TLS client-cert for RHEL CDN auth
+    /// (see `SourceCache::with_transport`'s doc comment).
     pub fn with_cache(mut self, cache_dir: &str) -> Result<Self> {
-        self.source_cache = Some(SourceCache::with_client(cache_dir, "rpm", self.client.clone())?);
+        let transport = HttpTransport::with_client(self.client.clone());
+        self.source_cache = Some(SourceCache::with_transport(cache_dir, "rpm", transport)?);
         Ok(self)
     }
 
