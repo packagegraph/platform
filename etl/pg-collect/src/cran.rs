@@ -1,13 +1,14 @@
+use crate::fetch_error::FetchError;
+use crate::http_transport::{HttpTransport, RetryPolicy, StatsSnapshot};
 use crate::ntriples::NTriplesWriter;
 use crate::uris::*;
 use flate2::read::GzDecoder;
-use reqwest::blocking::Client;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
 use crate::emit::rdf::write_package_identity;
 
 pub struct CranCollector {
-    client: Client,
+    transport: HttpTransport,
     mirror_url: String,
     pub graph_uri: Option<String>,
 }
@@ -34,13 +35,22 @@ struct CranPackage {
 
 impl CranCollector {
     pub fn new(mirror_url: String) -> Self {
-        let client = crate::enricher::default_http_client();
-
         Self {
-            client,
+            transport: HttpTransport::new(),
             mirror_url,
             graph_uri: None,
         }
+    }
+
+    /// Override the transport, for tests that need fast retries.
+    pub fn with_transport(mut self, transport: HttpTransport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// One-line fetch summary for the end of a run.
+    pub fn transport_stats(&self) -> StatsSnapshot {
+        self.transport.stats()
     }
 
     /// Set the graph URI for N-Quads output.
@@ -56,22 +66,13 @@ impl CranCollector {
         );
         eprintln!("Fetching PACKAGES from: {}", packages_url);
 
+        // Previously a single unretried request: any transient 5xx or
+        // connection reset aborted the whole CRAN collection.
         let response = self
-            .client
-            .get(&packages_url)
-            .send()
+            .transport
+            .get(&packages_url, None)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-
-        if !response.status().is_success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("HTTP {}", response.status()),
-            ));
-        }
-
-        let bytes = response
-            .bytes()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let bytes = response.bytes;
 
         let decoder = GzDecoder::new(&bytes[..]);
         let reader = BufReader::new(decoder);
@@ -370,5 +371,65 @@ mod tests {
         assert!(content.contains("cran#needsCompilation"));
         assert!(content.contains("\"false\""));
         assert!(triples > 10);
+    }
+
+    // ── Characterization: collect's PACKAGES.gz fetch, pre-migration ───
+
+    fn gz(body: &str) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+        e.write_all(body.as_bytes()).unwrap();
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn characterize_cran_reads_a_gzipped_packages_index() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/src/contrib/PACKAGES.gz")
+            .with_status(200)
+            .with_body(gz("Package: jsonlite\nVersion: 1.8.8\n\n"))
+            .expect(1)
+            .create();
+
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let c = CranCollector::new(server.url());
+        let (packages, triples) = c
+            .collect(out.path().to_str().unwrap())
+            .expect("should collect");
+
+        mock.assert();
+        assert_eq!(packages, 1);
+        assert!(triples > 0);
+    }
+
+    #[test]
+    fn migrated_cran_500_is_retried_then_reported() {
+        // Pre-migration CRAN made exactly one request and gave up. It had
+        // no retry at all, so one transient 5xx lost the whole run.
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/src/contrib/PACKAGES.gz")
+            .with_status(500)
+            .expect(3)
+            .create();
+
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let c = CranCollector::new(server.url()).with_transport(HttpTransport::new().with_policy(
+            RetryPolicy {
+                max_attempts: 3,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(4),
+                jitter: false,
+            },
+        ));
+        let err = c
+            .collect(out.path().to_str().unwrap())
+            .expect_err("500 should be an error");
+
+        mock.assert();
+        assert!(err.to_string().contains("500"), "got: {err}");
     }
 }

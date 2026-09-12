@@ -1,18 +1,17 @@
+use crate::fetch_error::FetchError;
+use crate::http_transport::{HttpTransport, StatsSnapshot};
 use crate::npm::read_seed_file;
 use crate::ntriples::{bnode_id, NTriplesWriter};
 use crate::sparql::{SparqlAuth, SparqlBackend};
 use crate::uris::*;
 use regex::Regex;
-use reqwest::blocking::Client;
-use reqwest::StatusCode;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::Result;
-use std::time::Duration;
 use crate::emit::rdf::write_package_identity;
 
 pub struct GoModCollector {
-    client: Client,
+    transport: HttpTransport,
     proxy_url: String,
     /// Cache of verified module roots (paths that have versions on the proxy)
     known_modules: std::cell::RefCell<HashSet<String>>,
@@ -23,10 +22,8 @@ pub struct GoModCollector {
 
 impl GoModCollector {
     pub fn new(proxy_url: String) -> Self {
-        let client = crate::enricher::default_http_client();
-
         Self {
-            client,
+            transport: HttpTransport::new(),
             proxy_url,
             known_modules: std::cell::RefCell::new(HashSet::new()),
             known_non_modules: std::cell::RefCell::new(HashSet::new()),
@@ -96,7 +93,6 @@ impl GoModCollector {
                 }
                 _ => {
                     self.known_non_modules.borrow_mut().insert(candidate);
-                    std::thread::sleep(Duration::from_millis(50));
                 }
             }
         }
@@ -201,8 +197,6 @@ impl GoModCollector {
                 }
                 Err(e) => eprintln!("  Error collecting {}: {}", module_path, e),
             }
-
-            std::thread::sleep(Duration::from_millis(100));
         }
 
         eprintln!(
@@ -284,19 +278,19 @@ impl GoModCollector {
         Ok((triples, dep_paths))
     }
 
+    /// Fetch a proxy document as text.
+    ///
+    /// 404 and 410 both mean "this module/version does not exist here",
+    /// which the caller treats as no data rather than a failure.
     fn fetch_text(&self, url: &str) -> std::result::Result<String, String> {
-        let response = self.client.get(url).send().map_err(|e| e.to_string())?;
-
-        if response.status() == StatusCode::NOT_FOUND || response.status() == StatusCode::GONE {
-            // Return empty string for 404/410 — caller handles as "no data"
-            return Ok(String::new());
+        match self.transport.get(url, None) {
+            Ok(response) => std::str::from_utf8(&response.bytes)
+                .map(|s| s.to_string())
+                .map_err(|e| e.to_string()),
+            Err(FetchError::NotFound { .. }) => Ok(String::new()),
+            Err(FetchError::HttpStatus { status: 410, .. }) => Ok(String::new()),
+            Err(e) => Err(e.to_string()),
         }
-
-        if !response.status().is_success() {
-            return Err(format!("HTTP {}: {}", response.status(), url));
-        }
-
-        response.text().map_err(|e| e.to_string())
     }
 
     fn emit_module_triples(
@@ -608,5 +602,80 @@ require (
         assert!(content.contains("\"1.22\""));
         assert!(content.contains("directlyDependsOn"));
         assert!(triples > 15);
+    }
+
+    // ── Characterization: fetch_text, pre-migration ────────────────────
+
+    #[test]
+    fn characterize_gomod_returns_body_on_200() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/mod/@v/list")
+            .with_status(200)
+            .with_body("v1.0.0\nv1.1.0\n")
+            .expect(1)
+            .create();
+
+        let c = GoModCollector::new(server.url());
+        let text = c
+            .fetch_text(&format!("{}/mod/@v/list", server.url()))
+            .expect("200 should yield the body");
+
+        mock.assert();
+        assert_eq!(text, "v1.0.0\nv1.1.0\n");
+    }
+
+    #[test]
+    fn characterize_gomod_404_is_empty_string_not_an_error() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/missing/@v/list")
+            .with_status(404)
+            .expect(1)
+            .create();
+
+        let c = GoModCollector::new(server.url());
+        let text = c
+            .fetch_text(&format!("{}/missing/@v/list", server.url()))
+            .expect("404 is 'no data', not an error");
+
+        mock.assert();
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn characterize_gomod_410_gone_is_also_empty_string() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/gone/@v/list")
+            .with_status(410)
+            .expect(1)
+            .create();
+
+        let c = GoModCollector::new(server.url());
+        let text = c
+            .fetch_text(&format!("{}/gone/@v/list", server.url()))
+            .expect("410 is 'no data', not an error");
+
+        mock.assert();
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn characterize_gomod_other_failure_is_an_error() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/bad/@v/list")
+            .with_status(400)
+            .expect(1)
+            .create();
+
+        let c = GoModCollector::new(server.url());
+        let err = c
+            .fetch_text(&format!("{}/bad/@v/list", server.url()))
+            .expect_err("400 should be an error");
+
+        mock.assert();
+        assert!(err.contains("400"), "got: {err}");
     }
 }
