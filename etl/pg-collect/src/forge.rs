@@ -8,7 +8,7 @@ use crate::ntriples::NTriplesWriter;
 use crate::uris::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use std::io::Result;
+use std::io::{Result, Write};
 
 /// Confidence level for an extracted repository URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -781,8 +781,8 @@ pub fn resolve_canonical(client: &reqwest::blocking::Client, url: &str) -> Optio
 /// Emit a `dq:DataQualityIssue` for a URL that failed extraction or validation.
 ///
 /// Returns the number of triples emitted (7).
-pub fn emit_dq_issue(
-    writer: &mut NTriplesWriter,
+pub fn emit_dq_issue<W: Write>(
+    writer: &mut NTriplesWriter<W>,
     detector: &str,
     field: &str,
     raw_value: &str,
@@ -912,8 +912,8 @@ fn forge_host_from_url(repo_url: &str) -> Option<String> {
 /// N-Triples (Fuseki deduplicates on load).
 ///
 /// Returns the number of triples emitted (0 or 4).
-pub fn emit_forge_triples(
-    writer: &mut NTriplesWriter,
+pub fn emit_forge_triples<W: Write>(
+    writer: &mut NTriplesWriter<W>,
     repo_uri: &str,
     repo_url: &str,
 ) -> Result<usize> {
@@ -1003,7 +1003,10 @@ pub fn emit_upstream_repo(
 /// write is unaffected by this function -- its subject is a genuine
 /// SourcePackage-typed node (opkg:OpkgPackage), where the predicate's
 /// domain is correctly satisfied.
-pub fn emit_upstream_project(writer: &mut NTriplesWriter, repo_url: &str) -> Result<usize> {
+pub fn emit_upstream_project<W: Write>(
+    writer: &mut NTriplesWriter<W>,
+    repo_url: &str,
+) -> Result<usize> {
     let project_uri = crate::uris::upstream_uri(repo_url);
     let mut triples = 0;
 
@@ -2050,5 +2053,17 @@ mod tests {
     fn test_detect_forge_software_unknown_returns_none() {
         assert_eq!(detect_forge_software("pagure.io"), None);
         assert_eq!(detect_forge_software("example.com"), None);
+    }
+
+    #[test]
+    fn emit_helpers_accept_an_in_memory_writer() {
+        // Guards the genericization the checkpoint capture path depends on:
+        // derivation must be able to run against a Vec<u8>-backed scratch writer.
+        let mut w = NTriplesWriter::new(Vec::<u8>::new());
+        let n = emit_dq_issue(&mut w, "test-detector", "field", "value", "issue", "warning")
+            .expect("emit_dq_issue should accept an in-memory writer");
+        assert!(n > 0, "expected emit_dq_issue to write at least one triple");
+        let out = w.into_string().expect("valid utf8");
+        assert!(out.contains("test-detector"), "got: {out}");
     }
 }

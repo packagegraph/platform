@@ -13,7 +13,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Result;
+use std::io::{Result, Write};
 
 pub struct KojiEnricher {
     sparql: Option<SparqlClient>,
@@ -234,7 +234,7 @@ impl KojiEnricher {
         Ok((total_builds, total_triples))
     }
 
-    fn get_build(&self, nvr: &str, writer: &mut NTriplesWriter) -> Result<usize> {
+    fn get_build<W: Write>(&self, nvr: &str, writer: &mut NTriplesWriter<W>) -> Result<usize> {
         let cache_key = format!("koji-build-{}", nvr);
 
         let data = match self.cached_get(&cache_key) {
@@ -318,9 +318,9 @@ impl KojiEnricher {
     /// Two-step API chain:
     ///   1. listBuildRPMs(build_id) → get rpm_ids for this build
     ///   2. queryRPMSigs(rpm_id)    → get sigkeys for the first binary RPM
-    fn query_rpm_signatures(
+    fn query_rpm_signatures<W: Write>(
         &self,
-        writer: &mut NTriplesWriter,
+        writer: &mut NTriplesWriter<W>,
         nvr: &str,
         build_id: &str,
     ) -> Result<usize> {
@@ -434,9 +434,9 @@ impl KojiEnricher {
     }
 
     /// Emit att:DigitalSignature triples for a signed RPM build.
-    fn emit_signature_triples(
+    fn emit_signature_triples<W: Write>(
         &self,
-        writer: &mut NTriplesWriter,
+        writer: &mut NTriplesWriter<W>,
         nvr: &str,
         data: &serde_json::Value,
     ) -> Result<usize> {
@@ -472,9 +472,9 @@ impl KojiEnricher {
         Ok(5)
     }
 
-    fn emit_build_triples(
+    fn emit_build_triples<W: Write>(
         &self,
-        writer: &mut NTriplesWriter,
+        writer: &mut NTriplesWriter<W>,
         nvr: &str,
         data: &serde_json::Value,
     ) -> Result<usize> {

@@ -15,7 +15,7 @@ use crate::uris::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::io::Result;
+use std::io::{Result, Write};
 
 /// Regex for extracting Source0 URL from spec file.
 static SOURCE0_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?im)^Source0?\s*:\s*(.+)$").unwrap());
@@ -110,9 +110,9 @@ impl SpecCollector {
 
     /// Collect spec file data for a set of SRPM source names.
     /// identity_map maps source name → list of PackageIdentity URIs for upstream linking.
-    pub fn collect(
+    pub fn collect<W: Write>(
         &self,
-        writer: &mut NTriplesWriter,
+        writer: &mut NTriplesWriter<W>,
         srpm_names: &HashSet<String>,
         srpm_identity_map: &HashMap<String, Vec<String>>,
         existing_ecosystem_pkgs: &HashSet<String>,
@@ -160,9 +160,9 @@ impl SpecCollector {
         Ok((total_specs, total_triples))
     }
 
-    fn process_spec(
+    fn process_spec<W: Write>(
         &self,
-        writer: &mut NTriplesWriter,
+        writer: &mut NTriplesWriter<W>,
         source_name: &str,
         identity_map: &HashMap<String, Vec<String>>,
         existing_ecosystem_pkgs: &HashSet<String>,
@@ -419,9 +419,9 @@ impl SpecCollector {
         }
     }
 
-    fn emit_ecosystem_triples(
+    fn emit_ecosystem_triples<W: Write>(
         &self,
-        writer: &mut NTriplesWriter,
+        writer: &mut NTriplesWriter<W>,
         spec: &SpecData,
         source_name: &str,
         identity_uris: &[String],
@@ -477,9 +477,9 @@ impl SpecCollector {
         Ok(triples)
     }
 
-    fn emit_buildrequires_triples(
+    fn emit_buildrequires_triples<W: Write>(
         &self,
-        writer: &mut NTriplesWriter,
+        writer: &mut NTriplesWriter<W>,
         spec: &SpecData,
         source_name: &str,
     ) -> Result<usize> {
@@ -507,9 +507,9 @@ impl SpecCollector {
         Ok(triples)
     }
 
-    fn emit_changelog_triples(
+    fn emit_changelog_triples<W: Write>(
         &self,
-        writer: &mut NTriplesWriter,
+        writer: &mut NTriplesWriter<W>,
         spec: &SpecData,
         source_name: &str,
     ) -> Result<usize> {
