@@ -1,5 +1,6 @@
 """Exercise the staged release, not textual assertions about the runbook."""
 import configparser
+import importlib.util
 import pathlib
 import subprocess
 import sys
@@ -8,6 +9,14 @@ import unittest
 
 SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "checkpoint-release.py"
 IMAGE = "ghcr.io/packagegraph/etl@sha256:" + "a" * 64
+
+
+def load_script():
+    """Import the tool as a module; its filename is not a valid identifier."""
+    spec = importlib.util.spec_from_file_location("checkpoint_release", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class ReleaseTest(unittest.TestCase):
@@ -71,6 +80,45 @@ class ReleaseTest(unittest.TestCase):
             self.assertNotEqual(self.run_tool("verify").returncode, 0, directory)
             config.unlink()
             dropin.rmdir()
+
+
+class RenderTest(unittest.TestCase):
+    """Directives are matched as systemd reads them, not by string prefix."""
+
+    def render(self, body):
+        module = load_script()
+        with tempfile.TemporaryDirectory() as source:
+            module.SOURCE = pathlib.Path(source)
+            (module.SOURCE / "scripts").mkdir()
+            for name in module.TEMPLATES:
+                (module.SOURCE / name).write_text(body)
+            # release_files also collects wrappers; supply the minimum that
+            # satisfies its non-empty check so rendering is what's under test.
+            for name in ("x-full.sh", "test-wrapper-checkpoint-contract.sh"):
+                (module.SOURCE / "scripts" / name).write_text("pg-collect rpm-full\n")
+            return module.release_files(IMAGE)[module.TEMPLATES[0]].decode()
+
+    def test_indented_directives_are_still_pinned_and_stripped(self):
+        rendered = self.render("[Container]\n  Image=ghcr.io/packagegraph/etl:devel-latest\n"
+                               "  AutoUpdate=registry\n")
+        self.assertIn(f"Image={IMAGE}", rendered)
+        self.assertNotIn("AutoUpdate", rendered)
+        self.assertNotIn("devel-latest", rendered)
+
+    def test_spaces_around_equals_are_still_pinned_and_stripped(self):
+        rendered = self.render("[Container]\nImage = ghcr.io/packagegraph/etl:devel-latest\n"
+                               "AutoUpdate = registry\n")
+        self.assertIn(f"Image={IMAGE}", rendered)
+        self.assertNotIn("AutoUpdate", rendered)
+        self.assertNotIn("devel-latest", rendered)
+
+    def test_a_commented_out_directive_is_not_treated_as_one(self):
+        # '#Image=' must not count toward the exactly-one check, or a template
+        # with a commented example would be rejected or double-counted.
+        rendered = self.render("[Container]\n#Image=ghcr.io/packagegraph/etl:old\n"
+                               "Image=ghcr.io/packagegraph/etl:devel-latest\n")
+        self.assertIn(f"Image={IMAGE}", rendered)
+        self.assertIn("#Image=ghcr.io/packagegraph/etl:old", rendered)
 
 
 if __name__ == "__main__":

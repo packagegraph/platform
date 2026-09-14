@@ -15,17 +15,29 @@ SOURCE = Path(__file__).resolve().parent
 TEMPLATES = ("pg-collect@.container", "pg-collect-rhel@.container")
 
 
+def unit_key(line):
+    """The directive a systemd unit line sets, or None.
+
+    Matched the way systemd reads it, not by prefix: leading whitespace and
+    space around `=` are both tolerated there. A prefix test would leave
+    ` AutoUpdate=registry` in a staged template -- failing open on exactly the
+    directive this tool exists to remove -- while the Image= count below fails
+    closed on the same input. Both keys go through this.
+    """
+    return line.split("=", 1)[0].strip() if "=" in line else None
+
+
 def release_files(image):
     if not re.fullmatch(r"ghcr\.io/packagegraph/etl@sha256:[0-9a-f]{64}", image):
         raise ValueError("IMAGE must be an immutable ghcr.io/packagegraph/etl@sha256:<64 hex> digest")
     files = {}
     for name in TEMPLATES:
         lines = (SOURCE / name).read_text().splitlines()
-        if sum(line.startswith("Image=") for line in lines) != 1:
+        if sum(unit_key(line) == "Image" for line in lines) != 1:
             raise ValueError(f"expected exactly one Image= in {name}")
         files[name] = ("\n".join(
-            f"Image={image}" if line.startswith("Image=") else line
-            for line in lines if not line.startswith("AutoUpdate=")
+            f"Image={image}" if unit_key(line) == "Image" else line
+            for line in lines if unit_key(line) != "AutoUpdate"
         ) + "\n").encode()
     wrappers = [p for p in (SOURCE / "scripts").glob("*-full.sh")
                 if "pg-collect rpm-full" in p.read_text()]

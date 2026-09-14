@@ -8,7 +8,7 @@
 //!
 //! Note that the Koji `FileCache`'s nominal 30-day TTL is not a second line of
 //! defence here: it is not enforced for Minio-backed entries (`cache.rs:295`
-//! never checks age). The generation is the only thing bounding reuse.
+//! never checks age).
 //!
 //! **A generation is only retired by an explicit `pg-collect checkpoint
 //! commit`**, which the rpm-full wrappers run after a successful upload. A
@@ -17,6 +17,11 @@
 //! Repository tests validate the wrapper contract; they do not update the
 //! host-mounted scripts when an image changes. Use the coordinated, pinned
 //! rollout in `deploy/quadlet/collectors/checkpoint-cutover.md`.
+//!
+//! `MAX_GENERATION_AGE_DAYS` is the backstop for when that rollout is not
+//! followed. It does not prevent the mispairing -- only the cutover does --
+//! but it bounds the damage to one stale cycle and logs the cause, instead of
+//! replaying silently forever.
 
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::RandomState;
@@ -41,6 +46,18 @@ pub struct AcquiredGeneration {
     /// minting. Logged, so an operator can tell a resume from a fresh start.
     pub reused: bool,
 }
+
+/// Longest a generation may be reused before it is treated as stuck.
+///
+/// Not a retry budget: rpm-full collectors run weekly, so a legitimate resume
+/// of a run that hit its 8h timeout lands 7 days later, and a second at 14.
+/// The bound exists because an active generation that is never committed
+/// replays its fragments forever -- silently bypassing spec re-fetch and
+/// signatures that appear after a build was first observed. 30 days leaves
+/// room for several real resume attempts while capping how stale a replayed
+/// fragment can be at the Koji `FileCache`'s nominal TTL, so no derived
+/// output outlives the source it was derived from.
+pub const MAX_GENERATION_AGE_DAYS: i64 = 30;
 
 pub struct Generation;
 
@@ -110,6 +127,21 @@ impl Generation {
         std::fs::rename(&tmp, Self::state_path(cache_dir))
     }
 
+    /// Absolute distance between the instant named by `id`'s timestamp prefix
+    /// and now. `None` when the prefix names no real instant -- `is_valid_id`
+    /// is purely structural, so a shape-valid id can still be unparseable, and
+    /// an unparseable age cannot be bounded.
+    ///
+    /// Returns a duration rather than a day count because callers must compare
+    /// against the bound *before* truncating: `num_days` rounds toward zero, so
+    /// a stamp 31 days away is reported as 30 once sub-second clock drift eats
+    /// into it, and an over-bound generation slips through as in-bound.
+    fn age(id: &str) -> Option<chrono::TimeDelta> {
+        let stamp = id.get(..16)?;
+        let naive = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%SZ").ok()?;
+        Some((chrono::Utc::now() - naive.and_utc()).abs())
+    }
+
     fn mint_id() -> String {
         let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
         // The crate has no `rand` dependency by design; seed from RandomState
@@ -129,7 +161,27 @@ impl Generation {
     pub fn acquire(cache_dir: &Path) -> io::Result<AcquiredGeneration> {
         if let Some(s) = Self::read_state(cache_dir) {
             if s.status == "active" && Self::output_dir(cache_dir).join(&s.id).is_dir() {
-                return Ok(AcquiredGeneration { id: s.id, reused: true });
+                // Falling through to mint is the safe direction: it costs one
+                // redundant re-collection, where reusing indefinitely costs
+                // correctness with no signal that anything is wrong.
+                let bound = chrono::TimeDelta::days(MAX_GENERATION_AGE_DAYS);
+                match Self::age(&s.id) {
+                    Some(age) if age <= bound => {
+                        return Ok(AcquiredGeneration { id: s.id, reused: true });
+                    }
+                    Some(age) => eprintln!(
+                        "Warning: checkpoint generation {} is {} days old (bound is {}); \
+                         re-deriving instead of replaying. An uncommitted generation this \
+                         old usually means the wrappers are not running `checkpoint commit` \
+                         -- see deploy/quadlet/collectors/checkpoint-cutover.md",
+                        s.id, age.num_days(), MAX_GENERATION_AGE_DAYS
+                    ),
+                    None => eprintln!(
+                        "Warning: checkpoint generation {} has an unparseable timestamp; \
+                         re-deriving instead of replaying",
+                        s.id
+                    ),
+                }
             }
         }
 
@@ -287,6 +339,77 @@ mod tests {
         ).unwrap();
         let b = Generation::acquire(d.path()).unwrap();
         assert_ne!(a, b.id);
+    }
+
+    /// Plants an `active` state whose generation directory exists, dated
+    /// `days_ago` before now, and returns its id.
+    fn plant_aged_generation(dir: &Path, days_ago: i64) -> String {
+        let stamp = (chrono::Utc::now() - chrono::Duration::days(days_ago))
+            .format("%Y%m%dT%H%M%SZ");
+        let id = format!("{stamp}-abcdef01");
+        std::fs::create_dir_all(dir.join("output").join(&id)).unwrap();
+        std::fs::write(
+            dir.join("output").join("GENERATION"),
+            format!(r#"{{"id":"{id}","status":"active"}}"#),
+        ).unwrap();
+        id
+    }
+
+    #[test]
+    fn a_legitimate_weekly_resume_chain_still_reuses_its_generation() {
+        // rpm-full collectors run weekly, so the first resume of a run that
+        // hit its 8h timeout lands a full 7 days later, and a second lands at
+        // 14. A staleness bound that rejected those would defeat the feature.
+        let d = TempDir::new().unwrap();
+        for days_ago in [7, 14, 21] {
+            let id = plant_aged_generation(d.path(), days_ago);
+            let g = Generation::acquire(d.path()).unwrap();
+            assert_eq!(g.id, id, "a {days_ago}-day-old resume must still be reused");
+            assert!(g.reused);
+        }
+    }
+
+    #[test]
+    fn a_generation_older_than_the_staleness_bound_is_not_reused() {
+        // The failure this bounds: a host whose image auto-updated onto
+        // wrappers that never run `checkpoint commit`. The generation stays
+        // active forever and replays its fragments on every later run, so
+        // spec re-fetch and late-appearing signatures are bypassed silently
+        // and indefinitely. Minting instead costs one re-collection.
+        let d = TempDir::new().unwrap();
+        let stale = plant_aged_generation(d.path(), MAX_GENERATION_AGE_DAYS + 1);
+        let g = Generation::acquire(d.path()).unwrap();
+        assert_ne!(g.id, stale, "a generation past the bound must not be reused");
+        assert!(!g.reused);
+        assert!(!d.path().join("output").join(&stale).exists(), "and must be pruned");
+    }
+
+    #[test]
+    fn a_shape_valid_but_impossible_timestamp_is_not_reused() {
+        // is_valid_id is purely structural, so this id passes it while naming
+        // no real instant. Unparseable means unbounded, so it must not reuse.
+        let d = TempDir::new().unwrap();
+        let id = "20269999T999999Z-abcdef01";
+        assert!(Generation::is_valid_id(id));
+        std::fs::create_dir_all(d.path().join("output").join(id)).unwrap();
+        std::fs::write(
+            d.path().join("output").join("GENERATION"),
+            format!(r#"{{"id":"{id}","status":"active"}}"#),
+        ).unwrap();
+        let g = Generation::acquire(d.path()).unwrap();
+        assert_ne!(g.id, id);
+        assert!(!g.reused);
+    }
+
+    #[test]
+    fn a_far_future_generation_is_not_reused_either() {
+        // Clock skew or a tampered state file. Age is measured absolutely so
+        // a future stamp cannot buy unbounded reuse.
+        let d = TempDir::new().unwrap();
+        let future = plant_aged_generation(d.path(), -(MAX_GENERATION_AGE_DAYS + 1));
+        let g = Generation::acquire(d.path()).unwrap();
+        assert_ne!(g.id, future);
+        assert!(!g.reused);
     }
 
     #[test]
