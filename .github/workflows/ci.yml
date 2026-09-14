@@ -21,9 +21,20 @@ jobs:
           workspaces: etl/pg-collect
       - run: cargo test --quiet
 
+  # The rpm-full binary enables checkpointing; the wrappers are what retire a
+  # generation and keep checkpoints out of Minio. Enabling one without the
+  # other leaves a generation active forever, replaying its fragments across
+  # every later scheduled run. This is an ordering/exclusion property in shell
+  # that no Rust test can observe, so it gets its own gate.
+  test-wrapper-checkpoint-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: deploy/quadlet/collectors/scripts/test-wrapper-checkpoint-contract.sh
+
   build-etl:
     runs-on: ubuntu-latest
-    needs: [test-rust]
+    needs: [test-rust, test-wrapper-checkpoint-contract]
     steps:
       - uses: actions/checkout@v4
       - name: Sync ontology files for container build
