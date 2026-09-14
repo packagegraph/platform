@@ -14,6 +14,42 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
 use std::time::Duration;
 
+/// Where a run's root coordinates came from, which decides whether a root
+/// that Central does not have counts as a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootSource {
+    /// Explicit `--packages-file`. The operator asserted these coordinates
+    /// exist, so Central not having them means the seed list or Central is
+    /// wrong, and the run should stop.
+    Asserted,
+    /// `--endpoint` discovery: a survey of coordinates other collectors
+    /// recorded as `upstreamEcosystem=maven`. Most distro Java sub-packages
+    /// were never published to Central -- `app/tuxguitar/` 404s as an entire
+    /// group -- so absence is the normal case for this seed source.
+    Discovered,
+}
+
+/// Whether a search-endpoint failure means "stop using search for this run".
+///
+/// `FetchError::is_retryable` is the wrong test here. It covers transport
+/// errors, 429 and 5xx, but `search.maven.org` signals throttling of the
+/// legacy `solrsearch` endpoint with **403** -- observed 1794 times in one
+/// run against 2148 roots, after which every remaining root kept querying a
+/// search API that had already cut us off, because 403 is not retryable and
+/// so never tripped the breaker. The fallback it was built to reach was
+/// never engaged.
+///
+/// 404 stays excluded: that is the coordinate genuinely not being indexed,
+/// not the endpoint refusing us.
+fn search_endpoint_is_refusing(e: &FetchError) -> bool {
+    match e {
+        FetchError::HttpStatus { status, .. } => {
+            *status == 403 || *status == 401 || *status == 429 || *status >= 500
+        }
+        other => other.is_retryable(),
+    }
+}
+
 pub struct MavenCollector {
     transport: HttpTransport,
     /// Fewer attempts for the search API, so the circuit breaker trips and
@@ -264,7 +300,7 @@ impl MavenCollector {
             raw_count,
             seeds.len()
         );
-        self.collect_recursive(seeds, output_path)
+        self.collect_recursive_from(seeds, output_path, RootSource::Discovered)
     }
 
     pub fn collect(&self, packages_file: &str, output_path: &str) -> Result<(usize, usize)> {
@@ -358,7 +394,7 @@ impl MavenCollector {
 
         let result = self.get_latest_version_via_search(group_id, artifact_id, base_delay_ms);
         if let Err((e, hit)) = &result {
-            if e.is_retryable() {
+            if search_endpoint_is_refusing(e) {
                 eprintln!(
                     "  Search API unusable ({e}) for {}:{}, falling back to maven-metadata.xml \
                      (and skipping the search API for the rest of this run)",
@@ -1029,10 +1065,22 @@ impl MavenCollector {
     /// Emits raw POM declarations, NOT effective Maven resolution.
     /// Dependencies are traversed only when they have compile/runtime scope,
     /// are non-optional, and have concrete (non-SNAPSHOT, non-range) versions.
+    /// Collect from coordinates the caller asserts exist.
     pub fn collect_recursive(
         &self,
         seeds: Vec<MavenSeed>,
         output_path: &str,
+    ) -> Result<(usize, usize)> {
+        self.collect_recursive_from(seeds, output_path, RootSource::Asserted)
+    }
+
+    /// As [`collect_recursive`](Self::collect_recursive), but stating where
+    /// the roots came from so the error-rate guard can judge them correctly.
+    pub fn collect_recursive_from(
+        &self,
+        seeds: Vec<MavenSeed>,
+        output_path: &str,
+        root_source: RootSource,
     ) -> Result<(usize, usize)> {
         // Finding 4: empty seed → truly empty output
         if seeds.is_empty() {
@@ -1055,7 +1103,8 @@ impl MavenCollector {
             roots_unique: 0,
             roots_resolved: 0,
             roots_pinned: 0,
-            root_resolution_failures: 0,
+            root_absent: 0,
+            root_errors: 0,
             fetched_ok: 0,
             fetch_errors: HashMap::new(),
             non_emittable_unresolved: 0,
@@ -1134,7 +1183,11 @@ impl MavenCollector {
                     }
                 }
                 Err((_e, was_hit)) => {
-                    state.root_resolution_failures += 1;
+                    if matches!(_e, FetchError::NotFound { .. }) {
+                        state.root_absent += 1;
+                    } else {
+                        state.root_errors += 1;
+                    }
                     state.roots_resolved += 1;
                     eprintln!(
                         "  Root resolution failed for {}:{}: {}",
@@ -1262,7 +1315,8 @@ impl MavenCollector {
         eprintln!("Roots unique:         {}", state.roots_unique);
         eprintln!("Roots resolved:       {}", state.roots_resolved);
         eprintln!("Roots pinned:         {}", state.roots_pinned);
-        eprintln!("Root failures:        {}", state.root_resolution_failures);
+        eprintln!("Roots absent upstream: {}", state.root_absent);
+        eprintln!("Root errors:          {}", state.root_errors);
         eprintln!("Scheduled:            {}", state.scheduled.len());
         eprintln!("Fetched OK:           {}", state.fetched_ok);
         eprintln!(
@@ -1279,11 +1333,32 @@ impl MavenCollector {
         eprintln!("Skipped (roots):      {}", state.skipped_roots);
 
         // Error rate check (threshold 20%)
+        //
+        // Which root failures count depends on where the roots came from. A
+        // coordinate Central does not have is a fault only if someone claimed
+        // it exists; under discovery it is the expected outcome for the many
+        // distro Java sub-packages that were never published upstream. What
+        // always counts is failing to *reach* Central, which is the outage
+        // this guard was built for.
+        let counted_root_failures = match root_source {
+            RootSource::Asserted => state.root_absent + state.root_errors,
+            RootSource::Discovered => state.root_errors,
+        };
         let root_rate = if state.roots_resolved > 0 {
-            state.root_resolution_failures as f64 / state.roots_resolved as f64
+            counted_root_failures as f64 / state.roots_resolved as f64
         } else {
             0.0
         };
+        if root_source == RootSource::Discovered && state.root_absent > 0 {
+            let absent_rate = state.root_absent as f64 / state.roots_resolved.max(1) as f64;
+            eprintln!(
+                "NOTE: {:.1}% of discovered roots ({}) are not published to Maven Central. \
+                 Expected for distro-sourced coordinates; not counted against the error \
+                 threshold.",
+                absent_rate * 100.0,
+                state.root_absent,
+            );
+        }
         let scheduled_count = state.scheduled.len();
         let pom_rate = if scheduled_count > 0 {
             total_fetch_errors as f64 / scheduled_count as f64
@@ -1309,7 +1384,10 @@ struct TraversalState {
     roots_unique: usize,
     roots_resolved: usize,
     roots_pinned: usize,
-    root_resolution_failures: usize,
+    /// Roots Central does not have (`FetchError::NotFound`).
+    root_absent: usize,
+    /// Roots that failed for any other reason: transport, 429, 5xx, parse.
+    root_errors: usize,
     fetched_ok: usize,
     fetch_errors: HashMap<String, usize>,
     non_emittable_unresolved: usize,
@@ -4946,7 +5024,8 @@ mod tests {
             roots_unique: 0,
             roots_resolved: 0,
             roots_pinned: 0,
-            root_resolution_failures: 0,
+            root_absent: 0,
+            root_errors: 0,
             fetched_ok: 0,
             fetch_errors: HashMap::new(),
             non_emittable_unresolved: 0,
@@ -4974,7 +5053,8 @@ mod tests {
             roots_unique: 0,
             roots_resolved: 0,
             roots_pinned: 0,
-            root_resolution_failures: 0,
+            root_absent: 0,
+            root_errors: 0,
             fetched_ok: 0,
             fetch_errors: HashMap::new(),
             non_emittable_unresolved: 0,
@@ -5001,7 +5081,8 @@ mod tests {
             roots_unique: 0,
             roots_resolved: 0,
             roots_pinned: 0,
-            root_resolution_failures: 0,
+            root_absent: 0,
+            root_errors: 0,
             fetched_ok: 0,
             fetch_errors: HashMap::new(),
             non_emittable_unresolved: 0,
@@ -5030,7 +5111,8 @@ mod tests {
             roots_unique: 0,
             roots_resolved: 0,
             roots_pinned: 0,
-            root_resolution_failures: 0,
+            root_absent: 0,
+            root_errors: 0,
             fetched_ok: 0,
             fetch_errors: HashMap::new(),
             non_emittable_unresolved: 0,
@@ -5058,7 +5140,8 @@ mod tests {
             roots_unique: 0,
             roots_resolved: 0,
             roots_pinned: 0,
-            root_resolution_failures: 0,
+            root_absent: 0,
+            root_errors: 0,
             fetched_ok: 0,
             fetch_errors: HashMap::new(),
             non_emittable_unresolved: 0,
@@ -5086,7 +5169,8 @@ mod tests {
             roots_unique: 0,
             roots_resolved: 0,
             roots_pinned: 0,
-            root_resolution_failures: 0,
+            root_absent: 0,
+            root_errors: 0,
             fetched_ok: 0,
             fetch_errors: HashMap::new(),
             non_emittable_unresolved: 0,
@@ -5422,6 +5506,146 @@ mod tests {
         let out = NamedTempFile::new().unwrap();
         let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
         assert!(result.is_err(), "100% root failure should return error");
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("error rate exceeded threshold"));
+    }
+
+    #[test]
+    fn search_403_trips_the_breaker_and_falls_back_to_metadata() {
+        // search.maven.org answers throttling of the legacy solrsearch
+        // endpoint with 403, not 429. Because 403 is not retryable the
+        // breaker never tripped, so all 2148 roots in one production run kept
+        // querying an endpoint that had already cut us off: 1794 HTTP 403s,
+        // an 83% root failure rate, and the whole run discarded -- while
+        // repo1's maven-metadata.xml was answering 200 the entire time.
+        let mut server = mockito::Server::new();
+        let search = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch".into()))
+            .with_status(403)
+            .expect(1) // tripped after the first refusal, not re-queried per root
+            .create();
+        let meta = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"maven-metadata\.xml".into()),
+            )
+            .with_status(200)
+            .expect(2) // one per root, via the fallback
+            .with_body(
+                r#"<metadata><groupId>org.a</groupId><artifactId>lib</artifactId>
+                   <versioning><latest>2.0</latest><release>2.0</release>
+                   <versions><version>1.0</version><version>2.0</version></versions>
+                   </versioning></metadata>"#,
+            )
+            .create();
+        for art in ["lib1", "lib2"] {
+            server
+                .mock(
+                    "GET",
+                    format!("/maven2/org/a/{}/2.0/{}-2.0.pom", art, art).as_str(),
+                )
+                .with_status(200)
+                .with_body(make_pom_xml("org.a", art, "2.0", &[]))
+                .create();
+        }
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 0;
+        collector.delay_ms = 0;
+
+        let seeds = vec![
+            MavenSeed::unpinned("org.a", "lib1"),
+            MavenSeed::unpinned("org.a", "lib2"),
+        ];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+
+        assert!(
+            result.is_ok(),
+            "a throttled search API must not fail the run when metadata.xml works: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().0, 2, "both roots resolve via the fallback");
+        search.assert();
+        meta.assert();
+    }
+
+    #[test]
+    fn discovered_roots_absent_from_central_do_not_fail_the_run() {
+        // Discovery surveys coordinates other collectors recorded as
+        // upstreamEcosystem=maven. Most distro Java sub-packages were never
+        // published to Central -- app/tuxguitar/ 404s as an entire group --
+        // so absence is the normal case for this seed source, not a fault.
+        // Failing the run here threw away every pom that *did* resolve,
+        // because maven.sh only uploads on exit 0.
+        let mut server = mockito::Server::new();
+        let _sa = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch".into()))
+            .with_status(200)
+            .with_body(r#"{"response":{"docs":[]}}"#)
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 1;
+        collector.delay_ms = 0;
+
+        let seeds = vec![
+            MavenSeed::unpinned("app.tuxguitar", "tuxguitar-debug-helper"),
+            MavenSeed::unpinned("app.tuxguitar", "tuxguitar-editor-utils"),
+        ];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive_from(
+            seeds,
+            out.path().to_str().unwrap(),
+            RootSource::Discovered,
+        );
+        assert!(
+            result.is_ok(),
+            "coordinates Central never had must not fail a discovery run: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn discovered_roots_failing_for_real_reasons_still_fail_the_run() {
+        // Relaxing absence must not also relax unreachability. A 5xx from
+        // both search and the metadata.xml fallback is the outage this guard
+        // exists to catch, and it must still stop the run regardless of where
+        // the seeds came from.
+        let mut server = mockito::Server::new();
+        let _sa = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch".into()))
+            .with_status(500)
+            .create();
+        let _mm = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"maven-metadata\.xml".into()),
+            )
+            .with_status(500)
+            .create();
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 1;
+        collector.delay_ms = 0;
+
+        let seeds = vec![
+            MavenSeed::unpinned("org.real", "lib1"),
+            MavenSeed::unpinned("org.real", "lib2"),
+        ];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive_from(
+            seeds,
+            out.path().to_str().unwrap(),
+            RootSource::Discovered,
+        );
+        assert!(
+            result.is_err(),
+            "a 5xx from search and metadata must still trip the guard"
+        );
         assert!(result
             .err()
             .unwrap()
