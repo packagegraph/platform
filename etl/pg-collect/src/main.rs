@@ -1429,6 +1429,23 @@ enum Commands {
         #[arg(long)]
         limit: Option<usize>,
     },
+
+    /// Checkpoint lifecycle management for resumable collectors
+    Checkpoint {
+        #[command(subcommand)]
+        action: CheckpointAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum CheckpointAction {
+    /// Mark the active run generation complete. Run only after a successful
+    /// upload -- a run that collected everything but failed to publish must
+    /// stay resumable.
+    Commit {
+        #[arg(long)]
+        cache_dir: String,
+    },
 }
 
 fn main() {
@@ -3836,6 +3853,32 @@ fn main() {
                 Ok((total_packages, total_triples))
             })()
         }
+
+        Commands::Checkpoint { action } => match action {
+            CheckpointAction::Commit { cache_dir } => {
+                (|| -> std::io::Result<(usize, usize)> {
+                    match pg_collect::checkpoint_generation::Generation::commit(
+                        std::path::Path::new(&cache_dir),
+                    ) {
+                        Ok(()) => eprintln!("Checkpoint generation committed for {}", cache_dir),
+                        // "Nothing to commit" is a success, not a failure. When
+                        // checkpoint setup degraded to disabled, the collection
+                        // and upload still succeeded, and the wrapper runs this
+                        // unconditionally under `set -e` -- erroring here would
+                        // kill the script after a good publication and skip the
+                        // final cache mirror.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            eprintln!(
+                                "No active checkpoint generation in {} — nothing to commit",
+                                cache_dir
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    Ok((0, 0))
+                })()
+            }
+        },
     };
 
     match result {
