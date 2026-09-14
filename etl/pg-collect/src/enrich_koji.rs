@@ -9,8 +9,6 @@ use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use crate::uris::*;
-use quick_xml::events::Event;
-use quick_xml::Reader;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Result, Write};
