@@ -118,9 +118,20 @@ already-familiar cost.
 
 Without this, an entry would be reused across *all future scheduled runs*,
 permanently bypassing refresh mechanisms the collectors rely on: spec files are
-re-fetched each run (`collect_spec.rs:385`), the Koji `FileCache` expires after 30
-days (`enrich_koji.rs:40`), and Koji signatures can appear after a build was first
-observed. Schema versions invalidate *code* changes, not *upstream data* changes.
+re-fetched each run (`collect_spec.rs:385`), the Koji `FileCache` is *intended*
+to expire after 30 days (`enrich_koji.rs:41`), and Koji signatures can appear
+after a build was first observed. Schema versions invalidate *code* changes, not
+*upstream data* changes.
+
+**That Koji TTL does not currently work when Minio is configured.**
+`FileCache::read_local` (`cache.rs:269`) checks file mtime against the TTL, but
+the Minio fallback `read_minio` (`:295`) accepts any successful response with no
+age check, and `get` (`:234`) then rewrites the local file — refreshing its
+mtime. So the local copy ages out, the remote copy resurrects it, and the clock
+restarts: no Minio-backed entry ever expires. This is a pre-existing `FileCache`
+defect, tracked separately from this design; it strengthens rather than weakens
+the case for run generations, since the generation is then the *only* mechanism
+bounding reuse.
 
 **State file:** `<cache_dir>/output/GENERATION` — generation id plus status
 (`active` | `complete`), written atomically.

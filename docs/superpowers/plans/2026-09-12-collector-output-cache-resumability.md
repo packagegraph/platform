@@ -3995,11 +3995,15 @@ stage's checkpoints. Bump one whenever that stage's emitted triples change,
 including via shared serialization or ontology helpers — a stale fragment is
 indistinguishable from a correct one.
 
-`KOJI_RPC_CACHE_VERSION` is separate: it retires the Koji stage's 30-day
-source-cache entries when a parser change makes previously-stored responses
-untrustworthy. It is also part of that stage's checkpoint identity, so
-bumping it invalidates both caches at once — necessary, because the source
-cache sits behind the checkpoint and would otherwise never be consulted.
+`KOJI_RPC_CACHE_VERSION` is separate: it retires the Koji stage's cached RPC
+responses when a parser change makes previously-stored ones untrustworthy. It
+is also part of that stage's checkpoint identity, so bumping it invalidates
+both caches at once — necessary, because the source cache sits behind the
+checkpoint and would otherwise never be consulted.
+
+Note that the Koji `FileCache`'s nominal 30-day TTL is not enforced for
+Minio-backed entries (`cache.rs:295` does not check age), so bumping the
+version — not expiry — is what actually retires a bad entry.
 ```
 
 - [ ] **Step 2: Commit**

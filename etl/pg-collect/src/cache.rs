@@ -221,6 +221,17 @@ impl FileCache {
     /// Get a cached value by key. Returns None if not cached or expired.
     ///
     /// Check order: local file → Minio (if configured).
+    ///
+    /// KNOWN DEFECT: the TTL is only enforced on the local tier. `read_minio`
+    /// accepts any successful response without checking age, and the hit is
+    /// then written back to the local file — refreshing its mtime. So when
+    /// Minio is configured, an entry never expires: the local copy ages out,
+    /// the remote copy resurrects it, and the clock restarts. Callers must not
+    /// rely on the TTL to retire bad data; version the key instead (see
+    /// `enrich_koji::KOJI_RPC_CACHE_VERSION`). Fixing this needs a stored
+    /// timestamp in the stored value (as `http_cache.rs` does with
+    /// `fetched_at`) or a bucket lifecycle rule, plus a decision about the
+    /// simultaneous refetch across every collector that would follow.
     pub fn get(&self, key: &str) -> Option<Value> {
         let file_path = self.key_path(key);
 

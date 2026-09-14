@@ -38,7 +38,12 @@ impl KojiEnricher {
     ) -> Self {
         let sparql = Some(make_sparql_client(endpoint, &auth, backend));
         let cache = cache_dir.map(|dir| {
-            FileCache::new(dir, "koji", 720, None) // 30 days TTL
+            // Nominally 30 days. NOTE: the TTL is only enforced for local
+            // entries — FileCache::read_minio does not check age and rewrites
+            // the local file, so a Minio-backed entry never expires. Tracked
+            // separately; do not rely on expiry to retire a bad entry, bump
+            // KOJI_RPC_CACHE_VERSION instead.
+            FileCache::new(dir, "koji", 720, None)
                 .expect("Failed to create cache")
         });
 
