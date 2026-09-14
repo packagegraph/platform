@@ -17,6 +17,13 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::io::{Result, Write};
 
+/// Bump this for any change to this stage's emitted triples, including
+/// changes to shared serialization or ontology helpers it calls. A stale
+/// checkpoint fragment is indistinguishable from a correct one -- there is
+/// no automatic detection. Emission changes and a bump belong in the same
+/// patch.
+pub const SPEC_SCHEMA_VERSION: &str = "spec-v1";
+
 /// Regex for extracting Source0 URL from spec file.
 static SOURCE0_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?im)^Source0?\s*:\s*(.+)$").unwrap());
 
