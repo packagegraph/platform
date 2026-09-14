@@ -133,12 +133,13 @@ PG_COLLECT_BIN="$PWD/etl/pg-collect/target/debug/pg-collect" \
 
 The lifecycle integration test runs the real shell wrapper, collector, caches,
 upload script and commit. It covers failed data upload, failed sidecar upload,
-failed collection, retryable RPC, disabled checkpoint setup, retained-generation
-replay, successful retirement, and a fresh generation reusing valid source
-entries. The uncheckpointed spec fetch is omitted from this offline fixture;
-spec-stage resumability remains a separate unfinished task. CI also runs the
-image's pinned `mc` on local directories to test its actual exclusions, not the
-object-store adapter's implementation.
+failed collection, retryable RPC, inconclusive spec fetch, disabled checkpoint
+setup, retained-generation replay, successful retirement, and a fresh
+generation reusing valid source entries. Both checkpointed stages are covered:
+specs are served from a local dist-git fixture via
+`PG_COLLECT_DIST_GIT_BASE`, so the rehearsal issues no outbound requests. CI
+also runs the image's pinned `mc` on local directories to test its actual
+exclusions, not the object-store adapter's implementation.
 
 With timers still masked, manually run one known RPM collector against the new
 release (for example `systemctl start pg-collect@fedora-44-full.service`). This

@@ -459,6 +459,62 @@ units, no separate credentials needed. Run one collector immediately
 without waiting for its timer with `systemctl start pg-collect@<name>.service`
 (e.g. `pg-collect@npm.service`); watch it with `journalctl -u pg-collect@<name>.service -f`.
 
+### Collector checkpoints (rpm-full)
+
+`rpm-full` collectors checkpoint each item's derived triples under
+`<cache_dir>/output/<generation>/`, so a run killed by `TimeoutStartSec`
+resumes instead of restarting. A generation is created at run start, reused
+by retries of an interrupted run, and retired by `pg-collect checkpoint
+commit` — which the wrapper runs only after `upload-nt.sh` succeeds, so a
+run that collected everything but failed to publish stays resumable.
+
+Both long stages are checkpointed: Koji enrichment per NVR, and spec
+collection per SRPM. Each prints its own hit/miss line, so
+`journalctl -u pg-collect@<name>.service` shows where a resumed run picked
+up.
+
+Deploying a checkpoint-enabled collector is **not** a plain image update —
+the wrappers are host-mounted while the image auto-updates, so the two can
+drift apart. Use the coordinated cutover in
+[`collectors/checkpoint-cutover.md`](collectors/checkpoint-cutover.md).
+
+Checkpoints are deliberately **local-only** and excluded from every Minio
+mirror with `--exclude 'output/*'`. The pipeline's Minio credentials can PUT
+but not delete (verified 2026-09-12: `mc rm` returns `Access Denied`), so
+mirrored checkpoints could never be pruned and would accumulate forever. The
+scratch volume is a bind mount on the data disk and already survives
+container restarts and host reboots, which is what the failure mode this
+feature addresses actually needs. Losing the host costs one full
+re-collection.
+
+A generation is also not reused past `MAX_GENERATION_AGE_DAYS` (30). That is
+not a retry budget — these collectors run weekly, so a legitimate resume
+lands 7 days later — it is the backstop for a host running a
+checkpoint-enabled image against wrappers that never call `checkpoint
+commit`. Without it such a generation replays forever; with it the damage is
+one stale cycle and a logged warning naming the cutover doc.
+
+Bumping `SPEC_SCHEMA_VERSION` or `KOJI_SCHEMA_VERSION` invalidates that
+stage's checkpoints. Bump one whenever that stage's emitted triples change,
+including via shared serialization or ontology helpers — a stale fragment is
+indistinguishable from a correct one.
+
+`KOJI_RPC_CACHE_VERSION` is separate: it retires the Koji stage's cached RPC
+responses when a parser change makes previously-stored ones untrustworthy. It
+is also part of that stage's checkpoint identity, so bumping it invalidates
+both caches at once — necessary, because the source cache sits behind the
+checkpoint and would otherwise never be consulted.
+
+Note that the Koji `FileCache`'s nominal 30-day TTL is not enforced for
+Minio-backed entries (`cache.rs:295` does not check age), so bumping the
+version — not expiry — is what actually retires a bad entry.
+
+`PG_COLLECT_DIST_GIT_BASE` overrides the origin spec files are fetched from,
+keeping each distro's dist-git path shape. Set it to point at an internal
+dist-git mirror. It is not part of the checkpoint identity: it names where a
+spec came from, not which spec, so switching mirrors does not invalidate
+fragments.
+
 ### Incident: `fedora-43-full` timeout + a real cache bug (2026-09-10)
 
 The first real production run of `pg-collect@fedora-43-full` hit its (then)
