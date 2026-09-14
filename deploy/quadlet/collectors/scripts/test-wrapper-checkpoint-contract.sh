@@ -1,6 +1,7 @@
 #!/bin/bash
 # Asserts the checkpoint contract every rpm-full wrapper must satisfy.
-# These are ordering and exclusion properties no Rust test can observe.
+# Fast static guard, complemented by the real-wrapper lifecycle integration
+# test. Neither check substitutes for verifying installed host scripts.
 set -uo pipefail
 cd "$(dirname "$0")"
 fail=0

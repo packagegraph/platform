@@ -168,12 +168,17 @@ pg-collect checkpoint commit --cache-dir "$CACHE_DIR"    # only after upload suc
 mc mirror --overwrite --exclude 'output/*' "${CACHE_DIR}/" "${MINIO_CACHE}/"
 ```
 
-All ten `rpm-full` wrappers **will be updated** to this shape (none has a
-checkpoint commit or a mirror exclusion today): `fedora-43-full`,
+All ten `rpm-full` wrappers use this shape: `fedora-43-full`,
 `fedora-44-full`, `centos-stream-9-full`, `centos-stream-10-full`, `rhel-9-full`,
 `rhel-10-full`, `alma-9-full`, `alma-10-full`, `rocky-9-full`, `rocky-10-full`.
 Note that `rhel-*` run under the separate `pg-collect-rhel@.container` template
 but use the same wrapper shape.
+
+Checkpointing is automatic, not behind a compatibility flag. Because these
+wrappers are host-mounted while images update separately, deployment requires
+the coordinated cutover in `deploy/quadlet/collectors/checkpoint-cutover.md`:
+freeze before publishing, install a digest-pinned image/wrapper pair, verify it,
+and only then resume scheduling. Repository CI is not a host rollout gate.
 
 Pruning at mint time (not at commit) means a crash between publish and commit
 leaves the prior generation intact, costing one redundant re-collection rather

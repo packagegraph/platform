@@ -114,6 +114,15 @@ script if you deploy rootless.
 
 ## Image tags and auto-update
 
+**Collector checkpoint rollout exception:** deploying the checkpoint-enabled
+collector requires the [coordinated cutover](collectors/checkpoint-cutover.md).
+Freeze before publishing the first such image, install matching host scripts,
+and pin both collector templates to its immutable image digest with auto-update
+disabled. Repository CI does not update host-mounted scripts. Subsequent
+collector upgrades and rollbacks must update the image/script pair together.
+The floating-tag history below still applies to the other units; it is not a
+collector rollout procedure.
+
 `.github/workflows/images.yml` builds every image for `linux/amd64` and
 `linux/arm64` — each on a runner of its own architecture, then assembled
 into a manifest list — and two callers decide what tag the result gets:
@@ -429,7 +438,10 @@ own access to them. Scoped to a separate template (rather than added to
 the shared one) so this SELinux-confinement relaxation only applies to
 these two collectors, not all 40+.
 
-Install:
+Initial timer/collector installation is shown below for reference. For a
+checkpoint-enabled release, install the digest-pinned templates and matching
+RPM wrappers through the [coordinated cutover](collectors/checkpoint-cutover.md)
+instead; do not overwrite that installation with the floating templates below.
 
 ```bash
 install -m 644 deploy/quadlet/collectors/pg-collect@.container deploy/quadlet/collectors/pg-collect-rhel@.container /etc/containers/systemd/

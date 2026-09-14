@@ -91,6 +91,10 @@ To change any of this, read the code and change it there.
   retired only by an explicit `checkpoint commit`. Enabling checkpointing in
   the binary without the wrapper change leaves a generation active forever and
   replays its fragments across every later scheduled run.
+  CI validates repository artifacts, not installed host scripts. Follow
+  `deploy/quadlet/collectors/checkpoint-cutover.md`: freeze before publishing,
+  install and verify a digest-pinned release, then resume. Checkpointing remains
+  automatic; there is no compatibility opt-in flag.
 - **Whole-file byte-identity is NOT the replay contract.** Stage 1 is not
   checkpointed and emits a `dq#detectedAt` wall-clock timestamp, so `diff`ing
   two full runs always differs. The contract is that each *checkpointed
@@ -346,12 +350,12 @@ now propagates it, which the checkpoint outcome model depends on."
 ### Task B: Checkpoint the spec stage
 
 **Files:**
-- Modify: `etl/pg-collect/src/collect_spec.rs` (`collect`, `process_spec`, add `SPEC_SCHEMA_VERSION`)
+- Modify: `etl/pg-collect/src/collect_spec.rs` (`collect`, `process_spec`; reuse `SPEC_SCHEMA_VERSION`)
 - Test: `etl/pg-collect/src/collect_spec.rs`
 
 **Interfaces:**
 - Consumes: `OutputCache`, `CachedOutput`, `ComputeOutcome`, `CanonicalContext`, and the generic writers — all already implemented, see above; `SpecFetchResult` (Task A).
-- Produces: `pub const SPEC_SCHEMA_VERSION: &str = "spec-v1";` and
+- Reuses the existing `SPEC_SCHEMA_VERSION` constant; produces
   `SpecCollector::collect_checkpointed<W: Write>(&self, writer: &mut NTriplesWriter<W>, srpm_names, srpm_identity_map, existing_ecosystem_pkgs, emit_buildrequires, emit_maintainers, checkpoint: &OutputCache) -> Result<(usize, usize)>`.
   `collect` remains, delegating with `OutputCache::disabled()`.
 
@@ -464,21 +468,14 @@ fn a_different_context_does_not_hit_the_checkpoint() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --manifest-path etl/pg-collect/Cargo.toml --lib collect_spec::tests::spec_cache_path_carries_its_own_schema_version -- --exact`
-Expected: FAIL to compile — `SPEC_SCHEMA_VERSION` undefined.
+Run: `cargo test --manifest-path etl/pg-collect/Cargo.toml --lib collect_spec::tests::collect_checkpointed_replays_a_prepopulated_item_without_fetching -- --exact`
+Expected: FAIL to compile — `collect_checkpointed` is not implemented yet.
 
-- [ ] **Step 3: Add the schema version constant**
+- [ ] **Step 3: Reuse the existing schema version constant**
 
-Near the top of `collect_spec.rs`:
-
-```rust
-/// Bump this for any change to this stage's emitted triples, including
-/// changes to shared serialization or ontology helpers it calls. A stale
-/// checkpoint fragment is indistinguishable from a correct one -- there is
-/// no automatic detection. Emission changes and a bump belong in the same
-/// patch.
-pub const SPEC_SCHEMA_VERSION: &str = "spec-v1";
-```
+`collect_spec.rs` already defines `SPEC_SCHEMA_VERSION` with the bump-policy
+comment. Do not add a second definition. The path test above uses it; the
+cross-stage independence test already lives in `enrich_koji.rs`.
 
 - [ ] **Step 4: Add `collect_checkpointed` and make `collect` delegate**
 
@@ -686,10 +683,16 @@ where the spec stage iterates it, for the same reason `nvr_list` is sorted:
 it comes out of a `HashSet`, so fragment order would otherwise vary between
 processes.
 
-Then extend the rehearsal at
-`/home/bharring/.claude/jobs/e22de645/tmp/rehearsal/run.sh` to assert
+Then extend the repository-owned rehearsal at
+`deploy/quadlet/collectors/tests/test_checkpoint_lifecycle.py` to assert
 non-zero spec hits on replay, and that the spec fragment replays
 byte-identically — the same shape as the Koji assertions already there.
+Its test-only command adapter currently omits the uncheckpointed spec stage;
+replace that omission with a local spec fixture when implementing this task.
+Run with `cargo test --manifest-path etl/pg-collect/Cargo.toml --test test_checkpoint_lifecycle`.
+The wrapper and upload script are real; failures of both the data upload and
+the sidecar upload must leave the generation active. The fail-closed mutation
+runner (`checkpoint_mutations.py` in the same directory) is also a CI gate.
 
 **Do not assert whole-file byte-identity.** Stage 1 emits a `dq#detectedAt`
 wall-clock timestamp, so a full-output `diff` between two runs always differs

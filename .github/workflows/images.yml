@@ -97,6 +97,8 @@ jobs:
           context: ${{ matrix.image.context }}
           file: ${{ matrix.image.file }}
           platforms: ${{ matrix.platform.id }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.OWNER }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Record digest

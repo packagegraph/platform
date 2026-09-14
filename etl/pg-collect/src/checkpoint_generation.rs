@@ -14,8 +14,9 @@
 //! commit`**, which the rpm-full wrappers run after a successful upload. A
 //! deployment that enables checkpointing without that call leaves a generation
 //! active forever, and its fragments replay across every later scheduled run.
-//! `deploy/quadlet/collectors/scripts/test-wrapper-checkpoint-contract.sh`
-//! is what keeps the two in step.
+//! Repository tests validate the wrapper contract; they do not update the
+//! host-mounted scripts when an image changes. Use the coordinated, pinned
+//! rollout in `deploy/quadlet/collectors/checkpoint-cutover.md`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::RandomState;
