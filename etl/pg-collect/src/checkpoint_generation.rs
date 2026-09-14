@@ -3,8 +3,19 @@
 //! A generation scopes checkpoints to one in-flight run: retries of an
 //! interrupted run reuse it, and a successful publication retires it. Without
 //! this, checkpoints would be reused across every future scheduled run,
-//! permanently bypassing spec re-fetch, the Koji 30-day TTL, and signatures
-//! that appear after a build was first observed.
+//! permanently bypassing spec re-fetch and signatures that appear after a
+//! build was first observed.
+//!
+//! Note that the Koji `FileCache`'s nominal 30-day TTL is not a second line of
+//! defence here: it is not enforced for Minio-backed entries (`cache.rs:295`
+//! never checks age). The generation is the only thing bounding reuse.
+//!
+//! **A generation is only retired by an explicit `pg-collect checkpoint
+//! commit`**, which the rpm-full wrappers run after a successful upload. A
+//! deployment that enables checkpointing without that call leaves a generation
+//! active forever, and its fragments replay across every later scheduled run.
+//! `deploy/quadlet/collectors/scripts/test-wrapper-checkpoint-contract.sh`
+//! is what keeps the two in step.
 
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::RandomState;
