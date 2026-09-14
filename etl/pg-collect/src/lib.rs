@@ -34,6 +34,7 @@ pub mod buildroot;
 pub mod openwrt;
 pub mod enricher;
 pub mod cache;
+pub mod output_cache;
 pub mod source_cache;
 pub mod ir;
 pub mod normalize;
