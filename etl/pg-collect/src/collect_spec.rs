@@ -145,6 +145,21 @@ pub fn aggregate_candidates(
     }
 }
 
+/// Replace `url`'s scheme and authority with `base`, keeping its path.
+///
+/// Each distro's dist-git layout differs, so the override names only the
+/// origin and the per-distro path shape is preserved. Used by
+/// `PG_COLLECT_DIST_GIT_BASE` to point spec fetches at a mirror, and by the
+/// wrapper rehearsal to serve specs from a local fixture rather than reaching
+/// src.fedoraproject.org.
+fn rewrite_origin(url: &str, base: &str) -> String {
+    let path = url
+        .find("://")
+        .and_then(|i| url[i + 3..].find('/').map(|j| &url[i + 3 + j..]))
+        .unwrap_or("/");
+    format!("{}{}", base.trim_end_matches('/'), path)
+}
+
 /// A parsed %changelog entry.
 pub struct ChangelogEntry {
     pub date: String,
@@ -158,6 +173,8 @@ pub struct SpecCollector {
     distro: String,
     release: String,
     cache: Option<SourceCache>,
+    /// Origin to fetch specs from instead of the distro's public dist-git.
+    dist_git_base: Option<String>,
 }
 
 impl SpecCollector {
@@ -172,6 +189,12 @@ impl SpecCollector {
             distro: distro.to_string(),
             release: release.to_string(),
             cache,
+            // Not part of the checkpoint context: the override names where a
+            // spec is fetched from, not which spec. Pointing at a mirror of
+            // the same dist-git must not invalidate fragments.
+            dist_git_base: std::env::var("PG_COLLECT_DIST_GIT_BASE")
+                .ok()
+                .filter(|v| !v.is_empty()),
         })
     }
 
@@ -487,6 +510,16 @@ impl SpecCollector {
     }
 
     fn spec_urls(&self, source_name: &str) -> Vec<String> {
+        let urls = self.public_spec_urls(source_name);
+        // An unsupported distro yields no candidates, and the override must
+        // not invent any: that is what keeps offline tests offline.
+        match &self.dist_git_base {
+            Some(base) => urls.iter().map(|u| rewrite_origin(u, base)).collect(),
+            None => urls,
+        }
+    }
+
+    fn public_spec_urls(&self, source_name: &str) -> Vec<String> {
         match self.distro.as_str() {
             "fedora" => {
                 let branch = if self.release == "rawhide" {
@@ -1459,6 +1492,22 @@ BuildRequires:  perl(Test::More)
             aggregate_candidates("pkg", 0, vec![]),
             SpecFetchResult::NotFound
         ));
+    }
+
+    #[test]
+    fn rewrite_origin_keeps_the_path_and_replaces_the_host() {
+        assert_eq!(
+            rewrite_origin(
+                "https://src.fedoraproject.org/rpms/zlib/raw/f44/f/zlib.spec",
+                "http://127.0.0.1:8080"
+            ),
+            "http://127.0.0.1:8080/rpms/zlib/raw/f44/f/zlib.spec"
+        );
+        // A trailing slash on the base must not double up.
+        assert_eq!(
+            rewrite_origin("https://gitlab.com/a/b.spec", "http://h:1/"),
+            "http://h:1/a/b.spec"
+        );
     }
 
     // --- spec-stage checkpointing ---

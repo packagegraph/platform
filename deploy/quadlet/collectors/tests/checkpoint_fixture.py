@@ -37,13 +37,35 @@ RPMS = '''<array><data><value><struct>
 SIGS = '''<array><data><value><struct>
  <member><name>sigkey</name><value><string>cafebabe</string></value></member>
  </struct></value></data></array>'''
+# Served at the real dist-git path shape, reached via PG_COLLECT_DIST_GIT_BASE.
+# Source0 is a forge URL so the spec stage emits linkable triples rather than
+# only a DQ issue -- a fragment of nothing would make the replay assertions
+# vacuous.
+SPEC = b'''Name: zlib
+Version: 1.3
+Release: 1.fc44
+Summary: zlib
+License: Zlib
+URL: https://example.invalid/zlib
+Source0: https://github.com/madler/zlib/archive/v1.3.tar.gz
+BuildRequires: cmake
+
+%description
+test package
+
+%changelog
+* Mon Apr 01 2026 Spec Fixture <fixture@example.invalid> - 1.3-1
+- rehearsal entry
+'''
 
 
 class Hub(http.server.ThreadingHTTPServer):
     def __init__(self):
         super().__init__(("127.0.0.1", 0), Handler)
         self.rpcs = []
+        self.spec_requests = []
         self.fail_signatures = False
+        self.fail_specs = False
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
 
@@ -67,6 +89,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         body = {"/repo/repodata/repomd.xml": REPOMD,
                 "/repo/repodata/primary.xml": PRIMARY}.get(self.path)
+        if body is None and self.path.startswith("/dist-git/"):
+            # Only the f44 branch exists, so the later rawhide/main candidates
+            # 404 -- exercising the real fallback chain rather than assuming
+            # the first URL always wins.
+            self.server.spec_requests.append(self.path)
+            if self.server.fail_specs:
+                self.send(503, b"dist-git down")
+                return
+            body = SPEC if self.path == "/dist-git/rpms/zlib/raw/f44/f/zlib.spec" else None
         self.send(200 if body else 404, body or b"not found")
 
     def do_POST(self):

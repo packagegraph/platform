@@ -3677,13 +3677,17 @@ fn main() {
                     let spec_collector =
                         SpecCollector::new(&distro, &release, cache_dir.as_deref())?;
                     let existing_ecosystem = std::collections::HashSet::new(); // TODO: track from RPM Provides
-                    let (specs, triples) = spec_collector.collect(
+                    // srpm_names is a HashSet; collect_checkpointed iterates it
+                    // sorted so fragment order -- and therefore byte-identical
+                    // replay -- does not depend on this process's hash seed.
+                    let (specs, triples) = spec_collector.collect_checkpointed(
                         &mut writer,
                         &srpm_names,
                         &srpm_identity_map,
                         &existing_ecosystem,
                         with_buildrequires,
                         with_maintainers,
+                        &open_cache("spec", pg_collect::collect_spec::SPEC_SCHEMA_VERSION),
                     )?;
                     total_packages += specs;
                     total_triples += triples;

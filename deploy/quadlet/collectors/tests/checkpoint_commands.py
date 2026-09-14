@@ -2,9 +2,10 @@
 """Test-only external-command adapters; never installed with the collectors.
 
 pg-collect still executes the real binary. Only network-source arguments are
-redirected; the spec stage (not checkpointed yet) is omitted to prevent live
-dist-git requests. mc models remote object storage, not collector/checkpoint or
-upload logic. Actual mc wildcard semantics need the separate mc check.
+redirected: the repo and Koji hub via their CLI flags, and dist-git via
+PG_COLLECT_DIST_GIT_BASE, which the harness points at the same fixture. mc
+models remote object storage, not collector/checkpoint or upload logic. Actual
+mc wildcard semantics need the separate mc check.
 """
 import fnmatch
 import json
@@ -25,8 +26,6 @@ if command == "pg-collect":
         rewritten = [args[0]]
         iterator = iter(args[1:])
         for arg in iterator:
-            if arg in ("--with-spec", "--with-maintainers"):
-                continue
             if arg in ("--url", "--koji-hub"):
                 next(iterator)
                 rewritten += [arg, os.environ["CHECKPOINT_TEST_HUB"] +

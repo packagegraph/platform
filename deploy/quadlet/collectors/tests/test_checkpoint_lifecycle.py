@@ -43,6 +43,7 @@ class LifecycleTest(unittest.TestCase):
         self.state_path = self.cache / "output/GENERATION"
         self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
                         CHECKPOINT_TEST_ROOT=str(self.root), CHECKPOINT_TEST_HUB=self.hub.url,
+                        PG_COLLECT_DIST_GIT_BASE=self.hub.url + "/dist-git",
                         MINIO_BUCKET="test", MINIO_ENDPOINT=self.hub.url,
                         MINIO_ACCESS_KEY="test", MINIO_SECRET_KEY="test")
         # Fail rather than accidentally using a globally installed old binary.
@@ -73,25 +74,60 @@ class LifecycleTest(unittest.TestCase):
         text = (self.root / "collection/fedora-44.nt").read_text()
         return "\n".join(line for line in text.splitlines() if "/d/build/fedora/" in line)
 
+    def spec_fragment(self):
+        # Source0 forge extraction and the %changelog maintainer. Neither is
+        # reachable from repodata, so these lines exist only if the spec stage
+        # produced them -- by fetching or by replaying a checkpoint.
+        text = (self.root / "collection/fedora-44.nt").read_text()
+        return "\n".join(line for line in text.splitlines()
+                         if "madler" in line or "/d/person/" in line)
+
+    def stage_line(self, output, prefix):
+        """The one progress line for a stage.
+
+        Both stages print '<n> hits, <n> misses', so asserting that substring
+        against the whole output would pass on the wrong stage's counters.
+        """
+        lines = [l for l in output.splitlines() if l.startswith(prefix)]
+        self.assertEqual(len(lines), 1, f"expected one {prefix!r} line:\n{output}")
+        return lines[0]
+
+    def spec_line(self, output):
+        return self.stage_line(output, "Spec collection complete:")
+
+    def koji_line(self, output):
+        return self.stage_line(output, "Koji checkpoint:")
+
     def test_failed_upload_replays_then_success_retires_and_rederives(self):
         # Removing/hoisting commit or swallowing an upload error must fail this.
         code, output = self.run_wrapper(fail_upload="cp")
         self.assertEqual(code, 42, output)
         old = self.state()
         self.assertEqual(old["status"], "active")
-        self.assertIn("0 hits, 1 misses", output)
+        self.assertIn("0 hits, 1 misses", self.koji_line(output))
+        self.assertIn("0 hits, 1 misses", self.spec_line(output))
         self.assertEqual(self.hub.rpcs, ["getBuild", "listBuildRPMs", "queryRPMSigs"])
+        self.assertEqual(self.hub.spec_requests,
+                         ["/dist-git/rpms/zlib/raw/f44/f/zlib.spec"])
         fragment = self.fragment()
         self.assertIn("rehearsal", fragment)
         self.assertIn("cafebabe", fragment)
+        spec_fragment = self.spec_fragment()
+        self.assertIn("fixture@example.invalid", spec_fragment)
         self.hub.rpcs.clear()
+        self.hub.spec_requests.clear()
 
         code, output = self.run_wrapper()
         self.assertEqual(code, 0, output)
         self.assertEqual(self.state(), {"id": old["id"], "status": "complete"})
-        self.assertIn("1 hits, 0 misses", output)
+        self.assertIn("1 hits, 0 misses", self.koji_line(output))
+        self.assertIn("1 hits, 0 misses", self.spec_line(output))
         self.assertEqual(self.hub.rpcs, [])
+        self.assertEqual(self.hub.spec_requests, [],
+                         "a replayed spec item must not re-fetch dist-git")
         self.assertEqual(self.fragment(), fragment)
+        self.assertEqual(self.spec_fragment(), spec_fragment,
+                         "the spec fragment must replay byte-identically")
         uploaded = self.root / "remote/nt-output/fedora-44.nt.gz"
         self.assertIn("cafebabe", gzip.decompress(uploaded.read_bytes()).decode())
         self.assertEqual(uploaded.with_suffix(".gz.graph").read_text(),
@@ -104,8 +140,18 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertNotEqual(self.state()["id"], old["id"])
         self.assertEqual(self.state()["status"], "complete")
-        self.assertIn("0 hits, 1 misses", output)
+        self.assertIn("0 hits, 1 misses", self.koji_line(output))
+        self.assertIn("0 hits, 1 misses", self.spec_line(output))
         self.assertEqual(self.hub.rpcs, [], "fresh generation still reuses valid source cache")
+        # The spec stage DOES talk to dist-git again here, and that is correct:
+        # SourceCache::fetch_or_reuse is a conditional-request cache (it can
+        # return NotModified), not a keyed store like Koji's FileCache. A fresh
+        # generation therefore revalidates rather than skipping the request.
+        # What must hold is that re-derivation is deterministic.
+        self.assertEqual(self.hub.spec_requests,
+                         ["/dist-git/rpms/zlib/raw/f44/f/zlib.spec"])
+        self.assertEqual(self.spec_fragment(), spec_fragment,
+                         "re-derivation from cached sources must be deterministic")
         self.assertFalse((self.cache / "output" / old["id"]).exists())
 
     def test_failed_sidecar_does_not_retire_generation(self):
@@ -129,16 +175,37 @@ class LifecycleTest(unittest.TestCase):
         self.hub.fail_signatures = True
         code, output = self.run_wrapper(fail_upload="cp")
         self.assertEqual(code, 42, output)
-        self.assertIn("1 retryable", output)
+        self.assertIn("1 retryable", self.koji_line(output))
         generation = self.state()["id"]
         self.assertEqual(list((self.cache / "output" / generation).rglob("koji-v1/*")), [])
         self.hub.fail_signatures = False
         self.hub.rpcs.clear()
         code, output = self.run_wrapper()
         self.assertEqual(code, 0, output)
-        self.assertIn("0 hits, 1 misses", output)
+        self.assertIn("0 hits, 1 misses", self.koji_line(output))
         self.assertIn("queryRPMSigs", self.hub.rpcs)
         self.assertIn("cafebabe", self.fragment())
+
+    def test_inconclusive_spec_fetch_is_not_checkpointed_and_retries_on_resume(self):
+        # The spec analogue: dist-git 503s are transport failures, not "this
+        # SRPM has no spec". Checkpointing that verdict would bake a blip into
+        # the corpus for the life of the generation.
+        self.hub.fail_specs = True
+        code, output = self.run_wrapper(fail_upload="cp")
+        self.assertEqual(code, 42, output)
+        self.assertIn("1 retryable", self.spec_line(output))
+        generation = self.state()["id"]
+        self.assertEqual(list((self.cache / "output" / generation).rglob("spec-v1/*")), [],
+                         "an inconclusive fetch must leave no checkpoint entry")
+        self.assertNotIn("fixture@example.invalid", self.spec_fragment())
+
+        self.hub.fail_specs = False
+        self.hub.spec_requests.clear()
+        code, output = self.run_wrapper()
+        self.assertEqual(code, 0, output)
+        self.assertIn("0 hits, 1 misses", self.spec_line(output))
+        self.assertIn("/dist-git/rpms/zlib/raw/f44/f/zlib.spec", self.hub.spec_requests)
+        self.assertIn("fixture@example.invalid", self.spec_fragment())
 
     def test_disabled_checkpoint_setup_still_uploads_and_finishes(self):
         self.cache.mkdir(parents=True)
