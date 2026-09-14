@@ -193,11 +193,17 @@ impl KojiEnricher {
 
     /// Enrich from a pre-built list of SRPM NVRs, bypassing the Fuseki discovery query.
     /// This is the entry point for --srpm-list mode and for colocated enrichment via rpm-full.
+    ///
+    /// `checkpoint` is injected explicitly rather than constructed here:
+    /// standalone `enrich-koji --srpm-list` shares this method but has no
+    /// wrapper that commits after publication, so it must pass `None` and
+    /// never leave an active generation behind.
     pub fn enrich_from_nvrs(
         &self,
         nvrs: &[String],
         output_path: &str,
         limit: Option<usize>,
+        checkpoint: Option<&crate::output_cache::OutputCache>,
     ) -> Result<(usize, usize)> {
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
@@ -222,18 +228,64 @@ impl KojiEnricher {
                 }
             }
 
-            match self.get_build(nvr, &mut writer) {
-                Ok(triples) if triples > 0 => {
-                    total_builds += 1;
-                    total_triples += triples;
-                    eprintln!("  {} → {} triples", nvr, triples);
-                }
-                Ok(_) => {
-                    eprintln!("  {} → not found", nvr);
+            use crate::output_cache::{CachedOutput, CanonicalContext, ComputeOutcome, OutputCache};
+            let disabled = OutputCache::disabled();
+            let cache = checkpoint.unwrap_or(&disabled);
+
+            // `rpc_cache_version` is in the context so the two versions cannot
+            // drift apart by hand. Bumping KOJI_RPC_CACHE_VERSION stops old
+            // *source-cache* entries being read, but an interrupted generation
+            // already holds *output* fragments the old parser produced, and
+            // those hit before any source lookup happens. Carrying the version
+            // here invalidates both in one move.
+            let ctx = CanonicalContext::new()
+                .field("distro", &self.distro)
+                .field("release", &self.release)
+                .field("koji_hub", &self.koji_hub)
+                .field("rpc_cache_version", KOJI_RPC_CACHE_VERSION);
+
+            let result = cache.get_or_compute(nvr, &ctx, || {
+                self.item_inconclusive.set(false);
+                let mut scratch = NTriplesWriter::new(Vec::<u8>::new());
+                let logical = self.get_build(nvr, &mut scratch)?;
+                let out = CachedOutput {
+                    logical_triples: logical,
+                    skipped_invalid_iri: scratch.skipped_invalid_iri,
+                    auto_inverses: scratch.auto_inverses,
+                    text: scratch.into_string()?,
+                };
+                Ok(if self.item_inconclusive.get() {
+                    ComputeOutcome::Retryable(out)
+                } else {
+                    ComputeOutcome::Complete(out)
+                })
+            });
+
+            match result {
+                Ok(out) => {
+                    for line in out.text.lines() {
+                        writer.write_raw_line(line)?;
+                    }
+                    writer.skipped_invalid_iri += out.skipped_invalid_iri;
+                    writer.auto_inverses += out.auto_inverses;
+                    if out.logical_triples > 0 {
+                        total_builds += 1;
+                        total_triples += out.logical_triples;
+                        eprintln!("  {} → {} triples", nvr, out.logical_triples);
+                    } else {
+                        eprintln!("  {} → not found", nvr);
+                    }
                 }
                 Err(e) => eprintln!("  {} → error: {}", nvr, e),
             }
+        }
 
+        if let Some(c) = checkpoint {
+            let s = c.stats();
+            eprintln!(
+                "Koji checkpoint: {} hits, {} misses, {} retryable, {} write-fail, {} integrity-fail",
+                s.hits, s.misses, s.retryable, s.write_failures, s.integrity_failures
+            );
         }
 
         writer.flush()?;
@@ -1384,7 +1436,7 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_str().unwrap().to_string();
 
-        let result = enricher.enrich_from_nvrs(&nvrs, &path, None);
+        let result = enricher.enrich_from_nvrs(&nvrs, &path, None, None);
         assert!(
             result.is_ok(),
             "enrich_from_nvrs should succeed: {:?}",
@@ -1930,14 +1982,22 @@ mod tests {
         </struct></value></fault></methodResponse>"#
     }
 
+    const HUB_PATH: &str = "/kojihub";
+
     /// One mock per RPC on a shared hub, with exact expected call counts.
     ///
     /// The counts are the point: mockito 1.7.2's `Server::new()` sets
     /// `assert_on_drop = false`, so a mock that is never called fails nothing on
     /// its own. The caller must `.assert()` every returned mock, including the
     /// ones expecting zero.
-    fn mock_hub(
+    ///
+    /// `path` exists so a test can present two *distinct hub URLs*. It cannot
+    /// do that with two servers: `Server::new()` draws from a pool and reuses
+    /// the port, so two sequentially-created servers hand out the same URL and
+    /// a test meaning to change hubs would silently not change anything.
+    fn mock_hub_at(
         server: &mut mockito::Server,
+        path: &str,
         bodies: [(&str, &str); 3],
         expected_calls: [usize; 3],
     ) -> Vec<mockito::Mock> {
@@ -1946,13 +2006,21 @@ mod tests {
             .zip(expected_calls)
             .map(|((method, body), n)| {
                 server
-                    .mock("POST", "/kojihub")
+                    .mock("POST", path)
                     .match_body(Matcher::Regex(format!("<methodName>{method}</methodName>")))
                     .with_body(body)
                     .expect(n)
                     .create()
             })
             .collect()
+    }
+
+    fn mock_hub(
+        server: &mut mockito::Server,
+        bodies: [(&str, &str); 3],
+        expected_calls: [usize; 3],
+    ) -> Vec<mockito::Mock> {
+        mock_hub_at(server, HUB_PATH, bodies, expected_calls)
     }
 
     /// Writes a source-cache entry under a key spelled out literally, as the
@@ -2120,5 +2188,312 @@ mod tests {
             key.contains(KOJI_RPC_CACHE_VERSION),
             "the version must be visible in the key namespace, got {key}"
         );
+    }
+
+    #[test]
+    fn passing_no_checkpoint_writes_no_checkpoint_files() {
+        // Guards the standalone-enrich-koji contract: it has no
+        // commit-after-publish lifecycle, so it must never leave checkpoint state.
+        // A real NVR against an unroutable host, so the code path is exercised
+        // rather than skipped by an empty list.
+        let d = tempfile::TempDir::new().unwrap();
+        let out = d.path().join("out.nt");
+        let e = KojiEnricher::new_standalone("https://koji.invalid/kojihub", "fedora", "44", None);
+        let _ = e.enrich_from_nvrs(&["zlib-1.3-1.fc44".to_string()], out.to_str().unwrap(), None, None);
+        assert!(!d.path().join("output").exists(), "no checkpoint tree may be created");
+    }
+
+    #[test]
+    fn a_checkpointed_nvr_replays_without_calling_koji() {
+        // Drives the real loop. The hub is unroutable, so if the checkpoint were
+        // not consulted the item would emit a DQ fragment instead of this text.
+        use crate::output_cache::{CachedOutput, CanonicalContext, ComputeOutcome, OutputCache};
+        let d = tempfile::TempDir::new().unwrap();
+        let cache = OutputCache::new(d.path(), "20260912T010203Z-abcdef01", "koji", KOJI_SCHEMA_VERSION).unwrap();
+        let hub = "https://koji.invalid/kojihub";
+
+        // This context must match the production one field for field, which is
+        // what pins `rpc_cache_version` into `enrich_from_nvrs`: drop it there and
+        // this test stops hitting.
+        let ctx = CanonicalContext::new()
+            .field("distro", "fedora")
+            .field("release", "44")
+            .field("koji_hub", hub)
+            .field("rpc_cache_version", KOJI_RPC_CACHE_VERSION);
+        cache.get_or_compute("zlib-1.3-1.fc44", &ctx, || Ok(ComputeOutcome::Complete(CachedOutput {
+            logical_triples: 3, skipped_invalid_iri: 0, auto_inverses: 1,
+            text: "<b> <p> <o> .\n".into(),
+        }))).unwrap();
+
+        let out = d.path().join("out.nt");
+        let e = KojiEnricher::new_standalone(hub, "fedora", "44", None);
+        let (builds, triples) = e.enrich_from_nvrs(
+            &["zlib-1.3-1.fc44".to_string()], out.to_str().unwrap(), None, Some(&cache),
+        ).unwrap();
+
+        assert_eq!((builds, triples), (1, 3), "totals must come from the checkpoint");
+        assert_eq!(cache.stats().hits, 1);
+        assert!(std::fs::read_to_string(&out).unwrap().contains("<b> <p> <o>"));
+    }
+
+    #[test]
+    fn an_rpc_cache_version_change_misses_existing_output_checkpoints() {
+        // The scenario: a generation is interrupted, someone fixes a parser bug
+        // and bumps KOJI_RPC_CACHE_VERSION, and the generation resumes. Fragments
+        // the old parser wrote must not replay.
+        use crate::output_cache::{CachedOutput, CanonicalContext, ComputeOutcome, OutputCache};
+        let d = tempfile::TempDir::new().unwrap();
+        let cache = OutputCache::new(
+            d.path(), "20260912T010203Z-abcdef01", "koji", KOJI_SCHEMA_VERSION).unwrap();
+
+        let ctx_for = |v: &str| CanonicalContext::new()
+            .field("distro", "fedora")
+            .field("release", "44")
+            .field("koji_hub", "https://koji.invalid/kojihub")
+            .field("rpc_cache_version", v);
+        let fragment = || Ok(ComputeOutcome::Complete(CachedOutput {
+            logical_triples: 1, skipped_invalid_iri: 0, auto_inverses: 0,
+            text: "<b> <p> <o> .\n".into(),
+        }));
+
+        cache.get_or_compute("zlib-1.3-1.fc44", &ctx_for(KOJI_RPC_CACHE_VERSION), fragment).unwrap();
+        assert_eq!(cache.stats().hits, 0, "first call is a miss");
+
+        // Same key, same generation, same KOJI_SCHEMA_VERSION -- only the parser
+        // version differs.
+        cache.get_or_compute("zlib-1.3-1.fc44", &ctx_for("vNEXT"), fragment).unwrap();
+        assert_eq!(cache.stats().hits, 0, "an RPC-version change must not replay old fragments");
+
+        // ...and the original context still hits, so the miss above is the
+        // version and not a context that never matches anything.
+        cache.get_or_compute("zlib-1.3-1.fc44", &ctx_for(KOJI_RPC_CACHE_VERSION), fragment).unwrap();
+        assert_eq!(cache.stats().hits, 1);
+    }
+
+    #[test]
+    fn an_unreachable_hub_is_retryable_not_checkpointed() {
+        // A transport failure must leave nothing behind, or the next run would
+        // replay an empty fragment as though the build genuinely had no data.
+        use crate::output_cache::OutputCache;
+        let d = tempfile::TempDir::new().unwrap();
+        let cache = OutputCache::new(d.path(), "20260912T010203Z-abcdef01", "koji", KOJI_SCHEMA_VERSION).unwrap();
+        let out = d.path().join("out.nt");
+        let e = KojiEnricher::new_standalone("https://koji.invalid/kojihub", "fedora", "44", None);
+        let _ = e.enrich_from_nvrs(
+            &["zlib-1.3-1.fc44".to_string()], out.to_str().unwrap(), None, Some(&cache),
+        );
+        assert_eq!(cache.stats().retryable, 1, "a transport failure must be Retryable");
+        assert_eq!(cache.stats().hits, 0);
+    }
+
+    // The whole-chain tests below reuse Task 6's `ok_build`/`ok_rpms`/`ok_sigs`/
+    // `fault` fixtures and its `mock_hub` helper. They live in THIS task, not
+    // Task 6, because they call the four-argument `enrich_from_nvrs` introduced
+    // here — in Task 6 they would not compile.
+
+    /// Runs one NVR with scripted responses.
+    ///
+    /// Every mock's exact call count is asserted, including the zeroes. That is
+    /// what makes these tests meaningful: without exact counts, a "later RPC"
+    /// test could pass merely because an earlier unmatched request produced a
+    /// transport failure, proving nothing about the RPC it claims to exercise.
+    fn run_chain(
+        bodies: [(&str, &str); 3],
+        expected_calls: [usize; 3],
+    ) -> (crate::output_cache::CacheStats, std::io::Result<(usize, usize)>) {
+        let mut server = mockito::Server::new();
+        let mocks = mock_hub(&mut server, bodies, expected_calls);
+
+        let d = tempfile::TempDir::new().unwrap();
+        let cache = crate::output_cache::OutputCache::new(
+            d.path(), "20260912T010203Z-abcdef01", "koji", KOJI_SCHEMA_VERSION).unwrap();
+        let hub = format!("{}/kojihub", server.url());
+        let out = d.path().join("out.nt");
+        let e = KojiEnricher::new_standalone(&hub, "fedora", "44", None);
+        let result = e.enrich_from_nvrs(
+            &["zlib-1.3-1.fc44".to_string()], out.to_str().unwrap(), None, Some(&cache),
+        );
+
+        // Exact call counts, including the zeroes.
+        for m in &mocks {
+            m.assert();
+        }
+        (cache.stats(), result)
+    }
+
+    #[test]
+    fn a_fault_in_get_build_makes_the_item_retryable() {
+        // The later RPCs must not run at all once getBuild has faulted.
+        let (s, r) = run_chain(
+            [("getBuild", fault()), ("listBuildRPMs", ok_rpms()), ("queryRPMSigs", ok_sigs())],
+            [1, 0, 0],
+        );
+        assert!(r.is_ok(), "a faulted item is reported, not an error: {r:?}");
+        assert_eq!(s.retryable, 1, "a getBuild fault must not be checkpointed");
+        assert_eq!(s.hits, 0);
+    }
+
+    #[test]
+    fn a_fault_in_list_build_rpms_makes_the_whole_item_retryable() {
+        // getBuild succeeded, so the chain reached listBuildRPMs. The item must
+        // STILL be retryable -- the whole-chain rule, and the case a per-RPC
+        // check would miss. queryRPMSigs must not be reached.
+        let (s, r) = run_chain(
+            [("getBuild", ok_build()), ("listBuildRPMs", fault()), ("queryRPMSigs", ok_sigs())],
+            [1, 1, 0],
+        );
+        assert!(r.is_ok());
+        assert_eq!(s.retryable, 1, "an inconclusive later RPC must poison the item");
+    }
+
+    #[test]
+    fn a_fault_in_query_rpm_sigs_makes_the_whole_item_retryable() {
+        // A build whose signature lookup faulted must not be checkpointed as
+        // though it were unsigned. All three RPCs run.
+        let (s, r) = run_chain(
+            [("getBuild", ok_build()), ("listBuildRPMs", ok_rpms()), ("queryRPMSigs", fault())],
+            [1, 1, 1],
+        );
+        assert!(r.is_ok());
+        assert_eq!(s.retryable, 1);
+    }
+
+    #[test]
+    fn a_fully_successful_chain_is_checkpointed() {
+        let (s, r) = run_chain(
+            [("getBuild", ok_build()), ("listBuildRPMs", ok_rpms()), ("queryRPMSigs", ok_sigs())],
+            [1, 1, 1],
+        );
+        let (builds, triples) = r.expect("a conclusive chain must succeed");
+        assert_eq!(builds, 1);
+        assert!(triples > 0, "a found build must emit triples");
+        assert_eq!(s.retryable, 0, "a conclusive chain must be Complete");
+        assert_eq!(s.misses, 1);
+    }
+
+    // ─── end-to-end: a hub change must not reuse the other hub's data ───
+
+    fn build_body(owner: &str) -> String {
+        // build_id is 1 on BOTH hubs on purpose: Koji ids are hub-relative, so
+        // this is precisely the case where a hub-blind source key would serve
+        // one hub's queryRPMSigs(1) answer for the other's.
+        format!(
+            r#"<?xml version="1.0"?><methodResponse><params><param><value><struct>
+              <member><name>build_id</name><value><int>1</int></value></member>
+              <member><name>name</name><value><string>zlib</string></value></member>
+              <member><name>owner_name</name><value><string>{owner}</string></value></member>
+            </struct></value></param></params></methodResponse>"#
+        )
+    }
+
+    fn sigs_body(sigkey: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><methodResponse><params><param><value><array><data>
+              <value><struct>
+                <member><name>sigkey</name><value><string>{sigkey}</string></value></member>
+              </struct></value>
+            </data></array></value></param></params></methodResponse>"#
+        )
+    }
+
+    const GEN: &str = "20260912T010203Z-abcdef01";
+
+    /// One `enrich_from_nvrs` run against a scripted hub, sharing `dir` for
+    /// both the RPC source cache and the output checkpoint tree.
+    ///
+    /// Takes the server by reference rather than creating one. Two hubs cannot
+    /// be two *servers*: `Server::new()` draws from a pool, so the port it
+    /// hands out is neither guaranteed to differ between two servers nor
+    /// guaranteed to repeat for the "same" one — and the port is part of the
+    /// hub URL, which is part of the checkpoint context. One server for the
+    /// whole test fixes the port, leaving `path` as the only thing that
+    /// varies, which is exactly the variable under test.
+    ///
+    /// Mocks are removed at the end of each run: `Mock`'s `Drop` does not
+    /// unregister it, so leftovers from an earlier run would keep matching and
+    /// the call counts would stop meaning anything.
+    fn run_against_hub(
+        server: &mut mockito::Server,
+        dir: &std::path::Path,
+        path: &str,
+        owner: &str,
+        sigkey: &str,
+        expected_calls: [usize; 3],
+    ) -> (String, crate::output_cache::CacheStats) {
+        let bb = build_body(owner);
+        let sb = sigs_body(sigkey);
+        let mocks = mock_hub_at(
+            server,
+            path,
+            [
+                ("getBuild", bb.as_str()),
+                ("listBuildRPMs", ok_rpms()),
+                ("queryRPMSigs", sb.as_str()),
+            ],
+            expected_calls,
+        );
+
+        let cache = crate::output_cache::OutputCache::new(
+            dir, GEN, "koji", KOJI_SCHEMA_VERSION,
+        )
+        .unwrap();
+        let hub = format!("{}{}", server.url(), path);
+        let out = dir.join(format!("out-{owner}.nt"));
+        let e = KojiEnricher::new_standalone(&hub, "fedora", "44", Some(dir.to_str().unwrap()));
+        e.enrich_from_nvrs(
+            &["zlib-1.3-1.fc44".to_string()],
+            out.to_str().unwrap(),
+            None,
+            Some(&cache),
+        )
+        .unwrap();
+
+        for m in &mocks {
+            m.assert();
+            m.remove();
+        }
+        (std::fs::read_to_string(&out).unwrap(), cache.stats())
+    }
+
+    #[test]
+    fn changing_hubs_neither_replays_nor_reuses_the_other_hubs_data() {
+        let d = tempfile::TempDir::new().unwrap();
+        // One server, two paths -- see run_against_hub.
+        let mut server = mockito::Server::new();
+
+        // 1. Populate both caches through hub A.
+        let (text_a, stats_a) = run_against_hub(&mut server, d.path(), "/hub-a", "ownerA", "aaaa", [1, 1, 1]);
+        assert_eq!(stats_a.misses, 1, "first run must be a checkpoint miss");
+        assert_eq!(stats_a.hits, 0);
+        assert_eq!(stats_a.retryable, 0, "a conclusive chain must be Complete");
+        assert!(text_a.contains("agent/koji/ownerA"));
+        assert!(text_a.contains("aaaa"));
+
+        // 2-4. Same cache dir, same generation, different hub. The output
+        // checkpoint must miss (its context carries koji_hub), and hub B must
+        // actually be called -- if the source key were hub-blind, hub A's
+        // cached getBuild and queryRPMSigs(1) would be served instead and
+        // these expect(1) mocks would see zero calls.
+        let (text_b, stats_b) = run_against_hub(&mut server, d.path(), "/hub-b", "ownerB", "bbbb", [1, 1, 1]);
+        assert_eq!(stats_b.hits, 0, "a different hub must not hit hub A's checkpoint");
+        assert_eq!(stats_b.misses, 1);
+
+        // 5. Hub B's own result is what was emitted...
+        assert!(text_b.contains("agent/koji/ownerB"), "got: {text_b}");
+        assert!(text_b.contains("bbbb"), "hub B's sigkey must be the one emitted");
+        assert!(!text_b.contains("ownerA"), "hub A's build must not leak into hub B's output");
+        assert!(!text_b.contains("aaaa"), "hub A's sigkey must not leak into hub B's output");
+
+        // ...and it was checkpointed: a repeat run on hub B hits, so the hub
+        // must not be called at all.
+        let (text_b2, stats_b2) = run_against_hub(&mut server, d.path(), "/hub-b", "ownerB", "bbbb", [0, 0, 0]);
+        assert_eq!(stats_b2.hits, 1, "hub B's result must have been checkpointed");
+        assert_eq!(text_b2, text_b, "a replay must reproduce the fragment byte for byte");
+
+        // And hub A's checkpoint is still intact alongside it, rather than
+        // having been overwritten.
+        let (text_a2, stats_a2) = run_against_hub(&mut server, d.path(), "/hub-a", "ownerA", "aaaa", [0, 0, 0]);
+        assert_eq!(stats_a2.hits, 1);
+        assert_eq!(text_a2, text_a);
     }
 }

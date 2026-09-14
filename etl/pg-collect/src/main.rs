@@ -2920,7 +2920,9 @@ fn main() {
                     cache_dir.as_deref(),
                 )
                 .with_graph_uri(graph_uri.clone());
-                enricher.enrich_from_nvrs(&nvrs, &output, limit)
+                // Standalone enrich-koji has no commit-after-publish
+                // lifecycle, so it never checkpoints.
+                enricher.enrich_from_nvrs(&nvrs, &output, limit, None)
             } else {
                 if endpoint.is_empty() {
                     panic!("Either --endpoint or --srpm-list is required for enrich-koji");
@@ -3665,7 +3667,7 @@ fn main() {
                     // Write to a temp file, then append (Koji enricher creates its own writer)
                     let koji_tmp = format!("{}.koji.tmp", output);
                     let (builds, triples) =
-                        koji_enricher.enrich_from_nvrs(&nvr_list, &koji_tmp, limit)?;
+                        koji_enricher.enrich_from_nvrs(&nvr_list, &koji_tmp, limit, None)?;
                     // Append Koji triples to main output
                     let koji_content = std::fs::read_to_string(&koji_tmp)?;
                     use std::io::Write;
