@@ -85,6 +85,56 @@ pub struct SpecData {
     pub changelog_entries: Vec<ChangelogEntry>,
 }
 
+/// Outcome of trying every candidate spec URL for one SRPM.
+///
+/// The distinction matters for checkpointing: `NotFound` is a deterministic
+/// answer about this SRPM and may be checkpointed, while `RetryableFailure`
+/// is operationally inconclusive and must not be.
+pub enum SpecFetchResult {
+    Found(String),
+    /// Every candidate URL returned a definitive 404.
+    NotFound,
+    /// At least one candidate failed inconclusively (transport error, 5xx,
+    /// malformed) and none succeeded.
+    RetryableFailure(String),
+}
+
+/// What one candidate URL produced.
+pub enum CandidateOutcome {
+    Found(String),
+    /// A definitive 404.
+    Missing,
+    /// Anything else: transport error, 5xx, malformed body.
+    Inconclusive(String),
+}
+
+/// Reduce per-candidate outcomes to one answer for this SRPM.
+///
+/// A definitive `NotFound` requires EVERY candidate to have 404'd: one
+/// inconclusive candidate means we cannot claim this SRPM has no spec, which
+/// is exactly the distinction checkpointing depends on.
+pub fn aggregate_candidates(
+    source_name: &str,
+    url_count: usize,
+    outcomes: Vec<CandidateOutcome>,
+) -> SpecFetchResult {
+    let mut inconclusive: Option<String> = None;
+    for o in outcomes {
+        match o {
+            CandidateOutcome::Found(c) => return SpecFetchResult::Found(c),
+            CandidateOutcome::Missing => continue,
+            CandidateOutcome::Inconclusive(d) => inconclusive = Some(d),
+        }
+    }
+    match inconclusive {
+        Some(detail) => SpecFetchResult::RetryableFailure(format!(
+            "spec fetch inconclusive for {} across {} URLs: {}",
+            source_name, url_count, detail
+        )),
+        None => SpecFetchResult::NotFound,
+    }
+}
+
 /// A parsed %changelog entry.
 pub struct ChangelogEntry {
     pub date: String,
@@ -176,25 +226,57 @@ impl SpecCollector {
         emit_buildrequires: bool,
         emit_maintainers: bool,
     ) -> Result<usize> {
-        // Fetch spec file
         let spec_content = match self.fetch_spec(source_name) {
-            Ok(content) => content,
-            Err(e) => {
-                eprintln!("  {} → spec not found: {}", source_name, e);
-                // DQ: record failed spec fetch
-                let triples = emit_dq_issue(
+            SpecFetchResult::Found(content) => content,
+            SpecFetchResult::NotFound => {
+                eprintln!("  {} → no spec in dist-git", source_name);
+                return emit_dq_issue(
                     writer,
                     "collect-spec",
                     "spec-file",
                     source_name,
                     "spec-fetch-failed",
                     "warning",
-                )?;
-                return Ok(triples);
+                );
+            }
+            SpecFetchResult::RetryableFailure(detail) => {
+                eprintln!("  {} → spec fetch inconclusive: {}", source_name, detail);
+                return emit_dq_issue(
+                    writer,
+                    "collect-spec",
+                    "spec-file",
+                    source_name,
+                    "spec-fetch-failed",
+                    "warning",
+                );
             }
         };
+        self.process_spec_with_content(
+            writer,
+            source_name,
+            &spec_content,
+            identity_map,
+            existing_ecosystem_pkgs,
+            emit_buildrequires,
+            emit_maintainers,
+        )
+    }
 
-        let spec = parse_spec(&spec_content);
+    /// Derivation only -- the caller has already fetched the spec. Split out so
+    /// the checkpointed path can classify the fetch and derive from its result
+    /// without issuing a second request.
+    #[allow(clippy::too_many_arguments)]
+    fn process_spec_with_content<W: Write>(
+        &self,
+        writer: &mut NTriplesWriter<W>,
+        source_name: &str,
+        spec_content: &str,
+        identity_map: &HashMap<String, Vec<String>>,
+        existing_ecosystem_pkgs: &HashSet<String>,
+        emit_buildrequires: bool,
+        emit_maintainers: bool,
+    ) -> Result<usize> {
+        let spec = parse_spec(spec_content);
         let mut triples = 0;
 
         // Get identity URIs for this SRPM
@@ -318,34 +400,25 @@ impl SpecCollector {
         Ok(triples)
     }
 
-    fn fetch_spec(&self, source_name: &str) -> Result<String> {
+    fn fetch_spec(&self, source_name: &str) -> SpecFetchResult {
         let urls = self.spec_urls(source_name);
-
-        let mut last_err: Option<std::io::Error> = None;
+        // Stop at the first success, exactly as before. Eagerly mapping every
+        // candidate would triple spec-fetch traffic (three URLs per SRPM,
+        // tens of thousands of SRPMs per run).
+        let mut outcomes = Vec::with_capacity(urls.len());
         for url in &urls {
-            match self.fetch_url(url, source_name) {
-                Ok(content) => return Ok(content),
-                Err(e) => {
-                    last_err = Some(e);
-                    continue;
-                }
+            let outcome = match self.fetch_url(url, source_name) {
+                Ok(content) => CandidateOutcome::Found(content),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => CandidateOutcome::Missing,
+                Err(e) => CandidateOutcome::Inconclusive(format!("{} ({})", url, e)),
+            };
+            let done = matches!(outcome, CandidateOutcome::Found(_));
+            outcomes.push(outcome);
+            if done {
+                break;
             }
         }
-
-        let detail = match last_err {
-            Some(e) => format!(
-                "Spec file not found for {} (tried {} URLs; last error: {})",
-                source_name,
-                urls.len(),
-                e
-            ),
-            None => format!(
-                "Spec file not found for {} (tried {} URLs)",
-                source_name,
-                urls.len()
-            ),
-        };
-        Err(std::io::Error::new(std::io::ErrorKind::NotFound, detail))
+        aggregate_candidates(source_name, urls.len(), outcomes)
     }
 
     fn spec_urls(&self, source_name: &str) -> Vec<String> {
@@ -1271,5 +1344,66 @@ BuildRequires:  perl(Test::More)
                 .unwrap();
         assert_eq!(detection.ecosystem, "cargo");
         assert_eq!(detection.detection_method, "homepage-domain");
+    }
+
+    // --- fetch_spec outcome classification ---
+    //
+    // The aggregation rule, not the variants, is what carries the risk, so
+    // these drive the pure reducer. Constructing the enum directly and
+    // asserting on it would assert nothing about behavior.
+
+    #[test]
+    fn all_404s_aggregate_to_not_found() {
+        let outcomes = vec![CandidateOutcome::Missing, CandidateOutcome::Missing];
+        assert!(matches!(
+            aggregate_candidates("pkg", 2, outcomes),
+            SpecFetchResult::NotFound
+        ));
+    }
+
+    #[test]
+    fn one_inconclusive_candidate_poisons_the_aggregate() {
+        // The case that matters: a 404 on one branch plus a transport error
+        // on another is NOT evidence that this SRPM has no spec. Checkpointing
+        // the NotFound would bake a transient blip into the corpus.
+        let outcomes = vec![
+            CandidateOutcome::Missing,
+            CandidateOutcome::Inconclusive("connection reset".into()),
+        ];
+        assert!(matches!(
+            aggregate_candidates("pkg", 2, outcomes),
+            SpecFetchResult::RetryableFailure(_)
+        ));
+    }
+
+    #[test]
+    fn a_later_success_wins_over_an_earlier_failure() {
+        let outcomes = vec![
+            CandidateOutcome::Inconclusive("5xx".into()),
+            CandidateOutcome::Found("Name: pkg".into()),
+        ];
+        match aggregate_candidates("pkg", 2, outcomes) {
+            SpecFetchResult::Found(c) => assert_eq!(c, "Name: pkg"),
+            _ => panic!("a successful fallback must win"),
+        }
+    }
+
+    #[test]
+    fn no_candidate_urls_is_not_found() {
+        assert!(matches!(
+            aggregate_candidates("pkg", 0, vec![]),
+            SpecFetchResult::NotFound
+        ));
+    }
+
+    #[test]
+    fn fetch_spec_reports_an_unsupported_distro_as_not_found() {
+        // spec_urls returns no candidates for an unknown distro, so this
+        // exercises the shell end-to-end without touching the network.
+        let c = SpecCollector::new("not-a-distro", "1", None).unwrap();
+        assert!(matches!(
+            c.fetch_spec("anything"),
+            SpecFetchResult::NotFound
+        ));
     }
 }
