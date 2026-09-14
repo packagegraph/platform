@@ -19,11 +19,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: etl/pg-collect
-      - run: cargo test --quiet
+      - run: cargo test --all-targets --locked --quiet
+      - name: Mutation-check the wrapper lifecycle
+        run: |
+          PG_COLLECT_BIN="$PWD/target/debug/pg-collect" \
+            python3 ../../deploy/quadlet/collectors/tests/checkpoint_mutations.py
+
+  # The rpm-full binary enables checkpointing; the wrappers are what retire a
+  # generation and keep checkpoints out of Minio. Enabling one without the
+  # other leaves a generation active forever, replaying its fragments across
+  # every later scheduled run. These gates validate repository artifacts, NOT
+  # the separately installed host scripts. The coordinated, pinned deployment
+  # is documented in deploy/quadlet/collectors/checkpoint-cutover.md.
+  test-wrapper-checkpoint-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: deploy/quadlet/collectors/scripts/test-wrapper-checkpoint-contract.sh
+      - run: python3 -m unittest discover -s deploy/quadlet/collectors/tests -p test_checkpoint_release.py
+      - name: Verify exclusion with the image's pinned mc
+        run: |
+          set -euo pipefail
+          mc_version=$(sed -n 's/^ARG MC_VERSION=//p' etl/Containerfile)
+          test -n "$mc_version"
+          mc_test_dir=$(mktemp -d)
+          asset="mc.linux-amd64.${mc_version}"
+          base="https://github.com/minio/mc/releases/download/${mc_version}"
+          curl -fsSL "$base/$asset" -o "$mc_test_dir/$asset"
+          curl -fsSL "$base/$asset.sha256sum" -o "$mc_test_dir/checksum"
+          expected_sha=$(awk '{print $1}' "$mc_test_dir/checksum")
+          printf '%s  %s\n' "$expected_sha" "$mc_test_dir/$asset" | sha256sum -c -
+          chmod +x "$mc_test_dir/$asset"
+          python3 deploy/quadlet/collectors/tests/check_mc_exclusion.py "$mc_test_dir/$asset"
 
   build-etl:
     runs-on: ubuntu-latest
-    needs: [test-rust]
+    needs: [test-rust, test-wrapper-checkpoint-contract]
     steps:
       - uses: actions/checkout@v4
       - name: Sync ontology files for container build

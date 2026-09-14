@@ -15,7 +15,14 @@ use crate::uris::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::io::Result;
+use std::io::{Result, Write};
+
+/// Bump this for any change to this stage's emitted triples, including
+/// changes to shared serialization or ontology helpers it calls. A stale
+/// checkpoint fragment is indistinguishable from a correct one -- there is
+/// no automatic detection. Emission changes and a bump belong in the same
+/// patch.
+pub const SPEC_SCHEMA_VERSION: &str = "spec-v1";
 
 /// Regex for extracting Source0 URL from spec file.
 static SOURCE0_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?im)^Source0?\s*:\s*(.+)$").unwrap());
@@ -78,6 +85,81 @@ pub struct SpecData {
     pub changelog_entries: Vec<ChangelogEntry>,
 }
 
+/// Outcome of trying every candidate spec URL for one SRPM.
+///
+/// The distinction matters for checkpointing: `NotFound` is a deterministic
+/// answer about this SRPM and may be checkpointed, while `RetryableFailure`
+/// is operationally inconclusive and must not be.
+pub enum SpecFetchResult {
+    Found(String),
+    /// Every candidate URL returned a definitive 404.
+    NotFound,
+    /// At least one candidate failed inconclusively (transport error, 5xx,
+    /// malformed) and none succeeded.
+    RetryableFailure(String),
+}
+
+/// Whether a derived item may be checkpointed.
+///
+/// A named type rather than a `bool`: the design's rule is an *explicit typed
+/// outcome*, and `(usize, bool)` makes an inverted argument silently compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cacheability {
+    Complete,
+    Retryable,
+}
+
+/// What one candidate URL produced.
+pub enum CandidateOutcome {
+    Found(String),
+    /// A definitive 404.
+    Missing,
+    /// Anything else: transport error, 5xx, malformed body.
+    Inconclusive(String),
+}
+
+/// Reduce per-candidate outcomes to one answer for this SRPM.
+///
+/// A definitive `NotFound` requires EVERY candidate to have 404'd: one
+/// inconclusive candidate means we cannot claim this SRPM has no spec, which
+/// is exactly the distinction checkpointing depends on.
+pub fn aggregate_candidates(
+    source_name: &str,
+    url_count: usize,
+    outcomes: Vec<CandidateOutcome>,
+) -> SpecFetchResult {
+    let mut inconclusive: Option<String> = None;
+    for o in outcomes {
+        match o {
+            CandidateOutcome::Found(c) => return SpecFetchResult::Found(c),
+            CandidateOutcome::Missing => continue,
+            CandidateOutcome::Inconclusive(d) => inconclusive = Some(d),
+        }
+    }
+    match inconclusive {
+        Some(detail) => SpecFetchResult::RetryableFailure(format!(
+            "spec fetch inconclusive for {} across {} URLs: {}",
+            source_name, url_count, detail
+        )),
+        None => SpecFetchResult::NotFound,
+    }
+}
+
+/// Replace `url`'s scheme and authority with `base`, keeping its path.
+///
+/// Each distro's dist-git layout differs, so the override names only the
+/// origin and the per-distro path shape is preserved. Used by
+/// `PG_COLLECT_DIST_GIT_BASE` to point spec fetches at a mirror, and by the
+/// wrapper rehearsal to serve specs from a local fixture rather than reaching
+/// src.fedoraproject.org.
+fn rewrite_origin(url: &str, base: &str) -> String {
+    let path = url
+        .find("://")
+        .and_then(|i| url[i + 3..].find('/').map(|j| &url[i + 3 + j..]))
+        .unwrap_or("/");
+    format!("{}{}", base.trim_end_matches('/'), path)
+}
+
 /// A parsed %changelog entry.
 pub struct ChangelogEntry {
     pub date: String,
@@ -91,6 +173,8 @@ pub struct SpecCollector {
     distro: String,
     release: String,
     cache: Option<SourceCache>,
+    /// Origin to fetch specs from instead of the distro's public dist-git.
+    dist_git_base: Option<String>,
 }
 
 impl SpecCollector {
@@ -105,41 +189,103 @@ impl SpecCollector {
             distro: distro.to_string(),
             release: release.to_string(),
             cache,
+            // Not part of the checkpoint context: the override names where a
+            // spec is fetched from, not which spec. Pointing at a mirror of
+            // the same dist-git must not invalidate fragments.
+            dist_git_base: std::env::var("PG_COLLECT_DIST_GIT_BASE")
+                .ok()
+                .filter(|v| !v.is_empty()),
         })
     }
 
     /// Collect spec file data for a set of SRPM source names.
     /// identity_map maps source name → list of PackageIdentity URIs for upstream linking.
-    pub fn collect(
+    pub fn collect<W: Write>(
         &self,
-        writer: &mut NTriplesWriter,
+        writer: &mut NTriplesWriter<W>,
         srpm_names: &HashSet<String>,
         srpm_identity_map: &HashMap<String, Vec<String>>,
         existing_ecosystem_pkgs: &HashSet<String>,
         emit_buildrequires: bool,
         emit_maintainers: bool,
     ) -> Result<(usize, usize)> {
+        self.collect_checkpointed(
+            writer, srpm_names, srpm_identity_map, existing_ecosystem_pkgs,
+            emit_buildrequires, emit_maintainers,
+            &crate::output_cache::OutputCache::disabled(),
+        )
+    }
+
+    /// As `collect`, but replays per-item fragments from `checkpoint` so an
+    /// interrupted run resumes instead of restarting.
+    #[allow(clippy::too_many_arguments)]
+    pub fn collect_checkpointed<W: Write>(
+        &self,
+        writer: &mut NTriplesWriter<W>,
+        srpm_names: &HashSet<String>,
+        srpm_identity_map: &HashMap<String, Vec<String>>,
+        existing_ecosystem_pkgs: &HashSet<String>,
+        emit_buildrequires: bool,
+        emit_maintainers: bool,
+        checkpoint: &crate::output_cache::OutputCache,
+    ) -> Result<(usize, usize)> {
+        use crate::output_cache::{CachedOutput, CanonicalContext, ComputeOutcome};
+
         let mut total_specs = 0;
         let mut total_triples = 0;
 
-        for (idx, name) in srpm_names.iter().enumerate() {
-            match self.process_spec(
-                writer,
-                name,
-                srpm_identity_map,
-                existing_ecosystem_pkgs,
-                emit_buildrequires,
-                emit_maintainers,
-            ) {
-                Ok(triples) => {
-                    if triples > 0 {
+        // Sorted, not HashSet order. Two processes iterate a HashSet in
+        // different randomized orders, which would make "a replayed run is
+        // byte-identical" untestable and, worse, produce gratuitously
+        // different .nt files between runs. Sorting makes byte identity a
+        // real contract.
+        let mut ordered: Vec<&String> = srpm_names.iter().collect();
+        ordered.sort();
+
+        for (idx, name) in ordered.into_iter().enumerate() {
+            let identities = srpm_identity_map.get(name).cloned().unwrap_or_default();
+            let ctx = CanonicalContext::new()
+                .field("distro", &self.distro)
+                .field("release", &self.release)
+                .list("identities", &identities)
+                .flag("in_existing_ecosystem", existing_ecosystem_pkgs.contains(name))
+                .flag("emit_buildrequires", emit_buildrequires)
+                .flag("emit_maintainers", emit_maintainers);
+
+            let result = checkpoint.get_or_compute(name, &ctx, || {
+                // Derive into a scratch writer with no graph term, so the
+                // fragment is canonical N-Triples and graph selection stays
+                // at replay time.
+                let mut scratch = NTriplesWriter::new(Vec::<u8>::new());
+                let (logical, cacheability) = self.process_spec_classified(
+                    &mut scratch, name, srpm_identity_map, existing_ecosystem_pkgs,
+                    emit_buildrequires, emit_maintainers,
+                )?;
+                let out = CachedOutput {
+                    logical_triples: logical,
+                    skipped_invalid_iri: scratch.skipped_invalid_iri,
+                    auto_inverses: scratch.auto_inverses,
+                    text: scratch.into_string()?,
+                };
+                Ok(match cacheability {
+                    Cacheability::Complete => ComputeOutcome::Complete(out),
+                    Cacheability::Retryable => ComputeOutcome::Retryable(out),
+                })
+            });
+
+            match result {
+                Ok(out) => {
+                    for line in out.text.lines() {
+                        writer.write_raw_line(line)?;
+                    }
+                    writer.skipped_invalid_iri += out.skipped_invalid_iri;
+                    writer.auto_inverses += out.auto_inverses;
+                    if out.logical_triples > 0 {
                         total_specs += 1;
-                        total_triples += triples;
+                        total_triples += out.logical_triples;
                     }
                 }
-                Err(e) => {
-                    eprintln!("  {} → error: {}", name, e);
-                }
+                Err(e) => eprintln!("  {} → error: {}", name, e),
             }
 
             if (idx + 1) % 100 == 0 {
@@ -150,44 +296,75 @@ impl SpecCollector {
                     total_triples
                 );
             }
-
         }
 
+        let s = checkpoint.stats();
         eprintln!(
-            "Spec collection complete: {} specs, {} triples",
-            total_specs, total_triples
+            "Spec collection complete: {} specs, {} triples \
+             (checkpoint: {} hits, {} misses, {} retryable, {} write-fail, {} integrity-fail)",
+            total_specs, total_triples,
+            s.hits, s.misses, s.retryable, s.write_failures, s.integrity_failures
         );
         Ok((total_specs, total_triples))
     }
 
-    fn process_spec(
+    /// Derivation plus an explicit cacheability verdict.
+    ///
+    /// Cacheability is NOT "did we emit a DQ issue" -- a successful ecosystem
+    /// detection deliberately emits one (see the DQ call after detection in
+    /// this file). Only an inconclusive *fetch* is non-cacheable; a definitive
+    /// 404 is a real answer about this SRPM and may be checkpointed.
+    #[allow(clippy::too_many_arguments)]
+    fn process_spec_classified<W: Write>(
         &self,
-        writer: &mut NTriplesWriter,
+        writer: &mut NTriplesWriter<W>,
         source_name: &str,
         identity_map: &HashMap<String, Vec<String>>,
         existing_ecosystem_pkgs: &HashSet<String>,
         emit_buildrequires: bool,
         emit_maintainers: bool,
-    ) -> Result<usize> {
-        // Fetch spec file
-        let spec_content = match self.fetch_spec(source_name) {
-            Ok(content) => content,
-            Err(e) => {
-                eprintln!("  {} → spec not found: {}", source_name, e);
-                // DQ: record failed spec fetch
-                let triples = emit_dq_issue(
-                    writer,
-                    "collect-spec",
-                    "spec-file",
-                    source_name,
-                    "spec-fetch-failed",
-                    "warning",
+    ) -> Result<(usize, Cacheability)> {
+        let content = match self.fetch_spec(source_name) {
+            SpecFetchResult::Found(c) => c,
+            SpecFetchResult::NotFound => {
+                eprintln!("  {} → no spec in dist-git", source_name);
+                let t = emit_dq_issue(
+                    writer, "collect-spec", "spec-file", source_name,
+                    "spec-fetch-failed", "warning",
                 )?;
-                return Ok(triples);
+                return Ok((t, Cacheability::Complete)); // definitive answer
+            }
+            SpecFetchResult::RetryableFailure(detail) => {
+                eprintln!("  {} → spec fetch inconclusive: {}", source_name, detail);
+                let t = emit_dq_issue(
+                    writer, "collect-spec", "spec-file", source_name,
+                    "spec-fetch-failed", "warning",
+                )?;
+                return Ok((t, Cacheability::Retryable));
             }
         };
+        let triples = self.process_spec_with_content(
+            writer, source_name, &content, identity_map,
+            existing_ecosystem_pkgs, emit_buildrequires, emit_maintainers,
+        )?;
+        Ok((triples, Cacheability::Complete))
+    }
 
-        let spec = parse_spec(&spec_content);
+    /// Derivation only -- the caller has already fetched the spec. Split out so
+    /// the checkpointed path can classify the fetch and derive from its result
+    /// without issuing a second request.
+    #[allow(clippy::too_many_arguments)]
+    fn process_spec_with_content<W: Write>(
+        &self,
+        writer: &mut NTriplesWriter<W>,
+        source_name: &str,
+        spec_content: &str,
+        identity_map: &HashMap<String, Vec<String>>,
+        existing_ecosystem_pkgs: &HashSet<String>,
+        emit_buildrequires: bool,
+        emit_maintainers: bool,
+    ) -> Result<usize> {
+        let spec = parse_spec(spec_content);
         let mut triples = 0;
 
         // Get identity URIs for this SRPM
@@ -311,37 +488,38 @@ impl SpecCollector {
         Ok(triples)
     }
 
-    fn fetch_spec(&self, source_name: &str) -> Result<String> {
+    fn fetch_spec(&self, source_name: &str) -> SpecFetchResult {
         let urls = self.spec_urls(source_name);
-
-        let mut last_err: Option<std::io::Error> = None;
+        // Stop at the first success, exactly as before. Eagerly mapping every
+        // candidate would triple spec-fetch traffic (three URLs per SRPM,
+        // tens of thousands of SRPMs per run).
+        let mut outcomes = Vec::with_capacity(urls.len());
         for url in &urls {
-            match self.fetch_url(url, source_name) {
-                Ok(content) => return Ok(content),
-                Err(e) => {
-                    last_err = Some(e);
-                    continue;
-                }
+            let outcome = match self.fetch_url(url, source_name) {
+                Ok(content) => CandidateOutcome::Found(content),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => CandidateOutcome::Missing,
+                Err(e) => CandidateOutcome::Inconclusive(format!("{} ({})", url, e)),
+            };
+            let done = matches!(outcome, CandidateOutcome::Found(_));
+            outcomes.push(outcome);
+            if done {
+                break;
             }
         }
-
-        let detail = match last_err {
-            Some(e) => format!(
-                "Spec file not found for {} (tried {} URLs; last error: {})",
-                source_name,
-                urls.len(),
-                e
-            ),
-            None => format!(
-                "Spec file not found for {} (tried {} URLs)",
-                source_name,
-                urls.len()
-            ),
-        };
-        Err(std::io::Error::new(std::io::ErrorKind::NotFound, detail))
+        aggregate_candidates(source_name, urls.len(), outcomes)
     }
 
     fn spec_urls(&self, source_name: &str) -> Vec<String> {
+        let urls = self.public_spec_urls(source_name);
+        // An unsupported distro yields no candidates, and the override must
+        // not invent any: that is what keeps offline tests offline.
+        match &self.dist_git_base {
+            Some(base) => urls.iter().map(|u| rewrite_origin(u, base)).collect(),
+            None => urls,
+        }
+    }
+
+    fn public_spec_urls(&self, source_name: &str) -> Vec<String> {
         match self.distro.as_str() {
             "fedora" => {
                 let branch = if self.release == "rawhide" {
@@ -419,9 +597,9 @@ impl SpecCollector {
         }
     }
 
-    fn emit_ecosystem_triples(
+    fn emit_ecosystem_triples<W: Write>(
         &self,
-        writer: &mut NTriplesWriter,
+        writer: &mut NTriplesWriter<W>,
         spec: &SpecData,
         source_name: &str,
         identity_uris: &[String],
@@ -477,9 +655,9 @@ impl SpecCollector {
         Ok(triples)
     }
 
-    fn emit_buildrequires_triples(
+    fn emit_buildrequires_triples<W: Write>(
         &self,
-        writer: &mut NTriplesWriter,
+        writer: &mut NTriplesWriter<W>,
         spec: &SpecData,
         source_name: &str,
     ) -> Result<usize> {
@@ -507,9 +685,9 @@ impl SpecCollector {
         Ok(triples)
     }
 
-    fn emit_changelog_triples(
+    fn emit_changelog_triples<W: Write>(
         &self,
-        writer: &mut NTriplesWriter,
+        writer: &mut NTriplesWriter<W>,
         spec: &SpecData,
         source_name: &str,
     ) -> Result<usize> {
@@ -1264,5 +1442,189 @@ BuildRequires:  perl(Test::More)
                 .unwrap();
         assert_eq!(detection.ecosystem, "cargo");
         assert_eq!(detection.detection_method, "homepage-domain");
+    }
+
+    // --- fetch_spec outcome classification ---
+    //
+    // The aggregation rule, not the variants, is what carries the risk, so
+    // these drive the pure reducer. Constructing the enum directly and
+    // asserting on it would assert nothing about behavior.
+
+    #[test]
+    fn all_404s_aggregate_to_not_found() {
+        let outcomes = vec![CandidateOutcome::Missing, CandidateOutcome::Missing];
+        assert!(matches!(
+            aggregate_candidates("pkg", 2, outcomes),
+            SpecFetchResult::NotFound
+        ));
+    }
+
+    #[test]
+    fn one_inconclusive_candidate_poisons_the_aggregate() {
+        // The case that matters: a 404 on one branch plus a transport error
+        // on another is NOT evidence that this SRPM has no spec. Checkpointing
+        // the NotFound would bake a transient blip into the corpus.
+        let outcomes = vec![
+            CandidateOutcome::Missing,
+            CandidateOutcome::Inconclusive("connection reset".into()),
+        ];
+        assert!(matches!(
+            aggregate_candidates("pkg", 2, outcomes),
+            SpecFetchResult::RetryableFailure(_)
+        ));
+    }
+
+    #[test]
+    fn a_later_success_wins_over_an_earlier_failure() {
+        let outcomes = vec![
+            CandidateOutcome::Inconclusive("5xx".into()),
+            CandidateOutcome::Found("Name: pkg".into()),
+        ];
+        match aggregate_candidates("pkg", 2, outcomes) {
+            SpecFetchResult::Found(c) => assert_eq!(c, "Name: pkg"),
+            _ => panic!("a successful fallback must win"),
+        }
+    }
+
+    #[test]
+    fn no_candidate_urls_is_not_found() {
+        assert!(matches!(
+            aggregate_candidates("pkg", 0, vec![]),
+            SpecFetchResult::NotFound
+        ));
+    }
+
+    #[test]
+    fn rewrite_origin_keeps_the_path_and_replaces_the_host() {
+        assert_eq!(
+            rewrite_origin(
+                "https://src.fedoraproject.org/rpms/zlib/raw/f44/f/zlib.spec",
+                "http://127.0.0.1:8080"
+            ),
+            "http://127.0.0.1:8080/rpms/zlib/raw/f44/f/zlib.spec"
+        );
+        // A trailing slash on the base must not double up.
+        assert_eq!(
+            rewrite_origin("https://gitlab.com/a/b.spec", "http://h:1/"),
+            "http://h:1/a/b.spec"
+        );
+    }
+
+    // --- spec-stage checkpointing ---
+
+    #[test]
+    fn spec_cache_path_carries_its_own_schema_version() {
+        // Non-vacuous version check: assert the path actually contains THIS
+        // stage's version segment, and that changing only the version changes
+        // the path. Asserting merely that spec and koji paths differ would
+        // pass even if both stages shared one constant, since the stage
+        // segment already differs. enrich_koji.rs has the mirror of this.
+        let d = tempfile::TempDir::new().unwrap();
+        let ctx = crate::output_cache::CanonicalContext::new();
+        let mine = crate::output_cache::OutputCache::new(
+            d.path(), "20260912T010203Z-abcdef01", "spec", SPEC_SCHEMA_VERSION).unwrap();
+        let bumped = crate::output_cache::OutputCache::new(
+            d.path(), "20260912T010203Z-abcdef01", "spec", "spec-vNEXT").unwrap();
+        let p = mine.entry_path("k", &ctx).unwrap();
+        assert!(p.to_string_lossy().contains(SPEC_SCHEMA_VERSION), "got {p:?}");
+        assert_ne!(p, bumped.entry_path("k", &ctx).unwrap(),
+            "a version bump must invalidate existing checkpoints");
+    }
+
+    #[test]
+    fn collect_checkpointed_replays_a_prepopulated_item_without_fetching() {
+        // Drives the REAL loop, not OutputCache in isolation. Only this shape
+        // can catch a wrong stage context, a fetch still happening on a hit,
+        // lost counter propagation, or output not going through
+        // write_raw_line.
+        //
+        // Distro "offline-test" is deliberately unsupported: spec_urls returns
+        // no candidates for it, so this test can never issue a network
+        // request. A hit replays the checkpoint; a miss would produce a
+        // NotFound DQ fragment instead. Either way the assertions below
+        // distinguish them deterministically, with no dependency on the live
+        // Fedora service.
+        use crate::output_cache::{CachedOutput, ComputeOutcome, OutputCache};
+        let d = tempfile::TempDir::new().unwrap();
+        let cache = OutputCache::new(
+            d.path(), "20260912T010203Z-abcdef01", "spec", SPEC_SCHEMA_VERSION).unwrap();
+
+        let c = SpecCollector::new("offline-test", "44", None).unwrap();
+        let mut names = HashSet::new();
+        names.insert("zlib".to_string());
+        let identity_map: HashMap<String, Vec<String>> = HashMap::new();
+        let existing: HashSet<String> = HashSet::new();
+
+        // Pre-populate using the exact context the loop will compute, so the
+        // lookup only hits if the stage builds its context identically.
+        let ctx = crate::output_cache::CanonicalContext::new()
+            .field("distro", "offline-test")
+            .field("release", "44")
+            .list("identities", &[])
+            .flag("in_existing_ecosystem", false)
+            .flag("emit_buildrequires", false)
+            .flag("emit_maintainers", false);
+        cache.get_or_compute("zlib", &ctx, || Ok(ComputeOutcome::Complete(CachedOutput {
+            logical_triples: 4,
+            skipped_invalid_iri: 1,
+            auto_inverses: 2,
+            text: "<s> <p> <o> .\n".into(),
+        }))).unwrap();
+
+        let mut w = crate::ntriples::NTriplesWriter::new(Vec::<u8>::new());
+        let (specs, triples) = c.collect_checkpointed(
+            &mut w, &names, &identity_map, &existing, false, false, &cache,
+        ).unwrap();
+        // A NotFound DQ fragment would have non-zero triples but different
+        // text, so the assertions below separate a hit from a silent miss.
+
+        assert_eq!((specs, triples), (1, 4), "totals must come from the checkpoint");
+        assert_eq!(w.skipped_invalid_iri, 1, "counters must propagate on replay");
+        assert_eq!(w.auto_inverses, 2);
+        assert_eq!(w.into_string().unwrap(), "<s> <p> <o> .\n",
+            "replayed text must reach the output writer verbatim");
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().misses, 1, "only the pre-population miss");
+    }
+
+    #[test]
+    fn a_different_context_does_not_hit_the_checkpoint() {
+        // Guards the context fingerprint: flipping a declared input must miss.
+        // Same offline-only distro, so the miss cannot reach the network.
+        use crate::output_cache::{CachedOutput, ComputeOutcome, OutputCache};
+        let d = tempfile::TempDir::new().unwrap();
+        let cache = OutputCache::new(
+            d.path(), "20260912T010203Z-abcdef01", "spec", SPEC_SCHEMA_VERSION).unwrap();
+        let ctx = crate::output_cache::CanonicalContext::new()
+            .field("distro", "offline-test").field("release", "44")
+            .list("identities", &[])
+            .flag("in_existing_ecosystem", false)
+            .flag("emit_buildrequires", false)   // <- differs from the call below
+            .flag("emit_maintainers", false);
+        cache.get_or_compute("zlib", &ctx, || Ok(ComputeOutcome::Complete(CachedOutput {
+            logical_triples: 4, skipped_invalid_iri: 0, auto_inverses: 0,
+            text: "<s> <p> <o> .\n".into(),
+        }))).unwrap();
+
+        let c = SpecCollector::new("offline-test", "44", None).unwrap();
+        let mut names = HashSet::new();
+        names.insert("zlib".to_string());
+        let mut w = crate::ntriples::NTriplesWriter::new(Vec::<u8>::new());
+        // emit_buildrequires = true this time.
+        let _ = c.collect_checkpointed(
+            &mut w, &names, &HashMap::new(), &HashSet::new(), true, false, &cache,
+        );
+        assert_eq!(cache.stats().hits, 0, "a changed declared input must not hit");
+    }
+
+    #[test]
+    fn fetch_spec_reports_an_unsupported_distro_as_not_found() {
+        // spec_urls returns no candidates for an unknown distro, so this
+        // exercises the shell end-to-end without touching the network.
+        let c = SpecCollector::new("not-a-distro", "1", None).unwrap();
+        assert!(matches!(
+            c.fetch_spec("anything"),
+            SpecFetchResult::NotFound
+        ));
     }
 }

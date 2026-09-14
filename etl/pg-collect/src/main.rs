@@ -1429,6 +1429,23 @@ enum Commands {
         #[arg(long)]
         limit: Option<usize>,
     },
+
+    /// Checkpoint lifecycle management for resumable collectors
+    Checkpoint {
+        #[command(subcommand)]
+        action: CheckpointAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum CheckpointAction {
+    /// Mark the active run generation complete. Run only after a successful
+    /// upload -- a run that collected everything but failed to publish must
+    /// stay resumable.
+    Commit {
+        #[arg(long)]
+        cache_dir: String,
+    },
 }
 
 fn main() {
@@ -2903,7 +2920,9 @@ fn main() {
                     cache_dir.as_deref(),
                 )
                 .with_graph_uri(graph_uri.clone());
-                enricher.enrich_from_nvrs(&nvrs, &output, limit)
+                // Standalone enrich-koji has no commit-after-publish
+                // lifecycle, so it never checkpoints.
+                enricher.enrich_from_nvrs(&nvrs, &output, limit, None)
             } else {
                 if endpoint.is_empty() {
                     panic!("Either --endpoint or --srpm-list is required for enrich-koji");
@@ -3555,6 +3574,53 @@ fn main() {
                 let mut total_packages = 0;
                 let mut total_triples = 0;
 
+                // One generation per run, shared by both checkpointed stages.
+                // Absent --cache-dir, or if setup fails, both stages get a
+                // disabled cache and the run proceeds exactly as before.
+                //
+                // Setup failure degrades rather than aborting: this is a
+                // resilience feature, so a permission problem on the
+                // checkpoint directory must not fail a run that would
+                // otherwise succeed. Same policy as individual writes.
+                let generation = match cache_dir.as_deref() {
+                    Some(dir) => {
+                        match pg_collect::checkpoint_generation::Generation::acquire(
+                            std::path::Path::new(dir),
+                        ) {
+                            Ok(g) => {
+                                eprintln!(
+                                    "Checkpoint generation: {} ({})",
+                                    g.id,
+                                    if g.reused { "resumed" } else { "new" }
+                                );
+                                Some((dir.to_string(), g.id))
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: checkpointing disabled ({}); this run cannot resume",
+                                    e
+                                );
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
+
+                let open_cache = |stage: &str, version: &str| match &generation {
+                    Some((dir, gen)) => pg_collect::output_cache::OutputCache::new(
+                        std::path::Path::new(dir),
+                        gen,
+                        stage,
+                        version,
+                    )
+                    .unwrap_or_else(|e| {
+                        eprintln!("Warning: {} checkpointing disabled ({})", stage, e);
+                        pg_collect::output_cache::OutputCache::disabled()
+                    }),
+                    None => pg_collect::output_cache::OutputCache::disabled(),
+                };
+
                 // Stage 1: Multi-arch RPM collection
                 let use_tls = sslclientcert.is_some();
                 if use_tls {
@@ -3611,13 +3677,17 @@ fn main() {
                     let spec_collector =
                         SpecCollector::new(&distro, &release, cache_dir.as_deref())?;
                     let existing_ecosystem = std::collections::HashSet::new(); // TODO: track from RPM Provides
-                    let (specs, triples) = spec_collector.collect(
+                    // srpm_names is a HashSet; collect_checkpointed iterates it
+                    // sorted so fragment order -- and therefore byte-identical
+                    // replay -- does not depend on this process's hash seed.
+                    let (specs, triples) = spec_collector.collect_checkpointed(
                         &mut writer,
                         &srpm_names,
                         &srpm_identity_map,
                         &existing_ecosystem,
                         with_buildrequires,
                         with_maintainers,
+                        &open_cache("spec", pg_collect::collect_spec::SPEC_SCHEMA_VERSION),
                     )?;
                     total_packages += specs;
                     total_triples += triples;
@@ -3626,7 +3696,11 @@ fn main() {
                 // Stage 3: Koji enrichment (optional)
                 if with_koji {
                     eprintln!("\n--- Koji Enrichment ---");
-                    let nvr_list: Vec<String> = srpm_nvrs.into_iter().collect();
+                    // Sorted: srpm_nvrs is a HashSet, so iteration order varies
+                    // between processes. "a replayed run is byte-identical"
+                    // has to be a contract, not a coincidence of hashing.
+                    let mut nvr_list: Vec<String> = srpm_nvrs.into_iter().collect();
+                    nvr_list.sort();
                     let minio_config = match (&minio_endpoint, &minio_access_key, &minio_secret_key)
                     {
                         (Some(ep), Some(ak), Some(sk)) => Some(MinioConfig {
@@ -3647,8 +3721,14 @@ fn main() {
                     .with_graph_uri(graph_uri.clone());
                     // Write to a temp file, then append (Koji enricher creates its own writer)
                     let koji_tmp = format!("{}.koji.tmp", output);
-                    let (builds, triples) =
-                        koji_enricher.enrich_from_nvrs(&nvr_list, &koji_tmp, limit)?;
+                    let koji_cache =
+                        open_cache("koji", pg_collect::enrich_koji::KOJI_SCHEMA_VERSION);
+                    let (builds, triples) = koji_enricher.enrich_from_nvrs(
+                        &nvr_list,
+                        &koji_tmp,
+                        limit,
+                        Some(&koji_cache),
+                    )?;
                     // Append Koji triples to main output
                     let koji_content = std::fs::read_to_string(&koji_tmp)?;
                     use std::io::Write;
@@ -3836,6 +3916,32 @@ fn main() {
                 Ok((total_packages, total_triples))
             })()
         }
+
+        Commands::Checkpoint { action } => match action {
+            CheckpointAction::Commit { cache_dir } => {
+                (|| -> std::io::Result<(usize, usize)> {
+                    match pg_collect::checkpoint_generation::Generation::commit(
+                        std::path::Path::new(&cache_dir),
+                    ) {
+                        Ok(()) => eprintln!("Checkpoint generation committed for {}", cache_dir),
+                        // "Nothing to commit" is a success, not a failure. When
+                        // checkpoint setup degraded to disabled, the collection
+                        // and upload still succeeded, and the wrapper runs this
+                        // unconditionally under `set -e` -- erroring here would
+                        // kill the script after a good publication and skip the
+                        // final cache mirror.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            eprintln!(
+                                "No active checkpoint generation in {} — nothing to commit",
+                                cache_dir
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    Ok((0, 0))
+                })()
+            }
+        },
     };
 
     match result {
