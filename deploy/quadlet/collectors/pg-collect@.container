@@ -91,16 +91,29 @@ RemainAfterExit=no
 # cross-run caching benefit -- fixed same day in etl/pg-collect/src/cache.rs
 # (AWS SigV4 signing instead of HTTP Basic Auth).
 #
-# Raised again from 8h to 14h on 2026-09-15, this time from a measurement
-# rather than an estimate. An instrumented fedora-44-full run (checkpointing
-# enabled, so its progress was observable rather than lost) completed the
-# RPM and spec stages in ~5h and then enriched Koji at a measured 39 NVRs/min
-# over 23,641 NVRs -- ~12h50m in total. 8h killed it at roughly the halfway
-# point of the Koji stage, every time.
+# Raised again from 8h to 14h on 2026-09-15. The distinction that matters here
+# is cold vs. warm, not fast vs. slow -- three measured fedora-44-full runs:
 #
-# 14h is a ceiling, not a target: checkpointing means an overrun resumes
-# rather than restarting, so the cost of setting this generously is bounded,
-# while the cost of setting it short is a collector that can never publish.
+#   2026-09-13  failed  'timeout' at the 8h ceiling, mid-Koji
+#   2026-09-14  SUCCESS in 7h44m -- resumed from the failed run's checkpoints
+#   2026-09-15  success in 13h02m -- instrumented COLD run (Koji checkpoint
+#               reported 0 hits / 23,641 misses, i.e. no reuse at all)
+#
+# So 8h fits a warm resume and does not fit a cold run. #51's checkpointing had
+# already made this collector publishable before this raise: the 2026-09-14 run
+# published fedora-44.nt.gz (176 MiB) under the old ceiling. What 8h cost was
+# not the data but the schedule -- a cold run had to fail once, at full cost,
+# before a second run could resume and succeed.
+#
+# 14h buys the cold run a single pass. It is a ceiling, not a target, and the
+# margin is thin: 13h02m leaves ~58min. That is acceptable only because an
+# overrun now resumes rather than restarts, so the downside is a second run
+# rather than a lost one.
+#
+# Do not re-derive the cold figure from a partial run. The Koji rate decays as
+# it proceeds -- sampled at 57/min at the 67% mark and 54/min at 78%, against a
+# true whole-stage average of 49/min. A mid-run projection during the very run
+# above predicted 11.9h; the answer was 13h02m.
 #
 # It is still one shared timeout for all 43 collectors, sized to the slowest
 # -- and rpm-full is not the only one near the old limit: cargo ran 6h47m on

@@ -11,12 +11,37 @@ it useless as a hang detector — the value that lets `fedora-44-full` finish
 
 ## Why now
 
-`fedora-44-full` was measured on 2026-09-15 at ~12h50m: ~5h for the RPM and
-spec stages, then 23,641 Koji NVRs at a measured 39/min. The 8h ceiling killed
-it around the halfway point of the Koji stage, every time. Raising the shared
-ceiling to 14h unblocks it, and that is the committed short-term fix — but it
-buys completion by giving up hang detection for the other 42 collectors. A
-genuinely stuck `npm` now burns 14h.
+Three measured `fedora-44-full` runs make the real problem visible, and it is
+not "the collector is too slow for its timeout":
+
+| date | outcome | duration | cache state |
+|---|---|---|---|
+| 2026-09-13 | failed, `timeout` at 8h | 8h (killed mid-Koji) | cold |
+| 2026-09-14 | **success, published 176 MiB** | **7h44m** | warm — resumed from the 09-13 checkpoints |
+| 2026-09-15 | success | **13h02m** | cold (Koji checkpoint: 0 hits / 23,641 misses) |
+
+So 8h fits a warm resume and does not fit a cold run. #51's checkpointing had
+already made this collector publishable before the ceiling was raised — the
+09-14 run published under the old 8h. What the short ceiling actually cost was
+not data but schedule: a cold run had to fail once, at full cost, before a
+second run could resume and succeed.
+
+Raising the shared ceiling to 14h lets a cold run finish in one pass, and that
+is the committed short-term fix. But it buys that by giving up hang detection
+for the other 42 collectors — a genuinely stuck `npm` now burns 14h — and the
+margin is thin: 13h02m under 14h is ~58 minutes, about 7%.
+
+A caution for anyone re-deriving these figures: the Koji rate decays as the
+stage proceeds. Sampled mid-run it read 57/min at the 67% mark and 54/min at
+78%, against a true whole-stage average of 49/min. A projection made at 67%
+predicted 11.9h for a run that took 13h02m. Size stage timeouts from completed
+runs only, and note whether the run was cold or warm.
+
+One caution for anyone re-deriving these figures: the Koji rate decays as the
+stage proceeds. Sampled mid-run it read 57/min at the 67% mark and 54/min at
+78%, against a true whole-stage average of 49/min. A projection made at 67%
+predicted 11.9h for a run that took 13h02m. Size stage timeouts from completed
+runs only.
 
 Per-stage timeouts are the actual answer. A stage-1 hang should die in 30
 minutes; a Koji stage legitimately needs 12h. One number cannot express both.
@@ -137,9 +162,14 @@ Indicative, from the 2026-09-15 measurement:
 |---|---|---|
 | rpm | 1h | stage 1 of fedora-44-full is minutes; streaming (#52) removed the memory pressure that made it slow |
 | spec | 8h | ~5h measured for RPM+spec combined, plus margin for a cold cache |
-| koji | 14h | 23,641 NVRs at 39/min ≈ 10h, plus margin; the degradation from 73/min to 39/min under load is not yet explained |
-| upload | 1h | 178 MB compressed today |
+| koji | 12h | 23,641 NVRs at the measured whole-stage average of 49/min ≈ 8h, plus 50% for a cold cache and rate decay |
+| upload | 1h | 184 MB compressed / 4.2 GB uncompressed as of 2026-09-15 |
 | commit | 5m | a directory rename |
+
+Note these sum to more than the 14h shared ceiling, which is the point: the
+stages do not all run at their worst case in the same run, and a per-stage
+ceiling can be generous where the work is genuinely slow without extending the
+window in which a *hung* fast collector goes unnoticed.
 
 A hung stage 1 then dies in 1h instead of 14h, which is the whole point.
 
