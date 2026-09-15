@@ -72,6 +72,12 @@ Entrypoint=/bin/sh
 Exec=/usr/local/bin/collect.sh
 NoNewPrivileges=true
 DropCapability=ALL
+Memory=4g
+PodmanArgs=--cpus=2
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
 # Ceiling generous enough for the slowest job (fedora-43-full's Koji+spec
 # enrichment pass) rather than tuned per collector -- one shared template
 # file, one shared timeout. Raised from 5h to 8h on 2026-09-10 after
@@ -83,12 +89,37 @@ DropCapability=ALL
 # failing 100% of its reads/writes (wrong auth scheme for Scaleway's S3
 # API), so every run re-fetched every Koji build from scratch with no
 # cross-run caching benefit -- fixed same day in etl/pg-collect/src/cache.rs
-# (AWS SigV4 signing instead of HTTP Basic Auth). 8h leaves headroom even
-# before confirming how much the cache fix actually shortens a warm-cache run.
-Memory=4g
-PodmanArgs=--cpus=2
-
-[Service]
-Type=oneshot
-RemainAfterExit=no
-TimeoutStartSec=28800
+# (AWS SigV4 signing instead of HTTP Basic Auth).
+#
+# Raised again from 8h to 14h on 2026-09-15. The distinction that matters here
+# is cold vs. warm, not fast vs. slow -- three measured fedora-44-full runs:
+#
+#   2026-09-13  failed  'timeout' at the 8h ceiling, mid-Koji
+#   2026-09-14  SUCCESS in 7h44m -- resumed from the failed run's checkpoints
+#   2026-09-15  success in 13h02m -- instrumented COLD run (Koji checkpoint
+#               reported 0 hits / 23,641 misses, i.e. no reuse at all)
+#
+# So 8h fits a warm resume and does not fit a cold run. #51's checkpointing had
+# already made this collector publishable before this raise: the 2026-09-14 run
+# published fedora-44.nt.gz (176 MiB) under the old ceiling. What 8h cost was
+# not the data but the schedule -- a cold run had to fail once, at full cost,
+# before a second run could resume and succeed.
+#
+# 14h buys the cold run a single pass. It is a ceiling, not a target, and the
+# margin is thin: 13h02m leaves ~58min. That is acceptable only because an
+# overrun now resumes rather than restarts, so the downside is a second run
+# rather than a lost one.
+#
+# Do not re-derive the cold figure from a partial run. The Koji rate decays as
+# it proceeds -- sampled at 57/min at the 67% mark and 54/min at 78%, against a
+# true whole-stage average of 49/min. A mid-run projection during the very run
+# above predicted 11.9h; the answer was 13h02m.
+#
+# It is still one shared timeout for all 43 collectors, sized to the slowest
+# -- and rpm-full is not the only one near the old limit: cargo ran 6h47m on
+# 2026-09-14. The price is that a genuinely hung fast collector now occupies
+# 14h instead of 8h before systemd kills it. Per-stage timeouts are the real
+# answer to that and want the pipeline split into separate units with
+# triggered hand-offs; see
+# docs/superpowers/specs/2026-09-15-collector-stage-decomposition-design.md.
+TimeoutStartSec=50400
