@@ -14,6 +14,28 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Result};
 use std::time::Duration;
 
+/// Whether a search-endpoint failure means "stop using search for this run".
+///
+/// `FetchError::is_retryable` is the wrong test here. It covers transport
+/// errors, 429 and 5xx, but `search.maven.org` signals throttling of the
+/// legacy `solrsearch` endpoint with **403** -- observed 1794 times in one
+/// run against 2148 roots. Because 403 is not retryable the breaker never
+/// tripped, so every remaining root kept querying a search API that had
+/// already cut us off, and the metadata.xml fallback the breaker exists to
+/// reach was never engaged -- while repo1 answered 200 throughout.
+///
+/// 401 is included for the same reason: it is the endpoint refusing us, not
+/// a statement about the coordinate. 404 stays excluded -- that is the
+/// coordinate genuinely not being indexed, and metadata.xml would 404 too.
+fn search_endpoint_is_refusing(e: &FetchError) -> bool {
+    match e {
+        FetchError::HttpStatus { status, .. } => {
+            *status == 403 || *status == 401 || *status == 429 || *status >= 500
+        }
+        other => other.is_retryable(),
+    }
+}
+
 pub struct MavenCollector {
     transport: HttpTransport,
     /// Fewer attempts for the search API, so the circuit breaker trips and
@@ -335,13 +357,9 @@ impl MavenCollector {
     /// unreachable for several hours while `repo1.maven.org` (the actual
     /// artifact CDN, used by every build tool) stayed healthy throughout
     /// -- confirmed live via direct `curl` before writing this fallback.
-    /// Any *transient* search failure triggers the fallback, as defined by
-    /// `FetchError::is_retryable()`: transport errors (DNS/TLS/reset/timeout)
-    /// plus HTTP 429 and 5xx. Rate limiting matters as much as an outage here
-    /// -- `search.maven.org` throttles the legacy `solrsearch` endpoint hard,
-    /// and without the 429 case each package re-paid the full 3-attempt retry
-    /// cost for the entire run. Reusing `is_retryable()` keeps "transient
-    /// upstream failure" defined in exactly one place.
+    /// The fallback triggers on any signal that search is refusing us --
+    /// see `search_endpoint_is_refusing`, which is deliberately *not*
+    /// `FetchError::is_retryable()`.
     ///
     /// A legitimate 404 (`FetchError::NotFound`) means the coordinate doesn't
     /// exist and metadata.xml would 404 too, so there's no reason to double
@@ -358,7 +376,7 @@ impl MavenCollector {
 
         let result = self.get_latest_version_via_search(group_id, artifact_id, base_delay_ms);
         if let Err((e, hit)) = &result {
-            if e.is_retryable() {
+            if search_endpoint_is_refusing(e) {
                 eprintln!(
                     "  Search API unusable ({e}) for {}:{}, falling back to maven-metadata.xml \
                      (and skipping the search API for the rest of this run)",
@@ -5430,6 +5448,66 @@ mod tests {
     }
 
     #[test]
+    fn search_403_trips_the_breaker_and_falls_back_to_metadata() {
+        // search.maven.org answers throttling of the legacy solrsearch
+        // endpoint with 403, not 429. Because 403 is not retryable the
+        // breaker never tripped, so all 2148 roots in one production run kept
+        // querying an endpoint that had already cut us off: 1794 HTTP 403s,
+        // an 83% root failure rate, and the whole run discarded -- while
+        // repo1's maven-metadata.xml was answering 200 the entire time.
+        let mut server = mockito::Server::new();
+        let search = server
+            .mock("GET", mockito::Matcher::Regex(r"solrsearch".into()))
+            .with_status(403)
+            .expect(1) // tripped after the first refusal, not re-queried per root
+            .create();
+        let meta = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"maven-metadata\.xml".into()),
+            )
+            .with_status(200)
+            .expect(2) // one per root, via the fallback
+            .with_body(
+                r#"<metadata><groupId>org.a</groupId><artifactId>lib</artifactId>
+                   <versioning><latest>2.0</latest><release>2.0</release>
+                   <versions><version>1.0</version><version>2.0</version></versions>
+                   </versioning></metadata>"#,
+            )
+            .create();
+        for art in ["lib1", "lib2"] {
+            server
+                .mock(
+                    "GET",
+                    format!("/maven2/org/a/{}/2.0/{}-2.0.pom", art, art).as_str(),
+                )
+                .with_status(200)
+                .with_body(make_pom_xml("org.a", art, "2.0", &[]))
+                .create();
+        }
+
+        let mut collector = MavenCollector::new(server.url(), format!("{}/maven2", server.url()));
+        collector.max_depth = 0;
+        collector.delay_ms = 0;
+
+        let seeds = vec![
+            MavenSeed::unpinned("org.a", "lib1"),
+            MavenSeed::unpinned("org.a", "lib2"),
+        ];
+        let out = NamedTempFile::new().unwrap();
+        let result = collector.collect_recursive(seeds, out.path().to_str().unwrap());
+
+        assert!(
+            result.is_ok(),
+            "a throttled search API must not fail the run when metadata.xml works: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().0, 2, "both roots resolve via the fallback");
+        search.assert();
+        meta.assert();
+    }
+
+    #[test]
     fn test_recursive_empty_seed_empty_output() {
         let mut collector = MavenCollector::new(
             "https://search.maven.org".into(),
@@ -6112,13 +6190,16 @@ mod tests {
 
     /// A 5xx from the search API must fail over as well.
     ///
-    /// The breaker delegates to `FetchError::is_retryable()` rather than
-    /// listing statuses itself, which keeps "transient upstream failure"
-    /// defined once. The cost of that reuse is that a future change to
-    /// `is_retryable()` silently changes breaker behaviour, so the intended
-    /// set is pinned here explicitly: 429 and transport have their own
-    /// tests, this covers 5xx, and `..._does_not_trip_on_not_found` pins the
-    /// negative case. Together they fail loudly if that set ever shifts.
+    /// The breaker now delegates to `search_endpoint_is_refusing` rather than
+    /// `FetchError::is_retryable()`. Sharing `is_retryable()` read as keeping
+    /// "transient upstream failure" defined once, but the two questions are
+    /// not the same one: 403 means search is refusing us while repo1 is fine,
+    /// which is a fallback signal and not a retry signal. The intended set is
+    /// pinned by tests rather than by that delegation: 429 and transport have
+    /// their own, this covers 5xx,
+    /// `search_403_trips_the_breaker_and_falls_back_to_metadata` covers the
+    /// case the reuse missed, and `..._does_not_trip_on_not_found` pins the
+    /// negative. Together they fail loudly if that set ever shifts.
     #[test]
     fn test_search_circuit_breaker_trips_on_server_error() {
         let mut server = mockito::Server::new();
