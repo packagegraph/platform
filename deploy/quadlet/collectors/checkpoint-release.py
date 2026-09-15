@@ -48,6 +48,25 @@ def release_files(image):
     return files
 
 
+def verify_seeds(root):
+    """Require a populated seeds directory on the host.
+
+    Seed lists are collection inputs drawn from private sources and are NOT in
+    this repository, so this checks presence, never content -- there is nothing
+    here to compare against. The check exists because pg-collect@.container
+    bind mounts this directory unconditionally and podman refuses to start a
+    container whose bind-mount source is missing. That template is shared, so
+    an absent or empty seeds directory breaks every collector, not merely the
+    ones that read a list.
+    """
+    seeds = root / "seeds"
+    if not any(p.is_file() and p.stat().st_size for p in seeds.glob("*.txt")):
+        raise ValueError(
+            f"{seeds} contains no non-empty *.txt seed list; installing the templates "
+            "in this state would fail every collector at container start"
+        )
+
+
 def verify(root, files):
     # Local overrides can negate the Image= pin. Do not silently remove them;
     # require operator reconciliation. Other Quadlet search paths and systemd
@@ -83,6 +102,10 @@ def main():
                 path.write_bytes(body)
                 path.chmod(0o755 if name.endswith(".sh") else 0o644)
         verify(args.directory, files)
+        # Only when verifying a real installation: a staging directory holds
+        # this release's files, and seed lists are not among them.
+        if args.action == "verify":
+            verify_seeds(args.directory)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"FAIL: {error}", file=sys.stderr)
         return 1

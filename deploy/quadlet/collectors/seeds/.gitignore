@@ -1,0 +1,18 @@
+# Seed lists are NOT tracked in this repository, and must not become tracked.
+#
+# This repository is public. A seed list is a curated set of coordinates drawn
+# from a private source, so its *contents* are sensitive even though nothing in
+# it is secret line by line: the set itself discloses which parts of an
+# ecosystem an internal project depends on. Redacting a name from the file
+# would not fix that -- the list is the disclosure.
+#
+# They are also genuinely runtime inputs. Changing which roots we explore
+# should be a file sync on the host, not an image rebuild plus a coordinated
+# cutover (deploy/quadlet/collectors/checkpoint-cutover.md).
+#
+# Deployment: install to /etc/containers/systemd/seeds/ on the collector host,
+# mode 644. pg-collect@.container bind mounts that directory read-only at
+# /seeds. See README.md here for the file format and the failure modes.
+*
+!.gitignore
+!README.md

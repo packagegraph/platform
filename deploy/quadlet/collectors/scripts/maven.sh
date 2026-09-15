@@ -2,7 +2,38 @@
 # Collector: maven
 # Ported from deploy/overlays/dev/jobs/collect-maven.yaml.
 set -eu
+# The single general Maven ecosystem view. The curated roots below are only a
+# starting point for traversal, not a separate corpus, so they publish here
+# and nowhere else.
 GRAPH_URI="https://packagegraph.github.io/graph/maven"
+
+# Curated root coordinates, bind-mounted from the host at /seeds by
+# pg-collect@.container. pg-collect resolves each to its newest release and
+# walks that release's declared dependencies outward.
+#
+# The list is host-installed and deliberately not in this repository: it is a
+# curated set drawn from a private source, and the set itself is the sensitive
+# part. It is also a genuine runtime input -- changing which roots we explore
+# should be a file sync, not an image rebuild plus a coordinated cutover.
+# See deploy/quadlet/collectors/seeds/README.md for the format.
+#
+# This replaced `--endpoint "$FUSEKI_ENDPOINT"` (SPARQL auto-discovery).
+# Discovery seeded from every package in the graph with
+# `upstreamEcosystem = maven` -- which answers "which distro packages claim a
+# Maven upstream", not "which Maven coordinates exist". 73.1% of that set was
+# never published to Maven Central, so root resolution failed en masse and
+# tripped pg-collect's 20% error-rate guard, producing zero data. See the
+# seed file's header for the full history and the 2026-09-14 failure.
+SEED_FILE=/seeds/maven-roots.txt
+
+# Checked before any cache work so a host missing the seed install fails
+# immediately and legibly, rather than after a multi-minute Minio cache warm.
+if [ ! -s "${SEED_FILE}" ]; then
+  echo "ERROR: seed file ${SEED_FILE} is missing or empty; refusing to run." >&2
+  echo "Install the host seed list to /etc/containers/systemd/seeds/ (mode 644);" >&2
+  echo "see deploy/quadlet/collectors/seeds/README.md." >&2
+  exit 1
+fi
 
 CACHE_DIR=/tmp/cache/maven
 mkdir -p "${CACHE_DIR}"
@@ -27,7 +58,7 @@ else
 fi
 
 set +e
-pg-collect maven --endpoint "$FUSEKI_ENDPOINT" --cache-dir "${CACHE_DIR}" -o /tmp/maven.nt
+pg-collect maven --packages-file "${SEED_FILE}" --cache-dir "${CACHE_DIR}" -o /tmp/maven.nt
 COLLECT_EXIT=$?
 set -e
 
