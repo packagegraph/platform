@@ -31,9 +31,22 @@ class ReleaseTest(unittest.TestCase):
             text=True, capture_output=True, timeout=10,
         )
 
+    def install_seeds(self):
+        """Simulate the host's seed install.
+
+        Seed lists are not in this repository, so `stage` cannot produce them
+        and `verify` only checks that the host has some. Every test that runs
+        `verify` installs them, so a failure is attributable to the thing that
+        test is actually about rather than to a missing seeds directory.
+        """
+        seeds = self.root / "seeds"
+        seeds.mkdir(exist_ok=True)
+        (seeds / "maven-roots.txt").write_text("com.example:example\n")
+
     def stage(self):
         result = self.run_tool("stage")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.install_seeds()
 
     def test_matching_release_verifies(self):
         self.stage()
@@ -68,6 +81,28 @@ class ReleaseTest(unittest.TestCase):
         self.assertNotEqual(self.run_tool("verify").returncode, 0)
         wrapper.unlink()
         self.assertNotEqual(self.run_tool("verify").returncode, 0)
+
+    def test_missing_or_empty_seeds_fails_verification(self):
+        # pg-collect@.container bind mounts /etc/containers/systemd/seeds
+        # unconditionally, and podman refuses to start a container whose
+        # bind-mount source is missing. The template is shared, so installing it
+        # over an absent seeds directory fails every collector.
+        self.stage()
+        seed = self.root / "seeds/maven-roots.txt"
+        seed.write_text("")
+        self.assertNotEqual(self.run_tool("verify").returncode, 0, "empty seed list")
+        seed.unlink()
+        self.assertNotEqual(self.run_tool("verify").returncode, 0, "no seed list")
+        (self.root / "seeds").rmdir()
+        self.assertNotEqual(self.run_tool("verify").returncode, 0, "no seeds directory")
+
+    def test_staging_does_not_require_seeds(self):
+        # Seeds are a host precondition, not a release artifact; requiring them
+        # at stage time would make it impossible to build a release anywhere
+        # except the collector host.
+        result = self.run_tool("stage")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "seeds").exists())
 
     def test_drop_in_cannot_silently_override_image_pin(self):
         self.stage()

@@ -47,8 +47,28 @@ spec:
                     echo "WARNING: Minio alias setup failed, proceeding without remote cache"
                   fi
 
+                  # Curated roots from the mounted seed list, not SPARQL
+                  # auto-discovery: discovery seeded from every package claiming
+                  # a Maven upstream, 73.1% of which was never published to
+                  # Maven Central, tripping the collector's error-rate guard.
+                  # Kept in step with deploy/quadlet/collectors/scripts/maven.sh,
+                  # which this job was ported to; both publish the same
+                  # GRAPH_URI.
+                  #
+                  # The list is NOT in this repository and NOT in the image --
+                  # it is a curated set from a private source, supplied here by
+                  # the collector-seeds Secret created out of band. Fail loudly
+                  # rather than publishing an empty graph over the real one.
+                  SEED_FILE=/seeds/maven-roots.txt
+                  if [ ! -s "$SEED_FILE" ]; then
+                    echo "ERROR: $SEED_FILE missing or empty; refusing to run." >&2
+                    echo "Create the collector-seeds Secret; see" >&2
+                    echo "deploy/quadlet/collectors/seeds/README.md." >&2
+                    exit 1
+                  fi
+
                   pg-collect maven \
-                    --endpoint "$FUSEKI_ENDPOINT" \
+                    --packages-file "$SEED_FILE" \
                     --cache-dir "${CACHE_DIR}" \
                     -o /tmp/maven.nt
                   COLLECT_EXIT=$?
@@ -61,3 +81,12 @@ spec:
 
                   [ $COLLECT_EXIT -eq 0 ] && /app/scripts/upload-nt.sh /tmp/maven.nt "$GRAPH_URI"
               resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "2", memory: 2Gi}}
+              volumeMounts:
+                - {name: seeds, mountPath: /seeds, readOnly: true}
+          # Secret, not ConfigMap: the seed set is curated from a private source
+          # and is deliberately absent from this repository. Create it out of
+          # band, e.g.
+          #   kubectl create secret generic collector-seeds \
+          #     --from-file=maven-roots.txt=<path to the list>
+          volumes:
+            - {name: seeds, secret: {secretName: collector-seeds}}

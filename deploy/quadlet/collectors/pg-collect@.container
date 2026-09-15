@@ -53,6 +53,21 @@ Environment=FUSEKI_ENDPOINT=http://127.0.0.1:7001
 # comment for the EACCES incident :Z caused here.
 Volume=pg-collect-scratch.volume:/tmp:z
 Volume=/etc/containers/systemd/scripts/collectors/%i.sh:/usr/local/bin/collect.sh:ro
+# Curated seed lists (currently maven-roots.txt), installed from
+# deploy/quadlet/collectors/seeds/. Mounted rather than baked into the image so
+# editing a data file does not require a coordinated image cutover.
+#
+# WARNING: this directory must exist on the host. Podman does not create a
+# missing bind-mount source -- it fails with `statfs ...: no such file or
+# directory` -- and because this template is shared by every collector, a
+# missing /etc/containers/systemd/seeds breaks all of them, not just the ones
+# that read a seed list. checkpoint-release.py stages and verifies its contents
+# alongside the wrappers; keep them installed together.
+#
+# :ro with no :z, matching the wrapper mount above: the host directory is
+# etc_t, which containers on this host can already read, so relabelling /etc
+# content is unnecessary. (Contrast pg-collect-scratch above, which needs :z.)
+Volume=/etc/containers/systemd/seeds:/seeds:ro
 Entrypoint=/bin/sh
 Exec=/usr/local/bin/collect.sh
 NoNewPrivileges=true

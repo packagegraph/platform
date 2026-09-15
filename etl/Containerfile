@@ -63,4 +63,10 @@ RUN chmod +x /app/entrypoint.sh
 COPY scripts/ /app/scripts/
 RUN chmod +x /app/scripts/*.sh
 
+# Seed lists are deliberately NOT copied here. They are collection inputs with
+# their own review cadence, and baking them in would make editing a data file
+# require a full coordinated image cutover (see
+# deploy/quadlet/collectors/checkpoint-cutover.md). They are installed on the
+# host from deploy/quadlet/collectors/seeds/ and bind-mounted at /seeds.
+
 ENTRYPOINT ["/app/entrypoint.sh"]
