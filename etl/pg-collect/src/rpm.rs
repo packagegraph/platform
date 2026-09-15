@@ -10,6 +10,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use regex::Regex;
 use reqwest::blocking::Client;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Result};
@@ -91,6 +92,52 @@ pub struct RpmCollector {
     repo_type: String,
     source_cache: Option<SourceCache>,
     pub graph_uri: Option<String>,
+}
+
+/// Arch and tree tokens recognized in a repodata URL path.
+///
+/// Only used to keep cache paths readable. Correctness does not depend on
+/// this list being complete: anything unrecognized falls back to a digest of
+/// the URL, which is still distinct.
+const KNOWN_REPO_TREES: &[&str] = &[
+    "aarch64", "x86_64", "ppc64le", "ppc64", "s390x", "i386", "i686", "riscv64", "armv7hl",
+    "armhfp", "noarch", "source", "srpms",
+];
+
+/// A per-repodata-tree discriminator for the source cache namespace.
+///
+/// `rpm-full` constructs one `RpmCollector` per `--url` and runs two arches
+/// of the same distro/release in one process. Those trees have different
+/// `repomd.xml` documents naming different `primary.xml` content hashes, so
+/// they must not share a cache manifest. They previously did, because the
+/// scope reported `arch: None` on the assumption that "primary.xml covers all
+/// arches" -- it does not; each arch has its own repodata tree.
+///
+/// Correctness rests entirely on the URL digest: one `RpmCollector` serves
+/// exactly one repodata tree, so two different URLs must never share a
+/// namespace whatever their shape. Deriving the namespace from a parsed arch
+/// alone would not be enough -- two repos of the same arch (`baseos` and
+/// `appstream`) both infer `repo_type: unknown` and would collide again, one
+/// wrapper edit away.
+///
+/// The leading arch token is ergonomics only, so cache paths stay greppable
+/// by arch rather than being opaque hashes.
+fn cache_discriminator(url: &str) -> String {
+    let path = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let token = path
+        .split('/')
+        .skip(1) // the host is not a path segment
+        .map(str::trim)
+        .find(|segment| {
+            KNOWN_REPO_TREES
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(segment))
+        })
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "tree".to_string());
+
+    let digest = format!("{:x}", Sha256::digest(url.as_bytes()));
+    format!("{}-{}", token, &digest[..12])
 }
 
 fn infer_repo_type(url: &str) -> String {
@@ -547,7 +594,10 @@ impl RpmCollector {
             distro: self.distro_name.clone(),
             release: self.release_name.clone(),
             repo: Some(self.repo_type.clone()),
-            arch: None, // RPM primary.xml covers all arches
+            // Derived from the repo URL, never None. One RpmCollector serves
+            // one repodata tree, and `rpm-full` runs two arches of the same
+            // distro/release in a single process -- see cache_discriminator.
+            arch: Some(cache_discriminator(&self.repo_url)),
         }
     }
 
@@ -2527,4 +2577,80 @@ mod tests {
         // joining through the shared repo URI instead.
         assert!(!content.contains("hasUpstreamProject"));
     }
+}
+
+/// The source cache must namespace per repodata tree, not per distro/release.
+///
+/// `rpm-full` runs one `RpmCollector` per `--url`, two arches of the same
+/// distro/release in a single process. Their `repomd.xml` files are different
+/// documents naming different content hashes. While `cache_scope()` reported
+/// `arch: None`, both wrote `<distro>/<release>/<repo_type>/manifest.json`,
+/// so the second arch's conditional request could be answered `304` against
+/// the first arch's entry -- after which it asked for a `primary.xml` content
+/// hash that does not exist under its own tree and failed with `not found`.
+/// It only bit when the CDN actually returned 304, which is why it survived.
+#[cfg(test)]
+mod cache_scope_tests {
+    use super::*;
+
+    fn scope_for(url: &str) -> CacheScope {
+        RpmCollector::new(url.to_string(), "rhel".to_string(), "9".to_string()).cache_scope()
+    }
+
+    /// The regression itself: same distro, release and repo type; different
+    /// arch trees. These must not share a manifest.
+    #[test]
+    fn two_arches_of_the_same_repo_get_distinct_cache_scopes() {
+        let a = scope_for("https://cdn.example.com/content/dist/rhel9/9/x86_64/baseos/os");
+        let b = scope_for("https://cdn.example.com/content/dist/rhel9/9/aarch64/baseos/os");
+
+        assert_ne!(
+            a.arch, b.arch,
+            "x86_64 and aarch64 repodata trees must not share a cache namespace"
+        );
+    }
+
+    /// The same trap one wrapper edit away. `baseos` and `appstream` are
+    /// different repodata trees, but both infer `repo_type: unknown` and share
+    /// an arch -- so a discriminator built from the parsed arch alone would
+    /// collide exactly as `arch: None` did. Production passes only `baseos`
+    /// today, which is why this would not have been caught by running it.
+    #[test]
+    fn two_repos_of_the_same_arch_get_distinct_cache_scopes() {
+        let base = scope_for("https://cdn.example.com/dist/rhel9/9/x86_64/baseos/os");
+        let app = scope_for("https://cdn.example.com/dist/rhel9/9/x86_64/appstream/os");
+        assert_ne!(base.arch, app.arch);
+    }
+
+    /// Ergonomics, not correctness: cache paths stay greppable by arch.
+    #[test]
+    fn the_discriminator_leads_with_a_readable_arch_token() {
+        let scope = scope_for("https://cdn.example.com/dist/rhel9/9/x86_64/baseos/os");
+        assert!(
+            scope.arch.as_deref().unwrap().starts_with("x86_64-"),
+            "expected a readable arch prefix, got {:?}",
+            scope.arch
+        );
+    }
+
+    /// Fall back to something URL-derived rather than colliding. An
+    /// unrecognized layout is exactly when a silent collision would be
+    /// hardest to notice.
+    #[test]
+    fn unrecognized_layouts_still_get_distinct_scopes() {
+        let a = scope_for("https://mirror.example.com/weird/tree-one/os");
+        let b = scope_for("https://mirror.example.com/weird/tree-two/os");
+
+        assert_ne!(a.arch, b.arch, "distinct repo URLs must not share a namespace");
+        assert!(a.arch.is_some(), "never fall back to a shared None namespace");
+    }
+
+    /// Determinism: the discriminator is part of a path that must be found
+    /// again on the next run, or every run re-downloads the whole repo.
+    #[test]
+    fn the_same_url_yields_a_stable_scope() {
+        let url = "https://cdn.example.com/content/dist/rhel9/9/x86_64/baseos/os";
+        assert_eq!(scope_for(url).arch, scope_for(url).arch);
+    }
+
 }
