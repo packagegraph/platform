@@ -72,6 +72,12 @@ Entrypoint=/bin/sh
 Exec=/usr/local/bin/collect.sh
 NoNewPrivileges=true
 DropCapability=ALL
+Memory=4g
+PodmanArgs=--cpus=2
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
 # Ceiling generous enough for the slowest job (fedora-43-full's Koji+spec
 # enrichment pass) rather than tuned per collector -- one shared template
 # file, one shared timeout. Raised from 5h to 8h on 2026-09-10 after
@@ -83,12 +89,24 @@ DropCapability=ALL
 # failing 100% of its reads/writes (wrong auth scheme for Scaleway's S3
 # API), so every run re-fetched every Koji build from scratch with no
 # cross-run caching benefit -- fixed same day in etl/pg-collect/src/cache.rs
-# (AWS SigV4 signing instead of HTTP Basic Auth). 8h leaves headroom even
-# before confirming how much the cache fix actually shortens a warm-cache run.
-Memory=4g
-PodmanArgs=--cpus=2
-
-[Service]
-Type=oneshot
-RemainAfterExit=no
-TimeoutStartSec=28800
+# (AWS SigV4 signing instead of HTTP Basic Auth).
+#
+# Raised again from 8h to 14h on 2026-09-15, this time from a measurement
+# rather than an estimate. An instrumented fedora-44-full run (checkpointing
+# enabled, so its progress was observable rather than lost) completed the
+# RPM and spec stages in ~5h and then enriched Koji at a measured 39 NVRs/min
+# over 23,641 NVRs -- ~12h50m in total. 8h killed it at roughly the halfway
+# point of the Koji stage, every time.
+#
+# 14h is a ceiling, not a target: checkpointing means an overrun resumes
+# rather than restarting, so the cost of setting this generously is bounded,
+# while the cost of setting it short is a collector that can never publish.
+#
+# It is still one shared timeout for all 43 collectors, sized to the slowest
+# -- and rpm-full is not the only one near the old limit: cargo ran 6h47m on
+# 2026-09-14. The price is that a genuinely hung fast collector now occupies
+# 14h instead of 8h before systemd kills it. Per-stage timeouts are the real
+# answer to that and want the pipeline split into separate units with
+# triggered hand-offs; see
+# docs/superpowers/specs/2026-09-15-collector-stage-decomposition-design.md.
+TimeoutStartSec=50400

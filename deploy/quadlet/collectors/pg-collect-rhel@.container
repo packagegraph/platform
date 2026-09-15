@@ -60,4 +60,10 @@ PodmanArgs=--cpus=2
 [Service]
 Type=oneshot
 RemainAfterExit=no
-TimeoutStartSec=28800
+# Kept in step with pg-collect@.container's 14h -- see the reasoning there.
+# rhel-9/10 are rpm-full collectors with the same stage profile as
+# fedora-44-full (16,310 and 7,196+6,547 packages respectively), so the same
+# measured ~12h50m applies. Neither has ever completed a run; until #52 they
+# OOM-killed during stage 1, so the timeout was never the binding constraint
+# here and this is the first run where it will be.
+TimeoutStartSec=50400
