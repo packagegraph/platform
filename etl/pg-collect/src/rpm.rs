@@ -10,6 +10,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use regex::Regex;
 use reqwest::blocking::Client;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Result};
@@ -45,6 +46,34 @@ pub struct RpmDep {
     pub dep_type: String,
 }
 
+/// Sentinel used to stop the `primary.xml` stream early once `--limit` is hit.
+///
+/// The streaming parser only knows how to propagate an `io::Error`, so the
+/// limit rides out as one and is matched by downcast (not by message text)
+/// at the call site.
+#[derive(Debug)]
+struct LimitReached(usize);
+
+impl std::fmt::Display for LimitReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reached limit of {} packages", self.0)
+    }
+}
+
+impl std::error::Error for LimitReached {}
+
+impl LimitReached {
+    fn into_io_error(self) -> std::io::Error {
+        std::io::Error::other(self)
+    }
+
+    fn matches(e: &std::io::Error) -> bool {
+        e.get_ref()
+            .map(|inner| inner.is::<LimitReached>())
+            .unwrap_or(false)
+    }
+}
+
 /// Parsed RPM package data including structured dependencies.
 #[derive(Debug)]
 pub struct RpmPackageData {
@@ -63,6 +92,52 @@ pub struct RpmCollector {
     repo_type: String,
     source_cache: Option<SourceCache>,
     pub graph_uri: Option<String>,
+}
+
+/// Arch and tree tokens recognized in a repodata URL path.
+///
+/// Only used to keep cache paths readable. Correctness does not depend on
+/// this list being complete: anything unrecognized falls back to a digest of
+/// the URL, which is still distinct.
+const KNOWN_REPO_TREES: &[&str] = &[
+    "aarch64", "x86_64", "ppc64le", "ppc64", "s390x", "i386", "i686", "riscv64", "armv7hl",
+    "armhfp", "noarch", "source", "srpms",
+];
+
+/// A per-repodata-tree discriminator for the source cache namespace.
+///
+/// `rpm-full` constructs one `RpmCollector` per `--url` and runs two arches
+/// of the same distro/release in one process. Those trees have different
+/// `repomd.xml` documents naming different `primary.xml` content hashes, so
+/// they must not share a cache manifest. They previously did, because the
+/// scope reported `arch: None` on the assumption that "primary.xml covers all
+/// arches" -- it does not; each arch has its own repodata tree.
+///
+/// Correctness rests entirely on the URL digest: one `RpmCollector` serves
+/// exactly one repodata tree, so two different URLs must never share a
+/// namespace whatever their shape. Deriving the namespace from a parsed arch
+/// alone would not be enough -- two repos of the same arch (`baseos` and
+/// `appstream`) both infer `repo_type: unknown` and would collide again, one
+/// wrapper edit away.
+///
+/// The leading arch token is ergonomics only, so cache paths stay greppable
+/// by arch rather than being opaque hashes.
+fn cache_discriminator(url: &str) -> String {
+    let path = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let token = path
+        .split('/')
+        .skip(1) // the host is not a path segment
+        .map(str::trim)
+        .find(|segment| {
+            KNOWN_REPO_TREES
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(segment))
+        })
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "tree".to_string());
+
+    let digest = format!("{:x}", Sha256::digest(url.as_bytes()));
+    format!("{}-{}", token, &digest[..12])
 }
 
 fn infer_repo_type(url: &str) -> String {
@@ -273,11 +348,11 @@ impl RpmCollector {
         let primary_url = self.get_metadata_url("primary")?;
         eprintln!("Primary metadata URL: {}", primary_url);
 
-        // Download and parse
-        let packages_data = self.parse_primary_metadata(&primary_url)?;
-        eprintln!("Found {} packages", packages_data.len());
-
-        // Get filelists for phantom detection (optional)
+        // Get filelists for phantom detection (optional).
+        //
+        // Fetched *before* the primary.xml stream starts, because each package
+        // is emitted as it is parsed and needs this set in hand. It is also
+        // the cheaper of the two, so nothing large is resident while it loads.
         let packages_with_files = match self.parse_filelists_metadata() {
             Ok(set) => {
                 eprintln!(
@@ -315,13 +390,19 @@ impl RpmCollector {
             &self.release_name
         };
 
-        for (idx, pkg_data) in packages_data.iter().enumerate() {
+        // Packages are emitted as primary.xml is parsed, so nothing
+        // repo-sized is ever resident. `limit` stops the stream early by
+        // raising a sentinel error, which is swallowed below.
+        let mut seen = 0usize;
+        let stream_result = self.stream_primary_metadata(&primary_url, |pkg_data| {
             if let Some(max) = limit {
                 if total_packages >= max {
-                    eprintln!("Reached limit of {} packages", max);
-                    break;
+                    return Err(LimitReached(max).into_io_error());
                 }
             }
+            seen += 1;
+            let idx = seen - 1;
+            let pkg_data = &pkg_data;
             let fields = &pkg_data.fields;
 
             // Check for noarch dedup on secondary arches
@@ -336,7 +417,7 @@ impl RpmCollector {
                     if arch == "noarch" {
                         let key = (name.clone(), epoch.clone(), ver.clone(), rel.clone());
                         if !noarch_seen.insert(key) {
-                            continue; // Already emitted from primary arch
+                            return Ok(()); // Already emitted from primary arch
                         }
                     }
                 }
@@ -416,7 +497,17 @@ impl RpmCollector {
             if (idx + 1) % 1000 == 0 {
                 eprintln!("Processed {} packages", idx + 1);
             }
+            Ok(())
+        });
+
+        match stream_result {
+            Ok(_) => {}
+            Err(e) if LimitReached::matches(&e) => {
+                eprintln!("Reached limit of {} packages", limit.unwrap_or(0));
+            }
+            Err(e) => return Err(e),
         }
+        eprintln!("Found {} packages", seen);
 
         // Parse updateinfo and emit advisory triples
         let advisories = self.parse_updateinfo()?;
@@ -503,13 +594,34 @@ impl RpmCollector {
             distro: self.distro_name.clone(),
             release: self.release_name.clone(),
             repo: Some(self.repo_type.clone()),
-            arch: None, // RPM primary.xml covers all arches
+            // Derived from the repo URL, never None. One RpmCollector serves
+            // one repodata tree, and `rpm-full` runs two arches of the same
+            // distro/release in a single process -- see cache_discriminator.
+            arch: Some(cache_discriminator(&self.repo_url)),
         }
     }
 
-    fn download_and_decompress(&self, url: &str) -> Result<Vec<u8>> {
-        let raw_bytes = self.fetch_raw_bytes(url)?;
-        Self::decompress_bytes(&raw_bytes, url)
+    /// Open a repodata artifact as a decoded, streaming reader.
+    ///
+    /// Prefer this over `download_and_decompress` for anything repo-sized:
+    /// it decodes incrementally, and when the source cache is in use the
+    /// bytes come off disk so neither the compressed nor the decompressed
+    /// artifact is ever fully resident.
+    fn open_metadata_stream(&self, url: &str) -> Result<Box<dyn std::io::BufRead>> {
+        if let Some(ref cache) = self.source_cache {
+            let scope = self.cache_scope();
+            let logical_name = url.rsplit('/').next().unwrap_or("artifact");
+            let path = cache.fetch_or_reuse_to_path(url, &scope, logical_name)?;
+            eprintln!("Streaming {} from {}", logical_name, path.display());
+            decoding_reader(&path)
+        } else {
+            // No cache configured: the transport hands back a whole body, but
+            // we still decode it as a stream so the (much larger) plaintext is
+            // never materialized.
+            eprintln!("Downloading {}", url);
+            let response = self.client_get_with_retry(url, 3)?;
+            decode_stream(std::io::Cursor::new(response.bytes), url)
+        }
     }
 
     fn fetch_raw_bytes(&self, url: &str) -> Result<Vec<u8>> {
@@ -535,140 +647,186 @@ impl RpmCollector {
         }
     }
 
-    fn decompress_bytes(raw: &[u8], url: &str) -> Result<Vec<u8>> {
-        if url.ends_with(".gz") {
-            let mut decoder = GzDecoder::new(raw);
-            let mut decompressed = Vec::new();
-            std::io::copy(&mut decoder, &mut decompressed)?;
-            Ok(decompressed)
-        } else if url.ends_with(".zst") {
-            let decompressed = zstd::decode_all(raw)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            Ok(decompressed)
-        } else {
-            Ok(raw.to_vec())
-        }
+    /// Stream `primary.xml`, handing each package to `on_package` as it is
+    /// parsed. Never holds more than one package, nor the decoded XML.
+    fn stream_primary_metadata(
+        &self,
+        primary_url: &str,
+        on_package: impl FnMut(RpmPackageData) -> Result<()>,
+    ) -> Result<usize> {
+        let reader = self.open_metadata_stream(primary_url)?;
+        stream_primary_packages(reader, on_package)
     }
+}
 
-    fn parse_primary_metadata(&self, primary_url: &str) -> Result<Vec<RpmPackageData>> {
-        let content = self.download_and_decompress(primary_url)?;
+/// I/O buffer size for streaming repodata decode. Large enough to keep the
+/// decompressor fed, small enough that peak memory is independent of the
+/// artifact size.
+const REPODATA_BUF: usize = 128 * 1024;
 
-        let mut reader = Reader::from_reader(BufReader::new(&content[..]));
-        reader.config_mut().trim_text(true);
+/// Open a repodata artifact as a streaming reader, transparently decoding
+/// `.gz`/`.zst`.
+///
+/// Deliberately never materializes either the compressed file or the
+/// decompressed XML. RHEL 9's `primary.xml.gz` is ~165 MB on disk and ~1.3 GB
+/// decompressed *per arch*, and `rpm-full` collects two arches in one process;
+/// reading either one whole is what pushed the collector past its 4 GB
+/// container cap.
+pub fn decoding_reader(path: &std::path::Path) -> Result<Box<dyn std::io::BufRead>> {
+    let file = File::open(path)?;
+    let raw = BufReader::with_capacity(REPODATA_BUF, file);
+    decode_stream(raw, &path.to_string_lossy())
+}
 
-        let mut packages = Vec::new();
-        let mut current_fields: HashMap<String, String> = HashMap::new();
-        let mut current_deps: Vec<RpmDep> = Vec::new();
-        let mut buf = Vec::new();
-        let mut current_text = String::new();
-        let mut in_package = false;
-        // Track which dependency section we're in (if any)
-        let mut current_dep_section: Option<String> = None;
+/// Wrap `raw` in the decompressor implied by `name`'s extension, streaming.
+fn decode_stream<'a, R: std::io::BufRead + 'a>(
+    raw: R,
+    name: &str,
+) -> Result<Box<dyn std::io::BufRead + 'a>> {
+    if name.ends_with(".gz") {
+        Ok(Box::new(BufReader::with_capacity(
+            REPODATA_BUF,
+            GzDecoder::new(raw),
+        )))
+    } else if name.ends_with(".zst") {
+        let decoder = zstd::stream::read::Decoder::new(raw)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Box::new(BufReader::with_capacity(REPODATA_BUF, decoder)))
+    } else {
+        Ok(Box::new(raw))
+    }
+}
 
-        loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e) | Event::Empty(ref e)) => {
-                    let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                    if name == "package" {
-                        in_package = true;
-                        current_fields = HashMap::new();
-                        current_deps = Vec::new();
-                        current_dep_section = None;
-                    } else if in_package {
-                        current_text.clear();
+/// Parse a repodata `primary.xml` stream, invoking `on_package` for each
+/// `<package>` element as it completes.
+///
+/// Returns the number of packages handed to the callback.
+/// Each package is moved into the callback and dropped when it returns, so
+/// peak memory is O(largest single package), not O(repo size). RHEL 9's
+/// `primary.xml` parses to roughly 3x its own (already ~1.3 GB) size as
+/// `RpmPackageData`, which is what OOM-killed the collector when this
+/// collected into a `Vec` first.
+pub fn stream_primary_packages<R: std::io::BufRead>(
+    input: R,
+    mut on_package: impl FnMut(RpmPackageData) -> Result<()>,
+) -> Result<usize> {
+    let mut reader = Reader::from_reader(input);
+    reader.config_mut().trim_text(true);
 
-                        // Check for dependency section start
-                        match name.as_str() {
-                            "rpm:requires" | "rpm:provides" | "rpm:conflicts" | "rpm:obsoletes" => {
-                                // Map XML element name to our dep_type label
-                                let dep_type =
-                                    name.strip_prefix("rpm:").unwrap_or(&name).to_string();
-                                current_dep_section = Some(dep_type);
-                            }
-                            "rpm:entry" => {
-                                // Extract dependency entry attributes
-                                if let Some(ref dep_type) = current_dep_section {
-                                    let mut dep = RpmDep {
-                                        name: String::new(),
-                                        flags: None,
-                                        epoch: None,
-                                        ver: None,
-                                        rel: None,
-                                        dep_type: dep_type.clone(),
-                                    };
-                                    for attr in e.attributes().flatten() {
-                                        let key =
-                                            String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                                        let value =
-                                            String::from_utf8_lossy(&attr.value).to_string();
-                                        match key.as_str() {
-                                            "name" => dep.name = value,
-                                            "flags" => dep.flags = Some(value),
-                                            "epoch" => dep.epoch = Some(value),
-                                            "ver" => dep.ver = Some(value),
-                                            "rel" => dep.rel = Some(value),
-                                            _ => {}
-                                        }
-                                    }
-                                    if !dep.name.is_empty() {
-                                        current_deps.push(dep);
-                                    }
-                                }
-                            }
-                            _ => {
-                                // version, location, size, time — capture attributes
+    let mut count = 0usize;
+    let mut current_fields: HashMap<String, String> = HashMap::new();
+    let mut current_deps: Vec<RpmDep> = Vec::new();
+    let mut buf = Vec::new();
+    let mut current_text = String::new();
+    let mut in_package = false;
+    // Track which dependency section we're in (if any)
+    let mut current_dep_section: Option<String> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e) | Event::Empty(ref e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if name == "package" {
+                    in_package = true;
+                    current_fields = HashMap::new();
+                    current_deps = Vec::new();
+                    current_dep_section = None;
+                } else if in_package {
+                    current_text.clear();
+
+                    // Check for dependency section start
+                    match name.as_str() {
+                        "rpm:requires" | "rpm:provides" | "rpm:conflicts" | "rpm:obsoletes" => {
+                            // Map XML element name to our dep_type label
+                            let dep_type = name.strip_prefix("rpm:").unwrap_or(&name).to_string();
+                            current_dep_section = Some(dep_type);
+                        }
+                        "rpm:entry" => {
+                            // Extract dependency entry attributes
+                            if let Some(ref dep_type) = current_dep_section {
+                                let mut dep = RpmDep {
+                                    name: String::new(),
+                                    flags: None,
+                                    epoch: None,
+                                    ver: None,
+                                    rel: None,
+                                    dep_type: dep_type.clone(),
+                                };
                                 for attr in e.attributes().flatten() {
                                     let key =
                                         String::from_utf8_lossy(attr.key.as_ref()).to_string();
                                     let value = String::from_utf8_lossy(&attr.value).to_string();
-                                    if name == "version"
-                                        || name == "location"
-                                        || name == "size"
-                                        || name == "time"
-                                    {
-                                        current_fields.insert(key.clone(), value.clone());
+                                    match key.as_str() {
+                                        "name" => dep.name = value,
+                                        "flags" => dep.flags = Some(value),
+                                        "epoch" => dep.epoch = Some(value),
+                                        "ver" => dep.ver = Some(value),
+                                        "rel" => dep.rel = Some(value),
+                                        _ => {}
                                     }
-                                    if name == "checksum" && key == "type" {
-                                        current_fields.insert("checksum_type".to_string(), value);
-                                    }
+                                }
+                                if !dep.name.is_empty() {
+                                    current_deps.push(dep);
+                                }
+                            }
+                        }
+                        _ => {
+                            // version, location, size, time — capture attributes
+                            for attr in e.attributes().flatten() {
+                                let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                                let value = String::from_utf8_lossy(&attr.value).to_string();
+                                if name == "version"
+                                    || name == "location"
+                                    || name == "size"
+                                    || name == "time"
+                                {
+                                    current_fields.insert(key.clone(), value.clone());
+                                }
+                                if name == "checksum" && key == "type" {
+                                    current_fields.insert("checksum_type".to_string(), value);
                                 }
                             }
                         }
                     }
                 }
-                Ok(Event::Text(ref e)) if in_package => {
-                    current_text.push_str(&e.unescape().unwrap_or_default());
-                }
-                Ok(Event::End(ref e)) => {
-                    let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                    if name == "package" {
-                        if !current_fields.is_empty() {
-                            packages.push(RpmPackageData {
-                                fields: current_fields.clone(),
-                                deps: current_deps.clone(),
-                            });
-                        }
-                        in_package = false;
-                    } else if matches!(
-                        name.as_str(),
-                        "rpm:requires" | "rpm:provides" | "rpm:conflicts" | "rpm:obsoletes"
-                    ) {
-                        current_dep_section = None;
-                    } else if in_package && !current_text.is_empty() {
-                        current_fields.insert(name, current_text.trim().to_string());
-                        current_text.clear();
-                    }
-                }
-                Ok(Event::Eof) => break,
-                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-                _ => {}
             }
-            buf.clear();
+            Ok(Event::Text(ref e)) if in_package => {
+                current_text.push_str(&e.unescape().unwrap_or_default());
+            }
+            Ok(Event::End(ref e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if name == "package" {
+                    if !current_fields.is_empty() {
+                        // Move, don't clone: the per-package buffers are
+                        // reset at the next <package> start anyway.
+                        on_package(RpmPackageData {
+                            fields: std::mem::take(&mut current_fields),
+                            deps: std::mem::take(&mut current_deps),
+                        })?;
+                        count += 1;
+                    }
+                    in_package = false;
+                } else if matches!(
+                    name.as_str(),
+                    "rpm:requires" | "rpm:provides" | "rpm:conflicts" | "rpm:obsoletes"
+                ) {
+                    current_dep_section = None;
+                } else if in_package && !current_text.is_empty() {
+                    current_fields.insert(name, current_text.trim().to_string());
+                    current_text.clear();
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            _ => {}
         }
-
-        Ok(packages)
+        buf.clear();
     }
 
+    Ok(count)
+}
+
+impl RpmCollector {
     fn emit_distribution_metadata(&self, writer: &mut NTriplesWriter) -> Result<()> {
         let dist_uri = distro_uri(&self.distro_name);
         writer.write_triple(&dist_uri, RDF_TYPE, &format!("{PKG}Distribution"))?;
@@ -716,9 +874,9 @@ impl RpmCollector {
 
         // Try to get filelists URL - if missing, return error (caller will handle gracefully)
         let filelists_url = self.get_metadata_url("filelists")?;
-        let content = self.download_and_decompress(&filelists_url)?;
-
-        let mut reader = Reader::from_reader(BufReader::new(&content[..]));
+        // Streamed: RHEL 9's filelists.xml is ~200 MB decoded, and it is read
+        // while the primary.xml parse results are still live.
+        let mut reader = Reader::from_reader(self.open_metadata_stream(&filelists_url)?);
         reader.config_mut().trim_text(true);
 
         let mut packages_with_files = HashSet::new();
@@ -1404,9 +1562,7 @@ impl RpmCollector {
         };
 
         eprintln!("Parsing updateinfo from {}", updateinfo_url);
-        let content = self.download_and_decompress(&updateinfo_url)?;
-
-        let mut reader = Reader::from_reader(BufReader::new(&content[..]));
+        let mut reader = Reader::from_reader(self.open_metadata_stream(&updateinfo_url)?);
         reader.config_mut().trim_text(true);
 
         let mut advisories = Vec::new();
@@ -1748,6 +1904,203 @@ struct UpdateInfoPackage {
     release: String,
     epoch: String,
     arch: String,
+}
+
+#[cfg(test)]
+mod collect_stream_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A repo advertising only `primary`; filelists/updateinfo are absent, so
+    /// the collector takes its graceful-degradation paths.
+    const REPOMD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<repomd xmlns="http://linux.duke.edu/metadata/repo">
+  <data type="primary">
+    <location href="repodata/primary.xml.gz"/>
+  </data>
+</repomd>"#;
+
+    fn pkg(name: &str, arch: &str, ver: &str, srpm: &str) -> String {
+        format!(
+            r#"<package type="rpm">
+  <name>{name}</name>
+  <arch>{arch}</arch>
+  <version epoch="0" ver="{ver}" rel="1.el9"/>
+  <summary>summary of {name}</summary>
+  <location href="Packages/{name}-{ver}-1.el9.{arch}.rpm"/>
+  <format>
+    <rpm:license>MIT</rpm:license>
+    <rpm:sourcerpm>{srpm}</rpm:sourcerpm>
+    <rpm:provides>
+      <rpm:entry name="{name}" flags="EQ" epoch="0" ver="{ver}" rel="1.el9"/>
+    </rpm:provides>
+    <rpm:requires>
+      <rpm:entry name="libc.so.6()(64bit)"/>
+    </rpm:requires>
+  </format>
+</package>"#
+        )
+    }
+
+    fn primary_gz(packages: &[String]) -> Vec<u8> {
+        let doc = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata xmlns="http://linux.duke.edu/metadata/common" xmlns:rpm="http://linux.duke.edu/metadata/rpm" packages="{}">
+{}
+</metadata>"#,
+            packages.len(),
+            packages.join("\n")
+        );
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(doc.as_bytes()).unwrap();
+        enc.finish().unwrap()
+    }
+
+    struct Harness {
+        _server: mockito::ServerGuard,
+        url: String,
+    }
+
+    fn serve(packages: &[String]) -> Harness {
+        let mut server = mockito::Server::new();
+        server
+            .mock("GET", "/repodata/repomd.xml")
+            .with_status(200)
+            .with_body(REPOMD)
+            .create();
+        server
+            .mock("GET", "/repodata/primary.xml.gz")
+            .with_status(200)
+            .with_body(primary_gz(packages))
+            .create();
+        let url = server.url();
+        Harness {
+            _server: server,
+            url,
+        }
+    }
+
+    struct Sinks {
+        noarch: HashSet<(String, String, String, String)>,
+        srpm_seen: HashSet<String>,
+        nvrs: HashSet<String>,
+        names: HashSet<String>,
+        identity: HashMap<String, Vec<String>>,
+    }
+
+    impl Sinks {
+        fn new() -> Self {
+            Self {
+                noarch: HashSet::new(),
+                srpm_seen: HashSet::new(),
+                nvrs: HashSet::new(),
+                names: HashSet::new(),
+                identity: HashMap::new(),
+            }
+        }
+    }
+
+    fn run(
+        url: &str,
+        sinks: &mut Sinks,
+        is_secondary: bool,
+        limit: Option<usize>,
+    ) -> (usize, String) {
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let collector = RpmCollector::new(url.to_string(), "rhel".to_string(), "9".to_string());
+        let mut writer = NTriplesWriter::new_maybe_graph(out.reopen().unwrap(), None);
+        let (packages, _triples) = collector
+            .collect_with_writer_limit(
+                &mut writer,
+                &mut sinks.noarch,
+                &mut sinks.srpm_seen,
+                &mut sinks.nvrs,
+                &mut sinks.names,
+                &mut sinks.identity,
+                is_secondary,
+                limit,
+            )
+            .unwrap();
+        writer.flush().unwrap();
+        let body = std::fs::read_to_string(out.path()).unwrap();
+        (packages, body)
+    }
+
+    #[test]
+    fn streaming_collect_emits_every_package_and_tracks_srpms() {
+        let h = serve(&[
+            pkg("bash", "x86_64", "5.2.15", "bash-5.2.15-1.el9.src.rpm"),
+            pkg(
+                "filesystem",
+                "noarch",
+                "3.16",
+                "filesystem-3.16-1.el9.src.rpm",
+            ),
+            pkg("zlib", "x86_64", "1.2.11", "zlib-1.2.11-1.el9.src.rpm"),
+        ]);
+        let mut sinks = Sinks::new();
+        let (packages, body) = run(&h.url, &mut sinks, false, None);
+
+        assert_eq!(packages, 3);
+        for name in ["bash", "filesystem", "zlib"] {
+            assert!(body.contains(name), "missing {} in output", name);
+        }
+        // SRPM tracking is fed from inside the streaming callback.
+        assert_eq!(sinks.names.len(), 3, "srpm names: {:?}", sinks.names);
+        assert!(sinks.names.contains("bash"));
+        assert!(sinks.nvrs.contains("bash-5.2.15-1.el9"));
+        assert!(sinks.identity.contains_key("zlib"));
+        // The noarch package is recorded for cross-arch dedup.
+        assert_eq!(sinks.noarch.len(), 1);
+    }
+
+    #[test]
+    fn streaming_collect_dedups_noarch_across_arches() {
+        let shared_noarch = pkg(
+            "filesystem",
+            "noarch",
+            "3.16",
+            "filesystem-3.16-1.el9.src.rpm",
+        );
+        let primary = serve(&[
+            pkg("bash", "x86_64", "5.2.15", "bash-5.2.15-1.el9.src.rpm"),
+            shared_noarch.clone(),
+        ]);
+        let secondary = serve(&[
+            pkg("bash", "aarch64", "5.2.15", "bash-5.2.15-1.el9.src.rpm"),
+            shared_noarch,
+        ]);
+
+        let mut sinks = Sinks::new();
+        let (first, _) = run(&primary.url, &mut sinks, false, None);
+        assert_eq!(first, 2);
+
+        let (second, body) = run(&secondary.url, &mut sinks, true, None);
+        assert_eq!(
+            second, 1,
+            "the noarch package was already emitted by the primary arch"
+        );
+        assert!(body.contains("aarch64"));
+    }
+
+    #[test]
+    fn streaming_collect_honours_limit() {
+        let h = serve(&[
+            pkg("a", "x86_64", "1.0", "a-1.0-1.el9.src.rpm"),
+            pkg("b", "x86_64", "1.0", "b-1.0-1.el9.src.rpm"),
+            pkg("c", "x86_64", "1.0", "c-1.0-1.el9.src.rpm"),
+            pkg("d", "x86_64", "1.0", "d-1.0-1.el9.src.rpm"),
+        ]);
+        let mut sinks = Sinks::new();
+        let (packages, body) = run(&h.url, &mut sinks, false, Some(2));
+
+        assert_eq!(packages, 2, "--limit must stop the stream");
+        assert!(body.contains("/a"), "first package should be emitted");
+        assert!(
+            !body.contains("\"d\""),
+            "packages past the limit must not be emitted"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2224,4 +2577,80 @@ mod tests {
         // joining through the shared repo URI instead.
         assert!(!content.contains("hasUpstreamProject"));
     }
+}
+
+/// The source cache must namespace per repodata tree, not per distro/release.
+///
+/// `rpm-full` runs one `RpmCollector` per `--url`, two arches of the same
+/// distro/release in a single process. Their `repomd.xml` files are different
+/// documents naming different content hashes. While `cache_scope()` reported
+/// `arch: None`, both wrote `<distro>/<release>/<repo_type>/manifest.json`,
+/// so the second arch's conditional request could be answered `304` against
+/// the first arch's entry -- after which it asked for a `primary.xml` content
+/// hash that does not exist under its own tree and failed with `not found`.
+/// It only bit when the CDN actually returned 304, which is why it survived.
+#[cfg(test)]
+mod cache_scope_tests {
+    use super::*;
+
+    fn scope_for(url: &str) -> CacheScope {
+        RpmCollector::new(url.to_string(), "rhel".to_string(), "9".to_string()).cache_scope()
+    }
+
+    /// The regression itself: same distro, release and repo type; different
+    /// arch trees. These must not share a manifest.
+    #[test]
+    fn two_arches_of_the_same_repo_get_distinct_cache_scopes() {
+        let a = scope_for("https://cdn.example.com/content/dist/rhel9/9/x86_64/baseos/os");
+        let b = scope_for("https://cdn.example.com/content/dist/rhel9/9/aarch64/baseos/os");
+
+        assert_ne!(
+            a.arch, b.arch,
+            "x86_64 and aarch64 repodata trees must not share a cache namespace"
+        );
+    }
+
+    /// The same trap one wrapper edit away. `baseos` and `appstream` are
+    /// different repodata trees, but both infer `repo_type: unknown` and share
+    /// an arch -- so a discriminator built from the parsed arch alone would
+    /// collide exactly as `arch: None` did. Production passes only `baseos`
+    /// today, which is why this would not have been caught by running it.
+    #[test]
+    fn two_repos_of_the_same_arch_get_distinct_cache_scopes() {
+        let base = scope_for("https://cdn.example.com/dist/rhel9/9/x86_64/baseos/os");
+        let app = scope_for("https://cdn.example.com/dist/rhel9/9/x86_64/appstream/os");
+        assert_ne!(base.arch, app.arch);
+    }
+
+    /// Ergonomics, not correctness: cache paths stay greppable by arch.
+    #[test]
+    fn the_discriminator_leads_with_a_readable_arch_token() {
+        let scope = scope_for("https://cdn.example.com/dist/rhel9/9/x86_64/baseos/os");
+        assert!(
+            scope.arch.as_deref().unwrap().starts_with("x86_64-"),
+            "expected a readable arch prefix, got {:?}",
+            scope.arch
+        );
+    }
+
+    /// Fall back to something URL-derived rather than colliding. An
+    /// unrecognized layout is exactly when a silent collision would be
+    /// hardest to notice.
+    #[test]
+    fn unrecognized_layouts_still_get_distinct_scopes() {
+        let a = scope_for("https://mirror.example.com/weird/tree-one/os");
+        let b = scope_for("https://mirror.example.com/weird/tree-two/os");
+
+        assert_ne!(a.arch, b.arch, "distinct repo URLs must not share a namespace");
+        assert!(a.arch.is_some(), "never fall back to a shared None namespace");
+    }
+
+    /// Determinism: the discriminator is part of a path that must be found
+    /// again on the next run, or every run re-downloads the whole repo.
+    #[test]
+    fn the_same_url_yields_a_stable_scope() {
+        let url = "https://cdn.example.com/content/dist/rhel9/9/x86_64/baseos/os";
+        assert_eq!(scope_for(url).arch, scope_for(url).arch);
+    }
+
 }
