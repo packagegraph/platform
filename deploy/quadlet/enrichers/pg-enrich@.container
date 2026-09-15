@@ -35,7 +35,27 @@ Entrypoint=/bin/sh
 Exec=/usr/local/bin/enrich.sh
 NoNewPrivileges=true
 DropCapability=ALL
-Memory=4g
+# Raised 4g -> 8g on 2026-09-15 after pg-enrich@taxonomy was OOM-killed at the
+# 4g cap on 2026-09-14 (exit 137, "killed by the OOM killer", 4.0G peak reached
+# in 29 seconds).
+#
+# Stated honestly: the OOM does not reproduce. Re-running enrich-taxonomy on
+# 2026-09-15 under a deliberately generous 24g cap, purely to measure, it
+# succeeded in 72s with a peak of 2.55 GiB -- comfortably inside the old 4g.
+# The index was rebuilt between the two runs and fedora-44 was republished, so
+# the 09-14 input was not the 09-15 input, and the exact trigger is unexplained.
+#
+# The raise is still justified on headroom rather than on the incident:
+#   - measured peak 2.55 GiB against a 4g cap is only ~1.4 GiB of margin;
+#   - the run also writes a 328 MB .nt, and cgroup v2 charges that page cache
+#     to the same limit, so the effective margin is smaller than it looks;
+#   - the work scales with the corpus -- 2,905,982 package identities today,
+#     growing with every collection -- so the margin shrinks on its own.
+#
+# Safe to apply to the shared template: Memory= is a cap, not a reservation,
+# and the other enrichers are nowhere near it (koji peaked at 677 MB, security
+# at 292 MB on their last runs), so they are unaffected.
+Memory=8g
 PodmanArgs=--cpus=2
 
 [Service]
