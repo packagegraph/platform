@@ -165,6 +165,25 @@ impl SourceCache {
         self.download_and_cache(resp, url, scope, logical_name)
     }
 
+    /// Like [`fetch_or_reuse`](Self::fetch_or_reuse) but always yields the
+    /// on-disk artifact path, so callers can stream large artifacts instead of
+    /// holding them in memory.
+    ///
+    /// Safe for every branch: `download_and_cache` writes the artifact before
+    /// returning `Fresh`, so a path exists in all three cases.
+    pub fn fetch_or_reuse_to_path(
+        &self,
+        url: &str,
+        scope: &CacheScope,
+        logical_name: &str,
+    ) -> io::Result<PathBuf> {
+        match self.fetch_or_reuse(url, scope, logical_name)? {
+            // Drop the in-memory copy immediately; it is already on disk.
+            CacheResult::Fresh(_) => Ok(self.artifact_path(scope, logical_name)),
+            CacheResult::Cached(path) | CacheResult::NotModified(path) => Ok(path),
+        }
+    }
+
     fn download_and_cache(
         &self,
         resp: HttpResponse,
