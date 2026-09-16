@@ -61,6 +61,73 @@ nt_check_iri_chars() {
 nt_check_iri_chars "graph-uri" "$GRAPH_URI"
 [ -n "$SOURCE_URL" ] && nt_check_iri_chars "source-url" "$SOURCE_URL"
 
+# An upload REPLACES the whole named graph, so publishing a file with no data
+# does not merely record nothing -- it erases that graph's contents on the next
+# rebuild. Refuse instead, loudly, because every downstream signal is blind to
+# this: the collector's exit code, the sidecar commit marker, and the rebuild's
+# corpus-wide loss gate all treat an empty-but-present graph as healthy. cpan,
+# hex and nuget published empty graphs, green, for as long as the journal
+# retained (#58).
+#
+# Counted as data: any line that is not blank, not an N-Triples comment, and
+# whose subject is neither a DataSnapshot nor a taxonomy node. Both exclusions
+# are load-bearing rather than tidy:
+#
+#   snapshot/  This script appends its own DataSnapshot block below, and strips
+#              a prior one on retry, so a retried run that collected nothing
+#              still presents a file with lines in it. Every snapshot IRI is
+#              excluded, not just this graph's, so the check does not depend on
+#              the strip below having run -- which keeps it ahead of any
+#              mutation of the caller's file.
+#
+#   distro/    Collectors emit a Distribution, its DistributionRelease and its
+#   release/   Architecture nodes unconditionally, before they know whether any
+#   arch/      package exists. That is the whole reason #58's zeroes were
+#              invisible: hex and nuget each published exactly six triples
+#              naming the distro and its release, and not one package. A floor
+#              of "at least one triple" passes that file and fixes nothing.
+#              These nodes describe the container, never the collected
+#              content, so they cannot stand in for it. Enrichers emit none of
+#              them, so excluding them cannot starve a small-but-real
+#              enrichment graph (enrichment-forge-version legitimately
+#              publishes ~14 triples, none of them taxonomy).
+DATA_IRI_ROOT="https://packagegraph.github.io/d/"
+MIN_DATA_TRIPLES="${PG_UPLOAD_MIN_TRIPLES:-1}"
+case "$MIN_DATA_TRIPLES" in
+    ''|*[!0-9]*)
+        echo "Error: PG_UPLOAD_MIN_TRIPLES must be a non-negative integer, got: $MIN_DATA_TRIPLES" >&2
+        exit 1
+        ;;
+esac
+
+# grep exits 1 when it selects nothing and >1 on a real error. Both leave the
+# capture empty, which floors the count at 0 and refuses: this fails closed.
+DATA_TRIPLE_COUNT=$(grep -cv \
+    -e '^[[:space:]]*$' \
+    -e '^[[:space:]]*#' \
+    -e "^<${DATA_IRI_ROOT}snapshot/collector/" \
+    -e "^<${DATA_IRI_ROOT}distro/" \
+    -e "^<${DATA_IRI_ROOT}release/" \
+    -e "^<${DATA_IRI_ROOT}arch/" \
+    "$LOCAL_FILE" || true)
+DATA_TRIPLE_COUNT="${DATA_TRIPLE_COUNT:-0}"
+
+if [ "$DATA_TRIPLE_COUNT" -lt "$MIN_DATA_TRIPLES" ]; then
+    if [ -n "${PG_UPLOAD_ALLOW_EMPTY:-}" ]; then
+        echo "Warning: $LOCAL_FILE has $DATA_TRIPLE_COUNT data triples (minimum" \
+             "$MIN_DATA_TRIPLES); publishing anyway because PG_UPLOAD_ALLOW_EMPTY is set" >&2
+    else
+        echo "Error: refusing to publish $GRAPH_URI -- $LOCAL_FILE has" \
+             "$DATA_TRIPLE_COUNT data triples, below the minimum of $MIN_DATA_TRIPLES." >&2
+        echo "  An upload replaces the entire named graph, so publishing this would" \
+             "erase the existing contents of that graph." >&2
+        echo "  If this collector is genuinely expected to produce nothing, set" \
+             "PG_UPLOAD_ALLOW_EMPTY=1 to declare that explicitly." >&2
+        exit 1
+    fi
+fi
+echo "Data triples: $DATA_TRIPLE_COUNT (minimum $MIN_DATA_TRIPLES)"
+
 # Escape a value for use inside an N-Triples STRING_LITERAL_QUOTE ("...").
 # Backslash must be escaped first -- escaping it after the other characters
 # would double-escape the backslashes those substitutions just introduced.
