@@ -86,7 +86,7 @@ podman run --rm --pull=never --network=none --entrypoint pg-collect "$ETL_IMAGE"
 
 The staged templates pin `Image=` to that digest and remove `AutoUpdate=`.
 Both templates and all ten RPM wrappers are included. Do not subsequently run
-the generic unpinned template install command from the README over these files.
+the generic template install command from the README over these files.
 Future collector upgrades use another coordinated release, not image-only
 auto-update. Other applications' auto-update settings are unchanged.
 

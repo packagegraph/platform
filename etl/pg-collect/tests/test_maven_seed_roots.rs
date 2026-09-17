@@ -71,29 +71,58 @@ fn seed_file_has_no_silently_dropped_lines() {
     );
 }
 
-/// The general Maven ecosystem view resolves each root to its newest release
-/// and then walks that release's declared dependencies. A pinned root skips
-/// version resolution entirely (see `MavenSeed::parse`), which would freeze
-/// that coordinate at whatever version was written down and, for
-/// vendor-suffixed builds such as `...redhat-00001`, 404 outright -- those are
-/// published to vendor repositories, never to Maven Central.
+/// Roots must be pinned. An unpinned root resolves through
+/// `maven-metadata.xml`, and `parse_metadata_version` prefers `<release>` then
+/// `<latest>` -- both of which Central reports as a pre-release milestone for
+/// some artifacts. Every `org.springframework.boot:*` root resolved to
+/// `4.2.0-M1` on 2026-09-17 and was published as though it were shipped
+/// software, with a clean 200 and nothing to flag it. Pinning skips resolution
+/// and removes that class of error.
+///
+/// Vendor-suffixed pins (`...redhat-00001`) must be stripped to their upstream
+/// base version in the seed list; see the seeds README.
 #[test]
-fn seed_roots_are_all_unpinned() {
+fn seed_roots_are_all_pinned() {
     let Some(path) = seed_path() else { return };
     let seeds = read_maven_seed_file(&path).expect("seed file should be readable");
 
-    let pinned: Vec<String> = seeds
+    let unpinned: Vec<String> = seeds
         .iter()
-        .filter(|s| s.version.is_some())
-        .map(|s| format!("{}:{}:{}", s.group_id, s.artifact_id, s.version.as_ref().unwrap()))
+        .filter(|s| s.version.is_none())
+        .map(|s| format!("{}:{}", s.group_id, s.artifact_id))
         .collect();
 
     assert!(
-        pinned.is_empty(),
-        "seed roots must be unpinned `groupId:artifactId` so each run resolves \
-         the newest release; found {} pinned: {:?}",
-        pinned.len(),
-        pinned
+        unpinned.is_empty(),
+        "seed roots must be pinned `groupId:artifactId:version` so a run \
+         collects shipped versions rather than whatever Central resolves to; \
+         found {} unpinned: {:?}",
+        unpinned.len(),
+        unpinned
+    );
+}
+
+/// A vendor-suffixed pin in the seed list is a packaging error: the string
+/// itself is not published to Central. The collector has a fallback, but the
+/// list should not rely on it.
+#[test]
+fn seed_roots_carry_no_vendor_suffix() {
+    let Some(path) = seed_path() else { return };
+    let seeds = read_maven_seed_file(&path).expect("seed file should be readable");
+
+    let suffixed: Vec<String> = seeds
+        .iter()
+        .filter_map(|s| s.version.as_ref().map(|v| (s, v)))
+        .filter(|(_, v)| v.contains("redhat-"))
+        .map(|(s, v)| format!("{}:{}:{}", s.group_id, s.artifact_id, v))
+        .collect();
+
+    assert!(
+        suffixed.is_empty(),
+        "seed versions must be upstream base versions, not vendor builds; \
+         found {}: {:?}",
+        suffixed.len(),
+        suffixed
     );
 }
 

@@ -8,14 +8,26 @@ set -eu
 GRAPH_URI="https://packagegraph.github.io/graph/maven"
 
 # Curated root coordinates, bind-mounted from the host at /seeds by
-# pg-collect@.container. pg-collect resolves each to its newest release and
-# walks that release's declared dependencies outward.
+# pg-collect@.container. Roots are PINNED (`groupId:artifactId:version`), so
+# pg-collect skips version resolution and walks each pinned release's declared
+# dependencies outward.
+#
+# Pinning is deliberate. An unpinned root resolves via maven-metadata.xml, and
+# parse_metadata_version prefers <release> then <latest> -- both of which
+# Central reports as a pre-release milestone for some artifacts. Every
+# org.springframework.boot:* root resolved to 4.2.0-M1 on 2026-09-17 and was
+# published as shipped software with a clean 200. Pinning removes that.
 #
 # The list is host-installed and deliberately not in this repository: it is a
 # curated set drawn from a private source, and the set itself is the sensitive
 # part. It is also a genuine runtime input -- changing which roots we explore
 # should be a file sync, not an image rebuild plus a coordinated cutover.
 # See deploy/quadlet/collectors/seeds/README.md for the format.
+#
+# Vendor-suffixed versions (`...redhat-00001`) must be stripped to their
+# upstream base version in the list itself; those strings publish to vendor
+# repositories, never to Central. The list is sanitized before install;
+# seed_roots_carry_no_vendor_suffix checks it.
 #
 # This replaced `--endpoint "$FUSEKI_ENDPOINT"` (SPARQL auto-discovery).
 # Discovery seeded from every package in the graph with
@@ -58,7 +70,13 @@ else
 fi
 
 set +e
-pg-collect maven --packages-file "${SEED_FILE}" --cache-dir "${CACHE_DIR}" -o /tmp/maven.nt
+# Full-depth traversal. The depth-3 default cut 160 edges on 2026-09-17;
+# --max-depth 64 is effectively unbounded (no real Maven graph nests that
+# deep) while still terminating on a pathological cycle. max-packages is
+# raised in step: it is a runaway backstop, not a coverage knob, and at the
+# old 5000 a fuller closure would silently truncate into Skipped (limit).
+pg-collect maven --packages-file "${SEED_FILE}" --cache-dir "${CACHE_DIR}" \
+  --max-depth 64 --max-packages 250000 -o /tmp/maven.nt
 COLLECT_EXIT=$?
 set -e
 

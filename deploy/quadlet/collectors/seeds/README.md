@@ -8,12 +8,28 @@ Currently one consumer: `maven.sh` reads `/seeds/maven-roots.txt`.
 
 ## Format
 
-One `groupId:artifactId` per line. Blank lines and `#` comments are ignored.
+One `groupId:artifactId:version` per line, sorted. Blank lines and `#`
+comments are ignored.
 
-Roots must be **unpinned**. A `groupId:artifactId:version` line skips version
-resolution entirely, which freezes that coordinate at whatever was written down
-and, for vendor-suffixed builds (`…redhat-00001` and similar), 404s outright —
-those publish to vendor repositories, never to Maven Central.
+Roots must be **pinned**. A pinned line skips version resolution entirely,
+which is the point: unpinned roots resolve through `maven-metadata.xml`, and
+`parse_metadata_version` prefers `<release>` then `<latest>`. For some roots
+Central reports a *pre-release milestone* in both fields — every
+`org.springframework.boot:*` root resolved to `4.2.0-M1` on 2026-09-17, was
+fetched with a clean 200, and was published as though it were shipped
+software. Nothing in the pipeline flags that. Pinning removes the whole class
+of error, and a seed list of shipped versions is what makes the graph describe
+software that exists rather than whatever Central resolves to this week.
+
+This reverses the previous rule. That rule existed because pinning
+`…redhat-00001`-style vendor-suffixed strings 404s — those publish to vendor
+repositories, never to Central. Strip any `.redhat-NNNNN` / `-redhat-NNNNN`
+suffix to its upstream base version, which does publish to Central, and the
+objection goes away. The list must therefore be
+sanitized before install; `seed_roots_carry_no_vendor_suffix` in
+`tests/test_maven_seed_roots.rs` checks it.
+
+Verify every coordinate resolves before installing a list — see below.
 
 ## Failure modes worth knowing
 
