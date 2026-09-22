@@ -23,7 +23,7 @@ Copied verbatim from the spec. Every task's requirements implicitly include thes
 - **Container base must be fully-qualified and pinned**, with `--no-install-recommends` plus apt-list cleanup and a non-root final `USER` (spec §3, repo convention).
 - **Never send `access-token` on a `public` target** (spec §5.4).
 - **QLever server flags in production** are `-j 4 -m 4G -c 1G -e 500M -k 200 -s 300s`; container limits `Memory=6g`, `--cpus=4`. Default `timeout_s` is 300 to match `-s 300s`.
-- **Public endpoint:** `https://packagegraph.di.riseproject.dev`, overridable via `PGPERF_PUBLIC_URL`. SSH host overridable via `PGPERF_SSH_HOST`, default `root@51.159.171.16`.
+- **Public endpoint:** `https://packagegraph.di.riseproject.dev`, overridable via `PGPERF_PUBLIC_URL`. SSH host overridable via `PGPERF_SSH_HOST`, default `root@${PGRAPH_HOST}`.
 - **The profiler is strictly serial.** One request in flight, always. Concurrency is Plan B's successor spec, not this one.
 - **`sync` must precede `drop_caches`** (spec §6). `drop_caches` frees only clean pages.
 - **Cache clearing granularity is per individual query sample**, not per pass (spec §6): `for query: for repetition: clear; execute`.
@@ -1401,7 +1401,7 @@ One multiplexed connection, shared by cache control here and by Plan B's telemet
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
-  - `SSH_HOST_ENV = "PGPERF_SSH_HOST"`, `DEFAULT_SSH_HOST = "root@51.159.171.16"`
+  - `SSH_HOST_ENV = "PGPERF_SSH_HOST"`, `DEFAULT_SSH_HOST = None  # no baked-in host; read from PGPERF_SSH_HOST or PGRAPH_HOST`
   - `class SshError(Exception)`
   - `class Ssh(host=None, control_path=None, runner=None)` — context manager. `runner(argv, timeout)` returns `(returncode, stdout, stderr)`; defaults to `subprocess`.
   - `Ssh.run(command: str, timeout: int = 30, check: bool = True) -> str` — stdout, stripped. Raises `SshError` when `check` and returncode is non-zero.
@@ -1536,7 +1536,7 @@ import os
 import subprocess
 
 SSH_HOST_ENV = "PGPERF_SSH_HOST"
-DEFAULT_SSH_HOST = "root@51.159.171.16"
+DEFAULT_SSH_HOST = None  # no baked-in host; read from PGPERF_SSH_HOST or PGRAPH_HOST
 
 DEFAULT_CONTROL_PATH = "/tmp/pgperf-ssh-%C"
 CONTROL_PERSIST = "120"
@@ -2752,8 +2752,8 @@ Stdlib-only Python 3.12. No dependency install, no virtualenv, no pytest.
 Needs an SSH tunnel to the server and the index's content hash, which pins
 the fingerprints to the index they were measured against:
 
-    ssh -N -L 7001:127.0.0.1:7001 root@51.159.171.16 &
-    INDEX_HASH=$(ssh root@51.159.171.16 cat /var/lib/packagegraph/qlever-data/index/.loaded)
+    ssh -N -L 7001:127.0.0.1:7001 root@${PGRAPH_HOST} &
+    INDEX_HASH=$(ssh root@${PGRAPH_HOST} cat /var/lib/packagegraph/qlever-data/index/.loaded)
     python3 -m pgperf manifest --index-hash "$INDEX_HASH"
 
 Writes `perf/corpus/cq/*.rq` and `perf/corpus/manifest.json`, reporting which
@@ -2806,8 +2806,8 @@ git commit -m "feat(perf): add pgperf CLI, container image, and docs"
 This is the first step that needs the endpoint. Open the tunnel, read the index hash, generate:
 
 ```bash
-ssh -f -N -L 7001:127.0.0.1:7001 root@51.159.171.16
-INDEX_HASH=$(ssh root@51.159.171.16 cat /var/lib/packagegraph/qlever-data/index/.loaded)
+ssh -f -N -L 7001:127.0.0.1:7001 root@${PGRAPH_HOST}
+INDEX_HASH=$(ssh root@${PGRAPH_HOST} cat /var/lib/packagegraph/qlever-data/index/.loaded)
 echo "index: $INDEX_HASH"
 cd perf && python3 -m pgperf manifest --import-from ../spike/cq-queries.json \
     --out corpus --index-hash "$INDEX_HASH"
