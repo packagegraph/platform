@@ -38,7 +38,10 @@ jobs:
       - run: deploy/quadlet/collectors/scripts/test-wrapper-checkpoint-contract.sh
       - run: python3 -m unittest discover -s deploy/quadlet/collectors/tests -p test_checkpoint_release.py
       - name: Gate the QLever rebuild's graph identity comparison
-        run: python3 -m unittest discover -s deploy/quadlet/tests -p 'test_*.py'
+        # Invoked directly, not via `unittest discover`: discover exits 0 when
+        # it finds nothing, so a renamed or moved file would turn this step
+        # into a vacuous pass -- the exact failure mode tracked in #57.
+        run: python3 deploy/quadlet/tests/test_rebuild_index_gate.py -v
       - name: Verify exclusion with the image's pinned mc
         run: |
           set -euo pipefail
