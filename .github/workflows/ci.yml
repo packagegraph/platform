@@ -41,7 +41,10 @@ jobs:
       # upload replaces the whole named graph. This runs the real script to
       # prove it refuses a graph with no data rather than erasing the live one.
       - name: Upload floor must refuse an empty graph
-        run: python3 -m unittest discover -s deploy/quadlet/collectors/tests -p test_upload_floor.py
+        # Invoked directly rather than via `unittest discover`, which exits 0
+        # when it matches nothing -- a rename would leave this step green
+        # while testing nothing. Same reasoning as the step below.
+        run: python3 deploy/quadlet/collectors/tests/test_upload_floor.py -v
       - name: Gate the QLever rebuild's graph identity comparison
         # Invoked directly, not via `unittest discover`: discover exits 0 when
         # it finds nothing, so a renamed or moved file would turn this step
