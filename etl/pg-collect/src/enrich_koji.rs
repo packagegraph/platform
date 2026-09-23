@@ -613,10 +613,7 @@ impl KojiEnricher {
             (nvr, "unknown".to_string())
         };
 
-        let build_uri = format!(
-            "{DATA}build/{}/{}/{}/{}",
-            self.distro, self.release, name, version
-        );
+        let build_uri = build_uri(&self.distro, &self.release, name, &version);
         let sig_uri = format!("{build_uri}/sig");
 
         writer.write_triple(&build_uri, &format!("{ATT}hasSignature"), &sig_uri)?;
@@ -657,10 +654,7 @@ impl KojiEnricher {
             (nvr, "unknown".to_string())
         };
 
-        let build_uri = format!(
-            "{DATA}build/{}/{}/{}/{}",
-            self.distro, self.release, name, version
-        );
+        let build_uri = build_uri(&self.distro, &self.release, name, &version);
 
         // BuildActivity with pkg: namespace properties (per core.ttl)
         writer.write_triple(&build_uri, RDF_TYPE, &format!("{PKG}BuildActivity"))?;
@@ -2451,6 +2445,57 @@ mod tests {
             m.remove();
         }
         (std::fs::read_to_string(&out).unwrap(), cache.stats())
+    }
+
+    #[test]
+    fn a_caret_snapshot_version_still_emits_its_build_triples() {
+        // RPM's `^` post-release marker is excluded from the N-Triples IRIREF
+        // grammar, so an unencoded build URI made the writer drop every triple
+        // for the build -- 822 of them in one observed fedora-44 run. See #56.
+        let e = KojiEnricher::new_standalone("https://example.invalid/kojihub", "fedora", "44", None);
+        let mut writer = NTriplesWriter::new(Vec::new());
+        let data = serde_json::json!({
+            "owner_name": "someowner",
+            "start_time": "2026-01-01 00:00:00.000000",
+            "completion_time": "2026-01-01 00:10:00.000000",
+        });
+
+        let n = e
+            .emit_build_triples(&mut writer, "python-medimages4tests-0.5.7^20-1.fc44", &data)
+            .unwrap();
+
+        assert!(n > 0, "the build must emit triples");
+        assert_eq!(
+            writer.skipped_invalid_iri, 0,
+            "no triple may be dropped for an invalid IRI"
+        );
+        let text = writer.into_string().unwrap();
+        assert!(
+            text.contains("/d/build/fedora/44/python-medimages4tests/0.5.7%5E20-1.fc44"),
+            "got: {text}"
+        );
+        // Note: `^` is legal *inside* the output -- `^^` is the N-Triples
+        // datatype marker on the timestamp literals -- so check the IRIs only.
+        for iri in text.split('<').skip(1).filter_map(|t| t.split('>').next()) {
+            assert!(!iri.contains('^'), "raw caret in IRI <{iri}>");
+        }
+    }
+
+    #[test]
+    fn a_plus_in_a_name_keys_the_build_where_the_rest_of_the_graph_points() {
+        // `+` is legal in an IRI so it was never dropped -- it just put the
+        // BuildActivity in a namespace `d/ver` and `d/src` do not use. See #56.
+        let e = KojiEnricher::new_standalone("https://example.invalid/kojihub", "fedora", "44", None);
+        let mut writer = NTriplesWriter::new(Vec::new());
+        let data = serde_json::json!({ "owner_name": "someowner" });
+
+        e.emit_build_triples(&mut writer, "gtk+-1.2.10-93.fc44", &data)
+            .unwrap();
+
+        let text = writer.into_string().unwrap();
+        let expected = crate::uris::version_uri("fedora", "44", "gtk+", "1.2.10-93.fc44")
+            .replace("/d/ver/", "/d/build/");
+        assert!(text.contains(&expected), "got: {text}");
     }
 
     #[test]

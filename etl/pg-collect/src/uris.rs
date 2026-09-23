@@ -304,6 +304,13 @@ pub fn advisory_uri(advisory_id: &str) -> String {
 }
 
 /// Build a BuildActivity URI.
+///
+/// Every component is percent-encoded, matching `source_uri`/`version_uri`.
+/// That matters twice over: RPM's `^` snapshot marker is excluded from the
+/// N-Triples `IRIREF` grammar, so an unencoded version makes the writer drop
+/// the triple outright; and `+` is legal in an IRI but encoded by the other
+/// minters, so an unencoded one silently keys the build into a namespace
+/// `d/ver` and `d/src` do not point at. Mint through here, never by hand.
 pub fn build_uri(distro: &str, release: &str, name: &str, version: &str) -> String {
     format!(
         "{DATA}build/{}/{}/{}/{}",
@@ -676,6 +683,42 @@ mod tests {
         assert_eq!(
             uri,
             "https://packagegraph.github.io/d/ver/debian/trixie/libc6/2.36-1"
+        );
+    }
+
+    #[test]
+    fn test_build_uri() {
+        let uri = build_uri("fedora", "44", "glibc", "2.40-5.fc44");
+        assert_eq!(
+            uri,
+            "https://packagegraph.github.io/d/build/fedora/44/glibc/2.40-5.fc44"
+        );
+    }
+
+    #[test]
+    fn test_build_uri_encodes_rpm_snapshot_caret() {
+        // `^` is not in the N-Triples IRIREF grammar; unencoded it makes the
+        // writer drop the triple outright. See issue #56.
+        let uri = build_uri("fedora", "44", "python-medimages4tests", "0.5.7^20");
+        assert_eq!(
+            uri,
+            "https://packagegraph.github.io/d/build/fedora/44/python-medimages4tests/0.5.7%5E20"
+        );
+        assert!(!uri.contains('^'), "caret must not survive into the IRI");
+    }
+
+    #[test]
+    fn test_build_uri_agrees_with_version_uri_on_plus() {
+        // `+` is legal in an IRI, so it is never dropped -- it just silently
+        // keys builds into a namespace the rest of the graph does not use.
+        // Both minters must encode it identically. See issue #56.
+        let build = build_uri("fedora", "44", "gtk+", "1.2.10-93");
+        let version = version_uri("fedora", "44", "gtk+", "1.2.10-93");
+        assert!(build.ends_with("/gtk%2B/1.2.10-93"), "got: {build}");
+        assert_eq!(
+            build.strip_prefix("https://packagegraph.github.io/d/build/"),
+            version.strip_prefix("https://packagegraph.github.io/d/ver/"),
+            "build and version URIs must agree on every component"
         );
     }
 
