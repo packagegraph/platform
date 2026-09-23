@@ -96,7 +96,8 @@ if [[ -f "$MIRROR_DIR/shacl.ttl" ]] || [[ -f "$MIRROR_DIR/examples.ttl" ]]; then
     rm -f "$MIRROR_DIR/shacl.ttl" "$MIRROR_DIR/examples.ttl"
 fi
 
-# Verify exact allowlist (v0.14.0: 37 modules)
+# Verify exact allowlist (PURL contract revision: same 37 modules as v0.14.0).
+# The exact commit/tag is pinned in etl/ONTOLOGY_VERSION.
 EXPECTED_FILES="apk.ttl
 attestation.ttl
 bitbake.ttl

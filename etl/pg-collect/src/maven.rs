@@ -830,18 +830,21 @@ impl MavenCollector {
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 1;
 
-        let purl = format!("pkg:maven/{}/{}", pom.group_id, pom.artifact_id);
-        // xsd:anyURI, not a plain literal: pkg:purl is rdfs:range xsd:anyURI and
-        // PackageIdentityShape constrains it with sh:datatype xsd:anyURI. rpm.rs
-        // and debian.rs already emit it typed; these two Maven sites were the
-        // only ones emitting xsd:string.
+        let purl = crate::ntriples::format_purl("maven", Some(&pom.group_id), &pom.artifact_id, None, &[]);
         writer.write_typed_literal(
             &identity_uri,
             &format!("{PKG}purl"),
             &purl,
             &format!("{XSD}anyURI"),
         )?;
-        triples += 1;
+        let package_purl = crate::ntriples::format_purl("maven", Some(&pom.group_id), &pom.artifact_id, Some(&pom.version), &[]);
+        writer.write_typed_literal(
+            &pkg_uri,
+            &format!("{PKG}purl"),
+            &package_purl,
+            &format!("{XSD}anyURI"),
+        )?;
+        triples += 2;
 
         writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), &identity_name)?;
         triples += 1;
@@ -960,7 +963,7 @@ impl MavenCollector {
         // PackageIdentityShape's rdfs:label requirement.
         let identity_name = format!("{}:{}", resolved.group_id, resolved.artifact_id);
         triples += write_package_identity(writer, &target_uri, &identity_name)?;
-        let purl = format!("pkg:maven/{}/{}", resolved.group_id, resolved.artifact_id);
+        let purl = crate::ntriples::format_purl("maven", Some(&resolved.group_id), &resolved.artifact_id, None, &[]);
         writer.write_typed_literal(
             &target_uri,
             &format!("{PKG}purl"),
@@ -2236,6 +2239,60 @@ mod tests {
         assert_eq!(pom.dependencies[0].group_id, "junit");
         assert_eq!(pom.dependencies[0].scope.as_deref(), Some("test"));
         assert!(pom.dependencies[1].optional);
+    }
+
+    #[test]
+    fn maven_two_versions_share_one_identity_purl_and_keep_dependency_purls() {
+        use packageurl::PackageUrl;
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::str::FromStr;
+
+        let collector = MavenCollector::new(
+            "https://example.org/search".into(),
+            "https://example.org/repo".into(),
+        );
+        let temp = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp.reopen().unwrap());
+        let mut triples = 0;
+        for version in ["1.0+build", "2.0"] {
+            let xml = format!(
+                r#"<project><groupId>org.Example</groupId><artifactId>demo+lib</artifactId><version>{version}</version><dependencies><dependency><groupId>org.Other</groupId><artifactId>util+lib</artifactId><version>3.0</version></dependency></dependencies></project>"#
+            );
+            let pom = collector
+                .parse_pom(&xml, "org.Example", "demo+lib", version)
+                .unwrap();
+            triples += collector.emit_artifact_triples(&mut writer, &pom).unwrap();
+        }
+        writer.flush().unwrap();
+        let nt = std::fs::read_to_string(temp.path()).unwrap();
+        if let Some(dir) = std::env::var_os("PURL_FIXTURE_DIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                std::path::Path::new(&dir).join("maven-two-versions.nt"),
+                &nt,
+            )
+            .unwrap();
+        }
+        assert_eq!(nt.lines().count(), triples + writer.auto_inverses);
+        let mut actual = BTreeMap::<String, BTreeSet<String>>::new();
+        for line in nt.lines().filter(|line| line.contains("/core#purl>")) {
+            let subject = line.split_once(' ').unwrap().0;
+            let value = line.split('"').nth(1).unwrap();
+            assert!(line.ends_with("\"^^<http://www.w3.org/2001/XMLSchema#anyURI> ."));
+            let parsed = PackageUrl::from_str(value).unwrap();
+            assert_eq!(parsed.to_string(), value, "canonical encoding");
+            actual
+                .entry(subject.to_string())
+                .or_default()
+                .insert(value.to_string());
+        }
+        let expected = BTreeMap::from([
+            ("<https://packagegraph.github.io/d/pkg/maven/central/any/org.Example%2Fdemo%2Blib>", "pkg:maven/org.Example/demo%2Blib"),
+            ("<https://packagegraph.github.io/d/pkg/maven/central/any/org.Example%2Fdemo%2Blib/1.0%2Bbuild>", "pkg:maven/org.Example/demo%2Blib@1.0%2Bbuild"),
+            ("<https://packagegraph.github.io/d/pkg/maven/central/any/org.Example%2Fdemo%2Blib/2.0>", "pkg:maven/org.Example/demo%2Blib@2.0"),
+            ("<https://packagegraph.github.io/d/pkg/maven/central/any/org.Other%2Futil%2Blib>", "pkg:maven/org.Other/util%2Blib"),
+        ]).into_iter().map(|(subject, purl)| (subject.to_string(), BTreeSet::from([purl.to_string()]))).collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]
