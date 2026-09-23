@@ -78,8 +78,11 @@ jobs:
             exit 1
           fi
           echo "ontology ref: ${ref}"
-          git clone --depth 1 --branch "${ref}" \
-            https://github.com/packagegraph/ontology.git /tmp/ontology
+          # Fetch supports both release tags and immutable commit pins.
+          git init /tmp/ontology
+          git -C /tmp/ontology remote add origin https://github.com/packagegraph/ontology.git
+          git -C /tmp/ontology fetch --depth 1 origin "${ref}"
+          git -C /tmp/ontology checkout --detach FETCH_HEAD
           bash etl/scripts/sync-ontology.sh /tmp/ontology
 
       - uses: docker/setup-buildx-action@v3

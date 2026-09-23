@@ -4,7 +4,7 @@
 //! type assignments, property choices, and inverse edge policy lives here.
 
 use crate::ir::{MaintainerIr, PackageIr};
-use crate::ntriples::NTriplesWriter;
+use crate::ntriples::{format_purl, NTriplesWriter};
 use crate::uris::*;
 use std::io::Result;
 
@@ -30,9 +30,10 @@ impl Default for EmitPolicy {
 /// and `rdfs:label`.
 ///
 /// This is **not** a whole-node conformance guarantee.
-/// `pkg:PackageIdentityShape` also requires exactly one `pkg:purl`, which only
-/// the caller can supply — it needs the ecosystem, namespace and version — so
-/// a node built solely from this helper is still short of the shape. An
+/// PURL completeness is a collection-profile contract, not a requirement on
+/// every dependency or capability identity. Where supported, callers supply a
+/// canonical versionless `pkg:purl` from the ecosystem, namespace and name.
+/// Concrete versioned PURLs belong on the package, never this identity. An
 /// earlier version of this doc called the output "complete, ontology-
 /// conformant"; that was wrong, and independent review of PR #25 caught it.
 ///
@@ -125,6 +126,35 @@ pub fn emit_rdf(ir: &PackageIr, writer: &mut NTriplesWriter, policy: &EmitPolicy
     writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
     triples += 1;
 
+    // IR replay must use the same PURL placement as the direct collectors.
+    // Other IR ecosystems do not yet have a supported PURL mapping.
+    let purl_type = match scope.collector.as_str() {
+        "rpm" => Some("rpm"),
+        "debian" => Some("deb"),
+        _ => None,
+    };
+    if let Some(kind) = purl_type {
+        let identity_purl = format_purl(kind, Some(&scope.distro), &pkg.name, None, &[("arch", &pkg.arch)]);
+        writer.write_typed_literal(&identity_uri, &format!("{PKG}purl"), &identity_purl, &format!("{XSD}anyURI"))?;
+
+        let version = if kind == "rpm" {
+            match &pkg.release {
+                Some(release) => format!("{}-{release}", pkg.version),
+                None => pkg.version.clone(),
+            }
+        } else {
+            pkg.full_version.clone()
+        };
+        let epoch = pkg.epoch.to_string();
+        let mut qualifiers = vec![("arch", pkg.arch.as_str())];
+        if kind == "rpm" && pkg.epoch != 0 {
+            qualifiers.push(("epoch", epoch.as_str()));
+        }
+        let package_purl = format_purl(kind, Some(&scope.distro), &pkg.name, Some(&version), &qualifiers);
+        writer.write_typed_literal(&pkg_uri, &format!("{PKG}purl"), &package_purl, &format!("{XSD}anyURI"))?;
+        triples += 2;
+    }
+
     // === Package name ===
     writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), &pkg.name)?;
     triples += 1;
@@ -194,6 +224,31 @@ pub fn emit_rdf(ir: &PackageIr, writer: &mut NTriplesWriter, policy: &EmitPolicy
         writer.write_literal(&src_uri, &format!("{PKG}packageName"), &src.name)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}builtFromSource"), &src_uri)?;
         triples += 3;
+
+        // Only emit source coordinates actually present in the IR. The legacy
+        // URI fallback above is retained, but is not evidence of source version.
+        if let (Some(kind), Some(version)) = (purl_type, src.version.as_deref()) {
+            let (version, arch) = if kind == "rpm" {
+                let version = match &src.release {
+                    Some(release) => format!("{version}-{release}"),
+                    None => version.to_string(),
+                };
+                let nosrc = ir.collector_specific.as_ref()
+                    .and_then(|cs| cs.get("source_rpm"))
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|filename| filename.ends_with(".nosrc.rpm"));
+                if nosrc {
+                    (version.strip_suffix(".nosrc").unwrap_or(&version).to_string(), "nosrc")
+                } else {
+                    (version, "src")
+                }
+            } else {
+                (version.to_string(), "source")
+            };
+            let purl = format_purl(kind, Some(&scope.distro), &src.name, Some(&version), &[("arch", arch)]);
+            writer.write_typed_literal(&src_uri, &format!("{PKG}purl"), &purl, &format!("{XSD}anyURI"))?;
+            triples += 1;
+        }
     }
 
     // === Dependencies ===

@@ -975,26 +975,39 @@ impl RpmCollector {
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 1;
 
-        // PURL (Package URL)
-        let evr = if epoch != "0" {
-            format!("{}:{}-{}", epoch, ver, rel)
-        } else {
-            format!("{}-{}", ver, rel)
-        };
-        let purl = crate::ntriples::format_purl(
+        // The identity spans versions and epochs. Concrete RPMs retain their
+        // version-release and (nonzero) epoch using the RPM PURL qualifiers.
+        let identity_purl = crate::ntriples::format_purl(
             "rpm",
             Some(&self.distro_name),
             name,
-            Some(&evr),
+            None,
             &[("arch", arch)],
         );
         writer.write_typed_literal(
             &identity_uri,
             &format!("{PKG}purl"),
+            &identity_purl,
+            &format!("{XSD}anyURI"),
+        )?;
+        let mut qualifiers = vec![("arch", arch.as_str())];
+        if !epoch.is_empty() && epoch != "0" {
+            qualifiers.push(("epoch", epoch));
+        }
+        let purl = crate::ntriples::format_purl(
+            "rpm",
+            Some(&self.distro_name),
+            name,
+            Some(&format!("{ver}-{rel}")),
+            &qualifiers,
+        );
+        writer.write_typed_literal(
+            &pkg_uri,
+            &format!("{PKG}purl"),
             &purl,
             &format!("{XSD}anyURI"),
         )?;
-        triples += 1;
+        triples += 2;
 
         // Packaging repository (dist-git — derivable from distro + package name)
         let distgit_uri = fedora_distgit_uri(&self.distro_name, name);
@@ -1359,6 +1372,23 @@ impl RpmCollector {
         writer.write_triple(&src_uri, RDF_TYPE, &format!("{RPM}SourceRPM"))?;
         writer.write_literal(&src_uri, &format!("{PKG}packageName"), source_name)?;
 
+        // SOURCERPM supplies NVR, not the source epoch; do not copy the binary
+        // epoch into source coordinates. Keep legacy source URIs/version triples
+        // unchanged, including their historical `.nosrc` suffix.
+        let (purl_version, source_arch) = if sourcerpm.ends_with(".nosrc.rpm") {
+            (source_version.strip_suffix(".nosrc").unwrap_or(&source_version), "nosrc")
+        } else {
+            (source_version.as_str(), "src")
+        };
+        let purl = crate::ntriples::format_purl(
+            "rpm",
+            Some(&self.distro_name),
+            source_name,
+            Some(purl_version),
+            &[("arch", source_arch)],
+        );
+        writer.write_typed_literal(&src_uri, &format!("{PKG}purl"), &purl, &format!("{XSD}anyURI"))?;
+
         let src_ver_uri = version_uri(
             &self.distro_name,
             release_name,
@@ -1375,7 +1405,7 @@ impl RpmCollector {
 
         writer.write_triple(pkg_uri, &format!("{PKG}builtFromSource"), &src_uri)?;
 
-        Ok(7)
+        Ok(8)
     }
 
     fn emit_dependency_triples(

@@ -37,4 +37,5 @@ libc = "0.2"
 
 [dev-dependencies]
 mockito = "1.6"
+packageurl = "0.7.1"
 tempfile = "3.15"

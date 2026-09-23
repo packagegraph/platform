@@ -1589,6 +1589,7 @@ fn main() {
                 // Multi --rpm-repo mode: iterate ALL specs
                 let mut total_packages = 0;
                 let mut total_triples = 0;
+                let mut invalid_output = None;
 
                 for (idx, repo_spec) in rpm_repos.iter().enumerate() {
                     let parts: Vec<&str> = repo_spec.splitn(3, ':').collect();
@@ -1636,11 +1637,20 @@ fn main() {
                         }
                         Err(e) => {
                             eprintln!("Error collecting {}/{}: {}", rpm_distro, rpm_release, e);
+                            if e.kind() == std::io::ErrorKind::InvalidData {
+                                // A conflicting PURL leaves an incomplete artifact.
+                                // The wrapper must see failure and refuse its upload.
+                                invalid_output = Some(e);
+                                break;
+                            }
                             // Continue with other repos
                         }
                     }
                 }
-                Ok((total_packages, total_triples))
+                match invalid_output {
+                    Some(error) => Err(error),
+                    None => Ok((total_packages, total_triples)),
+                }
             } else {
                 eprintln!("Error: Either --repo or --rpm-repo must be specified");
                 std::process::exit(1);

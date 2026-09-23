@@ -713,21 +713,36 @@ impl DebianCollector {
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 1;
 
-        // PURL (Package URL)
+        // A shared identity has no version; the concrete binary keeps the full
+        // Debian version (including epoch, revision and binNMU suffix).
+        let purl_arch = pkg_data.get("Architecture").map(String::as_str).unwrap_or(arch_name);
+        let identity_purl = crate::ntriples::format_purl(
+            "deb",
+            Some(&self.distro_name),
+            pkg_name,
+            None,
+            &[("arch", purl_arch)],
+        );
+        writer.write_typed_literal(
+            &identity_uri,
+            &format!("{PKG}purl"),
+            &identity_purl,
+            &format!("{XSD}anyURI"),
+        )?;
         let purl = crate::ntriples::format_purl(
             "deb",
             Some(&self.distro_name),
             pkg_name,
             Some(pkg_version),
-            &[("arch", arch_name)],
+            &[("arch", purl_arch)],
         );
         writer.write_typed_literal(
-            &identity_uri,
+            &pkg_uri,
             &format!("{PKG}purl"),
             &purl,
             &format!("{XSD}anyURI"),
         )?;
-        triples += 1;
+        triples += 2;
 
         // Core properties
         writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), pkg_name)?;
@@ -905,6 +920,15 @@ impl DebianCollector {
         writer.write_triple(&src_uri, RDF_TYPE, &format!("{PKG}SourcePackage"))?;
         writer.write_literal(&src_uri, &format!("{PKG}packageName"), &source_name)?;
 
+        let purl = crate::ntriples::format_purl(
+            "deb",
+            Some(&self.distro_name),
+            &source_name,
+            Some(&source_version),
+            &[("arch", "source")],
+        );
+        writer.write_typed_literal(&src_uri, &format!("{PKG}purl"), &purl, &format!("{XSD}anyURI"))?;
+
         // Version resource for source
         let src_ver_uri = version_uri(&self.distro_name, codename, &source_name, &source_version);
         writer.write_triple(&src_ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
@@ -918,7 +942,7 @@ impl DebianCollector {
         // Link binary to source
         writer.write_triple(pkg_uri, &format!("{PKG}builtFromSource"), &src_uri)?;
 
-        Ok(6)
+        Ok(7)
     }
 
     fn emit_dependency_triples(

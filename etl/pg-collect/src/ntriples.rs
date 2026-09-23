@@ -50,6 +50,10 @@ pub struct NTriplesWriter<W: Write = File> {
     /// object) so byte-identical duplicates are written only once per output file.
     /// Only low-cardinality definition triples are routed here, so this stays small.
     def_seen: std::collections::HashSet<String>,
+    /// One canonical PURL per RDF subject in this output artifact. SHA-256
+    /// digests avoid retaining every long subject and PURL string in memory.
+    /// Raw-line replay and separate writers require complete-graph validation.
+    purl_seen: std::collections::HashMap<[u8; 32], [u8; 32]>,
     /// Pre-formatted line suffix: " ." for N-Triples, " <graph_uri> ." for N-Quads.
     line_suffix: String,
 }
@@ -76,6 +80,7 @@ impl<W: Write> NTriplesWriter<W> {
             skipped_invalid_iri: 0,
             auto_inverses: 0,
             def_seen: std::collections::HashSet::new(),
+            purl_seen: std::collections::HashMap::new(),
             line_suffix: " .".to_string(),
         }
     }
@@ -186,6 +191,21 @@ impl<W: Write> NTriplesWriter<W> {
         value: &str,
         datatype: &str,
     ) -> Result<()> {
+        if predicate.strip_prefix(PKG) == Some("purl") {
+            use sha2::{Digest, Sha256};
+            let subject_hash: [u8; 32] = Sha256::digest(subject.as_bytes()).into();
+            let value_hash: [u8; 32] = Sha256::digest(value.as_bytes()).into();
+            if let Some(previous) = self.purl_seen.get(&subject_hash) {
+                if previous != &value_hash {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("conflicting PURLs for <{subject}>; refusing ambiguous package coordinates ({value})"),
+                    ));
+                }
+            } else {
+                self.purl_seen.insert(subject_hash, value_hash);
+            }
+        }
         let escaped = escape_literal(value);
         writeln!(
             self.writer,
@@ -307,6 +327,7 @@ impl NTriplesWriter<File> {
             skipped_invalid_iri: 0,
             auto_inverses: 0,
             def_seen: std::collections::HashSet::new(),
+            purl_seen: std::collections::HashMap::new(),
             line_suffix: format!(" <{}> .", graph_uri),
         }
     }
@@ -372,12 +393,12 @@ pub(crate) fn escape_literal(s: &str) -> String {
 }
 
 /// Percent-encode a PURL component per purl-spec rules.
-/// Encodes everything except unreserved characters: `[-._~a-zA-Z0-9]`
+/// Encodes everything except unreserved characters and `:` (PURL canonical form).
 fn purl_encode(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for byte in s.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' => {
                 result.push(byte as char);
             }
             _ => {
@@ -390,8 +411,10 @@ fn purl_encode(s: &str) -> String {
 
 /// Format a Package URL (PURL) string according to the purl-spec.
 ///
-/// Percent-encodes name, version, namespace, and qualifier values per spec.
-/// Qualifiers are sorted by key for canonical output.
+/// Accepts decoded components; percent-encodes name, version, namespace segments,
+/// and qualifier values. Type and qualifier keys are lowercase, qualifiers are
+/// sorted, and RPM/Debian vendor namespaces (and Debian names) are lowercase.
+/// Callers supply valid, nonempty names and unique, valid qualifier keys.
 ///
 /// See: https://github.com/package-url/purl-spec
 ///
@@ -404,20 +427,27 @@ pub fn format_purl(
     version: Option<&str>,
     qualifiers: &[(&str, &str)],
 ) -> String {
+    let purl_type = purl_type.to_ascii_lowercase();
     let mut purl = format!("pkg:{}", purl_type);
     if let Some(ns) = namespace {
+        let ns = if matches!(purl_type.as_str(), "rpm" | "deb") {
+            ns.to_ascii_lowercase()
+        } else {
+            ns.to_string()
+        };
         purl.push('/');
-        purl.push_str(&purl_encode(ns));
+        purl.push_str(&ns.split('/').map(purl_encode).collect::<Vec<_>>().join("/"));
     }
     purl.push('/');
-    purl.push_str(&purl_encode(name));
+    let name = if purl_type == "deb" { name.to_ascii_lowercase() } else { name.to_string() };
+    purl.push_str(&purl_encode(&name));
     if let Some(ver) = version {
         purl.push('@');
         purl.push_str(&purl_encode(ver));
     }
     if !qualifiers.is_empty() {
-        let mut sorted: Vec<_> = qualifiers.to_vec();
-        sorted.sort_by_key(|(k, _)| *k);
+        let mut sorted: Vec<_> = qualifiers.iter().map(|(k, v)| (k.to_ascii_lowercase(), *v)).collect();
+        sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
         purl.push('?');
         for (i, (k, v)) in sorted.iter().enumerate() {
             if i > 0 {

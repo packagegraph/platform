@@ -1,11 +1,11 @@
-# Tag of github.com/packagegraph/ontology that the ETL image is built
+# Commit/tag of github.com/packagegraph/ontology that the ETL image is built
 # against. Single source of truth: read by the build-etl validation job in
 # .github/workflows/ci.yml and by .github/workflows/images.yml for every
 # published image, so a release ships whatever this file said at that commit.
 #
 # Coupled to etl/scripts/sync-ontology.sh, which verifies an exact module
-# allowlist for this version ("v0.14.0: 37 modules"). Bump both in the same
-# commit or the sync step fails the allowlist check.
+# allowlist for this revision (37 modules, unchanged from v0.14.0).
+# Update the allowlist when a revision changes the deployed module set.
 #
 # Comments and blank lines are ignored; the first bare value wins.
-v0.14.0
+5840cf33ada5bdf814b1dd6c811692cc3e30189e

@@ -137,7 +137,6 @@ mod tests {
         ("https://purl.org/packagegraph/ontology/core#releaseOrigin", "property"),
         ("https://purl.org/packagegraph/ontology/core#releaseSuite", "property"),
         ("https://purl.org/packagegraph/ontology/core#repository", "property"),
-        ("https://purl.org/packagegraph/ontology/core#upstreamPackageVersion", "property"),
         // declared as deb:/rpm:versionConstraint (domain deb:Dependency);
         // emitted generically by emit/rdf.rs for every ecosystem
         ("https://purl.org/packagegraph/ontology/core#versionConstraint", "property"),
