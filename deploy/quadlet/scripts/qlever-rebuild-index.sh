@@ -375,9 +375,14 @@ if [ "$PREV_STATUS" = "success" ] && [ "$PREV_TRIPLES" -gt 0 ]; then
     exit 1
   fi
 
-  # Graph identity gate — every previously-present graph must still exist
-  PREV_GRAPHS=$(echo "$PREV_RUN" | jq -r '.graphs[]? // empty' 2>/dev/null | sort)
-  CURR_GRAPHS=$(sort /tmp/graph-uris.txt)
+  # Graph identity gate — every previously-present graph must still exist.
+  # `comm` is a line-by-line multiset merge, not a set-membership test: a
+  # duplicate entry in last-success.json's graphs[] with no matching
+  # duplicate in the current run's list produces a spurious "missing"
+  # report on the extra copy even though the graph is genuinely present.
+  # `sort -u` on both sides makes this a true set comparison.
+  PREV_GRAPHS=$(echo "$PREV_RUN" | jq -r '.graphs[]? // empty' 2>/dev/null | sort -u)
+  CURR_GRAPHS=$(sort -u /tmp/graph-uris.txt)
   MISSING=$(comm -23 <(echo "$PREV_GRAPHS") <(echo "$CURR_GRAPHS"))
   if [ -n "$MISSING" ]; then
     echo "ERROR: graphs present in previous successful run are missing:"
@@ -422,7 +427,12 @@ echo "${CONTENT_HASH}" | mc pipe "pgraph/${MINIO_BUCKET}/qlever-index/latest"
 
 echo "✓ Index ${CONTENT_HASH} promoted to latest"
 STATUS="success"
-GRAPHS_JSON=$(jq -R -s 'split("\n") | map(select(length > 0))' /tmp/graph-uris.txt)
+# Multiple physical files can legitimately share one graph URI (e.g.
+# multi-arch parts fanning into a single named graph), so graph-uris.txt
+# can contain duplicate lines by design -- dedup here so last-success.json
+# stores a true set, not a multiset (a multiset baseline breaks the graph
+# identity gate's `comm -23` set comparison on the next run).
+GRAPHS_JSON=$(sort -u /tmp/graph-uris.txt | jq -R -s 'split("\n") | map(select(length > 0))')
 if ! echo "{\"status\":\"success\",\"timestamp\":\"$(date -Iseconds)\",\"content_hash\":\"$CONTENT_HASH\",\"triple_count\":$TRIPLE_COUNT,\"index_size\":\"$INDEX_SIZE\",\"graphs\":$GRAPHS_JSON}" | \
   mc pipe "pgraph/${MINIO_BUCKET}/qlever-index/last-success.json"; then
   echo "ERROR: failed to persist last-success.json — next rebuild may use stale baseline"

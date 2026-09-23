@@ -42,6 +42,11 @@ jobs:
       # prove it refuses a graph with no data rather than erasing the live one.
       - name: Upload floor must refuse an empty graph
         run: python3 -m unittest discover -s deploy/quadlet/collectors/tests -p test_upload_floor.py
+      - name: Gate the QLever rebuild's graph identity comparison
+        # Invoked directly, not via `unittest discover`: discover exits 0 when
+        # it finds nothing, so a renamed or moved file would turn this step
+        # into a vacuous pass -- the exact failure mode tracked in #57.
+        run: python3 deploy/quadlet/tests/test_rebuild_index_gate.py -v
       - name: Verify exclusion with the image's pinned mc
         run: |
           set -euo pipefail
