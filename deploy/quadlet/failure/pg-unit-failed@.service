@@ -1,0 +1,34 @@
+# Records that a unit failed, somewhere a human will find it.
+#
+# Three enrichers had been failing since 2026-09-14 and one collector since
+# 2026-09-12 with nothing reporting it: `systemctl --failed` knew, and
+# nobody was reading `systemctl --failed`. The units were not silent --
+# they failed loudly, into a journal no one tails (#59).
+#
+# Deliberately local. This writes a file on the host and a journal line; it
+# sends nothing anywhere and needs no credentials, so it cannot itself
+# become a thing that breaks, leaks, or has to be rotated. It closes the
+# "nobody is listening" gap by giving the listening a fixed address:
+# /var/lib/packagegraph/failed-units/.
+#
+# Wired in from the [Unit] section of the collector and enricher templates
+# as OnFailure=pg-unit-failed@%n.service. %n expands to the full unit name
+# including its .service suffix -- systemd splits an instance name at the
+# FIRST '@' and the LAST '.', so pg-enrich@security.service arrives intact
+# as %i. This is the same shape as the widely-used unit-status-mail@%n
+# recipe.
+#
+# Not a quadlet unit: it runs a host script, not a container, and it must
+# keep working when podman is the thing that is broken.
+
+[Unit]
+Description=Record the failure of %i
+# Without this, a failure of the notifier would trigger the notifier.
+OnFailure=
+
+[Service]
+Type=oneshot
+ExecStart=/etc/containers/systemd/scripts/unit-failed.sh %i
+# The notifier is best-effort by construction: a host where it cannot
+# write must not also lose the original unit's failure to a second one.
+SuccessExitStatus=0 1

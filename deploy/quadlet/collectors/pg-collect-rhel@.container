@@ -20,6 +20,11 @@
 Description=PackageGraph collector: %i
 After=network-online.target
 Wants=network-online.target
+# A failed run records itself under /var/lib/packagegraph/failed-units/
+# rather than only into a journal nobody tails. %n arrives at the notifier
+# as its instance name, suffix and all -- systemd splits at the first '@'
+# and the last '.', so "pg-enrich@security.service" survives intact (#59).
+OnFailure=pg-unit-failed@%n.service
 
 [Container]
 Image=ghcr.io/packagegraph/etl:devel-latest
