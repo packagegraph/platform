@@ -1229,7 +1229,12 @@ impl RpmCollector {
         deps: &[RpmDep],
     ) -> Result<(usize, bool)> {
         let mut triples = 0;
-        let mut emitted_ecosystem = false;
+        // One entry per DISTINCT ecosystem. This was a single bool latched on
+        // the first capability, so a package providing python3dist(foo) and
+        // crate(bar) recorded pypi once and then filed "bar" -- a crate --
+        // under it, because the upstreamPackageName write below is per
+        // capability (#46).
+        let mut emitted_ecosystems: HashSet<&str> = HashSet::new();
 
         let provides: Vec<&RpmDep> = deps.iter().filter(|d| d.dep_type == "provides").collect();
 
@@ -1294,12 +1299,12 @@ impl RpmCollector {
                 continue;
             };
 
-            // Emit ecosystem entity and upstream name (once per ecosystem per package)
-            if !emitted_ecosystem {
+            // Once per ecosystem per package, which is what the comment
+            // here always claimed.
+            if emitted_ecosystems.insert(ecosystem) {
                 let eco_uri = ecosystem_uri(ecosystem);
                 writer.write_triple(pkg_uri, &format!("{PKG}upstreamEcosystem"), &eco_uri)?;
                 writer.write_triple(&eco_uri, RDF_TYPE, &format!("{PKG}Ecosystem"))?;
-                emitted_ecosystem = true;
                 triples += 2;
             }
             writer.write_literal(
@@ -1316,7 +1321,7 @@ impl RpmCollector {
             }
         }
 
-        Ok((triples, emitted_ecosystem))
+        Ok((triples, !emitted_ecosystems.is_empty()))
     }
 
     fn emit_maintainer_triples(
@@ -2006,17 +2011,16 @@ mod collect_stream_tests {
         )
     }
 
-    /// Like `pkg`, but the package also carries a language-ecosystem
-    /// capability, which is what Fedora packaging guidelines require and what
-    /// `emit_ecosystem_triples` reads the upstream name out of.
-    fn pkg_providing(name: &str, srpm: &str, capability: &str) -> String {
-        pkg(name, "x86_64", "1.0", srpm).replace(
-            "</rpm:provides>",
-            &format!(
-                "  <rpm:entry name=\"{capability}\" flags=\"EQ\" epoch=\"0\" ver=\"1.0\"/>\n\
-                 </rpm:provides>"
-            ),
-        )
+    /// Like `pkg`, but the package also carries language-ecosystem
+    /// capabilities, which is what Fedora packaging guidelines require and
+    /// what `emit_ecosystem_triples` reads the upstream name out of.
+    fn pkg_providing(name: &str, srpm: &str, capabilities: &[&str]) -> String {
+        let entries: String = capabilities
+            .iter()
+            .map(|c| format!("  <rpm:entry name=\"{c}\" flags=\"EQ\" epoch=\"0\" ver=\"1.0\"/>\n"))
+            .collect();
+        pkg(name, "x86_64", "1.0", srpm)
+            .replace("</rpm:provides>", &format!("{entries}</rpm:provides>"))
     }
 
     fn primary_gz(packages: &[String]) -> Vec<u8> {
@@ -2144,12 +2148,12 @@ mod collect_stream_tests {
             pkg_providing(
                 "rust-serde-devel",
                 "rust-serde-1.0-1.el9.src.rpm",
-                "crate(serde)",
+                &["crate(serde)"],
             ),
             pkg_providing(
                 "python3-requests",
                 "python-requests-2.31-1.el9.src.rpm",
-                "python3dist(requests)",
+                &["python3dist(requests)"],
             ),
             // Provides only its own name: nothing upstream is named, so the
             // spec heuristics are still the only evidence there is.
@@ -2178,6 +2182,37 @@ mod collect_stream_tests {
         // an empty set above would mean lost evidence rather than no evidence.
         assert!(body.contains("upstreamPackageName> \"serde\""), "{body}");
         assert!(body.contains("upstreamPackageName> \"requests\""));
+    }
+
+    #[test]
+    fn a_package_providing_two_ecosystems_records_both_of_them() {
+        // #46: a single latched bool emitted upstreamEcosystem once for the
+        // whole loop while upstreamPackageName was written per capability, so
+        // this package recorded pypi and then filed the crate name under it.
+        let h = serve(&[pkg_providing(
+            "mixed",
+            "mixed-1.0-1.el9.src.rpm",
+            &["python3dist(foo)", "crate(bar)"],
+        )]);
+        let mut sinks = Sinks::new();
+        let (_packages, body) = run(&h.url, &mut sinks, false, None);
+
+        for eco in ["pypi", "cargo"] {
+            assert!(
+                body.contains(&format!("upstreamEcosystem> <{}>", ecosystem_uri(eco))),
+                "no upstreamEcosystem for {eco}:\n{body}"
+            );
+        }
+        // Both names are still recorded; what changes is that the graph no
+        // longer claims the crate is a PyPI project.
+        assert!(body.contains("upstreamPackageName> \"foo\""), "{body}");
+        assert!(body.contains("upstreamPackageName> \"bar\""));
+        // Exactly one per distinct ecosystem -- not one per capability.
+        assert_eq!(
+            body.matches("upstreamEcosystem>").count(),
+            2,
+            "expected one upstreamEcosystem per distinct ecosystem:\n{body}"
+        );
     }
 
     #[test]
