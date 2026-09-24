@@ -334,6 +334,32 @@ impl SparqlClient {
             .collect())
     }
 
+    /// Packages of a type across every graph belonging to one distro.
+    ///
+    /// `query_packages_by_type_in_graph` needs an exact graph URI, so a
+    /// caller that knows the distro but not the release had no choice but
+    /// `query_packages_by_type` -- which spans the WHOLE corpus, every
+    /// distro in it. For the Koji enricher that meant asking Fedora's hub
+    /// about RHEL, AlmaLinux, Rocky and openSUSE builds, every one of which
+    /// is a guaranteed miss (#59).
+    pub fn query_packages_by_type_in_distro(
+        &self,
+        rdf_type: &str,
+        distro: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let bindings = self.query(&packages_by_type_in_distro_query(rdf_type, distro))?;
+        Ok(bindings
+            .into_iter()
+            .filter_map(|b| {
+                Some((
+                    b.get("pkg")?.clone(),
+                    b.get("name")?.clone(),
+                    b.get("version")?.clone(),
+                ))
+            })
+            .collect())
+    }
+
     /// Graph-scoped variant of query_packages_by_type.
     pub fn query_packages_by_type_in_graph(
         &self,
@@ -760,6 +786,26 @@ impl SparqlClient {
     }
 }
 
+/// The query behind `SparqlClient::query_packages_by_type_in_distro`.
+///
+/// The trailing slash on the prefix is load-bearing: without it `fedora`
+/// would also match a hypothetical `fedora-eln` graph.
+fn packages_by_type_in_distro_query(rdf_type: &str, distro: &str) -> String {
+    let prefix = format!("https://packagegraph.github.io/graph/{distro}/");
+    format!(
+        "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\n\
+         SELECT ?pkg ?name ?version WHERE {{\n\
+           GRAPH ?g {{\n\
+             ?pkg a <{rdf_type}> ;\n\
+                  pkg:packageName ?name ;\n\
+                  pkg:hasVersion ?v .\n\
+             ?v pkg:versionString ?version .\n\
+           }}\n\
+           FILTER(STRSTARTS(STR(?g), \"{prefix}\"))\n\
+         }}"
+    )
+}
+
 /// The query behind `SparqlClient::query_package_names_by_type`.
 fn package_names_by_type_query(rdf_type: &str) -> String {
     format!(
@@ -1147,6 +1193,21 @@ mod tests {
         assert!(q.contains("OPTIONAL")); // epoch is optional, defaults 0
         assert!(q.contains("COALESCE(?ep, 0) AS ?epoch")); // epoch-0 packages default 0
         assert!(q.contains("GRAPH <https://packagegraph.github.io/graph/rhel/9>"));
+    }
+
+    /// A distro without a release means every release of THAT distro. The
+    /// Koji enricher used to fall back to a corpus-wide query here and hand
+    /// RHEL, AlmaLinux and Rocky NVRs to Fedora's hub (#59).
+    #[test]
+    fn the_distro_scoped_query_matches_only_that_distros_graphs() {
+        let q = super::packages_by_type_in_distro_query(
+            "https://purl.org/packagegraph/ontology/rpm#BinaryRPM",
+            "fedora",
+        );
+        assert!(q.contains(
+            r#"FILTER(STRSTARTS(STR(?g), "https://packagegraph.github.io/graph/fedora/"))"#
+        ));
+        assert!(q.contains("GRAPH ?g"));
     }
 
     #[test]
