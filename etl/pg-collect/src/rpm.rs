@@ -315,6 +315,10 @@ impl RpmCollector {
         srpm_identity_map: &mut HashMap<String, Vec<String>>,
         is_secondary: bool,
     ) -> Result<(usize, usize)> {
+        // Nothing downstream of an RPM-only run consumes the Provides-derived
+        // ecosystem set; only the full pipeline, which runs the spec collector
+        // after this, has a reader for it.
+        let mut ecosystem_from_provides = HashSet::new();
         self.collect_with_writer_limit(
             writer,
             noarch_seen,
@@ -322,12 +326,22 @@ impl RpmCollector {
             srpm_nvrs,
             srpm_names,
             srpm_identity_map,
+            &mut ecosystem_from_provides,
             is_secondary,
             None,
         )
     }
 
-    /// Like collect_with_writer but with an optional package limit for testing.
+    /// Like collect_with_writer but with an optional package limit for testing,
+    /// and reporting which source packages had their upstream ecosystem named
+    /// by a `Provides:` capability.
+    ///
+    /// `ecosystem_from_provides` collects those source (SRPM) names. The spec
+    /// collector takes it as the set it must not re-derive: a capability says
+    /// `crate(serde)` outright, while the spec heuristics can only
+    /// domain-match a URL or prefix-match a name. Both describe the same
+    /// package -- this path on the version node, the spec path on each of its
+    /// PackageIdentity nodes -- and nothing in the graph ranks them (#43).
     pub fn collect_with_writer_limit(
         &self,
         writer: &mut NTriplesWriter,
@@ -336,6 +350,7 @@ impl RpmCollector {
         srpm_nvrs: &mut HashSet<String>,
         srpm_names: &mut HashSet<String>,
         srpm_identity_map: &mut HashMap<String, Vec<String>>,
+        ecosystem_from_provides: &mut HashSet<String>,
         is_secondary: bool,
         limit: Option<usize>,
     ) -> Result<(usize, usize)> {
@@ -440,6 +455,7 @@ impl RpmCollector {
             }
 
             // Track SRPM data (for downstream spec/koji enrichment)
+            let mut srpm_of_this_package: Option<String> = None;
             if let Some(sourcerpm) = fields
                 .get("rpm:sourcerpm")
                 .or_else(|| fields.get("sourcerpm"))
@@ -456,6 +472,7 @@ impl RpmCollector {
 
                         srpm_names.insert(source_name.clone());
                         srpm_nvrs.insert(nvr);
+                        srpm_of_this_package = Some(source_name.clone());
 
                         // Track identity URIs per SRPM for spec collector
                         if let Some(name) = fields.get("name") {
@@ -470,7 +487,7 @@ impl RpmCollector {
                                     name,
                                 );
                                 srpm_identity_map
-                                    .entry(source_name)
+                                    .entry(source_name.clone())
                                     .or_default()
                                     .push(identity);
                             }
@@ -486,12 +503,21 @@ impl RpmCollector {
                 }
             }
 
-            total_triples += self.emit_package_triples(
+            let (triples, ecosystem_named_by_provides) = self.emit_package_triples(
                 writer,
                 pkg_data,
                 packages_with_files.as_ref(),
                 &mut emitted_packages,
             )?;
+            total_triples += triples;
+            // Recorded against the source package, because that is what the
+            // spec collector iterates: one binary package resolving an
+            // ecosystem settles it for the SRPM they all come from.
+            if ecosystem_named_by_provides {
+                if let Some(source_name) = srpm_of_this_package {
+                    ecosystem_from_provides.insert(source_name);
+                }
+            }
             total_packages += 1;
 
             if (idx + 1) % 1000 == 0 {
@@ -919,13 +945,19 @@ impl RpmCollector {
         Ok(packages_with_files)
     }
 
+    /// Emit every triple for one binary package.
+    ///
+    /// Returns the triple count and whether the package's `Provides:` named an
+    /// upstream ecosystem. The caller records the latter against the source
+    /// package so the spec collector does not re-derive by heuristic what the
+    /// capability already stated outright (#43).
     pub fn emit_package_triples(
         &self,
         writer: &mut NTriplesWriter,
         pkg_data: &RpmPackageData,
         packages_with_files: Option<&std::collections::HashSet<String>>,
         emitted_packages: &mut HashSet<(String, String, String, String, String)>,
-    ) -> Result<usize> {
+    ) -> Result<(usize, bool)> {
         let fields = &pkg_data.fields;
 
         let name = fields.get("name").ok_or_else(|| {
@@ -1162,7 +1194,9 @@ impl RpmCollector {
         }
 
         // Upstream ecosystem identification from Provides entries
-        triples += self.emit_ecosystem_triples(writer, &pkg_uri, &pkg_data.deps)?;
+        let (ecosystem_triples, ecosystem_named_by_provides) =
+            self.emit_ecosystem_triples(writer, &pkg_uri, &pkg_data.deps)?;
+        triples += ecosystem_triples;
 
         // Dependencies
         triples += self.emit_dependency_triples(
@@ -1174,7 +1208,7 @@ impl RpmCollector {
             name,
         )?;
 
-        Ok(triples)
+        Ok((triples, ecosystem_named_by_provides))
     }
 
     /// Extract upstream ecosystem identity from RPM Provides entries.
@@ -1193,7 +1227,7 @@ impl RpmCollector {
         writer: &mut NTriplesWriter,
         pkg_uri: &str,
         deps: &[RpmDep],
-    ) -> Result<usize> {
+    ) -> Result<(usize, bool)> {
         let mut triples = 0;
         let mut emitted_ecosystem = false;
 
@@ -1282,7 +1316,7 @@ impl RpmCollector {
             }
         }
 
-        Ok(triples)
+        Ok((triples, emitted_ecosystem))
     }
 
     fn emit_maintainer_triples(
@@ -1972,6 +2006,19 @@ mod collect_stream_tests {
         )
     }
 
+    /// Like `pkg`, but the package also carries a language-ecosystem
+    /// capability, which is what Fedora packaging guidelines require and what
+    /// `emit_ecosystem_triples` reads the upstream name out of.
+    fn pkg_providing(name: &str, srpm: &str, capability: &str) -> String {
+        pkg(name, "x86_64", "1.0", srpm).replace(
+            "</rpm:provides>",
+            &format!(
+                "  <rpm:entry name=\"{capability}\" flags=\"EQ\" epoch=\"0\" ver=\"1.0\"/>\n\
+                 </rpm:provides>"
+            ),
+        )
+    }
+
     fn primary_gz(packages: &[String]) -> Vec<u8> {
         let doc = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -2016,6 +2063,7 @@ mod collect_stream_tests {
         nvrs: HashSet<String>,
         names: HashSet<String>,
         identity: HashMap<String, Vec<String>>,
+        ecosystems: HashSet<String>,
     }
 
     impl Sinks {
@@ -2026,6 +2074,7 @@ mod collect_stream_tests {
                 nvrs: HashSet::new(),
                 names: HashSet::new(),
                 identity: HashMap::new(),
+                ecosystems: HashSet::new(),
             }
         }
     }
@@ -2047,6 +2096,7 @@ mod collect_stream_tests {
                 &mut sinks.nvrs,
                 &mut sinks.names,
                 &mut sinks.identity,
+                &mut sinks.ecosystems,
                 is_secondary,
                 limit,
             )
@@ -2082,6 +2132,52 @@ mod collect_stream_tests {
         assert!(sinks.identity.contains_key("zlib"));
         // The noarch package is recorded for cross-arch dedup.
         assert_eq!(sinks.noarch.len(), 1);
+    }
+
+    #[test]
+    fn a_provides_capability_settles_the_ecosystem_for_its_source_package() {
+        // #43: the spec collector was handed a permanently empty set, so it
+        // re-derived by heuristic what the capability states outright, and
+        // both answers went into the graph with nothing to rank them. The set
+        // is what lets the weaker one stand down.
+        let h = serve(&[
+            pkg_providing(
+                "rust-serde-devel",
+                "rust-serde-1.0-1.el9.src.rpm",
+                "crate(serde)",
+            ),
+            pkg_providing(
+                "python3-requests",
+                "python-requests-2.31-1.el9.src.rpm",
+                "python3dist(requests)",
+            ),
+            // Provides only its own name: nothing upstream is named, so the
+            // spec heuristics are still the only evidence there is.
+            pkg("bash", "x86_64", "5.2.15", "bash-5.2.15-1.el9.src.rpm"),
+        ]);
+        let mut sinks = Sinks::new();
+        let (packages, body) = run(&h.url, &mut sinks, false, None);
+
+        assert_eq!(packages, 3);
+        // Keyed by SOURCE package, which is what the spec collector iterates.
+        // Keying by binary name would never match and the gate would stay shut.
+        assert_eq!(
+            sinks.ecosystems,
+            ["rust-serde", "python-requests"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<HashSet<String>>(),
+            "got {:?}",
+            sinks.ecosystems
+        );
+        assert!(
+            sinks.names.contains("bash"),
+            "the unresolved package must still be collected"
+        );
+        // Non-vacuous: the capability really did yield the upstream name, so
+        // an empty set above would mean lost evidence rather than no evidence.
+        assert!(body.contains("upstreamPackageName> \"serde\""), "{body}");
+        assert!(body.contains("upstreamPackageName> \"requests\""));
     }
 
     #[test]

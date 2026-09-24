@@ -111,7 +111,8 @@ fn rpm_two_versions_share_one_identity_purl_and_keep_source_coordinates() {
                 None,
                 &mut emitted,
             )
-            .unwrap();
+            .unwrap()
+            .0;
     }
     writer.flush().unwrap();
     let nt = std::fs::read_to_string(temp.path()).unwrap();
@@ -390,7 +391,9 @@ fn rpm_epoch_collisions_fail_direct_collection_and_ir_replay() {
                     &EmitPolicy::default(),
                 )
             } else {
-                collector.emit_package_triples(&mut writer, &data, None, &mut HashSet::new())
+                collector
+                    .emit_package_triples(&mut writer, &data, None, &mut HashSet::new())
+                    .map(|(triples, _ecosystem_from_provides)| triples)
             };
             if epoch == "1" {
                 result.unwrap();
