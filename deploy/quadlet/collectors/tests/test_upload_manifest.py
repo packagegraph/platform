@@ -63,9 +63,13 @@ class UploadManifestTest(unittest.TestCase):
 
     # ---- helpers ---------------------------------------------------------
 
-    def upload(self, content, graph=GRAPH, name="graph.nt", **extra_env):
+    def upload(self, content, graph=GRAPH, name="graph.nt", quality=None, **extra_env):
         target = self.root / name
         target.write_text(content)
+        if quality is not None:
+            sidecar = self.root / (name + ".quality.json")
+            sidecar.write_text(quality if isinstance(quality, str)
+                               else json.dumps(quality))
         return subprocess.run(
             ["bash", str(UPLOAD), str(target), graph],
             env=dict(self.env, **extra_env),
@@ -244,6 +248,66 @@ class UploadManifestTest(unittest.TestCase):
         manifest = self.assertCommitted(process)
         self.assertTrue((self.remote / manifest["key"]).exists())
         self.assertIn("warning", process.stderr.lower())
+
+    # ---- stage completeness (#70) -----------------------------------------
+
+    PARTIAL = {
+        "schema": 1,
+        "complete": False,
+        "stages": [{"stage": "koji", "required": False, "attempted": 1200,
+                    "completed": 1182, "retryable": 18, "failed": 0}],
+    }
+    COMPLETE = {
+        "schema": 1,
+        "complete": True,
+        "stages": [{"stage": "koji", "required": False, "attempted": 1200,
+                    "completed": 1200, "retryable": 0, "failed": 0}],
+    }
+
+    def test_a_partial_run_publishes_and_says_so(self):
+        """The availability trade is preserved -- the graph still publishes --
+        but it may never be mistaken for a complete snapshot."""
+        process = self.upload(DATA, quality=self.PARTIAL)
+        manifest = self.assertCommitted(process)
+        self.assertEqual(manifest["quality"], self.PARTIAL)
+        self.assertIs(manifest["quality"]["complete"], False)
+        self.assertIn("PARTIAL", process.stdout)
+        self.assertIn("18 retryable", process.stdout)
+
+    def test_a_complete_run_is_recorded_as_complete(self):
+        manifest = self.assertCommitted(self.upload(DATA, quality=self.COMPLETE))
+        self.assertIs(manifest["quality"]["complete"], True)
+        self.assertEqual(manifest["quality"]["stages"][0]["completed"], 1200)
+
+    def test_no_sidecar_leaves_completeness_unrecorded_not_complete(self):
+        """Every graph published before this has no sidecar. A manifest that
+        invented `complete: true` for them would make the field worthless."""
+        manifest = self.assertCommitted(self.upload(DATA))
+        self.assertNotIn("quality", manifest)
+
+    def test_an_unreadable_sidecar_refuses_to_publish(self):
+        """The collector wrote it moments ago, so an unparseable one is a bug.
+        Publishing without it would launder a partial graph into the
+        indistinguishable 'unknown' pile."""
+        process = self.upload(DATA, quality="{truncated")
+        self.assertNotEqual(process.returncode, 0,
+                            f"published despite an unreadable sidecar:\n{process.stdout}")
+        self.assertIsNone(self.manifest())
+        self.assertEqual(self.generations(), [])
+
+    def test_a_sidecar_without_a_boolean_complete_refuses_to_publish(self):
+        process = self.upload(DATA, quality={"schema": 1, "stages": []})
+        self.assertNotEqual(process.returncode, 0,
+                            f"published despite an unusable sidecar:\n{process.stdout}")
+        self.assertIsNone(self.manifest())
+
+    def test_a_sidecar_for_a_different_upload_is_not_picked_up(self):
+        """The sidecar is keyed to the .nt path, not to the graph: two
+        collectors sharing a run directory must not inherit each other's
+        completeness."""
+        self.upload(DATA, name="other.nt", quality=self.PARTIAL)
+        manifest = self.assertCommitted(self.upload(DATA, name="graph.nt"))
+        self.assertNotIn("quality", manifest)
 
     # ---- optional fields ---------------------------------------------------
 

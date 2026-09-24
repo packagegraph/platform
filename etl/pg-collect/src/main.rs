@@ -1561,6 +1561,28 @@ mod graph_publication_tests {
     }
 }
 
+/// Write the run's stage completeness beside its N-Triples output, for
+/// `upload-nt.sh` to carry into the graph's commit manifest (#70,
+/// docs/GRAPH-PUBLICATION.md).
+///
+/// A failure here is a warning, not an error: the graph itself is fine and
+/// refusing to publish it over missing metadata would trade away exactly the
+/// availability this stage accounting exists to describe. The consequence is
+/// that the graph publishes with completeness *unknown* -- which is what
+/// every graph published before this was, and is specifically not the same
+/// as publishing it marked complete.
+fn record_run_quality(output: &str, stages: Vec<pg_collect::stage_report::StageReport>) {
+    let quality = pg_collect::stage_report::RunQuality::new(stages);
+    quality.report();
+    if let Err(e) = quality.write_sidecar(std::path::Path::new(output)) {
+        eprintln!(
+            "Warning: stage completeness not recorded ({}); this graph will \
+             publish with unknown completeness",
+            e
+        );
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -3205,7 +3227,12 @@ fn main() {
                 .with_graph_uri(graph_uri.clone());
                 // Standalone enrich-koji has no commit-after-publish
                 // lifecycle, so it never checkpoints.
-                enricher.enrich_from_nvrs(&nvrs, &output, limit, None)
+                enricher.enrich_from_nvrs(&nvrs, &output, limit, None).map(
+                    |(builds, triples, report)| {
+                        record_run_quality(&output, vec![report]);
+                        (builds, triples)
+                    },
+                )
             } else {
                 if endpoint.is_empty() {
                     panic!("Either --endpoint or --srpm-list is required for enrich-koji");
@@ -3856,6 +3883,11 @@ fn main() {
 
                 let mut total_packages = 0;
                 let mut total_triples = 0;
+                // What each stage actually managed, carried into the graph's
+                // commit manifest by upload-nt.sh. The optional stages here
+                // may publish a partial graph by design; #70 is about that
+                // being legible downstream rather than being guessed at.
+                let mut stages: Vec<pg_collect::stage_report::StageReport> = Vec::new();
 
                 // One generation per run, shared by both checkpointed stages.
                 // Absent --cache-dir, or if setup fails, both stages get a
@@ -3912,6 +3944,11 @@ fn main() {
                         sslclientcert.as_deref().unwrap_or("")
                     );
                 }
+                // Required: any arch failing aborts below via `?`, so this
+                // stage can never be the reason a published graph is partial.
+                // Recorded anyway, so that is visible rather than implied.
+                let mut rpm_stage = pg_collect::stage_report::StageReport::new("rpm", true);
+                rpm_stage.attempted = urls.len() as u64;
                 for (i, url) in urls.iter().enumerate() {
                     eprintln!("\n--- Arch {} of {} ---", i + 1, urls.len());
                     let collector = if let (Some(cert), Some(key), Some(ca)) =
@@ -3946,7 +3983,9 @@ fn main() {
                     )?;
                     total_packages += pkgs;
                     total_triples += triples;
+                    rpm_stage.completed += 1;
                 }
+                stages.push(rpm_stage);
 
                 eprintln!(
                     "\nSRPM dedup: {} unique names, {} unique NVRs",
@@ -3963,7 +4002,7 @@ fn main() {
                     // srpm_names is a HashSet; collect_checkpointed iterates it
                     // sorted so fragment order -- and therefore byte-identical
                     // replay -- does not depend on this process's hash seed.
-                    let (specs, triples) = spec_collector.collect_checkpointed(
+                    let (specs, triples, spec_stage) = spec_collector.collect_checkpointed(
                         &mut writer,
                         &srpm_names,
                         &srpm_identity_map,
@@ -3974,6 +4013,7 @@ fn main() {
                     )?;
                     total_packages += specs;
                     total_triples += triples;
+                    stages.push(spec_stage);
                 }
 
                 // Stage 3: Koji enrichment (optional)
@@ -4006,7 +4046,7 @@ fn main() {
                     let koji_tmp = format!("{}.koji.tmp", output);
                     let koji_cache =
                         open_cache("koji", pg_collect::enrich_koji::KOJI_SCHEMA_VERSION);
-                    let (builds, triples) = koji_enricher.enrich_from_nvrs(
+                    let (builds, triples, koji_stage) = koji_enricher.enrich_from_nvrs(
                         &nvr_list,
                         &koji_tmp,
                         limit,
@@ -4021,9 +4061,11 @@ fn main() {
                     let _ = std::fs::remove_file(&koji_tmp);
                     total_packages += builds;
                     total_triples += triples;
+                    stages.push(koji_stage);
                 }
 
                 writer.flush()?;
+                record_run_quality(&output, stages);
                 Ok((total_packages, total_triples))
             })()
         }

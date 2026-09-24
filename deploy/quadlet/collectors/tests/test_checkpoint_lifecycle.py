@@ -57,6 +57,10 @@ class LifecycleTest(unittest.TestCase):
         # Fail rather than accidentally using a globally installed old binary.
         self.assertTrue(Path(self.env["PG_COLLECT_BIN"]).is_file())
 
+    def published_manifest(self):
+        return json.loads(
+            (self.root / "remote/graphs/fedora-44/manifest.json").read_text())
+
     def run_dirs(self):
         return {p for p in self.root.glob("run-*.*") if p.is_dir()}
 
@@ -177,6 +181,44 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(self.spec_fragment(), spec_fragment,
                          "re-derivation from cached sources must be deterministic")
         self.assertFalse((self.cache / "output" / old["id"]).exists())
+
+    def test_a_fully_successful_run_publishes_marked_complete(self):
+        """Complete has to be reachable, or `complete: false` says nothing."""
+        code, output = self.run_wrapper()
+        self.assertEqual(code, 0, output)
+        quality = self.published_manifest()["quality"]
+        self.assertIs(quality["complete"], True, quality)
+        stages = {s["stage"]: s for s in quality["stages"]}
+        self.assertEqual(set(stages), {"rpm", "spec", "koji"})
+        self.assertTrue(stages["rpm"]["required"])
+        self.assertFalse(stages["koji"]["required"])
+        for name, stage in stages.items():
+            self.assertEqual(stage["attempted"], stage["completed"],
+                             f"{name} lost an item: {stage}")
+            self.assertEqual((stage["retryable"], stage["failed"]), (0, 0), stage)
+
+    def test_retryable_optional_enrichment_publishes_marked_partial(self):
+        """#70's case, and the one this lifecycle never covered: an optional
+        stage leaves an item for the next run, the collector still succeeds,
+        the graph publishes and the generation retires. That is the intended
+        availability trade -- but the published graph has to carry that it was
+        a partial snapshot, or the only trace is a log line in a journal that
+        rotates.
+        """
+        self.hub.fail_signatures = True
+        code, output = self.run_wrapper()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.state()["status"], "complete",
+                         "the availability policy is unchanged: this still retires")
+
+        quality = self.published_manifest()["quality"]
+        self.assertIs(quality["complete"], False, quality)
+        koji = next(s for s in quality["stages"] if s["stage"] == "koji")
+        self.assertEqual((koji["attempted"], koji["completed"], koji["retryable"]),
+                         (1, 0, 1), koji)
+        # The required stage is untouched by an optional stage's retry.
+        rpm = next(s for s in quality["stages"] if s["stage"] == "rpm")
+        self.assertEqual(rpm["attempted"], rpm["completed"], rpm)
 
     def test_failed_commit_does_not_retire_generation(self):
         """The commit is the manifest PUT (#72), and `mc pipe` is how

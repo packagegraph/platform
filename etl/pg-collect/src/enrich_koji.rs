@@ -202,7 +202,7 @@ impl KojiEnricher {
         output_path: &str,
         limit: Option<usize>,
         checkpoint: Option<&crate::output_cache::OutputCache>,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<(usize, usize, crate::stage_report::StageReport)> {
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
@@ -213,6 +213,11 @@ impl KojiEnricher {
 
         let mut total_builds = 0;
         let mut total_triples = 0;
+        // Koji is an explicitly optional stage: an item that cannot be
+        // resolved does not fail the run. What it must not do is disappear --
+        // a consumer of the published graph has to be able to tell a complete
+        // enrichment from a knowingly partial one (#70).
+        let mut report = crate::stage_report::StageReport::new("koji", false);
         let mut seen_nvrs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for nvr in nvrs {
@@ -226,9 +231,20 @@ impl KojiEnricher {
                 }
             }
 
+            report.attempted += 1;
+
             use crate::output_cache::{CachedOutput, CanonicalContext, ComputeOutcome, OutputCache};
             let disabled = OutputCache::disabled();
             let cache = checkpoint.unwrap_or(&disabled);
+
+            // Reset here, not inside the closure below: on a checkpoint HIT
+            // the closure never runs, so a flag reset inside it would still
+            // hold the previous item's verdict. Reading it after
+            // `get_or_compute` is also what makes the retryable count
+            // independent of whether checkpointing is enabled at all --
+            // `cache.stats()` is empty for a disabled cache, and a run whose
+            // checkpoint setup failed still publishes a graph.
+            self.item_inconclusive.set(false);
 
             // `rpc_cache_version` is in the context so the two versions cannot
             // drift apart by hand. Bumping KOJI_RPC_CACHE_VERSION stops old
@@ -243,7 +259,6 @@ impl KojiEnricher {
                 .field("rpc_cache_version", KOJI_RPC_CACHE_VERSION);
 
             let result = cache.get_or_compute(nvr, &ctx, || {
-                self.item_inconclusive.set(false);
                 let mut scratch = NTriplesWriter::new(Vec::<u8>::new());
                 let logical = self.get_build(nvr, &mut scratch)?;
                 let out = CachedOutput {
@@ -266,6 +281,14 @@ impl KojiEnricher {
                     }
                     writer.skipped_invalid_iri += out.skipped_invalid_iri;
                     writer.auto_inverses += out.auto_inverses;
+                    if self.item_inconclusive.get() {
+                        report.retryable += 1;
+                    } else {
+                        // "This build does not exist" is a conclusive answer
+                        // from Koji, so a zero-triple item is completed, not
+                        // failed. Only an inconclusive one is retryable.
+                        report.completed += 1;
+                    }
                     if out.logical_triples > 0 {
                         total_builds += 1;
                         total_triples += out.logical_triples;
@@ -274,7 +297,13 @@ impl KojiEnricher {
                         eprintln!("  {} → not found", nvr);
                     }
                 }
-                Err(e) => eprintln!("  {} → error: {}", nvr, e),
+                Err(e) => {
+                    // Previously printed and then forgotten: a run could lose
+                    // a hundred items here and still report success with no
+                    // trace of them in any total.
+                    report.failed += 1;
+                    eprintln!("  {} → error: {}", nvr, e);
+                }
             }
         }
 
@@ -287,7 +316,7 @@ impl KojiEnricher {
         }
 
         writer.flush()?;
-        Ok((total_builds, total_triples))
+        Ok((total_builds, total_triples, report))
     }
 
     fn get_build<W: Write>(&self, nvr: &str, writer: &mut NTriplesWriter<W>) -> Result<usize> {
@@ -1435,8 +1464,15 @@ mod tests {
             result
         );
 
-        let (builds, triples) = result.unwrap();
+        let (builds, triples, report) = result.unwrap();
         assert_eq!(builds, 1, "Should process exactly 1 build");
+        // This fixture's listBuildRPMs returns a struct where an array is
+        // expected, which is inconclusive -- the item emits triples AND is
+        // left for the next run to retry. The build count alone cannot tell
+        // those apart, which is the whole of #70: before the stage report,
+        // this run looked exactly like a complete one.
+        assert_eq!((report.attempted, report.completed, report.retryable), (1, 0, 1));
+        assert!(!report.is_complete(), "a retried item must not read as complete");
         assert!(triples > 0, "Should emit at least some triples");
     }
 
@@ -2219,11 +2255,15 @@ mod tests {
 
         let out = d.path().join("out.nt");
         let e = KojiEnricher::new_standalone(hub, "fedora", "44", None);
-        let (builds, triples) = e.enrich_from_nvrs(
+        let (builds, triples, report) = e.enrich_from_nvrs(
             &["zlib-1.3-1.fc44".to_string()], out.to_str().unwrap(), None, Some(&cache),
         ).unwrap();
 
         assert_eq!((builds, triples), (1, 3), "totals must come from the checkpoint");
+        // A replayed item is a completed one, and the per-item verdict must
+        // come from the replay rather than from the previous item's flag --
+        // the closure that sets it never runs on a hit.
+        assert_eq!((report.attempted, report.completed, report.retryable), (1, 1, 0));
         assert_eq!(cache.stats().hits, 1);
         assert!(std::fs::read_to_string(&out).unwrap().contains("<b> <p> <o>"));
     }
@@ -2292,7 +2332,10 @@ mod tests {
     fn run_chain(
         bodies: [(&str, &str); 3],
         expected_calls: [usize; 3],
-    ) -> (crate::output_cache::CacheStats, std::io::Result<(usize, usize)>) {
+    ) -> (
+        crate::output_cache::CacheStats,
+        std::io::Result<(usize, usize, crate::stage_report::StageReport)>,
+    ) {
         let mut server = mockito::Server::new();
         let mocks = mock_hub(&mut server, bodies, expected_calls);
 
@@ -2356,11 +2399,12 @@ mod tests {
             [("getBuild", ok_build()), ("listBuildRPMs", ok_rpms()), ("queryRPMSigs", ok_sigs())],
             [1, 1, 1],
         );
-        let (builds, triples) = r.expect("a conclusive chain must succeed");
+        let (builds, triples, report) = r.expect("a conclusive chain must succeed");
         assert_eq!(builds, 1);
         assert!(triples > 0, "a found build must emit triples");
         assert_eq!(s.retryable, 0, "a conclusive chain must be Complete");
         assert_eq!(s.misses, 1);
+        assert!(report.is_complete(), "{report:?}");
     }
 
     // ─── end-to-end: a hub change must not reuse the other hub's data ───

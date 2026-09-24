@@ -214,6 +214,7 @@ impl SpecCollector {
             emit_buildrequires, emit_maintainers,
             &crate::output_cache::OutputCache::disabled(),
         )
+        .map(|(specs, triples, _report)| (specs, triples))
     }
 
     /// As `collect`, but replays per-item fragments from `checkpoint` so an
@@ -228,11 +229,21 @@ impl SpecCollector {
         emit_buildrequires: bool,
         emit_maintainers: bool,
         checkpoint: &crate::output_cache::OutputCache,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<(usize, usize, crate::stage_report::StageReport)> {
         use crate::output_cache::{CachedOutput, CanonicalContext, ComputeOutcome};
 
         let mut total_specs = 0;
         let mut total_triples = 0;
+        // Spec derivation is an explicitly optional stage: a dist-git that
+        // will not answer costs its packages' spec-derived triples, not the
+        // run. What the published graph must carry is which of the two
+        // happened (#70).
+        let mut report = crate::stage_report::StageReport::new("spec", false);
+        // Set by the closure below on a checkpoint MISS. Read after
+        // `get_or_compute` rather than from `checkpoint.stats()`, so the
+        // count is right even when checkpointing is disabled -- a run whose
+        // checkpoint setup failed still publishes a graph.
+        let inconclusive = std::cell::Cell::new(false);
 
         // Sorted, not HashSet order. Two processes iterate a HashSet in
         // different randomized orders, which would make "a replayed run is
@@ -252,6 +263,8 @@ impl SpecCollector {
                 .flag("emit_buildrequires", emit_buildrequires)
                 .flag("emit_maintainers", emit_maintainers);
 
+            report.attempted += 1;
+            inconclusive.set(false);
             let result = checkpoint.get_or_compute(name, &ctx, || {
                 // Derive into a scratch writer with no graph term, so the
                 // fragment is canonical N-Triples and graph selection stays
@@ -267,6 +280,7 @@ impl SpecCollector {
                     auto_inverses: scratch.auto_inverses,
                     text: scratch.into_string()?,
                 };
+                inconclusive.set(matches!(cacheability, Cacheability::Retryable));
                 Ok(match cacheability {
                     Cacheability::Complete => ComputeOutcome::Complete(out),
                     Cacheability::Retryable => ComputeOutcome::Retryable(out),
@@ -280,12 +294,23 @@ impl SpecCollector {
                     }
                     writer.skipped_invalid_iri += out.skipped_invalid_iri;
                     writer.auto_inverses += out.auto_inverses;
+                    if inconclusive.get() {
+                        report.retryable += 1;
+                    } else {
+                        // A definitive "no spec for this package" is a
+                        // conclusive answer, so a zero-triple item completed.
+                        report.completed += 1;
+                    }
                     if out.logical_triples > 0 {
                         total_specs += 1;
                         total_triples += out.logical_triples;
                     }
                 }
-                Err(e) => eprintln!("  {} → error: {}", name, e),
+                Err(e) => {
+                    // Previously printed and then forgotten.
+                    report.failed += 1;
+                    eprintln!("  {} → error: {}", name, e);
+                }
             }
 
             if (idx + 1) % 100 == 0 {
@@ -305,7 +330,7 @@ impl SpecCollector {
             total_specs, total_triples,
             s.hits, s.misses, s.retryable, s.write_failures, s.integrity_failures
         );
-        Ok((total_specs, total_triples))
+        Ok((total_specs, total_triples, report))
     }
 
     /// Derivation plus an explicit cacheability verdict.
@@ -1572,9 +1597,12 @@ BuildRequires:  perl(Test::More)
         }))).unwrap();
 
         let mut w = crate::ntriples::NTriplesWriter::new(Vec::<u8>::new());
-        let (specs, triples) = c.collect_checkpointed(
+        let (specs, triples, report) = c.collect_checkpointed(
             &mut w, &names, &identity_map, &existing, false, false, &cache,
         ).unwrap();
+        // A replayed item counts as completed, and its verdict comes from the
+        // replay -- the closure that would set the retryable flag never runs.
+        assert_eq!((report.attempted, report.completed, report.retryable), (1, 1, 0));
         // A NotFound DQ fragment would have non-zero triples but different
         // text, so the assertions below separate a hit from a silent miss.
 

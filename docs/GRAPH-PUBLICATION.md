@@ -94,11 +94,55 @@ a build).
 upstream. `data_triples` is the count `upload-nt.sh` already computes for its
 empty-graph floor (#58) — carried here so a reader can report it without
 decompressing. Readers must ignore fields they do not know: `schema` is bumped
-only for a change that would make an old reader wrong, and #70 is expected to
-add optional completeness metadata without bumping it.
+only for a change that would make an old reader wrong.
 
 `encoding` is `gzip` or `none`. Readers that see any other value must fail
 rather than guess.
+
+### `quality`, the completeness record
+
+Optional, and present only when the run that produced the payload recorded it:
+
+```json
+"quality": {
+  "schema": 1,
+  "complete": false,
+  "stages": [
+    {"stage": "rpm",  "required": true,  "attempted": 2,    "completed": 2,    "retryable": 0,  "failed": 0},
+    {"stage": "spec", "required": false, "attempted": 4200, "completed": 4200, "retryable": 0,  "failed": 0},
+    {"stage": "koji", "required": false, "attempted": 1200, "completed": 1182, "retryable": 18, "failed": 0}
+  ]
+}
+```
+
+Optional enrichment stages are allowed to fail item by item without failing
+the run — one unreachable Koji hub should not cost a distribution's entire
+package graph for the night. The cost is that a published graph can be a
+knowingly partial snapshot, and nothing downstream could tell: a graph
+enriched for 1,200 of 1,200 builds and one enriched for 400 of 1,200 arrived
+identical, both green (#70).
+
+Three rules make the field worth having:
+
+- **Absence means unknown, never complete.** Every graph published before this
+  existed has no `quality` block. A reader that filled one in, or that treated
+  a missing one as clean, would make the field meaningless.
+- **Any retryable or failed item means `complete: false`**, even though the
+  run exited 0 and the graph published. Those are the same run.
+- **`attempted` must equal `completed`** for a stage to be complete. An item
+  that falls out of the loop unclassified is a hole in the accounting, and a
+  hole reads as incomplete.
+
+`required` stages abort the run on failure, so they can never be the reason a
+published graph is partial. They are recorded so that is visible rather than
+implied.
+
+`pg-collect` writes this beside its N-Triples output as
+`<output>.nt.quality.json` (see `etl/pg-collect/src/stage_report.rs`), and
+`upload-nt.sh` carries it into the manifest. A sidecar that is present but
+unparseable **fails the upload**: the collector wrote it moments earlier, so
+an unreadable one is a bug, and publishing without it would launder a
+knowingly partial graph into the indistinguishable "unknown" pile.
 
 ## Writer protocol
 
