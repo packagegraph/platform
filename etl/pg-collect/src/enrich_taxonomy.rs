@@ -11,6 +11,24 @@
 //! - Function: keyword matching on name + description
 //! - Audience: keyword matching on description
 //! - Layer: inferred from name patterns and description keywords
+//!
+//! ## Why this pages (#59)
+//!
+//! It used to ask for every PackageIdentity in the corpus in one query and
+//! hold the answer in a Vec before classifying any of it. On the collection
+//! host that reached the 4 GB cgroup ceiling in 29 seconds and was OOM-killed
+//! -- the peak is the response body and its parse, not the classification,
+//! which needs nothing but the row in front of it.
+//!
+//! So the query is ordered by identity and walked a page at a time, keyed on
+//! the last identity seen rather than an OFFSET, and each row is classified
+//! and written as it arrives. Memory is now one page, not one corpus.
+//!
+//! The ordering is also a correctness fix. The description join fans out to
+//! one row per version, and the old code deduplicated with `Vec::dedup_by`,
+//! which only removes ADJACENT duplicates -- with no ORDER BY nothing
+//! guaranteed they were adjacent, so an identity whose rows arrived split
+//! could be classified, and emitted, more than once.
 
 use crate::ntriples::NTriplesWriter;
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
@@ -20,6 +38,9 @@ use std::io::Result;
 
 pub struct TaxonomyEnricher {
     sparql: SparqlClient,
+    /// Rows per request. A field only so the paging loop can be exercised in
+    /// a test without synthesising 50,000 rows.
+    page_size: usize,
     pub graph_uri: Option<String>,
 }
 
@@ -28,6 +49,7 @@ impl TaxonomyEnricher {
         let sparql = make_sparql_client(endpoint, &auth, backend);
         Self {
             sparql,
+            page_size: PAGE,
             graph_uri: None,
         }
     }
@@ -41,47 +63,101 @@ impl TaxonomyEnricher {
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
-        let packages = self.query_package_identities()?;
-        eprintln!("Found {} package identities to classify", packages.len());
-
         let mut classified = 0usize;
         let mut total_triples = 0usize;
+        let mut seen = 0usize;
+        let mut after: Option<String> = None;
+        // The identity the last emitted classification belonged to. Rows for
+        // one identity are contiguous under the ORDER BY, so remembering one
+        // is enough to collapse the description join's fan-out -- and a page
+        // boundary cannot split a run open, because the next page starts
+        // strictly after the last identity this one saw.
+        let mut current: Option<String> = None;
 
-        for pkg in &packages {
-            let classifications = classify_package(
-                &pkg.name,
-                pkg.description.as_deref(),
-                pkg.ecosystem.as_deref(),
-            );
-            if !classifications.is_empty() {
+        loop {
+            let rows = self.sparql.query(&package_identities_page_query(
+                after.as_deref(),
+                self.page_size,
+            ))?;
+            if rows.is_empty() {
+                break;
+            }
+
+            let mut page_last = None;
+            for row in &rows {
+                let (Some(identity_uri), Some(name)) = (row.get("identity"), row.get("name"))
+                else {
+                    continue;
+                };
+                page_last = Some(identity_uri.clone());
+                if current.as_deref() == Some(identity_uri.as_str()) {
+                    continue;
+                }
+                current = Some(identity_uri.clone());
+                seen += 1;
+
+                let description = row.get("description").filter(|s| !s.is_empty());
+                let ecosystem = row.get("ecosystemName").filter(|s| !s.is_empty());
+                let classifications = classify_package(
+                    name,
+                    description.map(|s| s.as_str()),
+                    ecosystem.map(|s| s.as_str()),
+                );
+                if classifications.is_empty() {
+                    continue;
+                }
                 classified += 1;
                 for concept_uri in &classifications {
                     writer.write_triple(
-                        &pkg.identity_uri,
+                        identity_uri,
                         &format!("{PKG}hasClassification"),
                         concept_uri,
                     )?;
                     total_triples += 1;
                 }
             }
+
+            eprintln!("Classified {classified} / {seen} package identities so far");
+            if rows.len() < self.page_size {
+                break;
+            }
+            // No new identity in a full page would mean the key never
+            // advanced; stopping beats looping on the same page forever.
+            match page_last {
+                Some(last) if Some(&last) != after.as_ref() => after = Some(last),
+                _ => break,
+            }
         }
 
         writer.flush()?;
-        eprintln!(
-            "Classified {} / {} packages ({} triples)",
-            classified,
-            packages.len(),
-            total_triples
-        );
+        eprintln!("Classified {classified} / {seen} packages ({total_triples} triples)");
         Ok((classified, total_triples))
     }
+}
 
-    fn query_package_identities(&self) -> Result<Vec<PackageInfo>> {
-        let eco_base = format!("{DATA}ecosystem/");
-        let query = format!(
-            r#"SELECT ?identity ?name ?description ?ecosystemName WHERE {{
+/// Rows per request. Large enough that the corpus is a few hundred requests,
+/// small enough that a page is megabytes rather than gigabytes.
+const PAGE: usize = 50_000;
+
+/// One page of package identities, ordered so that paging is stable and the
+/// description fan-out arrives contiguously.
+///
+/// Keyed on the last identity of the previous page rather than an OFFSET: a
+/// deep OFFSET makes the store re-walk everything it has already returned,
+/// and the cost of that grows with every page.
+fn package_identities_page_query(after: Option<&str>, limit: usize) -> String {
+    let eco_base = format!("{DATA}ecosystem/");
+    let keyset = match after {
+        Some(last) => format!(
+            "\n              FILTER(STR(?identity) > \"{}\")",
+            last.replace('\\', "\\\\").replace('"', "\\\"")
+        ),
+        None => String::new(),
+    };
+    format!(
+        r#"SELECT ?identity ?name ?description ?ecosystemName WHERE {{
               ?identity a <{PKG}PackageIdentity> ;
-                        <{PKG}packageName> ?name .
+                        <{PKG}packageName> ?name .{keyset}
               OPTIONAL {{
                 ?pkg <{PKG}isVersionOf> ?identity ;
                      <{PKG}description> ?description .
@@ -90,33 +166,12 @@ impl TaxonomyEnricher {
                 ?identity <{PKG}upstreamEcosystem> ?ecoUri .
                 BIND(STRAFTER(STR(?ecoUri), "{eco_base}") AS ?ecosystemName)
               }}
-            }}"#,
-            PKG = PKG,
-            eco_base = eco_base,
-        );
-
-        let results = self.sparql.query(&query)?;
-        let mut packages = Vec::new();
-        for row in results {
-            if let (Some(uri), Some(name)) = (row.get("identity"), row.get("name")) {
-                packages.push(PackageInfo {
-                    identity_uri: uri.clone(),
-                    name: name.clone(),
-                    description: row.get("description").filter(|s| !s.is_empty()).cloned(),
-                    ecosystem: row.get("ecosystemName").filter(|s| !s.is_empty()).cloned(),
-                });
-            }
-        }
-        packages.dedup_by(|a, b| a.identity_uri == b.identity_uri);
-        Ok(packages)
-    }
-}
-
-struct PackageInfo {
-    identity_uri: String,
-    name: String,
-    description: Option<String>,
-    ecosystem: Option<String>,
+            }} ORDER BY ?identity LIMIT {limit}"#,
+        PKG = PKG,
+        eco_base = eco_base,
+        keyset = keyset,
+        limit = limit,
+    )
 }
 
 fn classify_package(name: &str, description: Option<&str>, ecosystem: Option<&str>) -> Vec<String> {
@@ -616,6 +671,124 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use tempfile::NamedTempFile;
+
+    /// A page must be ordered (so the fan-out is contiguous and the key
+    /// advances predictably) and bounded (so the response is a page, not a
+    /// corpus -- the 4 GB OOM in #59).
+    #[test]
+    fn the_first_page_is_ordered_bounded_and_unfiltered() {
+        let q = package_identities_page_query(None, 50_000);
+        assert!(q.contains("ORDER BY ?identity"));
+        assert!(q.contains("LIMIT 50000"));
+        assert!(!q.contains("FILTER"), "the first page has nothing to skip");
+    }
+
+    /// Keyset, not OFFSET: a deep OFFSET makes the store re-walk every row it
+    /// has already returned.
+    #[test]
+    fn a_later_page_starts_strictly_after_the_previous_one() {
+        let q = package_identities_page_query(Some("https://example.org/i/curl"), 10);
+        assert!(q.contains(r#"FILTER(STR(?identity) > "https://example.org/i/curl")"#));
+        assert!(!q.contains("OFFSET"));
+    }
+
+    fn rows(bindings: &[(&str, &str)]) -> String {
+        let rows: Vec<String> = bindings
+            .iter()
+            .map(|(identity, name)| {
+                format!(
+                    r#"{{"identity": {{"value": "{identity}"}}, "name": {{"value": "{name}"}}}}"#
+                )
+            })
+            .collect();
+        format!(r#"{{"results": {{"bindings": [{}]}}}}"#, rows.join(","))
+    }
+
+    fn enricher_against(server: &mockito::Server, page_size: usize) -> TaxonomyEnricher {
+        TaxonomyEnricher {
+            sparql: SparqlClient::new(&server.url()),
+            page_size,
+            graph_uri: None,
+        }
+    }
+
+    fn classify_to_string(enricher: &TaxonomyEnricher) -> ((usize, usize), String) {
+        let temp_file = NamedTempFile::new().unwrap();
+        let counts = enricher.enrich(temp_file.path().to_str().unwrap()).unwrap();
+        let mut content = String::new();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        (counts, content)
+    }
+
+    /// The description join fans out to one row per version. Those rows are
+    /// the same identity and must be classified once -- the old code relied
+    /// on `Vec::dedup_by` over an unordered result, which only collapses
+    /// ADJACENT duplicates.
+    #[test]
+    fn the_description_fanout_is_classified_once_not_once_per_version() {
+        let mut server = mockito::Server::new();
+        let _page = server
+            .mock("POST", "/sparql")
+            .with_status(200)
+            .with_body(rows(&[
+                ("https://example.org/i/libfoo", "libfoo"),
+                ("https://example.org/i/libfoo", "libfoo"),
+                ("https://example.org/i/libfoo", "libfoo"),
+            ]))
+            .create();
+
+        let ((classified, triples), content) = classify_to_string(&enricher_against(&server, 10));
+
+        assert_eq!(classified, 1, "one identity, not three rows");
+        assert_eq!(
+            content.lines().filter(|l| !l.trim().is_empty()).count(),
+            triples,
+            "every counted triple is a line and vice versa"
+        );
+        assert_eq!(
+            content.matches("role-library").count(),
+            1,
+            "classified once:\n{content}"
+        );
+    }
+
+    /// A full page means there may be more. The next request must carry the
+    /// key forward rather than stopping at the limit.
+    #[test]
+    fn a_full_page_is_followed_by_another_keyed_on_its_last_identity() {
+        let mut server = mockito::Server::new();
+        let first = server
+            .mock("POST", "/sparql")
+            .with_status(200)
+            .with_body(rows(&[
+                ("https://example.org/i/libalpha", "libalpha"),
+                ("https://example.org/i/libbeta", "libbeta"),
+            ]))
+            .expect(1)
+            .create();
+        let second = server
+            .mock("POST", "/sparql")
+            // The key from the end of the first page, percent-encoded by the
+            // form body the SPARQL client posts.
+            .match_body(mockito::Matcher::Regex("libbeta".to_string()))
+            .with_status(200)
+            .with_body(rows(&[("https://example.org/i/libgamma", "libgamma")]))
+            .expect(1)
+            .create();
+
+        let ((classified, _), content) = classify_to_string(&enricher_against(&server, 2));
+
+        first.assert();
+        second.assert();
+        assert_eq!(classified, 3, "the short second page completed the walk");
+        assert!(content.contains("libgamma"), "page two was emitted");
+    }
 
     #[test]
     fn test_ecosystem_to_technology() {
