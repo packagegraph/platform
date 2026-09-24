@@ -56,6 +56,15 @@ jobs:
       # Directly invoked for the same reason as the step above.
       - name: Rebuild failures must stay retryable and preserve their inputs
         run: python3 deploy/quadlet/tests/test_rebuild_retry_and_preservation.py -v
+      # The collector scratch volume is shared by every concurrently running
+      # instance, so a fixed path under /tmp is a shared mailbox. The static
+      # check covers every wrapper; the concurrency check runs two real ones
+      # against a barrier and inspects what each actually publishes. Directly
+      # invoked, for the reason given above.
+      - name: Collector wrappers must isolate their scratch
+        run: python3 deploy/quadlet/collectors/tests/test_collector_run_dirs.py -v
+      - name: Concurrent collectors must not publish each other's bytes
+        run: python3 deploy/quadlet/collectors/tests/test_collector_concurrency.py -v
       - name: Verify exclusion with the image's pinned mc
         run: |
           set -euo pipefail

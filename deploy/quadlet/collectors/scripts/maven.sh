@@ -2,6 +2,13 @@
 # Collector: maven
 # Ported from deploy/overlays/dev/jobs/collect-maven.yaml.
 set -eu
+
+# Private per-invocation scratch. /tmp is one volume shared by every
+# concurrently running collector -- see README.md, "Run directories".
+find /tmp -maxdepth 1 -type d -name 'run-*.*' -mmin +2880 -exec rm -rf {} + 2>/dev/null || true
+RUN_DIR=$(mktemp -d /tmp/run-maven.XXXXXXXX)
+trap 'rm -rf "$RUN_DIR"' EXIT
+
 # The single general Maven ecosystem view. The curated roots below are only a
 # starting point for traversal, not a separate corpus, so they publish here
 # and nowhere else.
@@ -52,13 +59,13 @@ if mc alias set pgraph "${MINIO_ENDPOINT:-}" "${MINIO_ACCESS_KEY:-}" "${MINIO_SE
       mc mirror --overwrite --exclude "*.tmp" --exclude "*.lock" "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
     done ) &
   CACHE_SYNC_PID=$!
-  trap 'kill "${CACHE_SYNC_PID}" 2>/dev/null || true' EXIT
+  trap 'kill "${CACHE_SYNC_PID}" 2>/dev/null || true; rm -rf "$RUN_DIR"' EXIT
 else
   echo "WARNING: Minio alias setup failed, proceeding without remote cache"
 fi
 
 set +e
-pg-collect maven --packages-file "${SEED_FILE}" --cache-dir "${CACHE_DIR}" -o /tmp/maven.nt
+pg-collect maven --packages-file "${SEED_FILE}" --cache-dir "${CACHE_DIR}" -o "$RUN_DIR/maven.nt"
 COLLECT_EXIT=$?
 set -e
 
@@ -67,5 +74,5 @@ if [ "$CACHE_AVAILABLE" = "true" ]; then
   mc mirror --overwrite --exclude "*.tmp" --exclude "*.lock" "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || echo "Cache save failed"
 fi
 
-[ "$COLLECT_EXIT" -eq 0 ] && /app/scripts/upload-nt.sh /tmp/maven.nt "$GRAPH_URI"
+[ "$COLLECT_EXIT" -eq 0 ] && /app/scripts/upload-nt.sh "$RUN_DIR/maven.nt" "$GRAPH_URI"
 exit "$COLLECT_EXIT"

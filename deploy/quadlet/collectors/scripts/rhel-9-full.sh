@@ -7,6 +7,13 @@
 # underlying TLS-cert setup this script drives through pg-collect's
 # --sslclientcert/--sslclientkey/--sslcacert flags (rpm-full).
 set -eu
+
+# Private per-invocation scratch. /tmp is one volume shared by every
+# concurrently running collector -- see README.md, "Run directories".
+find /tmp -maxdepth 1 -type d -name 'run-*.*' -mmin +2880 -exec rm -rf {} + 2>/dev/null || true
+RUN_DIR=$(mktemp -d /tmp/run-rhel-9-full.XXXXXXXX)
+trap 'rm -rf "$RUN_DIR"' EXIT
+
 GRAPH_URI="https://packagegraph.github.io/graph/rhel/9"
 
 # Entitlement cert filename embeds a serial number that rotates on
@@ -15,7 +22,6 @@ CLIENT_CERT=$(ls /etc/pki/entitlement/[0-9]*.pem | grep -v -- '-key.pem$' | head
 CLIENT_KEY="${CLIENT_CERT%.pem}-key.pem"
 CA_CERT=/etc/rhsm/ca/redhat-uep.pem
 
-mkdir -p /tmp/collection
 CACHE_DIR=/tmp/cache/rhel-9-full
 MINIO_CACHE="pgraph/${MINIO_BUCKET}/collector-cache/rhel-9-full"
 mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
@@ -32,7 +38,7 @@ echo "Cache warmed: $(find "${CACHE_DIR}" -type f 2>/dev/null | wc -l) entries"
     mc mirror --overwrite --exclude 'output/*' "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
   done ) &
 CACHE_SYNC_PID=$!
-trap 'kill "${CACHE_SYNC_PID}" 2>/dev/null || true' EXIT
+trap 'kill "${CACHE_SYNC_PID}" 2>/dev/null || true; rm -rf "$RUN_DIR"' EXIT
 
 pg-collect rpm-full \
   --url https://cdn.redhat.com/content/dist/rhel9/9/x86_64/baseos/os/ \
@@ -41,9 +47,9 @@ pg-collect rpm-full \
   --sslclientcert "$CLIENT_CERT" --sslclientkey "$CLIENT_KEY" --sslcacert "$CA_CERT" \
   --with-spec --with-maintainers \
   --cache-dir "${CACHE_DIR}" \
-  -o /tmp/collection/rhel-9.nt
+  -o "$RUN_DIR/rhel-9.nt"
 
-/app/scripts/upload-nt.sh /tmp/collection/rhel-9.nt "$GRAPH_URI"
+/app/scripts/upload-nt.sh "$RUN_DIR/rhel-9.nt" "$GRAPH_URI"
 
 # Only after a successful publication: retire this run's checkpoint
 # generation so the next scheduled run starts fresh. `set -e` means a

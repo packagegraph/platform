@@ -2,9 +2,15 @@
 # Collector: centos-stream-9-full
 # Ported from deploy/overlays/dev/jobs/collect-centos-stream-9-full.yaml.
 set -eu
+
+# Private per-invocation scratch. /tmp is one volume shared by every
+# concurrently running collector -- see README.md, "Run directories".
+find /tmp -maxdepth 1 -type d -name 'run-*.*' -mmin +2880 -exec rm -rf {} + 2>/dev/null || true
+RUN_DIR=$(mktemp -d /tmp/run-centos-stream-9-full.XXXXXXXX)
+trap 'rm -rf "$RUN_DIR"' EXIT
+
 GRAPH_URI="https://packagegraph.github.io/graph/centos-stream/9"
 
-mkdir -p /tmp/collection
 CACHE_DIR=/tmp/cache/centos-stream-9-full
 MINIO_CACHE="pgraph/${MINIO_BUCKET}/collector-cache/centos-stream-9-full"
 mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4
@@ -21,7 +27,7 @@ echo "Cache warmed: $(find "${CACHE_DIR}" -type f 2>/dev/null | wc -l) entries"
     mc mirror --overwrite --exclude 'output/*' "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
   done ) &
 CACHE_SYNC_PID=$!
-trap 'kill "${CACHE_SYNC_PID}" 2>/dev/null || true' EXIT
+trap 'kill "${CACHE_SYNC_PID}" 2>/dev/null || true; rm -rf "$RUN_DIR"' EXIT
 
 pg-collect rpm-full \
   --url https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/ \
@@ -29,9 +35,9 @@ pg-collect rpm-full \
   --distro centos-stream --release 9 \
   --with-spec --with-maintainers \
   --cache-dir "${CACHE_DIR}" \
-  -o /tmp/collection/centos-stream-9.nt
+  -o "$RUN_DIR/centos-stream-9.nt"
 
-/app/scripts/upload-nt.sh /tmp/collection/centos-stream-9.nt "$GRAPH_URI"
+/app/scripts/upload-nt.sh "$RUN_DIR/centos-stream-9.nt" "$GRAPH_URI"
 
 # Only after a successful publication: retire this run's checkpoint
 # generation so the next scheduled run starts fresh. `set -e` means a

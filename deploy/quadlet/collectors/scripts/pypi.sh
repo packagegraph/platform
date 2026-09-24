@@ -2,6 +2,13 @@
 # Collector: pypi
 # Ported from deploy/overlays/dev/jobs/collect-pypi.yaml.
 set -eu
+
+# Private per-invocation scratch. /tmp is one volume shared by every
+# concurrently running collector -- see README.md, "Run directories".
+find /tmp -maxdepth 1 -type d -name 'run-*.*' -mmin +2880 -exec rm -rf {} + 2>/dev/null || true
+RUN_DIR=$(mktemp -d /tmp/run-pypi.XXXXXXXX)
+trap 'rm -rf "$RUN_DIR"' EXIT
+
 GRAPH_URI="https://packagegraph.github.io/graph/pypi"
 
 CACHE_DIR=/tmp/cache/pypi
@@ -22,16 +29,16 @@ fi
     mc mirror --overwrite --exclude "*.tmp" --exclude "*.lock" "${CACHE_DIR}/" "${MINIO_CACHE}/" 2>/dev/null || true
   done ) &
 CACHE_SYNC_PID=$!
-trap 'kill "${CACHE_SYNC_PID}" 2>/dev/null || true' EXIT
+trap 'kill "${CACHE_SYNC_PID}" 2>/dev/null || true; rm -rf "$RUN_DIR"' EXIT
 
 set +e
-pg-collect pypi --endpoint "$FUSEKI_ENDPOINT" --cache-dir "${CACHE_DIR}" --cache-ttl-hours 24 -o /tmp/pypi.nt
+pg-collect pypi --endpoint "$FUSEKI_ENDPOINT" --cache-dir "${CACHE_DIR}" --cache-ttl-hours 24 -o "$RUN_DIR/pypi.nt"
 COLLECT_EXIT=$?
 set -e
 
 if [ "$COLLECT_EXIT" -eq 0 ]; then
   echo "Syncing cache to Minio..."
   mc mirror --overwrite --exclude "*.tmp" --exclude "*.lock" "${CACHE_DIR}/" "${MINIO_CACHE}/" || echo "Cache save failed"
-  /app/scripts/upload-nt.sh /tmp/pypi.nt "$GRAPH_URI"
+  /app/scripts/upload-nt.sh "$RUN_DIR/pypi.nt" "$GRAPH_URI"
 fi
 exit "$COLLECT_EXIT"
