@@ -8,4 +8,4 @@
 # Update the allowlist when a revision changes the deployed module set.
 #
 # Comments and blank lines are ignored; the first bare value wins.
-5840cf33ada5bdf814b1dd6c811692cc3e30189e
+v0.15.0
