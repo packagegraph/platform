@@ -227,6 +227,17 @@ impl NpmCollector {
                 if let Some(deps) = &ver_data.dependencies {
                     triples += self.emit_npm_deps(writer, &pkg_uri, deps, "depends")?;
                 }
+                // Parsed but never emitted until now (#45). They inflate
+                // reverse-dependency counts, because enrich_revdeps counts
+                // pkg:directlyDependsOn without filtering by dependency type
+                // -- but they are real edges, and a dependency graph that
+                // omits what was present at build time answers build-
+                // provenance and supply-chain questions wrongly. dep_type_uri
+                // already routes "dev_depends" to buildDependsOn, so they
+                // remain distinguishable from runtime edges.
+                if let Some(deps) = &ver_data.dev_dependencies {
+                    triples += self.emit_npm_deps(writer, &pkg_uri, deps, "dev_depends")?;
+                }
                 if let Some(deps) = &ver_data.peer_dependencies {
                     triples += self.emit_npm_deps(writer, &pkg_uri, deps, "peer_depends")?;
                 }
@@ -259,13 +270,23 @@ impl NpmCollector {
         dep_type: &str,
     ) -> Result<usize> {
         let mut triples = 0;
-        for (dep_name, version_range) in deps {
-            let target_uri = package_identity_uri("npm", "registry", "any", dep_name);
+        for (dep_key, raw_spec) in deps {
+            let spec = NpmSpec::classify(raw_spec);
+
+            // For every spec form but an alias, the map key IS the registry
+            // package name -- `"lodash": "git+https://.../lodash"` still
+            // depends on lodash, it just says where to get it from. Only
+            // `npm:` renames the package, and only there does the key point
+            // at something that was never published (#41).
+            let target_name = spec.registry_name().unwrap_or(dep_key.as_str());
+            let target_uri = package_identity_uri("npm", "registry", "any", target_name);
 
             writer.write_triple(pkg_uri, &format!("{PKG}directlyDependsOn"), &target_uri)?;
             triples += 1;
 
-            let bnode = bnode_id(dep_type, &format!("{}-{}", pkg_uri, dep_name));
+            // Keyed by the map key, not the target: a package may alias the
+            // same target twice under different local names.
+            let bnode = bnode_id(dep_type, &format!("{}-{}", pkg_uri, dep_key));
             writer.write_bnode_object(pkg_uri, &format!("{PKG}hasDependency"), &bnode)?;
             writer.write_bnode_subject(&bnode, RDF_TYPE, &format!("{PKG}Dependency"))?;
             writer.write_bnode_subject(&bnode, &format!("{PKG}dependencyTarget"), &target_uri)?;
@@ -276,25 +297,149 @@ impl NpmCollector {
             )?;
             triples += 4;
 
-            // Version constraint (NPM uses semver ranges like "^1.2.3", "~2.0.0")
-            if !version_range.is_empty() {
-                let cb = bnode_id("constraint", &format!("{}-{}", pkg_uri, dep_name));
-                writer.write_bnode_to_bnode(&bnode, &format!("{PKG}hasVersionConstraint"), &cb)?;
-                writer.write_bnode_subject(&cb, RDF_TYPE, &format!("{PKG}VersionConstraint"))?;
-                writer.write_bnode_literal(
-                    &cb,
-                    &format!("{PKG}versionConstraintOperator"),
-                    "semver",
+            // A constraint is emitted only where the spec really is a version
+            // range. Labelling "file:../local" or "git+ssh://..." as semver
+            // does not merely mislead: a consumer doing semver arithmetic on
+            // it either fails to parse or parses a prefix and is confidently
+            // wrong.
+            match spec.semver_range() {
+                Some(range) if !range.is_empty() => {
+                    let cb = bnode_id("constraint", &format!("{}-{}", pkg_uri, dep_key));
+                    writer.write_bnode_to_bnode(
+                        &bnode,
+                        &format!("{PKG}hasVersionConstraint"),
+                        &cb,
+                    )?;
+                    writer.write_bnode_subject(
+                        &cb,
+                        RDF_TYPE,
+                        &format!("{PKG}VersionConstraint"),
+                    )?;
+                    writer.write_bnode_literal(
+                        &cb,
+                        &format!("{PKG}versionConstraintOperator"),
+                        "semver",
+                    )?;
+                    writer.write_bnode_literal(
+                        &cb,
+                        &format!("{PKG}versionConstraintValue"),
+                        range,
+                    )?;
+                    triples += 4;
+                }
+                _ => {}
+            }
+
+            // What was not representable is recorded rather than guessed at.
+            if let Some((issue_type, severity)) = spec.dq_issue() {
+                triples += crate::forge::emit_dq_issue(
+                    writer,
+                    "collect-npm",
+                    "dependency-spec",
+                    &format!("{dep_key} -> {raw_spec}"),
+                    issue_type,
+                    severity,
                 )?;
-                writer.write_bnode_literal(
-                    &cb,
-                    &format!("{PKG}versionConstraintValue"),
-                    version_range,
-                )?;
-                triples += 4;
             }
         }
         Ok(triples)
+    }
+}
+
+/// What a value in an npm dependency map actually says.
+///
+/// Every value was treated as a semver range and every key as a registry
+/// package name. npm permits neither assumption (#41).
+#[derive(Debug, PartialEq)]
+enum NpmSpec<'a> {
+    /// A semver range, dist-tag, or `*`. The map key names the package.
+    Range(&'a str),
+    /// `npm:<name>@<range>`: the map key is a local rename and `name` is the
+    /// package that actually exists. This is how a package depends on two
+    /// major versions of one library at once -- `string-width-cjs` and
+    /// friends in the `cliui`/`wrap-ansi` chain.
+    Alias { name: &'a str, range: &'a str },
+    /// `file:`, `link:`, `workspace:`, `portal:` -- resolved from the
+    /// checkout. The key still names the package; the value is not a version.
+    Local(&'a str),
+    /// `git+...`, `github:owner/repo`, a tarball URL -- says where to get the
+    /// package, not which version of it.
+    Source(&'a str),
+    /// A scheme we do not know. Recorded, not guessed at.
+    Unknown(&'a str),
+}
+
+impl<'a> NpmSpec<'a> {
+    fn classify(spec: &'a str) -> Self {
+        const LOCAL: [&str; 4] = ["file:", "link:", "workspace:", "portal:"];
+        const SOURCE: [&str; 7] = [
+            "git+",
+            "git:",
+            "github:",
+            "gitlab:",
+            "bitbucket:",
+            "http:",
+            "https:",
+        ];
+
+        if let Some(rest) = spec.strip_prefix("npm:") {
+            // A scoped name starts with '@', so the separator is the LAST '@'
+            // that is not the scope marker: npm:@scope/pkg@^1 -> @scope/pkg.
+            return match rest.rfind('@') {
+                Some(at) if at > 0 => NpmSpec::Alias {
+                    name: &rest[..at],
+                    range: &rest[at + 1..],
+                },
+                // npm:string-width, npm:@scope/pkg -- an alias with no range.
+                _ => NpmSpec::Alias {
+                    name: rest,
+                    range: "",
+                },
+            };
+        }
+        if LOCAL.iter().any(|p| spec.starts_with(p)) {
+            return NpmSpec::Local(spec);
+        }
+        if SOURCE.iter().any(|p| spec.starts_with(p)) || spec.ends_with(".tgz") {
+            return NpmSpec::Source(spec);
+        }
+        // A semver range never contains a colon, so one we did not recognise
+        // above is a scheme, not a version.
+        if spec.contains(':') {
+            return NpmSpec::Unknown(spec);
+        }
+        NpmSpec::Range(spec)
+    }
+
+    /// The registry package this depends on, when the map key is not it.
+    fn registry_name(&self) -> Option<&'a str> {
+        match self {
+            NpmSpec::Alias { name, .. } if !name.is_empty() => Some(name),
+            _ => None,
+        }
+    }
+
+    /// The semver range, where the value really carries one.
+    fn semver_range(&self) -> Option<&'a str> {
+        match self {
+            NpmSpec::Range(r) => Some(r),
+            NpmSpec::Alias { range, .. } => Some(range),
+            NpmSpec::Local(_) | NpmSpec::Source(_) | NpmSpec::Unknown(_) => None,
+        }
+    }
+
+    /// `(issue_type, severity)` for a spec whose meaning the graph cannot
+    /// carry, or `None` where nothing was lost.
+    fn dq_issue(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            NpmSpec::Range(_) => None,
+            // The local rename is real information the dependency edge no
+            // longer carries, now that the edge points at the real package.
+            NpmSpec::Alias { .. } => Some(("npm-aliased-dependency", "info")),
+            NpmSpec::Local(_) => Some(("npm-local-dependency-spec", "info")),
+            NpmSpec::Source(_) => Some(("npm-source-dependency-spec", "info")),
+            NpmSpec::Unknown(_) => Some(("npm-unrecognized-dependency-spec", "warning")),
+        }
     }
 }
 
@@ -422,6 +567,252 @@ mod tests {
         assert!(content.contains("directlyDependsOn"));
         assert!(content.contains("npm#integrity"));
         assert!(triples > 15);
+    }
+
+    // --- npm dependency specs are not all semver ranges (#41) ---
+
+    /// Emit one package whose only dependency is `key: spec`, and return the
+    /// N-Triples. Drives the real emitter, because the shape that hurts is
+    /// what reaches the graph, not what a classifier returns.
+    fn deps_output(key: &str, spec: &str) -> String {
+        deps_output_of_kind(key, spec, "dependencies")
+    }
+
+    /// As above, but choosing which of package.json's dependency maps the
+    /// entry goes in.
+    fn deps_output_of_kind(key: &str, spec: &str, kind: &str) -> String {
+        let collector = NpmCollector::new("https://registry.npmjs.org".into());
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+
+        let mut deps = HashMap::new();
+        deps.insert(key.to_string(), spec.to_string());
+        let mut version = NpmVersion {
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            dist: None,
+        };
+        match kind {
+            "dependencies" => version.dependencies = Some(deps),
+            "devDependencies" => version.dev_dependencies = Some(deps),
+            "peerDependencies" => version.peer_dependencies = Some(deps),
+            "optionalDependencies" => version.optional_dependencies = Some(deps),
+            other => panic!("no such dependency map: {other}"),
+        }
+        let mut versions = HashMap::new();
+        versions.insert("1.0.0".into(), version);
+        let mut dist_tags = HashMap::new();
+        dist_tags.insert("latest".into(), "1.0.0".into());
+
+        let pkg = NpmPackageDoc {
+            name: "cliui".into(),
+            description: None,
+            license: None,
+            homepage: None,
+            dist_tags: Some(dist_tags),
+            versions: Some(versions),
+        };
+        collector.emit_package_triples(&mut writer, &pkg).unwrap();
+        writer.flush().unwrap();
+
+        let mut content = String::new();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        content
+    }
+
+    fn identity(name: &str) -> String {
+        package_identity_uri("npm", "registry", "any", name)
+    }
+
+    #[test]
+    fn an_alias_depends_on_the_package_that_exists_not_on_the_local_rename() {
+        // "string-width-cjs" was minted as a registry identity. Nothing will
+        // ever collect it, so the edge pointed at a node with no describing
+        // triples -- and the real dependency on string-width, along with any
+        // CVE reachable through it, was never recorded at all.
+        let out = deps_output("string-width-cjs", "npm:string-width@^4.2.0");
+        assert!(
+            out.contains(&format!(
+                "directlyDependsOn> <{}>",
+                identity("string-width")
+            )),
+            "{out}"
+        );
+        assert!(
+            !out.contains(&identity("string-width-cjs")),
+            "the local rename was minted as a registry package:\n{out}"
+        );
+        // The range still belongs to the constraint.
+        assert!(out.contains("versionConstraintValue> \"^4.2.0\""), "{out}");
+    }
+
+    #[test]
+    fn a_scoped_alias_keeps_its_scope() {
+        // The scope marker is itself an '@', so splitting on the first one
+        // would yield an empty name and a target of "@".
+        let out = deps_output("pkg-cjs", "npm:@scope/pkg@^1.2.3");
+        assert!(
+            out.contains(&format!("directlyDependsOn> <{}>", identity("@scope/pkg"))),
+            "{out}"
+        );
+        assert!(out.contains("versionConstraintValue> \"^1.2.3\""), "{out}");
+    }
+
+    #[test]
+    fn an_alias_without_a_range_still_names_the_right_package() {
+        let out = deps_output("sw", "npm:string-width");
+        assert!(
+            out.contains(&format!(
+                "directlyDependsOn> <{}>",
+                identity("string-width")
+            )),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_non_registry_spec_keeps_the_key_as_the_package() {
+        // "lodash": "git+https://.../lodash" still depends on lodash; it only
+        // says where to get it. Dropping the edge would lose a real one.
+        for spec in [
+            "file:../local",
+            "link:../local",
+            "workspace:*",
+            "git+https://github.com/me/lodash.git",
+            "github:me/lodash#branch",
+            "https://example.invalid/lodash-1.0.0.tgz",
+        ] {
+            let out = deps_output("lodash", spec);
+            assert!(
+                out.contains(&format!("directlyDependsOn> <{}>", identity("lodash"))),
+                "{spec} lost the dependency edge:\n{out}"
+            );
+            assert!(
+                !out.contains("versionConstraintOperator"),
+                "{spec} was labelled a version constraint:\n{out}"
+            );
+            assert!(
+                !out.contains(&format!("versionConstraintValue> \"{spec}\"")),
+                "{spec} was written as a constraint value:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_semver_range_is_unchanged() {
+        // The common case, and the regression guard for everything above.
+        let out = deps_output("accepts", "~1.3.8");
+        assert!(out.contains(&format!("directlyDependsOn> <{}>", identity("accepts"))));
+        assert!(
+            out.contains("versionConstraintOperator> \"semver\""),
+            "{out}"
+        );
+        assert!(out.contains("versionConstraintValue> \"~1.3.8\""), "{out}");
+        assert!(
+            !out.contains("dependency-spec"),
+            "nothing was lost, so nothing should be reported:\n{out}"
+        );
+    }
+
+    #[test]
+    fn what_could_not_be_represented_is_recorded() {
+        // A dropped constraint that leaves no trace is the same failure in a
+        // quieter form.
+        for (spec, issue) in [
+            ("npm:string-width@^4.2.0", "npm-aliased-dependency"),
+            ("file:../local", "npm-local-dependency-spec"),
+            ("git+ssh://git@host/x.git", "npm-source-dependency-spec"),
+            (
+                "patch:lodash@^4#./p.patch",
+                "npm-unrecognized-dependency-spec",
+            ),
+        ] {
+            let out = deps_output("lodash", spec);
+            assert!(
+                out.contains(issue),
+                "{spec} was not recorded as {issue}:\n{out}"
+            );
+            assert!(
+                out.contains(spec),
+                "the raw spec is what a reader needs:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_dependencies_reach_the_graph_as_build_time_edges() {
+        // #45: the field was deserialized and silently dropped, so the npm
+        // graph could not answer what was present at build time. They are
+        // emitted as dev_depends, which dep_type_uri already routes to
+        // buildDependsOn -- inflating reverse-dependency counts, but
+        // accurately, and distinguishably from runtime edges.
+        let out = deps_output_of_kind("eslint", "^9.0.0", "devDependencies");
+        assert!(
+            out.contains(&format!("directlyDependsOn> <{}>", identity("eslint"))),
+            "{out}"
+        );
+        assert!(
+            out.contains("dependencyType> <") && out.contains("buildDependsOn"),
+            "a dev dependency must stay distinguishable from a runtime one:\n{out}"
+        );
+        assert!(out.contains("versionConstraintValue> \"^9.0.0\""), "{out}");
+    }
+
+    #[test]
+    fn each_dependency_map_keeps_its_own_kind() {
+        // Non-vacuous counterpart: if every map produced the same predicate,
+        // the assertion above would say nothing.
+        let runtime = deps_output_of_kind("accepts", "^1.0.0", "dependencies");
+        let dev = deps_output_of_kind("accepts", "^1.0.0", "devDependencies");
+        let optional = deps_output_of_kind("accepts", "^1.0.0", "optionalDependencies");
+        assert!(runtime.contains("dependsOn>"), "{runtime}");
+        assert!(!runtime.contains("buildDependsOn"), "{runtime}");
+        assert!(dev.contains("buildDependsOn"), "{dev}");
+        assert!(optional.contains("suggests"), "{optional}");
+    }
+
+    #[test]
+    fn classification_covers_the_forms_npm_actually_permits() {
+        use NpmSpec::*;
+        assert_eq!(NpmSpec::classify("^1.2.3"), Range("^1.2.3"));
+        assert_eq!(NpmSpec::classify("*"), Range("*"));
+        assert_eq!(NpmSpec::classify("latest"), Range("latest"));
+        assert_eq!(
+            NpmSpec::classify("npm:string-width@^4.2.0"),
+            Alias {
+                name: "string-width",
+                range: "^4.2.0"
+            }
+        );
+        assert_eq!(
+            NpmSpec::classify("npm:@scope/pkg@^1"),
+            Alias {
+                name: "@scope/pkg",
+                range: "^1"
+            }
+        );
+        assert_eq!(
+            NpmSpec::classify("npm:@scope/pkg"),
+            Alias {
+                name: "@scope/pkg",
+                range: ""
+            }
+        );
+        assert_eq!(NpmSpec::classify("workspace:^"), Local("workspace:^"));
+        assert_eq!(NpmSpec::classify("github:a/b"), Source("github:a/b"));
+        assert_eq!(
+            NpmSpec::classify("https://h/x.tgz"),
+            Source("https://h/x.tgz")
+        );
+        // A semver range never contains a colon, so one that does is a
+        // scheme we have not taught this function about.
+        assert_eq!(NpmSpec::classify("patch:x@^1"), Unknown("patch:x@^1"));
     }
 
     // ── Characterization: what fetch_package_with_retry does TODAY ──────
