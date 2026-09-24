@@ -47,10 +47,15 @@ Environment=FUSEKI_ENDPOINT=http://127.0.0.1:7001
 # Scratch space (cache + pre-upload output) on the dedicated data disk,
 # not the container's overlay writable layer -- see
 # pg-collect-scratch.volume's comment. Shared by every concurrently
-# running collector instance; safe because each script namespaces its own
-# paths under /tmp/cache/<name> and /tmp/collection/<name>.nt. :z
-# (lowercase, shared label), not :Z -- see pg-collect-scratch.volume's
-# comment for the EACCES incident :Z caused here.
+# running collector instance, and by repeated runs of one of them, so
+# every ephemeral path has to be private per invocation. It was not: this
+# comment used to claim the namespacing was already safe, while fifteen
+# wrappers both wrote and read /tmp/packages.nt and could publish each
+# other's bytes (#69). Each wrapper now mints its own /tmp/run-<name>.XXXX
+# and cleans it up; only /tmp/cache/<name> is shared on purpose, because
+# it is the persistent cache and checkpoint state. :z (lowercase, shared
+# label), not :Z -- see pg-collect-scratch.volume's comment for the
+# EACCES incident :Z caused here.
 Volume=pg-collect-scratch.volume:/tmp:z
 Volume=/etc/containers/systemd/scripts/collectors/%i.sh:/usr/local/bin/collect.sh:ro
 # Curated seed lists (currently maven-roots.txt), installed from

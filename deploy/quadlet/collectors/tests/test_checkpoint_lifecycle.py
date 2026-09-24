@@ -37,8 +37,15 @@ class LifecycleTest(unittest.TestCase):
         self.wrapper = self.root / "wrapper.sh"
         source = Path(os.environ.get("CHECKPOINT_TEST_WRAPPER",
                                     HERE.parent / "scripts/fedora-44-full.sh")).read_text()
+        # Also neutralise the run-directory cleanup. The wrapper removes its
+        # own scratch on exit (see scripts/README.md, "Run directories"), and
+        # these tests need to read the .nt it produced afterwards. Only the
+        # `rm -rf` is dropped -- the same trap's `kill` of the periodic cache
+        # loop is left intact, because the lifecycle under test depends on it.
+        # That cleanup has its own coverage in test_collector_concurrency.py.
         self.wrapper.write_text(source.replace("/tmp/", str(self.root) + "/")
-                                .replace("/app/scripts/", str(REPO / "etl/scripts") + "/"))
+                                .replace("/app/scripts/", str(REPO / "etl/scripts") + "/")
+                                .replace('rm -rf "$RUN_DIR"', ':'))
         self.cache = self.root / "cache/fedora-44-full"
         self.state_path = self.cache / "output/GENERATION"
         self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
@@ -49,8 +56,12 @@ class LifecycleTest(unittest.TestCase):
         # Fail rather than accidentally using a globally installed old binary.
         self.assertTrue(Path(self.env["PG_COLLECT_BIN"]).is_file())
 
+    def run_dirs(self):
+        return {p for p in self.root.glob("run-*.*") if p.is_dir()}
+
     def run_wrapper(self, fail_upload="", fail_collect=False):
         (self.root / "periodic-started").unlink(missing_ok=True)
+        before = self.run_dirs()
         process = subprocess.Popen(
             ["sh", str(self.wrapper)], env=dict(self.env, FAIL_UPLOAD=fail_upload,
                                               FAIL_COLLECT="1" if fail_collect else ""),
@@ -58,6 +69,14 @@ class LifecycleTest(unittest.TestCase):
         )
         try:
             output, _ = process.communicate(timeout=30)
+            # Each invocation mints its own run directory, so pin the one this
+            # run created. Previously every run reused a single fixed path,
+            # which meant a run that produced nothing silently inherited the
+            # previous run's .nt.
+            fresh = self.run_dirs() - before
+            self.assertEqual(len(fresh), 1,
+                             f"expected exactly one new run directory, got {fresh}")
+            self.run_dir = fresh.pop()
             return process.returncode, output
         finally:
             # Clean up the periodic-loop descendants even on timeout/assertion.
@@ -71,14 +90,14 @@ class LifecycleTest(unittest.TestCase):
         return json.loads(self.state_path.read_text())
 
     def fragment(self):
-        text = (self.root / "collection/fedora-44.nt").read_text()
+        text = (self.run_dir / "fedora-44.nt").read_text()
         return "\n".join(line for line in text.splitlines() if "/d/build/fedora/" in line)
 
     def spec_fragment(self):
         # Source0 forge extraction and the %changelog maintainer. Neither is
         # reachable from repodata, so these lines exist only if the spec stage
         # produced them -- by fetching or by replaying a checkpoint.
-        text = (self.root / "collection/fedora-44.nt").read_text()
+        text = (self.run_dir / "fedora-44.nt").read_text()
         return "\n".join(line for line in text.splitlines()
                          if "madler" in line or "/d/person/" in line)
 
