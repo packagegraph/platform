@@ -13,7 +13,7 @@ HERE = Path(__file__).resolve().parent
 SOURCE = (HERE.parent / "scripts/fedora-44-full.sh").read_text()
 TEST = "LifecycleTest.test_failed_upload_replays_then_success_retires_and_rederives"
 COMMIT = 'pg-collect checkpoint commit --cache-dir "${CACHE_DIR}"'
-UPLOAD = '/app/scripts/upload-nt.sh /tmp/collection/fedora-44.nt "$GRAPH_URI"'
+UPLOAD = '/app/scripts/upload-nt.sh "$RUN_DIR/fedora-44.nt" "$GRAPH_URI"'
 
 
 def run(wrapper=None):

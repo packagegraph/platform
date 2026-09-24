@@ -23,7 +23,7 @@ intermediates (`/tmp/void-repo`, `/tmp/gentoo.tar.gz`, `/tmp/feeds/<feed>`,
 Every wrapper therefore opens with:
 
 ```sh
-find /tmp -maxdepth 1 -type d -name 'run-*.*' -mmin +2880 -exec rm -rf {} + 2>/dev/null || true
+find /tmp/ -maxdepth 1 -type d -name 'run-*.*' -mmin +2880 -exec rm -rf {} + 2>/dev/null || true
 RUN_DIR=$(mktemp -d /tmp/run-<name>.XXXXXXXX)
 trap 'rm -rf "$RUN_DIR"' EXIT
 ```
@@ -46,6 +46,9 @@ Three details worth keeping:
 - **`mktemp` is what makes two concurrent runs of the same wrapper safe.** A
   per-collector fixed directory would fix the cross-collector collision and
   leave the self-collision.
+- **The trailing slash in `find /tmp/` is load-bearing.** Every test that runs
+  a real wrapper does so with its `/tmp/` prefix rewritten to a sandbox.
+  `find /tmp ...` would escape that rewrite and sweep the real `/tmp`.
 
 ## What deliberately stays shared
 

@@ -38,7 +38,11 @@ NOT_A_WRAPPER = {"test-wrapper-checkpoint-contract.sh"}
 PERSISTENT_ROOTS = ("/tmp/cache/",)
 
 MKTEMP = re.compile(r"^RUN_DIR=\$\(mktemp -d /tmp/run-(?P<name>[A-Za-z0-9._-]+)\.X{6,}\)$")
-SWEEP = re.compile(r"^find /tmp -maxdepth 1 -type d -name 'run-\*\.\*' -mmin \+(?P<age>\d+) ")
+# The trailing slash on /tmp/ is load-bearing, not style: every wrapper
+# test runs the real script with its `/tmp/` prefix rewritten to a
+# sandbox, and `find /tmp ...` would escape that rewrite and sweep the
+# developer's actual /tmp.
+SWEEP = re.compile(r"^find /tmp/ -maxdepth 1 -type d -name 'run-\*\.\*' -mmin \+(?P<age>\d+) ")
 CLEANUP_TRAP = "trap 'rm -rf \"$RUN_DIR\"' EXIT"
 
 # Longest a collector may run before systemd SIGKILLs it, from
