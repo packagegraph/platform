@@ -10,19 +10,25 @@
 use crate::cached_fetch::HttpResponse;
 use crate::fetch_error::FetchError;
 use crate::http_transport::HttpTransport;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
 
 /// Counter for unique temp file names within a process (mirrors
 /// `http_cache.rs`'s `TEMP_COUNTER` pattern for atomic tmp-file + rename
 /// writes). Kept as its own separate static -- see this file's top-of-file
 /// doc comment on why `SourceCache` and `HttpCache` stay independent types.
 static MANIFEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Same idea for artifact bytes. Artifacts used to be written in place with
+/// `fs::write`, which is not a publication: a kill part-way through left
+/// truncated bytes sitting under the *old* manifest's size and digest, and
+/// nothing ever re-read them to notice.
+static ARTIFACT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Scope identifier for a cached artifact.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,18 +128,55 @@ impl SourceCache {
 
         // Check if cached artifact exists with valid manifest
         if let Some(meta) = self.read_manifest(&manifest_path, logical_name)? {
-            // Conditional GET on whichever validators the server gave us.
+            // Verify the BYTES before trusting the metadata that describes
+            // them. Both reuse paths below -- a 304 and the stale-on-network-
+            // error fallback -- hand the caller this file without reading it,
+            // so an entry whose manifest survived while its artifact did not
+            // was silently served as if it were good. That happens: the
+            // artifact and the manifest are two separate writes, so an
+            // interrupted publication leaves new bytes under an old digest,
+            // and a truncated or half-written file is exactly the shape a
+            // kill during `fs::write` produced.
+            let intact = match Self::verify_artifact(&artifact_path, &meta) {
+                Ok(()) => true,
+                Err(why) => {
+                    eprintln!(
+                        "Warning: cached artifact {} failed verification ({}) — refetching",
+                        artifact_path.display(),
+                        why
+                    );
+                    false
+                }
+            };
+
+            // Validators describe bytes we no longer have, so sending them
+            // would invite a 304 and with it the corrupt copy. Ask
+            // unconditionally instead.
             let mut headers: Vec<(&str, &str)> = Vec::new();
-            if let Some(ref lm) = meta.last_modified {
-                headers.push(("If-Modified-Since", lm));
+            let mut etag: Option<&str> = None;
+            if intact {
+                if let Some(ref lm) = meta.last_modified {
+                    headers.push(("If-Modified-Since", lm));
+                }
+                etag = meta.etag.as_deref();
             }
 
-            match self
-                .transport
-                .get_with(url, &headers, meta.etag.as_deref())
-            {
+            match self.transport.get_with(url, &headers, etag) {
                 Ok(resp) if resp.status == 304 => {
-                    // 304 Not Modified — use cached version
+                    if !intact {
+                        // We sent no validators, so this is the server being
+                        // wrong. Refusing is the only safe answer: the only
+                        // bytes we could return are the ones we just rejected.
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "{}: server returned 304 to an unconditional request while \
+                                 the cached artifact is invalid; refusing to serve it",
+                                url
+                            ),
+                        ));
+                    }
+                    // 304 Not Modified — use the verified cached version
                     return Ok(CacheResult::NotModified(artifact_path));
                 }
                 Ok(resp) => {
@@ -142,13 +185,22 @@ impl SourceCache {
                 }
                 Err(FetchError::Transport { source, .. }) => {
                     // Network error, after the transport exhausted its
-                    // retries — if a cached copy exists, prefer it to
-                    // failing the run.
-                    if artifact_path.exists() {
+                    // retries — if a VERIFIED cached copy exists, prefer it to
+                    // failing the run. Unverified, an error is the better
+                    // outcome: a collector that silently parses truncated
+                    // repodata publishes a plausible, wrong graph, and the
+                    // completeness gates downstream only catch gross loss.
+                    if intact {
                         eprintln!("Warning: network error, using cached version: {}", source);
                         return Ok(CacheResult::Cached(artifact_path));
                     }
-                    return Err(io::Error::new(io::ErrorKind::Other, source.to_string()));
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "{}: cached artifact is invalid and cannot be refetched: {}",
+                            url, source
+                        ),
+                    ));
                 }
                 Err(e) => {
                     return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
@@ -184,6 +236,95 @@ impl SourceCache {
         }
     }
 
+    /// Does the artifact on disk still match what the manifest says?
+    ///
+    /// Existence, then length, then digest -- cheapest discriminator first,
+    /// so the common truncation case costs a `stat` rather than a full read.
+    /// The digest is streamed; some of these artifacts are tens of megabytes
+    /// and there is no reason to hold one in memory just to hash it.
+    fn verify_artifact(path: &Path, meta: &ArtifactMeta) -> Result<(), String> {
+        let file = match fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => return Err(format!("cannot open: {}", e)),
+        };
+        let len = match file.metadata() {
+            Ok(m) => m.len(),
+            Err(e) => return Err(format!("cannot stat: {}", e)),
+        };
+        if len != meta.size_bytes {
+            return Err(format!("size {} != manifest {}", len, meta.size_bytes));
+        }
+
+        let mut reader = io::BufReader::new(file);
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => hasher.update(&buf[..n]),
+                Err(e) => return Err(format!("read failed: {}", e)),
+            }
+        }
+        let actual = format!("{:x}", hasher.finalize());
+        if actual != meta.sha256 {
+            return Err(format!("sha256 {} != manifest {}", actual, meta.sha256));
+        }
+        Ok(())
+    }
+
+    /// Publish artifact bytes: same-directory temp file, fsync, rename.
+    ///
+    /// `fs::write` truncates the target and then streams into it, so a kill
+    /// mid-write left a short file described by the previous manifest entry's
+    /// size and digest -- corrupt bytes wearing valid metadata. A rename
+    /// within one directory is atomic on POSIX, so a reader sees either the
+    /// whole old artifact or the whole new one.
+    ///
+    /// The artifact and its manifest entry are still two writes, and this does
+    /// not make them one. What it guarantees is that the failure is always
+    /// *detectable*: interrupted between them, the new bytes sit under the old
+    /// digest, and `verify_artifact` rejects them on the next run.
+    fn write_artifact_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "artifact has no parent"))?;
+        fs::create_dir_all(parent)?;
+
+        let counter = ARTIFACT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let stem = path.file_name().unwrap().to_string_lossy();
+        let tmp_path = parent.join(format!(".{}.{}.{}.tmp", stem, std::process::id(), counter));
+
+        let mut file = fs::File::create(&tmp_path)?;
+        if let Err(e) = file
+            .write_all(bytes)
+            .and_then(|_| file.sync_all())
+        {
+            drop(file);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+        drop(file);
+
+        if let Err(e) = fs::rename(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// RFC3339 in UTC, to the second.
+    ///
+    /// Split out from the caller so the calendar conversion is testable at
+    /// month and year boundaries. It used to be open-coded arithmetic --
+    /// `1970 + secs / 31557600` for the year, `(secs / 2629800) % 12 + 1` for
+    /// the month, `(secs / 86400) % 30 + 1` for the day -- using an average
+    /// month and a 30-day month, so the day drifted within every month, the
+    /// month drifted within every year, and both could report values that are
+    /// not valid dates at all.
+    fn format_fetched_at(when: DateTime<Utc>) -> String {
+        when.to_rfc3339_opts(SecondsFormat::Secs, true)
+    }
+
     fn download_and_cache(
         &self,
         resp: HttpResponse,
@@ -200,25 +341,13 @@ impl SourceCache {
         hasher.update(&bytes);
         let sha256 = format!("{:x}", hasher.finalize());
 
-        // Save artifact
+        // Publish the artifact, then describe it. This order matters: the
+        // manifest is the claim, the bytes are the evidence, and a manifest
+        // entry must never point at bytes that were never fully written.
         let artifact_path = self.artifact_path(scope, logical_name);
-        fs::create_dir_all(artifact_path.parent().unwrap())?;
-        fs::write(&artifact_path, &bytes)?;
+        Self::write_artifact_atomic(&artifact_path, &bytes)?;
 
-        // Update manifest
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let fetched_at = format!(
-            "{}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-            1970 + now / 31557600,
-            (now / 2629800) % 12 + 1,
-            (now / 86400) % 30 + 1,
-            (now / 3600) % 24,
-            (now / 60) % 60,
-            now % 60
-        );
+        let fetched_at = Self::format_fetched_at(Utc::now());
 
         let relative_path = artifact_path
             .strip_prefix(&self.cache_dir)
@@ -697,4 +826,294 @@ mod tests {
         );
         mock.assert();
     }
+
+    // ---- #74: verify cached bytes before reusing them --------------------
+
+    /// Seed the cache with one good artifact and return its scope + url.
+    fn seed(cache: &SourceCache, server: &mut mockito::ServerGuard, body: &str) -> (CacheScope, String) {
+        let scope = CacheScope {
+            collector: "test".to_string(),
+            distro: "fedora".to_string(),
+            release: "43".to_string(),
+            repo: None,
+            arch: None,
+        };
+        let url = format!("{}/repomd.xml", server.url());
+        let mock = server
+            .mock("GET", "/repomd.xml")
+            .with_status(200)
+            .with_header("etag", "\"v1\"")
+            .with_body(body)
+            .create();
+        cache.fetch_or_reuse(&url, &scope, "repomd.xml").unwrap();
+        mock.assert();
+        (scope, url)
+    }
+
+    #[test]
+    fn a_verified_cache_still_falls_back_to_stale_bytes_when_the_network_dies() {
+        // The tolerance this cache is built around must survive the
+        // verification added alongside it.
+        let tmp = TempDir::new().unwrap();
+        let cache = SourceCache::new(tmp.path().to_str().unwrap(), "test").unwrap();
+        let mut server = mockito::Server::new();
+        let (scope, _url) = seed(&cache, &mut server, "good content");
+
+        // Point at a port nothing is listening on: a transport error after
+        // the transport has exhausted its own retries.
+        let dead = "http://127.0.0.1:1/repomd.xml";
+        match cache.fetch_or_reuse(dead, &scope, "repomd.xml") {
+            Ok(CacheResult::Cached(path)) => {
+                assert_eq!(fs::read_to_string(&path).unwrap(), "good content");
+            }
+            other => panic!("expected Cached fallback, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_truncated_artifact_plus_a_network_failure_is_an_error_not_bad_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let cache = SourceCache::new(tmp.path().to_str().unwrap(), "test").unwrap();
+        let mut server = mockito::Server::new();
+        let (scope, _url) = seed(&cache, &mut server, "good content");
+
+        // Exactly what a kill during the old in-place `fs::write` produced:
+        // a short file still described by the manifest's size and digest.
+        let artifact = cache.artifact_path(&scope, "repomd.xml");
+        fs::write(&artifact, "good con").unwrap();
+
+        let dead = "http://127.0.0.1:1/repomd.xml";
+        let result = cache.fetch_or_reuse(dead, &scope, "repomd.xml");
+        assert!(
+            result.is_err(),
+            "unverified cached bytes must not be served as a stale fallback; got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn a_corrupt_artifact_forces_an_unconditional_fetch_rather_than_a_304() {
+        let tmp = TempDir::new().unwrap();
+        let cache = SourceCache::new(tmp.path().to_str().unwrap(), "test").unwrap();
+        let mut server = mockito::Server::new();
+        let (scope, url) = seed(&cache, &mut server, "good content");
+
+        // Same length, different bytes: only the digest can catch this one.
+        let artifact = cache.artifact_path(&scope, "repomd.xml");
+        assert_eq!("good content".len(), "BAD! content".len());
+        fs::write(&artifact, "BAD! content").unwrap();
+
+        // Sending the validator would invite a 304 and with it the bad copy.
+        let conditional = server
+            .mock("GET", "/repomd.xml")
+            .match_header("if-none-match", "\"v1\"")
+            .with_status(304)
+            .expect(0)
+            .create();
+        let unconditional = server
+            .mock("GET", "/repomd.xml")
+            .match_header("if-none-match", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("etag", "\"v2\"")
+            .with_body("good content")
+            .create();
+
+        match cache.fetch_or_reuse(&url, &scope, "repomd.xml").unwrap() {
+            CacheResult::Fresh(bytes) => assert_eq!(bytes, b"good content"),
+            other => panic!("expected a fresh download, got {:?}", other),
+        }
+        conditional.assert();
+        unconditional.assert();
+        assert_eq!(fs::read_to_string(&artifact).unwrap(), "good content");
+    }
+
+    #[test]
+    fn a_304_to_an_unconditional_request_over_a_bad_artifact_is_refused() {
+        // A misbehaving server cannot talk us into serving bytes we already
+        // rejected -- they are the only ones we have.
+        let tmp = TempDir::new().unwrap();
+        let cache = SourceCache::new(tmp.path().to_str().unwrap(), "test").unwrap();
+        let mut server = mockito::Server::new();
+        let (scope, url) = seed(&cache, &mut server, "good content");
+
+        let artifact = cache.artifact_path(&scope, "repomd.xml");
+        fs::write(&artifact, "truncated").unwrap();
+
+        let _rude = server
+            .mock("GET", "/repomd.xml")
+            .with_status(304)
+            .create();
+
+        let result = cache.fetch_or_reuse(&url, &scope, "repomd.xml");
+        assert!(result.is_err(), "expected a refusal, got {:?}", result);
+    }
+
+    #[test]
+    fn a_missing_artifact_under_a_live_manifest_is_refetched() {
+        let tmp = TempDir::new().unwrap();
+        let cache = SourceCache::new(tmp.path().to_str().unwrap(), "test").unwrap();
+        let mut server = mockito::Server::new();
+        let (scope, url) = seed(&cache, &mut server, "good content");
+
+        fs::remove_file(cache.artifact_path(&scope, "repomd.xml")).unwrap();
+
+        let refetch = server
+            .mock("GET", "/repomd.xml")
+            .match_header("if-none-match", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_body("good content")
+            .create();
+        match cache.fetch_or_reuse(&url, &scope, "repomd.xml").unwrap() {
+            CacheResult::Fresh(bytes) => assert_eq!(bytes, b"good content"),
+            other => panic!("expected a fresh download, got {:?}", other),
+        }
+        refetch.assert();
+    }
+
+    // ---- #74: publication is atomic and its failures are detectable ------
+
+    #[test]
+    fn an_interrupted_publication_is_detected_rather_than_trusted() {
+        // Publishing the bytes and recording them are two writes. Interrupted
+        // between them, the artifact is whole but the manifest describes the
+        // previous one -- which must read as a miss, not a hit.
+        let tmp = TempDir::new().unwrap();
+        let cache = SourceCache::new(tmp.path().to_str().unwrap(), "test").unwrap();
+        let mut server = mockito::Server::new();
+        let (scope, url) = seed(&cache, &mut server, "generation one");
+
+        let artifact = cache.artifact_path(&scope, "repomd.xml");
+        fs::write(&artifact, "generation two, never recorded").unwrap();
+
+        let refetch = server
+            .mock("GET", "/repomd.xml")
+            .match_header("if-none-match", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_body("generation three")
+            .create();
+        match cache.fetch_or_reuse(&url, &scope, "repomd.xml").unwrap() {
+            CacheResult::Fresh(bytes) => assert_eq!(bytes, b"generation three"),
+            other => panic!("expected a fresh download, got {:?}", other),
+        }
+        refetch.assert();
+    }
+
+    #[test]
+    fn publishing_an_artifact_leaves_no_temp_file_behind() {
+        let tmp = TempDir::new().unwrap();
+        let cache = SourceCache::new(tmp.path().to_str().unwrap(), "test").unwrap();
+        let mut server = mockito::Server::new();
+        let (scope, _url) = seed(&cache, &mut server, "content");
+
+        let dir = cache.artifact_path(&scope, "repomd.xml").parent().unwrap().to_path_buf();
+        let strays: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "temp files survived publication: {:?}", strays);
+    }
+
+    #[test]
+    fn a_replaced_artifact_is_verified_against_its_new_digest() {
+        // Guards the obvious way to break verification: checking the bytes
+        // against a stale manifest entry that was never updated.
+        let tmp = TempDir::new().unwrap();
+        let cache = SourceCache::new(tmp.path().to_str().unwrap(), "test").unwrap();
+        let mut server = mockito::Server::new();
+        let (scope, url) = seed(&cache, &mut server, "first");
+
+        let replace = server
+            .mock("GET", "/repomd.xml")
+            .with_status(200)
+            .with_header("etag", "\"v2\"")
+            .with_body("second body, longer")
+            .create();
+        cache.fetch_or_reuse(&url, &scope, "repomd.xml").unwrap();
+        replace.assert();
+
+        let meta = cache
+            .read_manifest(&cache.manifest_path(&scope), "repomd.xml")
+            .unwrap()
+            .expect("manifest entry");
+        assert_eq!(meta.size_bytes, "second body, longer".len() as u64);
+        SourceCache::verify_artifact(&cache.artifact_path(&scope, "repomd.xml"), &meta)
+            .expect("the freshly published artifact must verify against its own entry");
+    }
+
+    #[test]
+    fn a_failed_publication_leaves_the_previous_artifact_intact() {
+        // The difference between `fs::write` and temp+rename only shows up
+        // when the write fails: in place, the destination is already
+        // truncated by then. Force the failure by making the artifact
+        // directory unwritable, so even creating the temp file fails.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("repomd.xml");
+        fs::write(&dest, "the previous generation").unwrap();
+
+        let mut perms = fs::metadata(&dir).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&dir, perms).unwrap();
+
+        // Running as root defeats the mechanism entirely. Fail loudly rather
+        // than reporting a pass that proved nothing.
+        let root_can_still_write = fs::File::create(dir.join(".root-probe")).is_ok();
+        if root_can_still_write {
+            let mut perms = fs::metadata(&dir).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            fs::set_permissions(&dir, perms).unwrap();
+            panic!("this test is meaningless when the writer can ignore permissions (root?)");
+        }
+
+        let result = SourceCache::write_artifact_atomic(&dest, b"a new generation");
+        assert!(result.is_err(), "expected the publication to fail");
+
+        let mut perms = fs::metadata(&dir).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(&dir, perms).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&dest).unwrap(),
+            "the previous generation",
+            "a failed publication truncated or replaced the previous artifact"
+        );
+    }
+
+    // ---- #74: UTC timestamps -------------------------------------------
+
+    #[test]
+    fn fetched_at_is_a_real_utc_calendar_date() {
+        use chrono::TimeZone;
+
+        // The previous open-coded arithmetic used an average month
+        // (2629800s) and a 30-day month, so it drifted. Each `was` below is
+        // what it actually produced for that instant.
+        let cases = [
+            // (epoch seconds, expected, what the old arithmetic said)
+            (1790251200i64, "2026-09-24T12:00:00Z", "2026-09-21T12:00:00Z"),
+            (1798761600, "2027-01-01T00:00:00Z", "2026-12-30T00:00:00Z"),
+            (1798761599, "2026-12-31T23:59:59Z", "2026-12-29T23:59:59Z"),
+            (1835438400, "2028-02-29T12:00:00Z", "2028-02-04T12:00:00Z"),
+        ];
+        for (epoch, expected, was) in cases {
+            let when = Utc.timestamp_opt(epoch, 0).unwrap();
+            let got = SourceCache::format_fetched_at(when);
+            assert_eq!(got, expected, "epoch {} (old arithmetic said {})", epoch, was);
+            assert_ne!(got, was, "epoch {} must no longer reproduce the old value", epoch);
+        }
+    }
+
+    #[test]
+    fn fetched_at_round_trips_as_rfc3339() {
+        let recorded = SourceCache::format_fetched_at(Utc::now());
+        let parsed = DateTime::parse_from_rfc3339(&recorded)
+            .expect("fetched_at must parse as RFC3339");
+        assert_eq!(parsed.timezone().local_minus_utc(), 0, "must be UTC: {}", recorded);
+        assert!(recorded.ends_with('Z'), "must use Z, not +00:00: {}", recorded);
+    }
+
 }
