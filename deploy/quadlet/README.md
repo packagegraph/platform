@@ -830,6 +830,15 @@ The contract between them is `docs/GRAPH-PUBLICATION.md`; the short form:
    payloads for one graph URI is how ~10GB of duplicate quads got indexed
    in September 2026.
 
+   The log names each manifest-backed graph as `complete`, `PARTIAL`, or
+   `completeness unrecorded`, and counts the partial ones at the end. A
+   partial graph is the availability trade working as intended -- an
+   optional enrichment stage left some items for the next run rather than
+   failing the collector -- but an index quietly built from a growing number
+   of them is something an operator should see. `completeness unrecorded` is
+   the honest reading for every graph published before that record existed;
+   absence is never reported as completeness (#70).
+
 **This second stage does not run itself -- it must be enabled.** Unlike
 the Kubernetes CronJob it replaces (scheduled by the cluster the moment
 the CronJob object exists), `qlever-rebuild-index.timer` is a plain

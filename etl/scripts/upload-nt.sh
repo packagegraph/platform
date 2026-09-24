@@ -205,6 +205,43 @@ COMPRESSED_FILE="${LOCAL_FILE}.gz"
 gzip -c "$LOCAL_FILE" > "$COMPRESSED_FILE"
 trap 'rm -f "$COMPRESSED_FILE"' EXIT
 
+# Stage completeness, when the collector recorded any (#70). The sidecar is
+# written by pg-collect beside the .nt it just produced; see
+# src/stage_report.rs for what the counts mean.
+#
+# Absent is NOT the same as complete. Every graph published before this
+# carried no such record, so a consumer has to read a missing quality block as
+# "unknown" -- which is exactly why a present-but-unreadable one is refused
+# rather than dropped. The collector wrote that file moments ago; if it cannot
+# be parsed something is wrong, and publishing without it would quietly
+# promote a knowingly partial graph into the indistinguishable "unknown" pile.
+QUALITY_FILE="${LOCAL_FILE}.quality.json"
+QUALITY_JSON="null"
+if [ -f "$QUALITY_FILE" ]; then
+  if ! QUALITY_JSON=$(jq -c '.' "$QUALITY_FILE" 2>/dev/null); then
+    echo "Error: $QUALITY_FILE is not readable JSON -- refusing to publish <$GRAPH_URI>." >&2
+    echo "  Publishing without it would record this graph's completeness as" >&2
+    echo "  unknown, which is indistinguishable from a graph that was never" >&2
+    echo "  measured at all." >&2
+    exit 1
+  fi
+  QUALITY_COMPLETE=$(printf '%s' "$QUALITY_JSON" | jq -r '.complete | tostring')
+  case "$QUALITY_COMPLETE" in
+    true|false) ;;
+    *)
+      echo "Error: $QUALITY_FILE has no boolean .complete -- refusing to publish <$GRAPH_URI>." >&2
+      exit 1
+      ;;
+  esac
+  if [ "$QUALITY_COMPLETE" = "true" ]; then
+    echo "Stage completeness: complete"
+  else
+    echo "Stage completeness: PARTIAL -- publishing anyway, recorded in the manifest"
+    printf '%s' "$QUALITY_JSON" | jq -r '.stages[]? |
+      "  \(.stage): \(.attempted) attempted, \(.completed) completed, \(.retryable) retryable, \(.failed) failed"'
+  fi
+fi
+
 PAYLOAD_SHA=$(sha256sum "$COMPRESSED_FILE" | cut -d' ' -f1)
 PAYLOAD_SIZE=$(stat -c '%s' "$COMPRESSED_FILE")
 GENERATION="$(date -u +%Y%m%dT%H%M%SZ)-${PAYLOAD_SHA:0:12}"
@@ -292,6 +329,7 @@ jq -n \
   --arg source_url "$SOURCE_URL" \
   --argjson size_bytes "$PAYLOAD_SIZE" \
   --argjson data_triples "$DATA_TRIPLE_COUNT" \
+  --argjson quality "$QUALITY_JSON" \
   '{
      schema: 1,
      graph: $graph,
@@ -303,7 +341,8 @@ jq -n \
      data_triples: $data_triples,
      committed_at: $committed_at
    }
-   + (if $source_url == "" then {} else {source_url: $source_url} end)' \
+   + (if $source_url == "" then {} else {source_url: $source_url} end)
+   + (if $quality == null then {} else {quality: $quality} end)' \
   > "$MANIFEST_TMP"
 if ! mc pipe "$MANIFEST_PATH" < "$MANIFEST_TMP"; then
   rm -f "$MANIFEST_TMP"

@@ -245,6 +245,7 @@ awk '{ k = $1
 : > /tmp/manifest-winners.txt
 : > /tmp/manifest-uris.txt
 MANIFEST_COUNT=0
+PARTIAL_COUNT=0
 while read -r slug; do
   [ -n "$slug" ] || continue
   # The slug becomes a local directory name. Keep it to what the uploaders
@@ -346,7 +347,18 @@ while read -r slug; do
   printf '%s' "$graph_uri" > "${local_payload}.graph"
   echo "${local_payload}.graph" >> /tmp/manifest-winners.txt
   MANIFEST_COUNT=$((MANIFEST_COUNT + 1))
-  echo "  manifest: $slug → <$graph_uri> ($generation, $have_size bytes, verified)"
+  # Surface recorded stage completeness where an operator already looks (#70).
+  # "unknown" is the honest reading of a manifest with no quality block --
+  # every graph published before that existed has none, and absence must never
+  # be reported as completeness.
+  quality=$(printf '%s' "$manifest" | jq -r '
+    if .quality == null then "completeness unrecorded"
+    elif .quality.complete == true then "complete"
+    else "PARTIAL" end')
+  echo "  manifest: $slug → <$graph_uri> ($generation, $have_size bytes, verified, $quality)"
+  if [ "$quality" = "PARTIAL" ]; then
+    PARTIAL_COUNT=$((PARTIAL_COUNT + 1))
+  fi
 done < /tmp/manifest-slugs.txt
 rm -f /tmp/manifest-slugs.txt
 
@@ -477,6 +489,12 @@ rm -f /tmp/manifest-winners.txt /tmp/manifest-uris.txt
 
 GRAPH_FILES=$(wc -l < /tmp/winning-graphs.txt | tr -d ' ')
 echo "$GRAPH_FILES graphs selected ($MANIFEST_COUNT manifest-backed, $LEGACY_COUNT legacy)"
+# Not a gate. A partial graph is the availability trade working as intended
+# (#70); an index quietly built from a growing number of them is what should
+# reach an operator, so it is counted rather than merely mentioned per graph.
+if [ "$PARTIAL_COUNT" -gt 0 ]; then
+  echo "NOTE: $PARTIAL_COUNT graph(s) published a knowingly partial snapshot"
+fi
 # <<< shared graph corpus discovery <<<
 
 if [ "$GRAPH_FILES" -eq 0 ]; then

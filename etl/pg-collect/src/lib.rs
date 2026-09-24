@@ -37,6 +37,7 @@ pub mod cache;
 pub mod checkpoint_generation;
 pub mod output_cache;
 pub mod source_cache;
+pub mod stage_report;
 pub mod ir;
 pub mod normalize;
 pub mod emit;

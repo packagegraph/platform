@@ -163,7 +163,28 @@ class TestManifestBackedGraphsAreIndexed(ManifestHarness):
     def test_a_manifest_payload_is_verified_before_use(self):
         proc = self.run_rebuild()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertRegex(proc.stdout, r"manifest: M0 → <.*M0> \(.*verified\)")
+        self.assertRegex(proc.stdout, r"manifest: M0 → <.*M0> \(.*verified,")
+
+    def test_a_manifest_without_a_quality_block_reads_as_unrecorded(self):
+        """Absence is not completeness. Every graph published before #70 has
+        no quality block, and reporting those as complete is the lie the
+        record exists to stop telling."""
+        proc = self.run_rebuild()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("completeness unrecorded", proc.stdout)
+        self.assertNotIn("knowingly partial", proc.stdout)
+
+    def test_a_partial_graph_is_named_in_the_rebuild_log(self):
+        self.amend("M0", quality={"schema": 1, "complete": False, "stages": [
+            {"stage": "koji", "required": False, "attempted": 10,
+             "completed": 7, "retryable": 3, "failed": 0}]})
+        self.amend("M1", quality={"schema": 1, "complete": True, "stages": []})
+        proc = self.run_rebuild()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"manifest: M0 .*PARTIAL")
+        self.assertRegex(proc.stdout, r"manifest: M1 .*complete")
+        self.assertIn("NOTE: 1 graph(s) published a knowingly partial snapshot",
+                      proc.stdout)
 
     def test_an_uncompressed_generation_is_read_as_plain_ntriples(self):
         self.publish("M0", f"{GRAPH_BASE}/M0", body_for("M0-plain"),
