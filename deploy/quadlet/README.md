@@ -795,23 +795,40 @@ documents the distinction so it isn't miscopied again.
 ## Data pipeline: collectors → Minio → QLever, and how to extend it
 
 The full path from a collector run to queryable data is two independently
-scheduled stages, joined only by Minio's `nt-output/` prefix:
+scheduled stages, joined only by the published corpus in object storage.
+The contract between them is `docs/GRAPH-PUBLICATION.md`; the short form:
 
-1. Every `pg-collect@<name>.service` collects, then uploads a
-   `<slug>.nt.gz` + `<slug>.nt.gz.graph` pair to
-   `pgraph/${MINIO_BUCKET}/nt-output/` via `upload-nt.sh` (gzip-compressed
-   since both files are large, mostly-text N-Triples -- see that script's
-   comment on why gzip over xz). The `.graph` sidecar (containing the
-   graph URI, written *after* the `.nt.gz` upload succeeds) is the commit
-   marker a rebuild looks for; an `.nt.gz` with no sidecar is a
-   still-in-progress or aborted upload and is correctly ignored.
-2. `qlever-rebuild-index.timer` (nightly, `03:30` UTC) downloads every
-   `.nt.gz`/`.graph` pair, converts them to one `.nq` corpus, builds a
-   fresh QLever index, and promotes it to `latest` only if it passes three
-   gates: at least 10 graphs present, no more than 25% triple-count loss
-   vs. the last successful promotion, and no previously-present graph URI
-   has disappeared. `qlever-refresh-if-changed.sh` then bounces
-   `qlever.service` only if a new index actually got promoted.
+1. Every `pg-collect@<name>.service` collects, then publishes through
+   `upload-nt.sh`. The payload goes to a generation key that has never
+   existed before -- `graphs/<slug>/generations/<gen>.nt.gz`, gzip-compressed
+   because these are large mostly-text N-Triples, see that script's comment
+   on why gzip over xz -- is read back and checked, and only then is
+   `graphs/<slug>/manifest.json` replaced. That single small `PUT` is the
+   commit: atomic in S3, so a reader sees the whole old manifest or the
+   whole new one. A failure before it leaves an orphan generation nothing
+   references, and the previous generation still authoritative.
+
+   It also refreshes the old `nt-output/<slug>.nt.gz` + `.graph` pair,
+   best-effort, purely for readers not yet upgraded. That pair used to be
+   the commit protocol, and was not one: on every upload after a graph's
+   first, the sidecar already existed, so the new payload became
+   discoverable the moment its `PUT` landed -- unverified, with nothing
+   left to gate it (#72).
+2. `qlever-rebuild-index.timer` (nightly, `03:30` UTC) reads every
+   manifest, fetches and **verifies** the committed generation against its
+   recorded size and SHA-256, adds the legacy pairs for graphs that have no
+   manifest yet, converts everything to one `.nq` corpus, builds a fresh
+   QLever index, and promotes it to `latest` only if it passes three gates:
+   at least 10 graphs present, no more than 25% triple-count loss vs. the
+   last successful promotion, and no previously-present graph URI has
+   disappeared. `qlever-refresh-if-changed.sh` then bounces
+   `qlever.service` when the promoted index differs from the one confirmed
+   serving.
+
+   A graph is manifest-backed or legacy, never both: a legacy copy of a
+   graph that has a manifest is reported and skipped. Two discoverable
+   payloads for one graph URI is how ~10GB of duplicate quads got indexed
+   in September 2026.
 
 **This second stage does not run itself -- it must be enabled.** Unlike
 the Kubernetes CronJob it replaces (scheduled by the cluster the moment

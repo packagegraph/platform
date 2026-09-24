@@ -1448,6 +1448,119 @@ enum CheckpointAction {
     },
 }
 
+/// Publishing a graph to object storage, as defined in
+/// docs/GRAPH-PUBLICATION.md.
+///
+/// This is the second writer of that contract; `etl/scripts/upload-nt.sh` is
+/// the one every collector and enricher goes through. The two must agree
+/// exactly. A reader refuses to build when two manifests claim the same graph
+/// URI, so a slug derived differently here would not quietly fork the corpus
+/// -- it would stop the nightly rebuild.
+mod graph_publication {
+    use sha2::{Digest, Sha256};
+    use std::io::{self, Read};
+    use std::path::Path;
+
+    /// Display name for a graph URI: the derivation upload-nt.sh does with
+    /// sed and tr. Deliberately not injective -- `.../graph/a/b` and
+    /// `.../graph/a-b` both give `a-b` -- which is why a writer checks the
+    /// graph URI in an existing manifest before publishing over it.
+    pub fn slug(graph_uri: &str) -> String {
+        graph_uri
+            .strip_prefix("https://packagegraph.github.io/graph/")
+            .or_else(|| graph_uri.strip_prefix("https://packagegraph.github.io/"))
+            .unwrap_or(graph_uri)
+            .replace('/', "-")
+    }
+
+    /// Streamed: published graphs run to hundreds of megabytes, and this is
+    /// the digest a reader will check on every rebuild.
+    pub fn digest_file(path: &Path) -> io::Result<(String, u64)> {
+        let file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        let mut reader = io::BufReader::new(file);
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok((format!("{:x}", hasher.finalize()), size))
+    }
+
+    /// `<UTC compact>-<first 12 of the digest>`: sortable, unique per upload,
+    /// and self-identifying, so a generation key is never reused and a PUT to
+    /// one can never replace anything.
+    pub fn generation(now: chrono::DateTime<chrono::Utc>, sha256: &str) -> String {
+        format!("{}-{}", now.format("%Y%m%dT%H%M%SZ"), &sha256[..12])
+    }
+}
+
+#[cfg(test)]
+mod graph_publication_tests {
+    use super::graph_publication::*;
+    use chrono::TimeZone;
+    use sha2::Digest;
+
+    #[test]
+    fn slugs_match_the_shell_uploaders_derivation() {
+        // Each of these is a graph URI the corpus actually publishes, with
+        // the slug `upload-nt.sh` produces for it today. Drifting from this
+        // table splits a graph across two manifests.
+        for (uri, expected) in [
+            (
+                "https://packagegraph.github.io/graph/debian/trixie",
+                "debian-trixie",
+            ),
+            (
+                "https://packagegraph.github.io/graph/security/osv",
+                "security-osv",
+            ),
+            (
+                "https://packagegraph.github.io/graph/fedora/44/riscv64",
+                "fedora-44-riscv64",
+            ),
+            ("https://packagegraph.github.io/graph/arch", "arch"),
+            ("https://packagegraph.github.io/ontology", "ontology"),
+        ] {
+            assert_eq!(slug(uri), expected, "slug drifted for {}", uri);
+        }
+    }
+
+    #[test]
+    fn two_graph_uris_can_share_a_slug() {
+        // The collision the writers check for. If this ever stops being true
+        // the check is dead code, and someone should know.
+        assert_eq!(
+            slug("https://packagegraph.github.io/graph/test/manifest"),
+            slug("https://packagegraph.github.io/graph/test-manifest"),
+        );
+    }
+
+    #[test]
+    fn a_generation_name_carries_its_own_digest() {
+        let when = chrono::Utc.timestamp_opt(1790251200, 0).unwrap();
+        let name = generation(when, "3f2a1c8d9e01aabbccddeeff00112233");
+        assert_eq!(name, "20260924T120000Z-3f2a1c8d9e01");
+    }
+
+    #[test]
+    fn digesting_a_file_reports_its_size_and_sha256() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("graph.nt");
+        std::fs::write(&path, b"<a> <b> <c> .\n").unwrap();
+        let (sha256, size) = digest_file(&path).unwrap();
+        assert_eq!(size, 14);
+        assert_eq!(
+            sha256,
+            format!("{:x}", sha2::Sha256::digest(b"<a> <b> <c> .\n"))
+        );
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -2618,16 +2731,141 @@ fn main() {
                         "alias", "set", "pgraph", minio_ep, &minio_ak, &minio_sk, "--api", "S3v4",
                     ])?;
 
-                    eprintln!("Uploading {} → {}...", file, nt_path);
-                    mc(&["cp", &file, &nt_path])?;
+                    // Publish an immutable generation, then commit it by
+                    // replacing this graph's manifest. The old scheme wrote a
+                    // stable key and then its sidecar and called the sidecar a
+                    // commit marker; that is true for a graph's first upload
+                    // and never again, because on every later one the sidecar
+                    // already exists and the new payload becomes discoverable
+                    // the instant its PUT lands -- unverified, with nothing
+                    // left to gate it (#72). docs/GRAPH-PUBLICATION.md.
+                    let (sha256, size_bytes) =
+                        graph_publication::digest_file(std::path::Path::new(&file))?;
+                    let slug = graph_publication::slug(&graph);
+                    let generation = graph_publication::generation(chrono::Utc::now(), &sha256);
+                    let generation_key = format!("graphs/{}/generations/{}.nt", slug, generation);
+                    let manifest_key = format!("graphs/{}/manifest.json", slug);
+                    let generation_path = format!("pgraph/{}/{}", minio_bucket, generation_key);
+                    let manifest_path = format!("pgraph/{}/{}", minio_bucket, manifest_key);
 
-                    let tmp_graph = std::env::temp_dir().join(format!("{}.graph", filename));
-                    std::fs::write(&tmp_graph, &graph)?;
-                    mc(&["cp", tmp_graph.to_str().unwrap(), &graph_path])?;
-                    std::fs::remove_file(&tmp_graph).ok();
+                    // A slug collision is two graph URIs taking turns erasing
+                    // each other's manifest, invisibly. Refuse rather than
+                    // guess which one is meant.
+                    if let Ok(existing) = mc(&["cat", &manifest_path]) {
+                        let owner = serde_json::from_str::<serde_json::Value>(&existing)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("graph").and_then(|g| g.as_str()).map(String::from)
+                            });
+                        if let Some(owner) = owner {
+                            if owner != graph {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    format!(
+                                        "{} already belongs to <{}>; <{}> derives the same \
+                                         slug '{}' and would publish over it",
+                                        manifest_key, owner, graph, slug
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+
+                    eprintln!("Uploading {} → {}...", file, generation_key);
+                    mc(&["cp", &file, &generation_path])?;
+
+                    // Read back what actually landed, before anything points
+                    // at it. The reader re-verifies the digest on every
+                    // rebuild; this is here to catch the object not arriving
+                    // whole, while the previous generation is still committed.
+                    let listing = mc(&["ls", "--json", &generation_path])?;
+                    let stored_size = listing
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .find_map(|value| value.get("size").and_then(|s| s.as_u64()))
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("{} is not readable back — not committing", generation_key),
+                            )
+                        })?;
+                    if stored_size != size_bytes {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "{} stored as {} bytes, expected {} — not committing",
+                                generation_key, stored_size, size_bytes
+                            ),
+                        ));
+                    }
 
                     let count = pg_collect::sparql::count_triples_pub(&file)?;
-                    eprintln!("✓ Loaded {} triples to Minio ({})", count, nt_path);
+
+                    // The commit. One small object, one PUT, which S3 makes
+                    // atomic: a reader sees the whole previous manifest or the
+                    // whole new one. Failing here leaves an orphan generation
+                    // nothing references and the previous one authoritative.
+                    let manifest = serde_json::json!({
+                        "schema": 1,
+                        "graph": graph,
+                        "generation": generation,
+                        "key": generation_key,
+                        "encoding": "none",
+                        "size_bytes": size_bytes,
+                        "sha256": sha256,
+                        "data_triples": count,
+                        "committed_at": chrono::Utc::now()
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    });
+                    let tmp_manifest = std::env::temp_dir().join(format!("{}.manifest.json", slug));
+                    std::fs::write(&tmp_manifest, manifest.to_string())?;
+                    let committed = mc(&["cp", tmp_manifest.to_str().unwrap(), &manifest_path]);
+                    std::fs::remove_file(&tmp_manifest).ok();
+                    committed.map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "failed to commit {}: {} — {} is an orphan and will be \
+                                 ignored; the previously committed generation remains \
+                                 authoritative",
+                                manifest_key, e, generation_key
+                            ),
+                        )
+                    })?;
+
+                    // The legacy pair, for readers not yet upgraded. This is
+                    // the unsafe stable-key write the manifest replaces, kept
+                    // alive deliberately and temporarily -- see the
+                    // PG_UPLOAD_LEGACY_MIRROR block in upload-nt.sh for when
+                    // to delete it. Best-effort: the graph is already
+                    // published above, and failing here would report a
+                    // successful load as a failure.
+                    if std::env::var("PG_UPLOAD_LEGACY_MIRROR").as_deref() != Ok("0") {
+                        match mc(&["cp", &file, &nt_path]) {
+                            Ok(_) => {
+                                let tmp_graph =
+                                    std::env::temp_dir().join(format!("{}.graph", filename));
+                                std::fs::write(&tmp_graph, &graph)?;
+                                if let Err(e) =
+                                    mc(&["cp", tmp_graph.to_str().unwrap(), &graph_path])
+                                {
+                                    eprintln!(
+                                        "Warning: legacy sidecar for {} not refreshed: {}",
+                                        filename, e
+                                    );
+                                }
+                                std::fs::remove_file(&tmp_graph).ok();
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: legacy mirror of {} failed: {}", filename, e)
+                            }
+                        }
+                    }
+
+                    eprintln!(
+                        "✓ Committed {} triples to <{}> ({})",
+                        count, graph, generation_key
+                    );
                     Ok((count, count))
                 })()
             } else {
@@ -2730,6 +2968,41 @@ fn main() {
                                 errors += 1;
                             }
                             removed += 1;
+                        }
+                    }
+
+                    // A manifest-backed graph is un-published by removing
+                    // its manifest: that object is the commit pointer, and
+                    // without it the generations are orphans no reader looks
+                    // at. The generations themselves stay -- deleting them is
+                    // a retention decision with its own policy, and #72 is
+                    // explicit that this change does not make it.
+                    let manifest_path = format!(
+                        "pgraph/{}/graphs/{}/manifest.json",
+                        minio_bucket,
+                        graph_publication::slug(&graph)
+                    );
+                    if let Ok(existing) = mc(&["cat", &manifest_path]) {
+                        let owner = serde_json::from_str::<serde_json::Value>(&existing)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("graph").and_then(|g| g.as_str()).map(String::from)
+                            });
+                        // Only this graph's manifest, never a slug neighbour's.
+                        if owner.as_deref() == Some(graph.as_str()) {
+                            eprintln!("Removing {}...", manifest_path);
+                            match mc(&["rm", &manifest_path]) {
+                                Ok(_) => removed += 1,
+                                Err(e) => {
+                                    eprintln!("WARNING: failed to remove {}: {}", manifest_path, e);
+                                    errors += 1;
+                                }
+                            }
+                        } else if let Some(owner) = owner {
+                            eprintln!(
+                                "WARNING: {} belongs to <{}>, not <{}> — left alone",
+                                manifest_path, owner, graph
+                            );
                         }
                     }
 

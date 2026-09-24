@@ -4,8 +4,9 @@
 # deploy/overlays/{dev,prod}/jobs/collect-*.yaml, minus the direct-to-Fuseki
 # load step: this host has no writable Fuseki (only QLever, which is
 # read-only -- see sparql-proxy.container's comment), so every collector
-# here only collects and uploads .nt/.graph pairs to Minio's nt-output/
-# prefix. qlever-rebuild-index.timer picks those up on its own nightly
+# here only collects and publishes through upload-nt.sh -- an immutable
+# generation plus the manifest that commits it, see
+# docs/GRAPH-PUBLICATION.md. qlever-rebuild-index.timer picks those up nightly
 # schedule and promotes them into the live QLever index -- see
 # [[qlever-tdb2-decoupling]] in the README's cross-reference, or just
 # qlever-rebuild-index.sh directly.

@@ -8,6 +8,7 @@ models remote object storage, not collector/checkpoint or upload logic. Actual
 mc wildcard semantics need the separate mc check.
 """
 import fnmatch
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -68,13 +69,45 @@ elif command == "mc":
                 destination = target / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(path, destination)
+    elif args[0] == "cat":
+        source = local(args[1])
+        if not source.is_file():
+            sys.stderr.write("mc: <ERROR> Unable to read: NoSuchKey\n")
+            sys.exit(1)
+        sys.stdout.buffer.write(source.read_bytes())
+    elif args[0] == "ls":
+        # Only the single-object form upload-nt.sh uses to verify what it just
+        # stored. Size is real; the ETag is the object's MD5, which is what a
+        # single-part PUT returns -- see the multipart case in upload-nt.sh.
+        target = local(args[-1])
+        if target.is_file():
+            payload = target.read_bytes()
+            print(json.dumps({"status": "success", "type": "file",
+                              "key": target.name, "size": len(payload),
+                              "etag": hashlib.md5(payload).hexdigest()}))
     elif args[0] in ("cp", "pipe"):
         if os.environ.get("FAIL_UPLOAD") == args[0]:
+            sys.exit(42)
+        # Finer-grained than FAIL_UPLOAD: a substring of the DESTINATION key,
+        # so a test can fail the generation upload, the manifest commit or the
+        # legacy mirror independently. They are three separate steps of one
+        # protocol and their failure modes are not the same.
+        failing = os.environ.get("FAIL_MC_DEST")
+        if failing and failing in args[-1]:
+            sys.stderr.write(f"mc: <ERROR> Unable to write {args[-1]}: AccessDenied\n")
             sys.exit(42)
         destination = local(args[-1])
         destination.parent.mkdir(parents=True, exist_ok=True)
         if args[0] == "cp":
-            shutil.copyfile(local(args[1]), destination)
+            payload = local(args[1]).read_bytes()
+            # A PUT that "succeeds" having stored fewer bytes than were sent.
+            # S3 does not do this, but a writer that trusts its own upload
+            # without reading anything back cannot tell the difference, and
+            # the read-back check exists precisely for what it cannot rule out.
+            truncating = os.environ.get("TRUNCATE_MC_DEST")
+            if truncating and truncating in args[-1]:
+                payload = payload[: len(payload) // 2]
+            destination.write_bytes(payload)
         else:
             destination.write_bytes(sys.stdin.buffer.read())
     else:

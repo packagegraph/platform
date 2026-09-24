@@ -83,6 +83,18 @@ jobs:
       # path. Directly invoked, for the reason given above.
       - name: QLever refresh must follow state, not run status
         run: python3 deploy/quadlet/tests/test_qlever_refresh.py -v
+      # Publishing a graph must commit through a manifest, not by overwriting
+      # a stable key and rewriting a sidecar that was already there -- that
+      # "commit marker" only ever gated a graph's first upload (#72). These
+      # three cover the two writers, the host reader, and the four Kubernetes
+      # readers that must apply identical rules. Directly invoked, for the
+      # reason given above.
+      - name: Publishing a graph must commit through a manifest
+        run: python3 deploy/quadlet/collectors/tests/test_upload_manifest.py -v
+      - name: The index must be built from one verified generation per graph
+        run: python3 deploy/quadlet/tests/test_graph_manifest.py -v
+      - name: Every corpus reader must apply the same rules
+        run: python3 deploy/quadlet/tests/test_reader_parity.py -v
       - name: Verify exclusion with the image's pinned mc
         run: |
           set -euo pipefail

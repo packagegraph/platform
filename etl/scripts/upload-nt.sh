@@ -24,8 +24,16 @@ set -euo pipefail
 # Example:
 #   upload-nt.sh /tmp/packages.nt "https://packagegraph.github.io/graph/debian/trixie" "http://deb.debian.org/debian"
 #
-# Uploads to: pgraph/${MINIO_BUCKET}/nt-output/debian-trixie.nt.gz
-# Creates: pgraph/${MINIO_BUCKET}/nt-output/debian-trixie.nt.gz.graph (sidecar)
+# Publishes an immutable generation and then commits it by replacing that
+# graph's manifest -- see docs/GRAPH-PUBLICATION.md for the full contract and
+# for why the previous stable-key-plus-sidecar scheme was not one (#72):
+#
+#   graphs/debian-trixie/generations/<gen>.nt.gz   the payload, never replaced
+#   graphs/debian-trixie/manifest.json             the commit point
+#
+# It also refreshes the legacy nt-output/debian-trixie.nt.gz pair, temporarily
+# and best-effort, for readers that have not been upgraded yet. See the
+# PG_UPLOAD_LEGACY_MIRROR block at the end.
 
 if [ $# -lt 2 ] || [ $# -gt 3 ]; then
     echo "Usage: upload-nt.sh <local-file.nt> <graph-uri> [source-url]" >&2
@@ -64,7 +72,7 @@ nt_check_iri_chars "graph-uri" "$GRAPH_URI"
 # An upload REPLACES the whole named graph, so publishing a file with no data
 # does not merely record nothing -- it erases that graph's contents on the next
 # rebuild. Refuse instead, loudly, because every downstream signal is blind to
-# this: the collector's exit code, the sidecar commit marker, and the rebuild's
+# this: the collector's exit code, the commit marker, and the rebuild's
 # corpus-wide loss gate all treat an empty-but-present graph as healthy. cpan,
 # hex and nuget published empty graphs, green, for as long as the journal
 # retained (#58).
@@ -188,32 +196,146 @@ NOW_ESC=$(nt_escape "$NOW")
   fi
 } >> "$LOCAL_FILE"
 
+
 # gzip, not xz: N-Triples text compresses well under either, but gzip
 # decompresses several times faster, which matters more here than the last
 # few percent of ratio -- qlever-rebuild-index.sh decompresses every graph
 # on every nightly rebuild.
-MINIO_FILENAME="${GRAPH_SLUG}.nt.gz"
+COMPRESSED_FILE="${LOCAL_FILE}.gz"
+gzip -c "$LOCAL_FILE" > "$COMPRESSED_FILE"
+trap 'rm -f "$COMPRESSED_FILE"' EXIT
 
-echo "=== Uploading N-Triples to Minio ==="
+PAYLOAD_SHA=$(sha256sum "$COMPRESSED_FILE" | cut -d' ' -f1)
+PAYLOAD_SIZE=$(stat -c '%s' "$COMPRESSED_FILE")
+GENERATION="$(date -u +%Y%m%dT%H%M%SZ)-${PAYLOAD_SHA:0:12}"
+
+MANIFEST_KEY="graphs/${GRAPH_SLUG}/manifest.json"
+GENERATION_KEY="graphs/${GRAPH_SLUG}/generations/${GENERATION}.nt.gz"
+MANIFEST_PATH="pgraph/${MINIO_BUCKET}/${MANIFEST_KEY}"
+GENERATION_PATH="pgraph/${MINIO_BUCKET}/${GENERATION_KEY}"
+
+echo "=== Publishing N-Triples to object storage ==="
 echo "Local: $LOCAL_FILE"
 echo "Graph: $GRAPH_URI"
-echo "Minio: nt-output/$MINIO_FILENAME"
+echo "Generation: $GENERATION_KEY ($PAYLOAD_SIZE bytes)"
 
 # Configure mc alias (idempotent)
 mc alias set pgraph "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 >/dev/null 2>&1
 
-COMPRESSED_FILE="${LOCAL_FILE}.gz"
-gzip -c "$LOCAL_FILE" > "$COMPRESSED_FILE"
+# The slug is a display name derived from the graph URI, and the derivation is
+# not injective -- .../graph/a/b and .../graph/a-b both slug to "a-b". Two
+# graphs sharing a slug would silently take turns overwriting each other's
+# manifest, which is the same class of bug as the graph-URI collision that
+# corpus-wide loss gates cannot see. Refuse instead.
+EXISTING_MANIFEST=$(mc cat "$MANIFEST_PATH" 2>/dev/null || true)
+if [ -n "$EXISTING_MANIFEST" ]; then
+  EXISTING_GRAPH=$(printf '%s' "$EXISTING_MANIFEST" | jq -r '.graph // empty' 2>/dev/null || true)
+  if [ -n "$EXISTING_GRAPH" ] && [ "$EXISTING_GRAPH" != "$GRAPH_URI" ]; then
+    echo "Error: $MANIFEST_KEY already belongs to <$EXISTING_GRAPH>, refusing to publish <$GRAPH_URI> over it." >&2
+    echo "  Two graph URIs are deriving the same slug '$GRAPH_SLUG'. One of them needs a different URI." >&2
+    exit 1
+  fi
+fi
 
-# Upload .nt.gz file first — orphan .nt.gz without sidecar is safely excluded
-# by rebuilds (they iterate .graph files). The .graph sidecar acts as a
-# commit marker: only written after the .nt.gz upload succeeds.
-mc cp "$COMPRESSED_FILE" "pgraph/${MINIO_BUCKET}/nt-output/${MINIO_FILENAME}"
+# Step 1: the payload, under a key that has never existed before. A generation
+# key embeds a timestamp and the payload digest, so this upload cannot replace
+# anything -- which is the whole point. See docs/GRAPH-PUBLICATION.md.
+mc cp "$COMPRESSED_FILE" "$GENERATION_PATH"
 
-# Create .graph sidecar (commit marker) — signals this .nt.gz is ready for rebuild
-SIDECAR_PATH="pgraph/${MINIO_BUCKET}/nt-output/${MINIO_FILENAME}.graph"
-echo -n "$GRAPH_URI" | mc pipe "$SIDECAR_PATH"
+# Step 2: verify what actually landed before anything points at it. Size is
+# authoritative; the ETag is an MD5 only for a single-part upload (a multipart
+# ETag ends in "-<partcount>" and is a digest of digests), so it is checked
+# only when it is one. The reader re-verifies the SHA-256 on every rebuild,
+# which is what makes the multipart case safe to wave through here.
+STORED=$(mc ls --json "$GENERATION_PATH" 2>/dev/null | jq -s '.[0] // {}')
+STORED_SIZE=$(printf '%s' "$STORED" | jq -r '.size // empty')
+STORED_ETAG=$(printf '%s' "$STORED" | jq -r '.etag // empty')
+if [ -z "$STORED_SIZE" ]; then
+  echo "Error: uploaded generation $GENERATION_KEY is not readable back — not committing." >&2
+  exit 1
+fi
+if [ "$STORED_SIZE" != "$PAYLOAD_SIZE" ]; then
+  echo "Error: $GENERATION_KEY stored as $STORED_SIZE bytes, expected $PAYLOAD_SIZE — not committing." >&2
+  exit 1
+fi
+case "$STORED_ETAG" in
+  *-*|'')
+    echo "Verified: $STORED_SIZE bytes (multipart or absent ETag; digest checked by the reader)"
+    ;;
+  *)
+    PAYLOAD_MD5=$(md5sum "$COMPRESSED_FILE" | cut -d' ' -f1)
+    if [ "$STORED_ETAG" != "$PAYLOAD_MD5" ]; then
+      echo "Error: $GENERATION_KEY ETag $STORED_ETAG does not match uploaded MD5 $PAYLOAD_MD5 — not committing." >&2
+      exit 1
+    fi
+    echo "Verified: $STORED_SIZE bytes, ETag matches"
+    ;;
+esac
 
-rm -f "$COMPRESSED_FILE"
+# Step 3: the manifest. THIS is the commit -- one small object, one PUT, which
+# S3 makes atomic, so a reader sees the whole old manifest or the whole new
+# one and never a half-written pointer. Everything above this line is
+# invisible to readers; everything below it is cleanup.
+#
+# Failing between steps 1 and 3 leaves an orphan generation that nothing
+# references. Failing at step 1 leaves the previous manifest authoritative and
+# its generation intact. Neither can make an unverified payload discoverable,
+# which is exactly what the old stable-key-plus-sidecar scheme did on every
+# upload after the first (#72).
+MANIFEST_TMP="${COMPRESSED_FILE}.manifest.json"
+jq -n \
+  --arg graph "$GRAPH_URI" \
+  --arg generation "$GENERATION" \
+  --arg key "$GENERATION_KEY" \
+  --arg sha256 "$PAYLOAD_SHA" \
+  --arg committed_at "$NOW" \
+  --arg source_url "$SOURCE_URL" \
+  --argjson size_bytes "$PAYLOAD_SIZE" \
+  --argjson data_triples "$DATA_TRIPLE_COUNT" \
+  '{
+     schema: 1,
+     graph: $graph,
+     generation: $generation,
+     key: $key,
+     encoding: "gzip",
+     size_bytes: $size_bytes,
+     sha256: $sha256,
+     data_triples: $data_triples,
+     committed_at: $committed_at
+   }
+   + (if $source_url == "" then {} else {source_url: $source_url} end)' \
+  > "$MANIFEST_TMP"
+if ! mc pipe "$MANIFEST_PATH" < "$MANIFEST_TMP"; then
+  rm -f "$MANIFEST_TMP"
+  echo "Error: failed to commit $MANIFEST_KEY — $GENERATION_KEY is an orphan and will be ignored." >&2
+  echo "  The previously committed generation remains authoritative. Retry this upload." >&2
+  exit 1
+fi
+rm -f "$MANIFEST_TMP"
+echo "✓ Committed <$GRAPH_URI> → $GENERATION_KEY"
 
-echo "✓ Uploaded $MINIO_FILENAME + .graph sidecar"
+# Step 4: the legacy pair, for readers that have not been upgraded yet.
+#
+# This is the unsafe stable-key write the manifest replaces, kept alive
+# deliberately and temporarily: writers ship inside the collector image while
+# the host readers are installed files under /etc/containers/systemd/scripts/,
+# so the two do not move together, and a writer that stopped refreshing
+# nt-output/ before its readers were synced would freeze those graphs at their
+# last legacy upload -- silently, because a stale-but-present graph passes
+# every gate. An upgraded reader ignores legacy copies of any graph that has a
+# manifest, so this costs storage and nothing else.
+#
+# Remove this block, and PG_UPLOAD_LEGACY_MIRROR with it, once every reader in
+# docs/GRAPH-PUBLICATION.md is deployed. Failures here are warnings: the graph
+# is already committed above, and this is a courtesy to old readers.
+if [ "${PG_UPLOAD_LEGACY_MIRROR:-1}" != "0" ]; then
+  LEGACY_FILENAME="${GRAPH_SLUG}.nt.gz"
+  LEGACY_PATH="pgraph/${MINIO_BUCKET}/nt-output/${LEGACY_FILENAME}"
+  if mc cp "$COMPRESSED_FILE" "$LEGACY_PATH"; then
+    if ! echo -n "$GRAPH_URI" | mc pipe "${LEGACY_PATH}.graph"; then
+      echo "Warning: legacy sidecar ${LEGACY_FILENAME}.graph not refreshed (manifest is committed)" >&2
+    fi
+  else
+    echo "Warning: legacy mirror of ${LEGACY_FILENAME} failed (manifest is committed)" >&2
+  fi
+fi

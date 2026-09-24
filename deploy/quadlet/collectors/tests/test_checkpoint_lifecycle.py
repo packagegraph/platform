@@ -4,6 +4,7 @@ Run via cargo test --test test_checkpoint_lifecycle (sets PG_COLLECT_BIN).
 No production paths, credentials, private scratch files or network services.
 """
 import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -147,10 +148,14 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(self.fragment(), fragment)
         self.assertEqual(self.spec_fragment(), spec_fragment,
                          "the spec fragment must replay byte-identically")
-        uploaded = self.root / "remote/nt-output/fedora-44.nt.gz"
-        self.assertIn("cafebabe", gzip.decompress(uploaded.read_bytes()).decode())
-        self.assertEqual(uploaded.with_suffix(".gz.graph").read_text(),
+        manifest = json.loads(
+            (self.root / "remote/graphs/fedora-44/manifest.json").read_text())
+        self.assertEqual(manifest["graph"],
                          "https://packagegraph.github.io/graph/fedora/44")
+        uploaded = self.root / "remote" / manifest["key"]
+        self.assertIn("cafebabe", gzip.decompress(uploaded.read_bytes()).decode())
+        self.assertEqual(manifest["sha256"],
+                         hashlib.sha256(uploaded.read_bytes()).hexdigest())
         remote_cache = self.root / "remote/collector-cache/fedora-44-full"
         self.assertTrue(list(remote_cache.rglob("*.json")), "source files must actually mirror")
         self.assertFalse((remote_cache / "output").exists())
@@ -173,12 +178,20 @@ class LifecycleTest(unittest.TestCase):
                          "re-derivation from cached sources must be deterministic")
         self.assertFalse((self.cache / "output" / old["id"]).exists())
 
-    def test_failed_sidecar_does_not_retire_generation(self):
+    def test_failed_commit_does_not_retire_generation(self):
+        """The commit is the manifest PUT (#72), and `mc pipe` is how
+        upload-nt.sh makes it. Until it lands the graph is not published, so
+        the checkpoint generation must stay active -- retiring it would make
+        the retry recollect from scratch to republish bytes it already had.
+        """
         code, output = self.run_wrapper(fail_upload="pipe")
-        self.assertEqual(code, 42, output)
+        self.assertNotEqual(code, 0, output)
         self.assertEqual(self.state()["status"], "active")
-        self.assertTrue((self.root / "remote/nt-output/fedora-44.nt.gz").is_file())
-        self.assertFalse((self.root / "remote/nt-output/fedora-44.nt.gz.graph").exists())
+        graph_dir = self.root / "remote/graphs/fedora-44"
+        self.assertEqual(len(list((graph_dir / "generations").iterdir())), 1,
+                         "the payload should be on the bucket, as an orphan")
+        self.assertFalse((graph_dir / "manifest.json").exists(),
+                         "the manifest committed despite its write failing")
 
     def test_failed_collect_neither_uploads_nor_commits(self):
         self.assertEqual(self.run_wrapper(fail_upload="cp")[0], 42)
@@ -232,7 +245,8 @@ class LifecycleTest(unittest.TestCase):
         code, output = self.run_wrapper()
         self.assertEqual(code, 0, output)
         self.assertIn("checkpointing disabled", output)
-        self.assertTrue((self.root / "remote/nt-output/fedora-44.nt.gz.graph").is_file())
+        self.assertTrue(
+            (self.root / "remote/graphs/fedora-44/manifest.json").is_file())
 
 
 if __name__ == "__main__":

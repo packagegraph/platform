@@ -4,7 +4,8 @@
 # enrich-*.yaml, minus the direct-to-Fuseki drop+load round trip those jobs
 # do (no writable Fuseki on this host -- see collectors/pg-collect@.container's
 # header for the same reasoning): every enricher here just enriches and
-# uploads a .nt/.graph pair to Minio's nt-output/ prefix, picked up by
+# publishes its output through upload-nt.sh -- an immutable generation plus
+# the manifest that commits it, see docs/GRAPH-PUBLICATION.md -- picked up by
 # qlever-rebuild-index.timer on its own nightly schedule.
 #
 # %i is the enricher name (matches the .sh filename under scripts/enrichers/).

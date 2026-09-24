@@ -1,12 +1,18 @@
 #!/bin/bash
-# Build a fresh QLever index from the .nt/.graph corpus in Minio and promote
-# it to "latest" if it passes completeness gates. Equivalent of the
+# Build a fresh QLever index from the published graph corpus in Minio and
+# promote it to "latest" if it passes completeness gates. Equivalent of the
 # rebuild-qlever-index CronJob (deploy/overlays/{dev,prod}/jobs/rebuild-qlever-index.yaml),
 # minus the `kubectl rollout restart/status` steps at the end -- those are the
 # host's job here, not the container's. See qlever-refresh-if-changed.sh,
-# invoked via ExecStartPost= on qlever-rebuild-index.service, which reloads
-# and bounces qlever.service only when this script actually promotes a new
-# index (STATUS=success in last-run.json).
+# invoked via ExecStopPost= on qlever-rebuild-index.service, which reloads and
+# bounces qlever.service whenever the promoted index differs from the one
+# confirmed serving -- it decides from that comparison, not from this run's
+# exit status or its last-run.json (#73).
+#
+# The corpus comes from two places and the rules for combining them are in
+# docs/GRAPH-PUBLICATION.md: a per-graph commit manifest under graphs/ (the
+# authority, verified by digest here) and the legacy stable-key .nt/.graph
+# pairs under nt-output/ (a fallback for graphs nothing has re-published yet).
 #
 # Requires: mc, jq, qlever-index -- all present in the qlever-rebuild image.
 # Env: MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_BUCKET.
@@ -91,14 +97,82 @@ PREV_TRIPLES=$(echo "$PREV_RUN" | jq -r '.triple_count // 0')
 PREV_STATUS=$(echo "$PREV_RUN" | jq -r '.status // "none"')
 MAX_LOSS_PCT=25
 
-# ETag-based snapshot before download to detect concurrent writes
-echo "Taking pre-download ETag snapshot..."
-mc ls -r --json "pgraph/${MINIO_BUCKET}/nt-output/" | \
-  jq -r 'select(.status == "success") | select(.key | test("\\.json$") | not) | "\(.key) \(.etag)"' | \
-  sort > /tmp/etag-before.txt
 
-# Early-exit skip: this same listing is a cheap, complete fingerprint of
-# nt-output/'s current contents. QLever's indexer isn't incremental --
+# ---------------------------------------------------------------------------
+# Corpus discovery.
+#
+# Two prefixes carry graph data and a reader has to consider both:
+#
+#   graphs/<slug>/manifest.json   the commit point for one graph (#72), naming
+#                                 an immutable generation and its digest
+#   nt-output/<slug>.nt[.gz]      legacy stable-key payload + .graph sidecar
+#
+# A graph is manifest-backed or legacy, never both: every legacy candidate
+# whose graph URI has a manifest is dropped below. That is what keeps a
+# rebuild from unioning two copies of one named graph, which is not a
+# hypothetical -- see the dedup comment further down for the 24 graphs and
+# ~10GB of duplicate quads the old scheme actually produced.
+#
+# The full contract, and what each side may assume of the other, is in
+# docs/GRAPH-PUBLICATION.md.
+# ---------------------------------------------------------------------------
+
+# The region between the markers below is the ONLY copy of the corpus
+# discovery logic. It is generated verbatim into the Kubernetes readers
+# (deploy/overlays/{dev,prod}/jobs/rebuild-qlever-index.yaml and
+# rebuild-tdb2.yaml), minus the host-only part marked inside it, and
+# deploy/quadlet/tests/test_reader_parity.py fails if any of them has drifted.
+# Four readers that disagree about which generation of a graph is current is
+# the class of bug #72 is about; they drifted once already, which is why the
+# Kubernetes readers still had no dedup step long after this one grew one.
+# >>> shared graph corpus discovery >>>
+# mc_list_json: raw `mc ls -r --json` lines for a prefix.
+#
+# An absent prefix is empty, not an error: graphs/ does not exist until the
+# first manifest-backed upload, and nt-output/ will eventually be emptied.
+# Anything else is fatal, deliberately -- "the listing failed" and "nothing is
+# published there" must never look alike. Swallowing a transport error as an
+# empty manifest set would silently fall back to the legacy copy of every
+# graph and rebuild a stale corpus while reporting success.
+mc_list_json() {
+  local target="$1"
+  local out err rc
+  out=$(mktemp)
+  err=$(mktemp)
+  rc=0
+  mc ls -r --json "$target" >"$out" 2>"$err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if grep -qi "does not exist\|NoSuchKey\|no such file\|not found" "$err"; then
+      rm -f "$out" "$err"
+      return 0
+    fi
+    echo "ERROR: listing $target failed: $(cat "$err")" >&2
+    rm -f "$out" "$err"
+    return 1
+  fi
+  cat "$out"
+  rm -f "$out" "$err"
+}
+
+# corpus_listing: one sorted fingerprint of everything a rebuild reads.
+#
+# nt-output/'s .json keys are run metadata (last-run.json and friends), not
+# corpus, and are excluded as they always were. graphs/'s .json keys ARE the
+# manifests -- a manifest changing mid-download is the single most important
+# race to catch here, so nothing is excluded from that side.
+corpus_listing() {
+  mc_list_json "pgraph/${MINIO_BUCKET}/nt-output/" | \
+    jq -r 'select(.status == "success") | select(.key | test("\\.json$") | not) | "nt-output/\(.key) \(.etag)"'
+  mc_list_json "pgraph/${MINIO_BUCKET}/graphs/" | \
+    jq -r 'select(.status == "success") | "graphs/\(.key) \(.etag)"'
+}
+
+echo "Taking pre-download listing snapshot..."
+corpus_listing | sort > /tmp/etag-before.txt
+
+# >>> host-only >>>
+# Early-exit skip: this same listing is a cheap, complete fingerprint of the
+# corpus's current contents. QLever's indexer isn't incremental --
 # every rebuild pays the full download+convert+build cost regardless of
 # how much actually changed, which is wasted work entirely on any night
 # where no collector uploaded anything new. Compare against the listing
@@ -116,13 +190,15 @@ if [ "$MC_RC" -eq 0 ]; then
   MC_RC2=0; mc_cat_check "pgraph/${MINIO_BUCKET}/qlever-index/last-corpus-listing-hash.txt" || MC_RC2=$?
   [ "$MC_RC2" -eq 0 ] && PREV_LISTING_HASH="$MC_RESULT"
   if [ "$PREV_LISTING_HASH" = "$CORPUS_LISTING_HASH" ]; then
-    echo "nt-output/ unchanged since the last completed run — skipping download/build entirely"
+    echo "corpus unchanged since the last completed run — skipping download/build entirely"
     STATUS="unchanged"
     exit 0
   fi
 fi
 
-echo "Downloading all .nt/.nt.gz and .graph files..."
+# <<< host-only <<<
+
+echo "Downloading legacy .nt/.nt.gz and .graph files..."
 # --overwrite is required, not optional. /tmp is the persistent
 # qlever-rebuild-scratch.volume (not tmpfs), so anything downloaded once
 # stays cached across runs -- that part of the original reasoning was
@@ -140,42 +216,152 @@ echo "Downloading all .nt/.nt.gz and .graph files..."
 # --overwrite, a file that already matches by size+mtime is still skipped
 # (no needless re-transfer of genuinely-unchanged graphs); only an actual
 # mismatch now gets synced instead of silently ignored.
+#
+# Only the legacy prefix is mirrored. graphs/ deliberately is not: its
+# generations are immutable and never deleted, so mirroring it would
+# accumulate every generation of every graph ever published on this volume.
+# Each committed generation is fetched individually below and its superseded
+# predecessors are pruned locally.
 mc mirror --overwrite --exclude '*.json' \
   "pgraph/${MINIO_BUCKET}/nt-output/" /tmp/nt-output/
 
-# Verify no files changed during download (ETags catch same-size replacements)
-mc ls -r --json "pgraph/${MINIO_BUCKET}/nt-output/" | \
-  jq -r 'select(.status == "success") | select(.key | test("\\.json$") | not) | "\(.key) \(.etag)"' | \
-  sort > /tmp/etag-after.txt
+# ---------------------------------------------------------------------------
+# Manifest-backed graphs.
+# ---------------------------------------------------------------------------
+PAYLOAD_DIR=/tmp/graph-payloads
+mkdir -p "$PAYLOAD_DIR"
+
+# Slug from ".../<slug>/manifest.json", taken as the path segment before the
+# filename rather than by stripping a fixed prefix -- `mc ls --json` reports
+# keys relative to the listed target, and this stays correct whether or not
+# that relative key repeats the prefix.
+awk '{ k = $1
+       if (k ~ /\/manifest\.json$/) {
+         sub(/\/manifest\.json$/, "", k)
+         n = split(k, seg, "/")
+         print seg[n]
+       } }' /tmp/etag-before.txt | sort -u > /tmp/manifest-slugs.txt
+
+: > /tmp/manifest-winners.txt
+: > /tmp/manifest-uris.txt
+MANIFEST_COUNT=0
+while read -r slug; do
+  [ -n "$slug" ] || continue
+  # The slug becomes a local directory name. Keep it to what the uploaders
+  # actually produce rather than trusting a bucket key to be well behaved.
+  case "$slug" in
+    .|..|*[!A-Za-z0-9._-]*)
+      echo "ERROR: refusing manifest slug '$slug' — not a plain name"
+      exit 1 ;;
+  esac
+
+  MC_RC=0; mc_cat_check "pgraph/${MINIO_BUCKET}/graphs/${slug}/manifest.json" || MC_RC=$?
+  if [ "$MC_RC" -eq 1 ]; then
+    echo "ERROR: graphs/${slug}/manifest.json was listed but is gone — concurrent write detected"
+    exit 1
+  elif [ "$MC_RC" -ne 0 ]; then
+    exit 1
+  fi
+  manifest="$MC_RESULT"
+
+  if ! printf '%s' "$manifest" | jq -e . >/dev/null 2>&1; then
+    echo "ERROR: graphs/${slug}/manifest.json is not valid JSON"
+    exit 1
+  fi
+
+  graph_uri=$(printf '%s' "$manifest" | jq -r '.graph // empty')
+  generation=$(printf '%s' "$manifest" | jq -r '.generation // empty')
+  gen_key=$(printf '%s' "$manifest" | jq -r '.key // empty')
+  encoding=$(printf '%s' "$manifest" | jq -r '.encoding // empty')
+  want_size=$(printf '%s' "$manifest" | jq -r '.size_bytes // empty')
+  want_sha=$(printf '%s' "$manifest" | jq -r '.sha256 // empty')
+  # A field that resolved to empty leaves its label with a trailing colon.
+  for field in "graph:$graph_uri" "generation:$generation" "key:$gen_key" \
+               "encoding:$encoding" "size_bytes:$want_size" "sha256:$want_sha"; do
+    case "$field" in
+      *:) echo "ERROR: graphs/${slug}/manifest.json is missing required field '${field%%:*}'"
+          exit 1 ;;
+    esac
+  done
+
+  # A manifest may only vouch for bytes under its own graph. Without this a
+  # manifest could name another graph's generation, and the digest check
+  # would pass -- both the key and the digest it is compared against come
+  # from the same manifest, so they agree on the wrong object happily.
+  case "$gen_key" in
+    "graphs/${slug}/generations/"*) ;;
+    *) echo "ERROR: graphs/${slug}/manifest.json points outside its own generations: $gen_key"
+       exit 1 ;;
+  esac
+  case "$generation" in
+    .|..|*[!A-Za-z0-9._-]*)
+      echo "ERROR: graphs/${slug}/manifest.json has an unusable generation name '$generation'"
+      exit 1 ;;
+  esac
+
+  case "$encoding" in
+    gzip) ext=".nt.gz" ;;
+    none) ext=".nt" ;;
+    *) echo "ERROR: graphs/${slug}/manifest.json declares unknown encoding '$encoding'"
+       exit 1 ;;
+  esac
+
+  if grep -qxF "$graph_uri" /tmp/manifest-uris.txt; then
+    echo "ERROR: two manifests claim <$graph_uri> — refusing to guess which one is current"
+    exit 1
+  fi
+  echo "$graph_uri" >> /tmp/manifest-uris.txt
+
+  local_dir="$PAYLOAD_DIR/$slug"
+  mkdir -p "$local_dir"
+  local_payload="$local_dir/${slug}.${generation}${ext}"
+  # Generations are immutable and never deleted upstream, so every past
+  # download of this graph is dead weight on a volume that has to hold the
+  # whole corpus plus the index being built. Keep exactly the committed one.
+  find "$local_dir" -maxdepth 1 -type f \
+    ! -name "$(basename "$local_payload")" \
+    ! -name "$(basename "$local_payload").graph" -delete
+  if [ ! -f "$local_payload" ]; then
+    mc cp "pgraph/${MINIO_BUCKET}/${gen_key}" "$local_payload"
+  fi
+
+  have_size=$(stat -c '%s' "$local_payload")
+  if [ "$have_size" != "$want_size" ]; then
+    rm -f "$local_payload"
+    echo "ERROR: ${gen_key} is $have_size bytes, manifest says $want_size"
+    exit 1
+  fi
+  have_sha=$(sha256sum "$local_payload" | cut -d' ' -f1)
+  if [ "$have_sha" != "$want_sha" ]; then
+    # Drop the bad copy: leaving it cached would make every retry fail the
+    # same way without ever re-fetching it.
+    rm -f "$local_payload"
+    echo "ERROR: ${gen_key} digest $have_sha does not match manifest $want_sha"
+    exit 1
+  fi
+
+  # Give the verified payload the same .graph sidecar shape the legacy files
+  # have, so everything downstream -- pair validation, conversion, fragment
+  # accounting -- handles one kind of input rather than two.
+  printf '%s' "$graph_uri" > "${local_payload}.graph"
+  echo "${local_payload}.graph" >> /tmp/manifest-winners.txt
+  MANIFEST_COUNT=$((MANIFEST_COUNT + 1))
+  echo "  manifest: $slug → <$graph_uri> ($generation, $have_size bytes, verified)"
+done < /tmp/manifest-slugs.txt
+rm -f /tmp/manifest-slugs.txt
+
+# Verify no files changed during download (ETags catch same-size replacements,
+# and the graphs/ half of this listing is what catches a manifest committed
+# while we were reading the corpus it describes).
+corpus_listing | sort > /tmp/etag-after.txt
 if ! diff -q /tmp/etag-before.txt /tmp/etag-after.txt >/dev/null 2>&1; then
-  echo "ERROR: nt-output changed during download — concurrent write detected"
+  echo "ERROR: the corpus changed during download — concurrent write detected"
   diff /tmp/etag-before.txt /tmp/etag-after.txt || true
   exit 1
 fi
 rm -f /tmp/etag-before.txt /tmp/etag-after.txt
 
-GRAPH_FILES=$(find /tmp/nt-output -name '*.graph' | wc -l | tr -d ' ')
-echo "$GRAPH_FILES graphs discovered"
-
-if [ "$GRAPH_FILES" -eq 0 ]; then
-  echo "ERROR: no .graph sidecar files found"
-  exit 1
-fi
-
-if [ "$GRAPH_FILES" -lt 10 ]; then
-  echo "ERROR: only $GRAPH_FILES graphs found, minimum is 10"
-  exit 1
-fi
-echo "Completeness: $GRAPH_FILES graphs, previous status=$PREV_STATUS ($PREV_TRIPLES triples)"
-
-DOWNLOAD_SIZE=$(du -sh /tmp/nt-output | cut -f1)
-echo "Downloaded $DOWNLOAD_SIZE to local disk"
-
-echo "Converting to N-Quads..."
-: > /tmp/packagegraph.nq
-: > /tmp/graph-uris.txt
-
-# Validate complete pairs — every .graph must have its .nt/.nt.gz. The
+# Validate complete pairs — every legacy .graph must have its .nt/.nt.gz. The
 # sidecar filename always embeds the real extension of its pair (whatever
 # upload-nt.sh wrote at upload time), so this works unchanged for both
 # older uncompressed .nt uploads and current .nt.gz ones -- no format
@@ -183,6 +369,7 @@ echo "Converting to N-Quads..."
 # naturally re-uploads it in the new format.
 INCOMPLETE=0
 for graph_file in /tmp/nt-output/*.graph; do
+    [ -e "$graph_file" ] || continue
     nt_file="${graph_file%.graph}"
     if [ ! -f "$nt_file" ]; then
         echo "ERROR: orphan sidecar $(basename "$graph_file") — .nt/.nt.gz missing (concurrent upload in progress?)"
@@ -194,11 +381,11 @@ if [ "$INCOMPLETE" -gt 0 ]; then
   exit 1
 fi
 
-# Dedup by graph URI: upload-nt.sh migrated from uploading <slug>.nt to
-# <slug>.nt.gz, but never deletes the old key when a collector re-uploads
-# under the new name (nothing in this pipeline has Minio delete permission
-# -- confirmed live, `mc rm` returns Access Denied). Without this step,
-# both the stale <slug>.nt.graph and the current <slug>.nt.gz.graph get
+# Dedup the LEGACY sidecars by graph URI: upload-nt.sh migrated from uploading
+# <slug>.nt to <slug>.nt.gz, but never deletes the old key when a collector
+# re-uploads under the new name (nothing in this pipeline has Minio delete
+# permission -- confirmed live, `mc rm` returns Access Denied). Without this
+# step, both the stale <slug>.nt.graph and the current <slug>.nt.gz.graph get
 # discovered by the glob above and BOTH get converted below, silently
 # duplicating that graph's triples under the same graph URI with stale
 # package data mixed into the current data -- confirmed live 2026-09-11
@@ -217,11 +404,24 @@ fi
 # failure downstream therefore destroyed bytes the retry needed and could
 # not get back. Storage reclamation is a separate concern from index
 # construction and does not belong in front of it.
-echo "Deduplicating graphs by URI (keep newest non-empty upload per graph)..."
+#
+# A graph with a committed manifest is excluded from this entirely. The
+# manifest is the authority for that URI, and mtime is a guess -- publishing
+# the legacy copy alongside it would union two generations of one named
+# graph, which is the exact failure the manifest exists to end. The heuristic
+# below should disappear with the last legacy sidecar.
+echo "Deduplicating legacy graphs by URI (keep newest non-empty upload per graph)..."
 : > /tmp/graph-candidates.txt
+SUPERSEDED_COUNT=0
 for graph_file in /tmp/nt-output/*.graph; do
+    [ -e "$graph_file" ] || continue
     nt_file="${graph_file%.graph}"
     graph_uri=$(tr -d '\n' < "$graph_file")
+    if grep -qxF "$graph_uri" /tmp/manifest-uris.txt; then
+        echo "  legacy (superseded by manifest): $(basename "$nt_file") <$graph_uri>"
+        SUPERSEDED_COUNT=$((SUPERSEDED_COUNT + 1))
+        continue
+    fi
     mtime=$(stat -c '%Y' "$nt_file")
     size=$(stat -c '%s' "$nt_file")
     # A reclaimed (zeroed) file's mtime is refreshed to the time of the
@@ -265,7 +465,33 @@ while IFS=$'\t' read -r graph_uri _nonzero _mtime graph_file; do
     fi
 done < /tmp/graph-candidates-sorted.txt
 rm -f /tmp/graph-candidates-sorted.txt
+LEGACY_COUNT=$(wc -l < /tmp/winning-graphs.txt | tr -d ' ')
 echo "Dedup complete: $STALE_COUNT duplicate(s) excluded from this build, all source objects retained"
+echo "Superseded by a manifest: $SUPERSEDED_COUNT legacy sidecar(s) ignored"
+
+# Manifest-backed graphs go in ahead of the legacy winners; from here down
+# there is no distinction between them.
+cat /tmp/manifest-winners.txt /tmp/winning-graphs.txt > /tmp/all-winners.txt
+mv /tmp/all-winners.txt /tmp/winning-graphs.txt
+rm -f /tmp/manifest-winners.txt /tmp/manifest-uris.txt
+
+GRAPH_FILES=$(wc -l < /tmp/winning-graphs.txt | tr -d ' ')
+echo "$GRAPH_FILES graphs selected ($MANIFEST_COUNT manifest-backed, $LEGACY_COUNT legacy)"
+# <<< shared graph corpus discovery <<<
+
+if [ "$GRAPH_FILES" -eq 0 ]; then
+  echo "ERROR: no graphs found — neither a committed manifest nor a .graph sidecar"
+  exit 1
+fi
+
+if [ "$GRAPH_FILES" -lt 10 ]; then
+  echo "ERROR: only $GRAPH_FILES graphs found, minimum is 10"
+  exit 1
+fi
+echo "Completeness: $GRAPH_FILES graphs, previous status=$PREV_STATUS ($PREV_TRIPLES triples)"
+
+DOWNLOAD_SIZE=$(du -sch /tmp/nt-output "$PAYLOAD_DIR" 2>/dev/null | tail -1 | cut -f1)
+echo "Corpus on local disk: $DOWNLOAD_SIZE"
 
 # Per-graph gunzip+sed is independent work (no shared state, output order
 # doesn't matter -- qlever-index sorts everything internally regardless of
@@ -276,6 +502,7 @@ echo "Dedup complete: $STALE_COUNT duplicate(s) excluded from this build, all so
 # allotted cores during this exact phase, with 10+ host cores sitting idle.
 # Each graph converts into its own fragment under /tmp/nq-parts/, then all
 # fragments concatenate into packagegraph.nq once every job finishes.
+echo "Converting to N-Quads..."
 NQ_PARTS=/tmp/nq-parts
 rm -rf "$NQ_PARTS"
 mkdir -p "$NQ_PARTS"
@@ -322,10 +549,13 @@ cat "$NQ_PARTS"/*.nq > /tmp/packagegraph.nq
 cat "$NQ_PARTS"/*.uri > /tmp/graph-uris.txt
 rm -rf "$NQ_PARTS"
 rm -f /tmp/winning-graphs.txt
-# Deliberately not deleting /tmp/nt-output or its contents: it lives on
-# qlever-rebuild-scratch.volume (a real disk, not tmpfs -- see its own
-# comment), and keeping it around is what lets next run's mc mirror above
-# skip re-downloading every graph that hasn't changed since tonight.
+# Deliberately not deleting /tmp/nt-output or /tmp/graph-payloads: they live
+# on qlever-rebuild-scratch.volume (a real disk, not tmpfs -- see its own
+# comment), and keeping them around is what lets next run's mc mirror above
+# skip re-downloading every graph that hasn't changed since tonight, and lets
+# an unchanged manifest reuse its already-verified generation. Unbounded
+# growth is prevented per graph rather than by wiping: each graph's payload
+# directory is pruned to its committed generation above.
 
 NQ_SIZE=$(du -sh /tmp/packagegraph.nq | cut -f1)
 TRIPLE_COUNT=$(wc -l < /tmp/packagegraph.nq)

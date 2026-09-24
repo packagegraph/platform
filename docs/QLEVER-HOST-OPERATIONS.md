@@ -103,7 +103,7 @@ ssh root@$PGRAPH_HOST 'journalctl -u qlever.service -f'
 # Restart the server (e.g. after an index reload)
 ssh root@$PGRAPH_HOST 'systemctl restart qlever.service'
 
-# Manually trigger a full index rebuild from the nt-output corpus
+# Manually trigger a full index rebuild from the published corpus
 # (heavy: downloads ~28G, builds a new index, can take 30-60+ min)
 ssh root@$PGRAPH_HOST 'systemctl start qlever-rebuild-index.service'
 ssh root@$PGRAPH_HOST 'journalctl -u qlever-rebuild-index.service -f'
