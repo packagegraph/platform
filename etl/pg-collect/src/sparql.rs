@@ -320,6 +320,20 @@ impl SparqlClient {
             .collect())
     }
 
+    /// Distinct package NAMES of a given RDF type.
+    ///
+    /// `query_packages_by_type` returns one row per (package, version), which
+    /// is what a per-version enricher wants. An enricher whose upstream query
+    /// is keyed by name alone -- OSV is -- would issue the same request once
+    /// per version of the same package, so it wants this instead (#59).
+    pub fn query_package_names_by_type(&self, rdf_type: &str) -> Result<Vec<String>> {
+        let bindings = self.query(&package_names_by_type_query(rdf_type))?;
+        Ok(bindings
+            .into_iter()
+            .filter_map(|b| b.get("name").cloned())
+            .collect())
+    }
+
     /// Graph-scoped variant of query_packages_by_type.
     pub fn query_packages_by_type_in_graph(
         &self,
@@ -746,6 +760,17 @@ impl SparqlClient {
     }
 }
 
+/// The query behind `SparqlClient::query_package_names_by_type`.
+fn package_names_by_type_query(rdf_type: &str) -> String {
+    format!(
+        "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\n\
+         SELECT DISTINCT ?name WHERE {{\n\
+           ?pkg a <{rdf_type}> ;\n\
+                pkg:packageName ?name .\n\
+         }} ORDER BY ?name"
+    )
+}
+
 pub(crate) fn source_builds_query(graph: &str) -> String {
     format!(
         r#"PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>
@@ -1122,6 +1147,19 @@ mod tests {
         assert!(q.contains("OPTIONAL")); // epoch is optional, defaults 0
         assert!(q.contains("COALESCE(?ep, 0) AS ?epoch")); // epoch-0 packages default 0
         assert!(q.contains("GRAPH <https://packagegraph.github.io/graph/rhel/9>"));
+    }
+
+    #[test]
+    fn package_names_query_is_one_row_per_name_not_per_version() {
+        let q = super::package_names_by_type_query(
+            "https://purl.org/packagegraph/ontology/deb#BinaryPackage",
+        );
+        assert!(q.contains("SELECT DISTINCT ?name"));
+        assert!(q.contains("pkg:packageName ?name"));
+        // A version join here is what made the security enricher issue one
+        // identical OSV request per version of every package (#59).
+        assert!(!q.contains("hasVersion"), "must not join versions: {q}");
+        assert!(!q.contains("versionString"), "must not join versions: {q}");
     }
 
     #[test]
