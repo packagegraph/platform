@@ -50,6 +50,12 @@ jobs:
         # it finds nothing, so a renamed or moved file would turn this step
         # into a vacuous pass -- the exact failure mode tracked in #57.
         run: python3 deploy/quadlet/tests/test_rebuild_index_gate.py -v
+      # A rebuild that fails must stay retryable, and must not have eaten the
+      # inputs the retry needs. Drives the real script against a fake object
+      # store with conversion, build, gate and promotion failures injected.
+      # Directly invoked for the same reason as the step above.
+      - name: Rebuild failures must stay retryable and preserve their inputs
+        run: python3 deploy/quadlet/tests/test_rebuild_retry_and_preservation.py -v
       - name: Verify exclusion with the image's pinned mc
         run: |
           set -euo pipefail

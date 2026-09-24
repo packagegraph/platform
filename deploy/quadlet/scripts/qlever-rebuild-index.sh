@@ -56,6 +56,24 @@ mc_cat_check() {
   return 2
 }
 
+# advance_corpus_marker: record the corpus fingerprint this run succeeded on.
+# Call ONLY from a path that has produced or confirmed a live index, never
+# earlier. The marker drives the early-exit skip at the top of the script, so
+# writing it before conversion/build/gate/promotion made every failure in that
+# window permanent: the next run saw an unchanged corpus, skipped, and left
+# the index at whatever stale state the failure had frozen it in, forever --
+# nothing short of a new upload to nt-output/ could break the cycle. Written
+# last instead, a failure anywhere leaves the previous marker in place and the
+# next run retries the full pipeline. See issue #75.
+advance_corpus_marker() {
+  if ! echo "$CORPUS_LISTING_HASH" | \
+    mc pipe "pgraph/${MINIO_BUCKET}/qlever-index/last-corpus-listing-hash.txt"; then
+    # Non-fatal: a missing marker costs one redundant rebuild, never
+    # correctness. Failing here would discard a good, promoted index.
+    echo "WARN: failed to record corpus marker — next run will rebuild redundantly" >&2
+  fi
+}
+
 # Completeness gate: compare against last successful run
 # || captures non-zero without triggering set -e
 MC_RC=0; mc_cat_check "pgraph/${MINIO_BUCKET}/qlever-index/last-success.json" || MC_RC=$?
@@ -84,9 +102,11 @@ mc ls -r --json "pgraph/${MINIO_BUCKET}/nt-output/" | \
 # every rebuild pays the full download+convert+build cost regardless of
 # how much actually changed, which is wasted work entirely on any night
 # where no collector uploaded anything new. Compare against the listing
-# hash saved after the last run that got this far (below); an identical
-# corpus means an identical index would result, so skip before doing any
-# of that work rather than after (the existing content-hash check further
+# hash saved by the last run that actually produced or confirmed the live
+# index (see advance_corpus_marker); an identical corpus against a marker
+# that only a successful run could have written means an identical index
+# would result, so skip before doing any of that work rather than after
+# (the existing content-hash check further
 # down still catches the case where the corpus *did* change but happens to
 # produce a byte-identical index).
 CORPUS_LISTING_HASH=$(sha256sum /tmp/etag-before.txt | cut -d' ' -f1)
@@ -133,14 +153,6 @@ if ! diff -q /tmp/etag-before.txt /tmp/etag-after.txt >/dev/null 2>&1; then
   exit 1
 fi
 rm -f /tmp/etag-before.txt /tmp/etag-after.txt
-
-# Record this corpus state now that it's confirmed stable, so the next run's
-# early-exit check (above) can skip if nothing changes before then. Recorded
-# regardless of whether this run ends up promoting -- a crash before this
-# point (script error, indexer failure, etc.) simply leaves the previous
-# marker in place, so the next run correctly does NOT skip and retries the
-# full pipeline instead of getting stuck skipping forever.
-echo "$CORPUS_LISTING_HASH" | mc pipe "pgraph/${MINIO_BUCKET}/qlever-index/last-corpus-listing-hash.txt"
 
 GRAPH_FILES=$(find /tmp/nt-output -name '*.graph' | wc -l | tr -d ' ')
 echo "$GRAPH_FILES graphs discovered"
@@ -197,13 +209,14 @@ fi
 #
 # Group every discovered sidecar by the graph URI in its contents (not by
 # filename -- naming schemes can and have changed) and keep only the
-# newest data file per URI. The older duplicate's SOURCE key in Minio is
-# then overwritten with a 0-byte payload (confirmed live: `mc pipe` with
-# empty stdin succeeds even without delete permission, since this is a
-# plain PUT to an existing key, a different S3 permission than
-# DeleteObject -- and the bucket is unversioned, so the old bytes are
-# actually freed, not retained under a hidden version) so the exact same
-# duplication doesn't get rediscovered and reclaimed on every future run.
+# newest data file per URI. Selection only: losing duplicates are skipped
+# for this build and left untouched in Minio. This step used to overwrite
+# the loser's SOURCE key with a 0-byte payload to reclaim its storage, and
+# that is why it no longer does: the reclaim ran here, before conversion,
+# the build, the gates or promotion, against an unversioned bucket. Any
+# failure downstream therefore destroyed bytes the retry needed and could
+# not get back. Storage reclamation is a separate concern from index
+# construction and does not belong in front of it.
 echo "Deduplicating graphs by URI (keep newest non-empty upload per graph)..."
 : > /tmp/graph-candidates.txt
 for graph_file in /tmp/nt-output/*.graph; do
@@ -237,18 +250,22 @@ while IFS=$'\t' read -r graph_uri _nonzero _mtime graph_file; do
         echo "$graph_file" >> /tmp/winning-graphs.txt
         LAST_URI="$graph_uri"
     else
-        # Older duplicate of an already-won URI -- reclaim its storage.
+        # Older duplicate of an already-won URI -- excluded from this build,
+        # but deliberately NOT reclaimed. Zeroing it here destroyed the only
+        # recoverable copy of a losing payload before the winning candidate
+        # had been converted, gated or promoted: the bucket is unversioned,
+        # so a build that then failed left neither a new index nor the bytes
+        # needed to retry. Several graphs in this corpus exist only as a
+        # single legacy object, so the loser is not always redundant.
+        # Reclamation, if it returns, belongs after a validated index is
+        # accepted and needs its own retention policy.
         nt_file="${graph_file%.graph}"
-        stale_key="nt-output/$(basename "$nt_file")"
-        echo "  stale duplicate: $(basename "$nt_file") <$graph_uri> — reclaiming $stale_key"
+        echo "  duplicate (not used, retained): $(basename "$nt_file") <$graph_uri>"
         STALE_COUNT=$((STALE_COUNT + 1))
-        if ! printf '' | mc pipe "pgraph/${MINIO_BUCKET}/${stale_key}"; then
-            echo "WARN: failed to reclaim $stale_key — will retry next run" >&2
-        fi
     fi
 done < /tmp/graph-candidates-sorted.txt
 rm -f /tmp/graph-candidates-sorted.txt
-echo "Dedup complete: $STALE_COUNT stale duplicate(s) reclaimed"
+echo "Dedup complete: $STALE_COUNT duplicate(s) excluded from this build, all source objects retained"
 
 # Per-graph gunzip+sed is independent work (no shared state, output order
 # doesn't matter -- qlever-index sorts everything internally regardless of
@@ -356,6 +373,8 @@ if [ "$MC_RC" -eq 2 ]; then
   exit 1
 elif [ "$MC_RC" -eq 0 ] && [ "$MC_RESULT" = "$CONTENT_HASH" ]; then
   echo "QLever index ${CONTENT_HASH} already promoted — no changes, skipping promotion"
+  # A success exit: this corpus demonstrably builds the index that is live.
+  advance_corpus_marker
   STATUS="unchanged"
   exit 0
 fi
@@ -426,6 +445,7 @@ echo "Promoting ${CONTENT_HASH} to latest..."
 echo "${CONTENT_HASH}" | mc pipe "pgraph/${MINIO_BUCKET}/qlever-index/latest"
 
 echo "✓ Index ${CONTENT_HASH} promoted to latest"
+advance_corpus_marker
 STATUS="success"
 # Multiple physical files can legitimately share one graph URI (e.g.
 # multi-arch parts fanning into a single named graph), so graph-uris.txt

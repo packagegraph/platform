@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""A local stand-in for the `mc` client, backed by a directory tree.
+
+Only the six subcommands qlever-rebuild-index.sh actually issues are
+implemented: alias set, cat, pipe, ls -r --json, mirror, cp. Anything else
+is a hard error rather than a silent success -- a stub that shrugs at an
+unrecognised verb would let the script under test appear to pass while
+skipping the very call the test is about.
+
+The store is a plain directory: $FAKE_S3_ROOT/<bucket>/<key>. Every
+mutating call is appended to $FAKE_MC_LOG as "<verb>\t<path>", which is
+what lets a test assert that a source object was never written to.
+
+Failure injection: FAKE_MC_FAIL holds comma-separated substrings; any
+pipe/cp whose destination path contains one of them fails the way the real
+client fails on a rejected PUT.
+"""
+import json
+import os
+import shutil
+import sys
+import hashlib
+
+ROOT = os.environ["FAKE_S3_ROOT"]
+LOG = os.environ.get("FAKE_MC_LOG")
+FAIL = [s for s in os.environ.get("FAKE_MC_FAIL", "").split(",") if s]
+
+
+def local(remote):
+    # "pgraph/bucket/a/b" -> "$ROOT/bucket/a/b"; the alias is the first segment.
+    parts = remote.split("/", 1)
+    if parts[0] != "pgraph":
+        sys.exit(f"mc: unknown alias {parts[0]!r}")
+    return os.path.join(ROOT, parts[1])
+
+
+def log(verb, path):
+    if LOG:
+        with open(LOG, "a") as fh:
+            fh.write(f"{verb}\t{path}\n")
+
+
+def should_fail(path):
+    return any(s in path for s in FAIL)
+
+
+def main(argv):
+    if argv[:2] == ["alias", "set"]:
+        return 0
+
+    verb = argv[0]
+
+    if verb == "cat":
+        path = local(argv[1])
+        if not os.path.isfile(path):
+            # Matches the message mc_cat_check greps for to tell "absent"
+            # (retryable, expected) apart from "broken" (fatal).
+            sys.stderr.write(f"mc: <ERROR> Unable to read: NoSuchKey\n")
+            return 1
+        sys.stdout.write(open(path).read())
+        return 0
+
+    if verb == "pipe":
+        dest = argv[1]
+        log("pipe", dest)
+        if should_fail(dest):
+            sys.stderr.write(f"mc: <ERROR> Unable to write {dest}: AccessDenied\n")
+            return 1
+        path = local(dest)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = sys.stdin.buffer.read()
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return 0
+
+    if verb == "cp":
+        src, dest = argv[-2], argv[-1]
+        log("cp", dest)
+        if should_fail(dest):
+            sys.stderr.write(f"mc: <ERROR> Unable to write {dest}: AccessDenied\n")
+            return 1
+        path = local(dest)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        shutil.copy2(src, path)
+        return 0
+
+    if verb == "ls":
+        prefix = local(argv[-1]).rstrip("/")
+        for dirpath, _, names in os.walk(prefix):
+            for name in sorted(names):
+                full = os.path.join(dirpath, name)
+                rel = os.path.relpath(full, prefix)
+                etag = hashlib.md5(open(full, "rb").read()).hexdigest()
+                print(json.dumps({"status": "success", "key": rel, "etag": etag}))
+        return 0
+
+    if verb == "mirror":
+        src = local(argv[-2]).rstrip("/")
+        dst = argv[-1].rstrip("/")
+        excludes = []
+        for i, a in enumerate(argv):
+            if a == "--exclude":
+                excludes.append(argv[i + 1].lstrip("*"))
+        os.makedirs(dst, exist_ok=True)
+        for dirpath, _, names in os.walk(src):
+            for name in sorted(names):
+                if any(name.endswith(e) for e in excludes):
+                    continue
+                full = os.path.join(dirpath, name)
+                out = os.path.join(dst, os.path.relpath(full, src))
+                os.makedirs(os.path.dirname(out), exist_ok=True)
+                shutil.copy2(full, out)
+        return 0
+
+    sys.exit(f"mc: stub does not implement {verb!r} (argv={argv})")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
