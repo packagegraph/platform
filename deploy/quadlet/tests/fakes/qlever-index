@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""A local stand-in for `qlever-index`.
+
+Writes an index whose bytes are a deterministic function of the input
+N-Quads, so that -- as with the real indexer -- an unchanged corpus yields
+an unchanged content hash and the script's idempotency short-circuit
+behaves realistically.
+
+Each invocation is appended to $FAKE_QLEVER_LOG, which is how a test
+proves the build was attempted again on a retry rather than skipped.
+FAKE_QLEVER_FAIL=1 makes the build fail.
+"""
+import hashlib
+import os
+import sys
+
+argv = sys.argv[1:]
+index_prefix = argv[argv.index("-i") + 1]
+nq = argv[argv.index("-f") + 1]
+
+log = os.environ.get("FAKE_QLEVER_LOG")
+if log:
+    with open(log, "a") as fh:
+        fh.write(f"{nq}\n")
+
+if os.environ.get("FAKE_QLEVER_FAIL") == "1":
+    sys.stderr.write("qlever-index: simulated index build failure\n")
+    sys.exit(1)
+
+digest = hashlib.sha256(open(nq, "rb").read()).hexdigest()
+os.makedirs(os.path.dirname(index_prefix), exist_ok=True)
+for suffix in (".index", ".meta", ".vocabulary"):
+    with open(index_prefix + suffix, "w") as fh:
+        fh.write(digest + suffix + "\n")
