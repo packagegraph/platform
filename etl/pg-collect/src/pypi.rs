@@ -412,8 +412,18 @@ impl PypiCollector {
         response: &PypiProjectResponse,
     ) -> Result<(usize, Vec<String>)> {
         let info = &response.info;
-        let pkg_uri = package_uri("pypi", "index", "any", &info.name, &info.version);
-        let identity_uri = package_identity_uri("pypi", "index", "any", &info.name);
+        // PEP 503 normalization exists precisely so one project cannot have
+        // two identifiers. PyPI's JSON API returns the DECLARED name, case and
+        // separators intact ("Flask", "zope.interface", "typing_extensions"),
+        // while dependency targets and seeds have always been normalized -- so
+        // every project whose declared name is not already canonical had its
+        // identity minted under one IRI and its inbound edges pointed at
+        // another (#48). Deriving an IRI from a display name also means a
+        // project that restyles its capitalization silently acquires a second
+        // identity between runs.
+        let canonical = normalize_pypi_name(&info.name);
+        let pkg_uri = package_uri("pypi", "index", "any", &canonical, &info.version);
+        let identity_uri = package_identity_uri("pypi", "index", "any", &canonical);
         let mut triples = 0;
 
         // Dual typing
@@ -422,17 +432,19 @@ impl PypiCollector {
         triples += 2;
 
         // Identity
-        triples += write_package_identity(writer, &identity_uri, &info.name)?;
+        triples += write_package_identity(writer, &identity_uri, &canonical)?;
         // identityName + rdfs:label, not packageName: see
         // emit::rdf::write_package_identity for why.
         writer.write_triple(&pkg_uri, &format!("{PKG}isVersionOf"), &identity_uri)?;
         triples += 1;
 
+        // The declared name is kept here, where the model puts human-facing
+        // names. It is display, not identity: nothing joins on it.
         writer.write_literal(&pkg_uri, &format!("{PKG}packageName"), &info.name)?;
         triples += 1;
 
         // Version
-        let ver_uri = version_uri("pypi", "index", &info.name, &info.version);
+        let ver_uri = version_uri("pypi", "index", &canonical, &info.version);
         writer.write_triple(&ver_uri, RDF_TYPE, &format!("{PKG}Version"))?;
         writer.write_literal(&ver_uri, &format!("{PKG}versionString"), &info.version)?;
         writer.write_triple(&pkg_uri, &format!("{PKG}hasVersion"), &ver_uri)?;
@@ -591,6 +603,106 @@ mod tests {
         assert_eq!(resp.info.name, "requests");
         assert_eq!(resp.info.version, "2.31.0");
         assert_eq!(resp.info.requires_dist.unwrap().len(), 2);
+    }
+
+    // --- one project, one IRI (#48) ---
+
+    /// Emit a project declaring `name`, optionally depending on `dep`, and
+    /// return the N-Triples.
+    fn emit_declared(name: &str, dep: Option<&str>) -> String {
+        let collector = PypiCollector::new();
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+        let response = PypiProjectResponse {
+            info: PypiInfo {
+                name: name.into(),
+                version: "1.0.0".into(),
+                summary: None,
+                license: None,
+                home_page: None,
+                requires_python: None,
+                requires_dist: dep.map(|d| vec![d.to_string()]),
+                classifiers: None,
+            },
+        };
+        collector
+            .emit_package_triples(&mut writer, &response)
+            .unwrap();
+        writer.flush().unwrap();
+        let mut content = String::new();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        content
+    }
+
+    #[test]
+    fn a_projects_identity_iri_is_its_canonical_name() {
+        // PyPI returns the declared name, so collecting Flask minted
+        // .../any/Flask while everything depending on it minted
+        // .../any/flask -- an identity nothing joins to and edges that
+        // dangle. PEP 503 normalization is exactly what prevents that.
+        for (declared, canonical) in [
+            ("Flask", "flask"),
+            ("SQLAlchemy", "sqlalchemy"),
+            ("zope.interface", "zope-interface"),
+            ("typing_extensions", "typing-extensions"),
+        ] {
+            let out = emit_declared(declared, None);
+            let identity = package_identity_uri("pypi", "index", "any", canonical);
+            assert!(
+                out.contains(&format!("<{identity}>")),
+                "{declared} did not mint {identity}:\n{out}"
+            );
+            assert!(
+                !out.contains(&package_identity_uri("pypi", "index", "any", declared)),
+                "{declared} still mints an identity from its display name:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_declared_name_is_kept_as_a_literal() {
+        // Canonicalizing the IRI must not lose how the project spells itself.
+        let out = emit_declared("Flask", None);
+        assert!(
+            out.contains("packageName> \"Flask\""),
+            "the declared spelling was lost:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_dependency_resolves_to_the_same_identity_the_project_mints() {
+        // The two paths agreeing is the whole point; asserting either alone
+        // would not catch a split.
+        let dependant = emit_declared("some-project", Some("Flask (>=2.0)"));
+        let flask = emit_declared("Flask", None);
+        let identity = package_identity_uri("pypi", "index", "any", "flask");
+        assert!(
+            dependant.contains(&format!("directlyDependsOn> <{identity}>")),
+            "{dependant}"
+        );
+        assert!(
+            flask.contains(&format!("<{identity}> ")),
+            "the project does not define the identity its dependants point at:\n{flask}"
+        );
+    }
+
+    #[test]
+    fn the_version_node_is_canonical_too() {
+        // "or the split simply moves" -- version_uri is built from the same
+        // name and would strand the version under a second IRI.
+        let out = emit_declared("PyYAML", None);
+        assert!(
+            out.contains(&version_uri("pypi", "index", "pyyaml", "1.0.0")),
+            "{out}"
+        );
+        assert!(
+            !out.contains(&version_uri("pypi", "index", "PyYAML", "1.0.0")),
+            "{out}"
+        );
     }
 
     #[test]
