@@ -222,8 +222,10 @@ impl SourcesCollector {
             }
         };
 
-        // Go-Import-Path: authoritative Go module path from Sources.gz
-        // Overrides the heuristic name-prefix detection for Go packages
+        // Go-Import-Path: authoritative Go module path from Sources.gz.
+        // The only source of one: the golang- name prefix establishes the
+        // ecosystem and nothing else, because the distro name has had "/"
+        // and "." flattened out of it irreversibly (#42).
         if let Some(go_import_path) = src_data.get("Go-Import-Path") {
             let import_path = go_import_path.trim();
             if !import_path.is_empty() {

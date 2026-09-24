@@ -842,6 +842,27 @@ fn expand_macros(url: &str, spec: &SpecData) -> String {
 }
 
 /// Detect upstream ecosystem from spec data.
+/// A `golang-` prefix establishes the ecosystem and nothing more.
+///
+/// A Go module path is slash-separated (`github.com/spf13/cobra`), and both
+/// Fedora and Debian flatten `/` and `.` to `-` when they name the package.
+/// That flattening is not reversible by string manipulation:
+/// `github-spf13-cobra` could be `github.com/spf13/cobra` or
+/// `github-spf13.com/cobra`. Stripping the prefix would only produce a
+/// differently-unusable name, and `seed.rs` hands these straight to the Go
+/// module collector (#42).
+///
+/// The import path is carried by evidence that actually knows it: a
+/// `golang(...)` RPM Provides, read by `rpm::emit_ecosystem_triples`, and
+/// Debian's `Go-Import-Path`, read by `collect_sources`. Where neither is
+/// present the ecosystem is all we know, and recording only that is the
+/// honest answer.
+const GO_ECOSYSTEM_ONLY: EcosystemDetection = EcosystemDetection {
+    ecosystem: "gomod",
+    package_name: None,
+    detection_method: "name-prefix",
+};
+
 pub fn detect_ecosystem(spec: &SpecData, source_name: &str) -> Option<EcosystemDetection> {
     // Strategy 1: Source0 URL domain (highest confidence)
     if let Some(ref source0) = spec.source0_url {
@@ -973,11 +994,7 @@ pub fn detect_ecosystem(spec: &SpecData, source_name: &str) -> Option<EcosystemD
         });
     }
     if source_name.starts_with("golang-") {
-        return Some(EcosystemDetection {
-            ecosystem: "gomod",
-            package_name: Some(source_name.to_string()),
-            detection_method: "name-prefix",
-        });
+        return Some(GO_ECOSYSTEM_ONLY);
     }
     if source_name.starts_with("nodejs-") {
         let pkg = strip_ecosystem_prefix(source_name, &["nodejs-"]);
@@ -1143,11 +1160,7 @@ pub fn detect_ecosystem_by_name(
 
     // Go: golang-
     if package_name.starts_with("golang-") {
-        return Some(EcosystemDetection {
-            ecosystem: "gomod",
-            package_name: Some(package_name.to_string()),
-            detection_method: "name-prefix",
-        });
+        return Some(GO_ECOSYSTEM_ONLY);
     }
 
     // R CRAN: r-cran-
@@ -1743,6 +1756,79 @@ BuildRequires:  perl(Test::More)
         assert_eq!(
             rewrite_origin("https://gitlab.com/a/b.spec", "http://h:1/"),
             "http://h:1/a/b.spec"
+        );
+    }
+
+    // --- a golang- prefix is not a module path (#42) ---
+
+    #[test]
+    fn a_golang_prefix_names_the_ecosystem_and_not_the_module() {
+        // Fedora and Debian both flatten "/" and "." to "-", and that is not
+        // reversible: github-spf13-cobra could be github.com/spf13/cobra or
+        // github-spf13.com/cobra. Stripping the prefix, as every neighbouring
+        // branch does, would only produce a differently-unusable name.
+        let spec = SpecData {
+            source0_url: None,
+            all_sources: vec![],
+            patches: vec![],
+            commit_hash: None,
+            url_field: None,
+            name: Some("golang-github-spf13-cobra".to_string()),
+            version: Some("1.8.0".to_string()),
+            build_requires: vec![],
+            changelog_entries: vec![],
+        };
+        let by_spec = detect_ecosystem(&spec, "golang-github-spf13-cobra").unwrap();
+        let by_name = detect_ecosystem_by_name("golang-github-spf13-cobra", None).unwrap();
+        for detection in [by_spec, by_name] {
+            assert_eq!(detection.ecosystem, "gomod");
+            assert_eq!(
+                detection.package_name, None,
+                "a flattened distro name was recorded as a Go module path"
+            );
+        }
+    }
+
+    #[test]
+    fn a_go_package_publishes_its_ecosystem_without_an_unusable_name() {
+        // What reaches the graph, not what the detector returns: seed.rs
+        // hands upstreamPackageName straight to the Go module collector, so
+        // an unusable name there is a lookup that can only fail.
+        let name = "golang-github-spf13-cobra";
+        let mut server = mockito::Server::new();
+        server
+            .mock(
+                "GET",
+                format!("/rpms/{name}/raw/f44/f/{name}.spec").as_str(),
+            )
+            .with_status(200)
+            .with_body(format!(
+                "Name:           {name}\nVersion:        1.8.0\n%description\na package\n"
+            ))
+            .create();
+        let collector = offline_spec_collector(server.url());
+
+        let names: HashSet<String> = [name.to_string()].into_iter().collect();
+        let identities: HashMap<String, Vec<String>> = [(
+            name.to_string(),
+            vec![format!("{DATA}identity/fedora/44/x86_64/{name}")],
+        )]
+        .into_iter()
+        .collect();
+
+        let mut w = crate::ntriples::NTriplesWriter::new(Vec::<u8>::new());
+        collector
+            .collect(&mut w, &names, &identities, &HashSet::new(), false, false)
+            .unwrap();
+        let body = w.into_string().unwrap();
+
+        assert!(
+            body.contains(&format!("upstreamEcosystem> <{DATA}ecosystem/gomod>")),
+            "the ecosystem is still worth recording:\n{body}"
+        );
+        assert!(
+            !body.contains("upstreamPackageName"),
+            "a flattened distro name reached the graph as a Go module path:\n{body}"
         );
     }
 
