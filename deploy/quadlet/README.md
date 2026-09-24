@@ -34,6 +34,7 @@ see "Public SPARQL reverse proxy" below.
 | `collectors/pg-collect@.container` + `collectors/scripts/*.sh` + `collectors/timers/*.timer` | `deploy/overlays/{dev,prod}/jobs/collect-*.yaml` -- see "Package collectors" |
 | `pg-collect-scratch.volume` | the CronJobs' `tmp` emptyDir |
 | `podman-image-prune.service` + `.timer` | no k8s equivalent (kubelet's own image GC is the analogue) |
+| `failure/pg-unit-failed@.service` + `scripts/unit-failed.sh` + `enrichers/dropins/` | no k8s equivalent (a Job's failure is visible in the cluster's own status; a systemd oneshot's is not) -- see "Failure visibility and per-enricher timeouts" |
 
 The scripts are bind-mounted into their containers read-only rather than
 baked into the `qlever-rebuild` image, so this set works against the image
@@ -975,11 +976,67 @@ install -d /etc/containers/systemd/scripts/enrichers
 install -m 755 deploy/quadlet/enrichers/scripts/*.sh /etc/containers/systemd/scripts/enrichers/
 install -m 644 deploy/quadlet/enrichers/timers/*.timer /etc/systemd/system/
 
+# Per-enricher timeouts (see "Failure visibility and per-enricher timeouts").
+for d in deploy/quadlet/enrichers/dropins/*.service.d; do
+  install -d "/etc/systemd/system/$(basename "$d")"
+  install -m 644 "$d"/*.conf "/etc/systemd/system/$(basename "$d")/"
+done
+
 systemctl daemon-reload
 systemctl enable --now pg-enrich-advisory.timer pg-enrich-koji.timer pg-enrich-npm-provenance.timer \
   pg-enrich-repology.timer pg-enrich-epss.timer pg-enrich-taxonomy.timer pg-enrich-security.timer \
   pg-enrich-forge-version.timer pg-enrich-nvd.timer pg-enrich-revdeps.timer pg-enrich-blast-radius.timer
 ```
+
+### Failure visibility and per-enricher timeouts
+
+Three enrichers had been failing since 2026-09-14 and one collector since
+2026-09-12 with nothing reporting it (#59). They were not silent:
+`systemctl --failed` knew, and so did the journal. Nobody was reading
+either.
+
+`failure/pg-unit-failed@.service` closes that by giving the listening a
+fixed address. The collector and enricher templates name it in
+`OnFailure=`, and it runs `scripts/unit-failed.sh`, which writes:
+
+| path | contents |
+|---|---|
+| `/var/lib/packagegraph/failed-units/<unit>.txt` | the latest failure of that unit -- how it ended, when, and the last 100 journal lines. Overwritten each time: the question is "what is wrong now". |
+| `/var/lib/packagegraph/failed-units/history.tsv` | one line per failure, appended forever, so a unit that fails every week looks different from one that failed once. |
+
+It also logs to the journal under the `pg-unit-failed` tag, so
+`journalctl -t pg-unit-failed` is a complete list even if the directory is
+lost. Nothing leaves the host and no credentials are involved, so the
+notifier cannot itself become a thing that breaks, leaks, or has to be
+rotated.
+
+```bash
+install -m 644 deploy/quadlet/failure/pg-unit-failed@.service /etc/systemd/system/
+install -m 755 deploy/quadlet/scripts/unit-failed.sh /etc/containers/systemd/scripts/
+install -d -m 755 /var/lib/packagegraph/failed-units
+systemctl daemon-reload
+```
+
+`enrichers/dropins/pg-enrich@<name>.service.d/timeout.conf` then gives each
+enricher its own `TimeoutStartSec`. One number shared by eleven enrichers
+is what let `koji` and `security` be SIGKILL'd mid-run while `taxonomy`,
+which finishes in about a minute, would have sat undetected for eight hours
+if it hung. Every drop-in states whether its number is MEASURED, ESTIMATED
+or UNMEASURED, and `tests/test_unit_failure_notifier.py` fails if a new
+enricher arrives without one, or if a drop-in carries a number with no
+stated basis.
+
+Only `taxonomy` (1h, measured) and `security` (4h, estimated from the
+redesign) are currently below the shared 8h ceiling. The rest are honestly
+unmeasured and stay conservative: a timeout below the real runtime is
+exactly how `koji` and `security` were lost, so guessing downward is worse
+than leaving the ceiling in place until a run measures it.
+
+`repology` is the deliberate exception. A complete pass needs ~90 hours,
+so every weekly run ends in a timeout kill BY DESIGN -- its value is the
+cache progress it flushes to Minio, not completion. Its drop-in clears
+`OnFailure=`, because a failure report that fires every week on healthy
+behaviour trains the reader to ignore failure reports.
 
 **One-time ontology bootstrap**, needed before `revdeps`/`blast-radius` (or
 any future consumer of ontology-level declarations) will work -- not part

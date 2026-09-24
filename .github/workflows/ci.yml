@@ -95,6 +95,14 @@ jobs:
         run: python3 deploy/quadlet/tests/test_graph_manifest.py -v
       - name: Every corpus reader must apply the same rules
         run: python3 deploy/quadlet/tests/test_reader_parity.py -v
+      # Three enrichers and a collector failed for days with nothing
+      # reporting it (#59). Drives the real unit-failed.sh against fake
+      # systemctl/journalctl/logger, and statically checks that every
+      # template still names the notifier and every enricher still has a
+      # timeout with a stated basis. Directly invoked, for the reason given
+      # above.
+      - name: A failed unit must report itself somewhere a human looks
+        run: python3 deploy/quadlet/tests/test_unit_failure_notifier.py -v
       - name: Verify exclusion with the image's pinned mc
         run: |
           set -euo pipefail
