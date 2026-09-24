@@ -532,11 +532,18 @@ fn extract_registry_name(url: &str) -> Option<(&'static str, String)> {
         // Extract last path component before version
         let parts: Vec<&str> = url.rsplitn(2, '/').collect();
         if let Some(filename) = parts.first() {
-            // Module-Name-1.23.tar.gz → Module-Name
+            // libwww-perl-6.72.tar.gz → libwww-perl. A CPAN tarball is
+            // always named for a DISTRIBUTION, and a distribution is not a
+            // module: libwww-perl ships LWP, LWP::UserAgent and twenty
+            // others, and there is no module called libwww::perl. Rewriting
+            // "-" to "::" here invented a module name and filed it under the
+            // same `cpan` token every spec path uses for distributions, so
+            // Debian-via-Salsa and Fedora-via-spec never converged on one
+            // upstream even when they packaged the same thing (#44).
             if let Some(idx) = filename.rfind('-') {
                 let name = &filename[..idx];
                 if !name.is_empty() {
-                    return Some(("cpan", name.replace('-', "::")));
+                    return Some(("cpan", name.to_string()));
                 }
             }
         }
@@ -859,6 +866,74 @@ https://github.com/openssl/openssl/releases .*/v?([\d.]+)\.tar\.gz
         assert_eq!(
             extract_registry_name("https://hackage.haskell.org/package/aeson-2.1.0.tar.gz"),
             Some(("hackage", "aeson".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_cpan_watch_url_yields_a_distribution_not_a_module() {
+        // #44: this rewrote "-" to "::", turning a distribution name into a
+        // module name that in general does not exist. libwww-perl ships LWP
+        // and twenty others; there is no libwww::perl. Every spec path emits
+        // the distribution form under the same `cpan` token, so the two
+        // producers never matched even for the same upstream project.
+        assert_eq!(
+            extract_registry_name(
+                "https://cpan.metacpan.org/authors/id/O/OA/OALDERS/libwww-perl-6.72.tar.gz"
+            ),
+            Some(("cpan", "libwww-perl".to_string()))
+        );
+        // The case that used to round-trip by accident must not regress into
+        // the module form either -- HTTP-Message is the distribution.
+        assert_eq!(
+            extract_registry_name(
+                "https://cpan.metacpan.org/authors/id/O/OA/OALDERS/HTTP-Message-6.45.tar.gz"
+            ),
+            Some(("cpan", "HTTP-Message".to_string()))
+        );
+    }
+
+    #[test]
+    fn salsa_and_spec_agree_on_one_cpan_upstream_name() {
+        // The point of picking a namespace: two producers describing one
+        // upstream project must emit byte-identical names, or cross-distro
+        // correlation silently finds nothing even when both are present.
+        let via_salsa = extract_registry_name(
+            "https://cpan.metacpan.org/authors/id/O/OA/OALDERS/HTTP-Message-6.45.tar.gz",
+        )
+        .unwrap();
+        // Fedora's perl-<Dist> form, recognised here by its cpan.org
+        // homepage: detect_ecosystem_by_name's name-prefix strategy covers
+        // Debian conventions only.
+        let via_spec = crate::collect_spec::detect_ecosystem_by_name(
+            "perl-HTTP-Message",
+            Some("https://metacpan.org/dist/HTTP-Message"),
+        )
+        .unwrap();
+        assert_eq!(via_salsa.0, via_spec.ecosystem);
+        assert_eq!(
+            Some(via_salsa.1),
+            via_spec.package_name,
+            "the Salsa and spec producers disagree about the same distribution"
+        );
+    }
+
+    #[test]
+    fn debians_binary_name_is_not_offered_as_a_cpan_name() {
+        // Salsa reads debian/watch, which carries the real tarball name;
+        // the binary-package heuristic cannot reverse lib<dist>-perl, so it
+        // stands down rather than guessing (#44).
+        assert_eq!(
+            crate::collect_spec::detect_ecosystem_by_name("libwww-perl", None)
+                .unwrap()
+                .package_name,
+            None
+        );
+        assert_eq!(
+            extract_registry_name(
+                "https://cpan.metacpan.org/authors/id/O/OA/OALDERS/libwww-perl-6.72.tar.gz"
+            ),
+            Some(("cpan", "libwww-perl".to_string())),
+            "the producer that can name it still does"
         );
     }
 

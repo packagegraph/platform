@@ -1064,10 +1064,9 @@ pub fn detect_ecosystem_by_name(
             || lower.contains("search.cpan.org")
             || lower.contains("cpan.org")
         {
-            let pkg = strip_perl_packaging(package_name);
             return Some(EcosystemDetection {
                 ecosystem: "cpan",
-                package_name: Some(pkg),
+                package_name: strip_perl_packaging(package_name),
                 detection_method: "homepage-domain",
             });
         }
@@ -1115,11 +1114,11 @@ pub fn detect_ecosystem_by_name(
         });
     }
 
-    // Perl: lib*-perl pattern
+    // Perl: lib*-perl pattern. Ecosystem only -- see strip_perl_packaging.
     if package_name.ends_with("-perl") && package_name.starts_with("lib") {
         return Some(EcosystemDetection {
             ecosystem: "cpan",
-            package_name: Some(strip_perl_packaging(package_name)),
+            package_name: None,
             detection_method: "name-prefix",
         });
     }
@@ -1254,22 +1253,27 @@ fn strip_ecosystem_prefix(source_name: &str, prefixes: &[&str]) -> String {
         .to_string()
 }
 
-/// Strip Perl packaging decoration, whichever distribution applied it.
+/// Strip Perl packaging decoration, where doing so yields a real CPAN
+/// distribution name.
 ///
-/// Fedora names a CPAN distribution `perl-<Dist>`; Debian names it
-/// `lib<dist>-perl`. Both tokens are packaging rather than part of the
-/// distribution name, but only when the whole shape is present -- stripping a
-/// bare `lib` from anything that merely starts with those letters is the #40
-/// truncation again.
-fn strip_perl_packaging(package_name: &str) -> String {
+/// Fedora names a distribution `perl-<Dist>`, preserving `<Dist>` verbatim,
+/// so `perl-HTTP-Message` gives `HTTP-Message` and that is the distribution.
+///
+/// Debian's `lib<dist>-perl` cannot be reversed. It lowercases, and CPAN is
+/// case-sensitive: `libjson-perl` unstrips to `json`, but the distribution is
+/// `JSON` and `json` resolves to nothing. Distributions that already begin
+/// with `lib` are not re-decorated either, so `libwww-perl` unstrips to `www`
+/// -- a distribution that does not exist -- while the real one is
+/// `libwww-perl` itself. Debian's authoritative source is `debian/watch`,
+/// whose tarball filename `collect_salsa` reads as the distribution name.
+///
+/// So this returns `None` for the Debian shape: the ecosystem is recorded and
+/// the name is left to the producer that knows it (#44).
+fn strip_perl_packaging(package_name: &str) -> Option<String> {
     if package_name.starts_with("lib") && package_name.ends_with("-perl") {
-        let without_lib = package_name.strip_prefix("lib").unwrap_or(package_name);
-        let without_suffix = without_lib.strip_suffix("-perl").unwrap_or(without_lib);
-        if !without_suffix.is_empty() {
-            return without_suffix.to_string();
-        }
+        return None;
     }
-    strip_ecosystem_prefix(package_name, &["perl-"])
+    Some(strip_ecosystem_prefix(package_name, &["perl-"]))
 }
 
 /// Strip a `-dev` suffix and a `+<feature>` suffix from a Debian Rust
@@ -1508,11 +1512,13 @@ BuildRequires:  perl(Test::More)
 
     #[test]
     fn test_detect_ecosystem_by_name_debian_perl() {
-        // RED: Test Debian lib*-perl pattern
+        // Debian's lib*-perl shape names the ecosystem and nothing else.
+        // This used to yield "www", a CPAN distribution that does not exist:
+        // the real one is libwww-perl, and Debian does not re-decorate names
+        // that already begin with lib. See strip_perl_packaging (#44).
         let detection = detect_ecosystem_by_name("libwww-perl", None).unwrap();
         assert_eq!(detection.ecosystem, "cpan");
-        // Should strip "lib" prefix and "-perl" suffix
-        assert_eq!(detection.package_name, Some("www".to_string()));
+        assert_eq!(detection.package_name, None);
     }
 
     // --- packaging prefixes are stripped, upstream names are not (#40) ---
@@ -1618,13 +1624,20 @@ BuildRequires:  perl(Test::More)
     }
 
     #[test]
-    fn perl_packaging_is_stripped_from_both_distro_conventions() {
-        assert_eq!(strip_perl_packaging("libjson-perl"), "json");
-        assert_eq!(strip_perl_packaging("perl-JSON"), "JSON");
-        assert_eq!(strip_perl_packaging("perl-Test-More"), "Test-More");
+    fn perl_packaging_is_stripped_only_where_it_can_be() {
+        // Fedora preserves the distribution verbatim after "perl-".
+        assert_eq!(strip_perl_packaging("perl-JSON").as_deref(), Some("JSON"));
+        assert_eq!(
+            strip_perl_packaging("perl-Test-More").as_deref(),
+            Some("Test-More")
+        );
         // Nothing left over is not a name.
-        assert_eq!(strip_perl_packaging("lib-perl"), "lib-perl");
-        assert_eq!(strip_perl_packaging("perl-"), "perl-");
+        assert_eq!(strip_perl_packaging("perl-").as_deref(), Some("perl-"));
+        // Debian's shape is not reversible: "json" is not "JSON", and the
+        // distribution behind libwww-perl is libwww-perl (#44).
+        assert_eq!(strip_perl_packaging("libjson-perl"), None);
+        assert_eq!(strip_perl_packaging("libwww-perl"), None);
+        assert_eq!(strip_perl_packaging("lib-perl"), None);
     }
 
     #[test]

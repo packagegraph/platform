@@ -26,6 +26,15 @@ struct MetaCpanRelease {
     #[serde(default)]
     dependency: Vec<MetaCpanDependency>,
     resources: Option<MetaCpanResources>,
+    /// Modules this distribution ships. MetaCPAN returns them on the release
+    /// endpoint, so the distribution-to-module mapping costs no extra request
+    /// -- which matters, because the mapping is many-to-one and not derivable
+    /// from the names (#47).
+    #[serde(default)]
+    provides: Vec<String>,
+    /// The distribution's primary module. For libwww-perl this is LWP, not
+    /// anything resembling the distribution name.
+    main_module: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,7 +244,45 @@ impl CpanCollector {
             }
         }
 
-        // Dependencies (runtime phase, requires relationship)
+        // Modules this distribution ships.
+        //
+        // Identities are keyed by DISTRIBUTION; dependency edges below are
+        // declared against MODULES, because that is how Perl code declares
+        // them. Those are different namespaces and the mapping is
+        // many-to-one -- libwww-perl ships LWP, LWP::UserAgent and twenty
+        // others, and no string rewrite turns one into the other. So every
+        // CPAN dependency edge pointed at a node nothing described, and a CVE
+        // in libwww-perl was invisible from anything requiring
+        // LWP::UserAgent (#47).
+        //
+        // Emitting the modules makes those targets resolve, and the ontology
+        // already declares cpan:Module and cpan:containsModule for exactly
+        // this -- until now with no emit sites. The module node is dual-typed
+        // as a PackageIdentity too, so the existing dependency edges reach a
+        // described node without changing their shape.
+        if let Some(main_module) = &release.main_module {
+            writer.write_literal(&pkg_uri, &format!("{CPAN}mainModule"), main_module)?;
+            triples += 1;
+        }
+        for module in &release.provides {
+            let module_uri = package_identity_uri("cpan", "cpan", "any", module);
+            writer.write_triple(&module_uri, RDF_TYPE, &format!("{CPAN}Module"))?;
+            writer.write_literal(&module_uri, &format!("{CPAN}moduleName"), module)?;
+            // From the release, not the identity: cpan:containsModule has
+            // rdfs:domain cpan:Distribution, which is what pkg_uri is typed
+            // as. Hanging it off the PackageIdentity would entail that the
+            // identity is a SourcePackage.
+            writer.write_triple(&pkg_uri, &format!("{CPAN}containsModule"), &module_uri)?;
+            triples += 3;
+            // Dual typing: dependency edges target PackageIdentity, and a
+            // module is what they name.
+            triples += write_package_identity(writer, &module_uri, module)?;
+        }
+
+        // Dependencies (runtime phase, requires relationship).
+        //
+        // Still keyed by module name -- that is what the target is. What
+        // changed is that the distribution providing it now says so.
         for dep in &release.dependency {
             if dep.phase == "runtime" && dep.relationship == "requires" {
                 let target_uri = package_identity_uri("cpan", "cpan", "any", &dep.module);
@@ -324,6 +371,8 @@ mod tests {
             license: Some(vec!["perl_5".to_string()]),
             dependency: vec![],
             resources: None,
+            provides: vec![],
+            main_module: None,
         };
 
         let triples = collector
@@ -345,6 +394,107 @@ mod tests {
         assert!(content.contains("cpan#authorPAUSEID"));
         assert!(content.contains("\"TIMB\""));
         assert!(triples > 10);
+    }
+
+    // --- a distribution is not a module (#47) ---
+
+    /// libwww-perl is the canonical case: no module it ships bears any
+    /// mechanical relation to the distribution name.
+    fn libwww_perl() -> MetaCpanRelease {
+        MetaCpanRelease {
+            distribution: "libwww-perl".to_string(),
+            version: "6.72".to_string(),
+            abstract_text: None,
+            author: "OALDERS".to_string(),
+            status: Some("latest".to_string()),
+            license: None,
+            dependency: vec![MetaCpanDependency {
+                module: "HTTP::Request".to_string(),
+                phase: "runtime".to_string(),
+                relationship: "requires".to_string(),
+                version: None,
+            }],
+            resources: None,
+            provides: vec!["LWP".to_string(), "LWP::UserAgent".to_string()],
+            main_module: Some("LWP".to_string()),
+        }
+    }
+
+    fn emit(release: &MetaCpanRelease) -> String {
+        let collector = CpanCollector::new("https://fastapi.metacpan.org".into());
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(temp_file.reopen().unwrap());
+        collector
+            .emit_distribution_triples(&mut writer, release)
+            .unwrap();
+        writer.flush().unwrap();
+        let mut content = String::new();
+        temp_file
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        content
+    }
+
+    #[test]
+    fn a_dependency_on_a_module_reaches_a_described_node() {
+        // Identities are keyed by distribution and dependency edges are
+        // declared against modules. Nothing minted the module, so every CPAN
+        // dependency edge pointed at a node with no describing triples, and a
+        // CVE in libwww-perl was invisible from anything requiring
+        // LWP::UserAgent -- which is how Perl code actually declares it.
+        let out = emit(&libwww_perl());
+        let module = package_identity_uri("cpan", "cpan", "any", "LWP::UserAgent");
+        assert!(
+            out.contains(&format!(
+                "<{module}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>"
+            )),
+            "the module node has no describing triples:\n{out}"
+        );
+        assert!(out.contains("cpan#Module"), "{out}");
+        assert!(out.contains("cpan#moduleName> \"LWP::UserAgent\""), "{out}");
+    }
+
+    #[test]
+    fn the_distribution_says_which_modules_it_ships() {
+        // Without this edge the module node exists but nothing connects it
+        // back to the distribution, so blast radius still cannot traverse.
+        let out = emit(&libwww_perl());
+        for module in ["LWP", "LWP::UserAgent"] {
+            let module_uri = package_identity_uri("cpan", "cpan", "any", module);
+            assert!(
+                out.contains(&format!("cpan#containsModule> <{module_uri}>")),
+                "{module} is not linked to its distribution:\n{out}"
+            );
+        }
+        assert!(out.contains("cpan#mainModule> \"LWP\""), "{out}");
+    }
+
+    #[test]
+    fn the_module_name_is_never_derived_from_the_distribution_name() {
+        // There is no module called libwww::perl, and no string rewrite
+        // produces LWP from libwww-perl. Any fix that invents a name is
+        // wrong however plausible it looks.
+        let out = emit(&libwww_perl());
+        assert!(!out.contains("libwww::perl"), "{out}");
+        let identity = package_identity_uri("cpan", "cpan", "any", "libwww-perl");
+        assert!(
+            out.contains(&format!("<{identity}>")),
+            "the distribution identity is still keyed by distribution:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_distribution_that_declares_no_modules_still_collects() {
+        // provides is populated from the distribution's own META, which not
+        // every release declares. A missing list is not a failure.
+        let mut release = libwww_perl();
+        release.provides = vec![];
+        release.main_module = None;
+        let out = emit(&release);
+        assert!(out.contains("cpan#Distribution"), "{out}");
+        assert!(!out.contains("cpan#containsModule"), "{out}");
     }
 
     // ── Characterization: fetch_release_with_retry, pre-migration ──────
