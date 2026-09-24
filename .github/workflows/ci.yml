@@ -20,6 +20,17 @@ jobs:
         with:
           workspaces: etl/pg-collect
       - run: cargo test --all-targets --locked --quiet
+      # `pg-collect debian` names the repository FORMAT; its default
+      # distribution is debian regardless of what the Release file says, so
+      # the Ubuntu entry points have to pass --distro ubuntu explicitly or
+      # they mint Debian-namespaced identities for Ubuntu data (#71). This
+      # runs all six real entry points against a local repository fixture.
+      # Invoked directly, not via `unittest discover` (#57).
+      - name: Ubuntu entry points must emit Ubuntu identities and PURLs
+        run: |
+          python3 -m pip install PyYAML==6.0.3
+          PG_COLLECT_BIN="$PWD/target/debug/pg-collect" \
+            python3 ../../deploy/quadlet/collectors/tests/test_ubuntu_identity.py -v
       - name: Mutation-check the wrapper lifecycle
         run: |
           PG_COLLECT_BIN="$PWD/target/debug/pg-collect" \
