@@ -2,6 +2,16 @@
 //!
 //! Queries Fuseki for RPM packages, looks up build metadata from Koji,
 //! and emits BuildActivity + SLSA attestation triples.
+//!
+//! ## Why "not found" is cached (#59)
+//!
+//! The enricher was SIGKILL'd at the 8h timeout with 10 minutes of CPU
+//! consumed -- network-bound on the Koji hub, still progressing at the last
+//! second, and losing everything. Its final lines were `not found`, which was
+//! the whole problem: a conclusive "Koji has no such build" used to return
+//! without being written to the cache, so every run re-asked the hub the same
+//! questions and got the same answers. A run that never finishes never gets
+//! past them.
 
 use crate::cache::FileCache;
 use crate::forge::emit_dq_issue;
@@ -12,6 +22,10 @@ use crate::uris::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Result, Write};
+
+/// Marks a cached "Koji has no such build". Prefixed so it cannot collide
+/// with a field of a real getBuild response.
+const ABSENT: &str = "__pg_absent";
 
 pub struct KojiEnricher {
     sparql: Option<SparqlClient>,
@@ -26,6 +40,18 @@ pub struct KojiEnricher {
     /// per-NVR fragment is Retryable -- a build whose getBuild succeeded but
     /// whose queryRPMSigs faulted must not be checkpointed as unsigned.
     item_inconclusive: std::cell::Cell<bool>,
+}
+
+/// The Koji NVR for a package name and the version string repo data gives.
+///
+/// Repo versions are `{ver}-{release}.{arch}`; Koji's NVR has no arch, so the
+/// last dot-separated component goes. Several arches of one build therefore
+/// collapse to the same NVR, which is what lets the caller deduplicate them.
+fn build_nvr(name: &str, version: &str) -> String {
+    match version.rfind('.') {
+        Some(dot) => format!("{}-{}", name, &version[..dot]),
+        None => format!("{}-{}", name, version),
+    }
 }
 
 impl KojiEnricher {
@@ -137,56 +163,36 @@ impl KojiEnricher {
                 "enrich_with_limit requires a SPARQL endpoint. Use enrich_from_nvrs() with --srpm-list instead.")
         })?;
 
-        let file = File::create(output_path)?;
-        let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
-
-        let packages = match &self.graph {
-            Some(graph_uri) => {
+        let packages = match (&self.graph, self.distro.as_str()) {
+            (Some(graph_uri), _) => {
                 eprintln!("Querying graph: {}", graph_uri);
                 sparql.query_packages_by_type_in_graph(&format!("{RPM}BinaryRPM"), graph_uri)?
             }
-            None => sparql.query_packages_by_type(&format!("{RPM}BinaryRPM"))?,
+            // A distro without a release is every release of THAT distro --
+            // not every RPM in the corpus. The unscoped query used to hand
+            // RHEL, AlmaLinux, Rocky and openSUSE NVRs to Fedora's Koji hub,
+            // which cannot know any of them (#59).
+            (None, distro) if !distro.is_empty() => {
+                eprintln!("Querying every graph of distro: {}", distro);
+                sparql.query_packages_by_type_in_distro(&format!("{RPM}BinaryRPM"), distro)?
+            }
+            (None, _) => sparql.query_packages_by_type(&format!("{RPM}BinaryRPM"))?,
         };
         eprintln!("Found {} RPM packages to query Koji for", packages.len());
 
-        let mut total_builds = 0;
-        let mut total_triples = 0;
-        let mut seen_nvrs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let nvrs: Vec<String> = packages
+            .iter()
+            .map(|(_pkg_uri, name, version)| build_nvr(name, version))
+            .collect();
 
-        for (_pkg_uri, name, version) in &packages {
-            // version is "{ver}-{release}.{arch}" from repo data — strip arch suffix for Koji NVR
-            let nvr = match version.rfind('.') {
-                Some(dot) => format!("{}-{}", name, &version[..dot]),
-                None => format!("{}-{}", name, version),
-            };
-
-            // Skip duplicates (multiple arch builds share the same NVR)
-            if !seen_nvrs.insert(nvr.clone()) {
-                continue;
-            }
-
-            if let Some(max) = limit {
-                if seen_nvrs.len() > max {
-                    break;
-                }
-            }
-
-            match self.get_build(&nvr, &mut writer) {
-                Ok(triples) if triples > 0 => {
-                    total_builds += 1;
-                    total_triples += triples;
-                    eprintln!("  {} → {} triples", nvr, triples);
-                }
-                Ok(_) => {
-                    eprintln!("  {} → not found", nvr);
-                }
-                Err(e) => eprintln!("  {} → error: {}", nvr, e),
-            }
-
-        }
-
-        writer.flush()?;
-        Ok((total_builds, total_triples))
+        // Delegated rather than looped here a second time: enrich_from_nvrs
+        // already carries the per-item accounting (#70's StageReport) and the
+        // checkpoint seam, so the two entry points cannot drift apart. The
+        // checkpoint stays None -- standalone enrich-koji has no wrapper that
+        // commits a generation after publication, and an active generation
+        // left behind is worse than no checkpoint at all.
+        let (builds, triples, _report) = self.enrich_from_nvrs(&nvrs, output_path, limit, None)?;
+        Ok((builds, triples))
     }
 
     /// Enrich from a pre-built list of SRPM NVRs, bypassing the Fuseki discovery query.
@@ -328,6 +334,20 @@ impl KojiEnricher {
         .to_key();
 
         let data = match self.cached_get(&cache_key) {
+            // A cached "Koji has no such build": the same conclusive answer,
+            // without the request. The DQ issue is still emitted, so the
+            // output is byte-identical to having asked (#59).
+            Some(d) if d.get(ABSENT).is_some() => {
+                emit_dq_issue(
+                    writer,
+                    "koji-enricher",
+                    "getBuild",
+                    nvr,
+                    "koji-build-not-found",
+                    "info",
+                )?;
+                return Ok(0);
+            }
             Some(d) => d,
             None => {
                 // XML-RPC call: system.methodCall getBuild(nvr)
@@ -385,7 +405,11 @@ impl KojiEnricher {
                 let data = match parse_build_response(&body) {
                     KojiRpcResult::ValidNonempty(d) => d,
                     KojiRpcResult::ValidEmpty => {
-                        // A real answer: Koji has no such build. Checkpointable.
+                        // A real answer: Koji has no such build. Checkpointable
+                        // -- and cacheable, which is the point: this is the
+                        // answer for most of what the enricher asks about, and
+                        // not caching it made every run start from zero (#59).
+                        self.cache_put(&cache_key, &serde_json::json!({ ABSENT: true }));
                         emit_dq_issue(
                             writer,
                             "koji-enricher",
@@ -1265,6 +1289,73 @@ mod tests {
     use super::*;
     use std::io::Read;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn an_nvr_drops_the_arch_but_keeps_the_release() {
+        assert_eq!(
+            build_nvr("gcc", "14.0.1-1.fc41.x86_64"),
+            "gcc-14.0.1-1.fc41"
+        );
+        assert_eq!(
+            build_nvr("gcc", "14.0.1-1.fc41.noarch"),
+            "gcc-14.0.1-1.fc41"
+        );
+        // Several arches of one build collapse to one NVR, which is what
+        // lets the caller deduplicate them.
+        assert_eq!(
+            build_nvr("gcc", "14.0.1-1.fc41.aarch64"),
+            build_nvr("gcc", "14.0.1-1.fc41.x86_64")
+        );
+        // Nothing to strip: leave it alone rather than eat the version.
+        assert_eq!(build_nvr("gcc", "14"), "gcc-14");
+    }
+
+    /// "Koji has no such build" is conclusive, and it is the answer for most
+    /// of what this enricher asks about. Not caching it made every run
+    /// re-ask the hub the same questions -- and the run never finished, so
+    /// it never got past them (#59).
+    #[test]
+    fn a_conclusive_not_found_is_asked_once_and_remembered() {
+        let mut server = mockito::Server::new();
+        let hub = server
+            .mock("POST", "/kojihub")
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?><methodResponse><params><param>
+                   <value><nil/></value></param></params></methodResponse>"#,
+            )
+            .expect(1)
+            .create();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let enricher = KojiEnricher::new(
+            &server.url(),
+            &format!("{}/kojihub", server.url()),
+            "fedora",
+            "41",
+            Some(cache_dir.path().to_str().unwrap()),
+            None,
+            SparqlBackend::Fuseki,
+        );
+
+        let mut first = NTriplesWriter::new(Vec::<u8>::new());
+        assert_eq!(
+            enricher.get_build("nosuch-1-1.fc41", &mut first).unwrap(),
+            0
+        );
+        let mut second = NTriplesWriter::new(Vec::<u8>::new());
+        assert_eq!(
+            enricher.get_build("nosuch-1-1.fc41", &mut second).unwrap(),
+            0
+        );
+
+        hub.assert();
+        // The answer is the same whether it came from the hub or the cache:
+        // the data-quality record must not vanish on the second run.
+        let (a, b) = (first.into_string().unwrap(), second.into_string().unwrap());
+        assert!(a.contains("koji-build-not-found"), "{a}");
+        assert_eq!(a, b, "a cached miss emits exactly what asking emitted");
+    }
 
     #[test]
     fn test_emit_build_triples() {
