@@ -30,5 +30,5 @@ spec:
               command: ["/bin/sh", "-c"]
               args:
                 - |
-                  pg-collect debian --repo "http://archive.ubuntu.com/ubuntu" --dist noble --component main --arch binary-amd64 -o /tmp/packages.nt && /app/scripts/upload-nt.sh /tmp/packages.nt "$GRAPH_URI"
+                  pg-collect debian --repo "http://archive.ubuntu.com/ubuntu" --distro ubuntu --dist noble --component main --arch binary-amd64 -o /tmp/packages.nt && /app/scripts/upload-nt.sh /tmp/packages.nt "$GRAPH_URI"
               resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "2", memory: 2Gi}}

@@ -11,5 +11,5 @@ trap 'rm -rf "$RUN_DIR"' EXIT
 
 GRAPH_URI="https://packagegraph.github.io/graph/ubuntu/noble"
 
-pg-collect debian --repo "http://archive.ubuntu.com/ubuntu" --dist noble --component main --arch binary-amd64 -o "$RUN_DIR/packages.nt"
+pg-collect debian --repo "http://archive.ubuntu.com/ubuntu" --distro ubuntu --dist noble --component main --arch binary-amd64 -o "$RUN_DIR/packages.nt"
 /app/scripts/upload-nt.sh "$RUN_DIR/packages.nt" "$GRAPH_URI" "http://archive.ubuntu.com/ubuntu"

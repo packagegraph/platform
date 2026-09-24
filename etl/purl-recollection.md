@@ -59,6 +59,11 @@ PURLs in place. Retain the previous graph/export and image revision for rollback
 and validate PURL placement and the matching completeness profile before
 publishing the rebuilt graph.
 
+Ubuntu Noble additionally needs its corrected `--distro ubuntu` input. This
+changes previously Debian-namespaced resource IRIs, not just PURLs; follow the
+[Ubuntu identity rollout](ubuntu-identity-rollout.md) and audit retained
+references before replacing those three graphs.
+
 Raw source/HTTP caches may be reused: these emitters regenerate the RDF from the
 cached package metadata. Existing generated `.nt`/`.nq` exports must be
 regenerated, not republished. Current RPM output checkpoints cover only the
