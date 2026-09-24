@@ -12,6 +12,13 @@ set -euo pipefail
 
 INDEX_DIR=/data/index
 BUCKET="${MINIO_BUCKET:-packagegraph}"
+# .loaded means "these bytes are on disk", and is what makes a host reboot
+# cheap: without it every boot would re-download a multi-gigabyte index.
+# It deliberately does NOT mean qlever is serving them. That second fact
+# lives in .serving, written by qlever-refresh-if-changed.sh only after the
+# reloaded server has answered a query (#73). The atomic swap below replaces
+# the whole index directory, so new bytes arrive with no .serving at all --
+# which is correct: nothing is confirmed until the refresh confirms it.
 MARKER="$INDEX_DIR/.loaded"
 
 # Recover from interrupted swap: .prev exists but INDEX_DIR doesn't

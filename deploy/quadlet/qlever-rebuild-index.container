@@ -3,10 +3,13 @@
 # deploy/overlays/{dev,prod}/jobs/rebuild-qlever-index.yaml. Scheduled by
 # qlever-rebuild-index.timer.
 #
-# On success (a new index was actually promoted), qlever-refresh-if-changed.sh
-# (ExecStartPost below) reloads qlever-index-load.service and bounces
-# qlever.service. See that script's header for what it does NOT do
-# (no automatic rollback on a failed reload).
+# qlever-refresh-if-changed.sh (ExecStopPost below) then reloads
+# qlever-index-load.service and bounces qlever.service if -- and only if --
+# the promoted index differs from the one confirmed serving. It decides from
+# that comparison, not from this run's exit status or its last-run.json, so a
+# run that promotes and then dies before reporting still gets reloaded (#73).
+# See that script's header for what it does NOT do (no automatic rollback on
+# a failed reload).
 
 [Unit]
 Description=PackageGraph QLever nightly index rebuild
@@ -39,7 +42,24 @@ DropCapability=ALL
 Type=oneshot
 RemainAfterExit=no
 TimeoutStartSec=7200
-ExecStartPost=/etc/containers/systemd/scripts/qlever-refresh-if-changed.sh
+# ExecStopPost=, not ExecStartPost=. systemd runs ExecStartPost= only after
+# ExecStart= has succeeded, and the case that most needs a reload is a run
+# that PROMOTED and then failed -- the rebuild script exits 1 if it cannot
+# persist last-success.json, after `latest` already moved. With
+# ExecStartPost= the refresh never fired there, so a correctly promoted index
+# sat unloaded until some later run happened to succeed (#73). ExecStopPost=
+# runs on both the success and the failure path, and the script is a no-op
+# when the promoted index is already the one confirmed serving, so running it
+# unconditionally costs one cheap comparison.
+#
+# A failing ExecStopPost= still marks the unit failed, so a reload problem
+# stays visible in `systemctl status` exactly as before.
+ExecStopPost=/etc/containers/systemd/scripts/qlever-refresh-if-changed.sh
+# The refresh polls readiness for up to 30 x 10s after restarting qlever, and
+# ExecStopPost= is bounded by TimeoutStopSec= (default 90s), which would kill
+# it mid-poll and leave the serving marker unadvanced on a reload that was
+# actually working.
+TimeoutStopSec=900
 
 [Install]
 WantedBy=default.target
