@@ -112,8 +112,11 @@ ssh root@$PGRAPH_HOST 'journalctl -u qlever-rebuild-index.service -f'
 ssh root@$PGRAPH_HOST 'systemctl is-enabled qlever-rebuild-index.timer'
 ssh root@$PGRAPH_HOST 'systemctl enable --now qlever-rebuild-index.timer'
 
-# Check what index is currently loaded / what's promoted in Minio
+# Check what index is on disk vs. what is confirmed serving. They differ when
+# a reload extracted new bytes but qlever never became ready -- the refresh
+# will retry on its next run. See deploy/quadlet/README.md, "Host dependencies".
 ssh root@$PGRAPH_HOST 'cat /var/lib/packagegraph/qlever-data/index/.loaded'
+ssh root@$PGRAPH_HOST 'cat /var/lib/packagegraph/qlever-data/index/.serving'
 
 # Reverse proxy status / logs
 ssh root@$PGRAPH_HOST 'systemctl status sparql-proxy.service'

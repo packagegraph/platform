@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""A local stand-in for `curl`, standing for QLever's readiness endpoint.
+
+Ready exactly when $FAKE_READY_FLAG exists, so a test controls readiness
+without timing games. Exits 22, the code real curl uses for an HTTP error
+under -f, so the refresh script sees a realistic failure.
+"""
+import os
+import sys
+
+if os.path.isfile(os.environ.get("FAKE_READY_FLAG", "")):
+    sys.exit(0)
+sys.stderr.write("curl: (22) The requested URL returned error: 503\n")
+sys.exit(22)

@@ -76,6 +76,13 @@ jobs:
         run: python3 deploy/quadlet/collectors/tests/test_collector_run_dirs.py -v
       - name: Concurrent collectors must not publish each other's bytes
         run: python3 deploy/quadlet/collectors/tests/test_collector_concurrency.py -v
+      # Whether to reload qlever must follow promoted-vs-serving state, not a
+      # best-effort status report that a promoting run can die before writing
+      # (#73). Drives the real host script against fake podman/systemctl/curl,
+      # and statically checks that the unit still invokes it on the failure
+      # path. Directly invoked, for the reason given above.
+      - name: QLever refresh must follow state, not run status
+        run: python3 deploy/quadlet/tests/test_qlever_refresh.py -v
       - name: Verify exclusion with the image's pinned mc
         run: |
           set -euo pipefail

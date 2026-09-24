@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""A local stand-in for `systemctl`, recording unit transitions.
+
+FAKE_SYSTEMCTL_FAIL holds comma-separated unit names whose restart fails, so
+a test can injure the loader or the server independently.
+"""
+import os
+import sys
+
+LOG = os.environ.get("FAKE_SYSTEMCTL_LOG")
+FAIL = [u for u in os.environ.get("FAKE_SYSTEMCTL_FAIL", "").split(",") if u]
+
+argv = sys.argv[1:]
+if LOG:
+    with open(LOG, "a") as fh:
+        fh.write(" ".join(argv) + "\n")
+
+if argv[:1] != ["restart"]:
+    sys.exit(f"systemctl: stub does not implement {argv}")
+
+unit = argv[1]
+if unit in FAIL:
+    sys.stderr.write(f"Job for {unit} failed.\n")
+    sys.exit(1)

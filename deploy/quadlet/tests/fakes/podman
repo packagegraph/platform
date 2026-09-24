@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""A local stand-in for `podman`, for the host-side qlever refresh script.
+
+Only `podman run ... --entrypoint /bin/bash <image> -c <script>` is
+implemented; anything else is a hard error rather than a silent success.
+
+The run is emulated rather than skipped: the inner script is executed for
+real under bash, with `--env-file` sourced into its environment and `/data/`
+rewritten to $FAKE_DATA so the mounted volume has a place to live. That keeps
+the parts of the refresh script that matter -- reading the promotion, reading
+and writing the serving marker -- under test rather than stubbed away.
+
+FAKE_PODMAN_FAIL=<substring> makes any run whose inner script contains that
+substring fail, which is how a test injects an unwritable marker.
+"""
+import os
+import re
+import subprocess
+import sys
+
+DATA = os.environ["FAKE_DATA"]
+LOG = os.environ.get("FAKE_PODMAN_LOG")
+FAIL = os.environ.get("FAKE_PODMAN_FAIL", "")
+
+argv = sys.argv[1:]
+if not argv or argv[0] != "run":
+    sys.exit(f"podman: stub does not implement {argv[:1]} (argv={argv})")
+
+if "-c" not in argv:
+    sys.exit(f"podman: expected `-c <script>` in: {argv}")
+script = argv[argv.index("-c") + 1]
+
+env = dict(os.environ)
+if "--env-file" in argv:
+    path = argv[argv.index("--env-file") + 1]
+    if not os.path.isfile(path):
+        sys.exit(f"podman: env file not found: {path}")
+    for line in open(path):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            env[k] = v
+
+if LOG:
+    with open(LOG, "a") as fh:
+        fh.write(script.replace("\n", " ")[:200] + "\n")
+
+if FAIL and FAIL in script:
+    sys.stderr.write("podman: simulated container failure\n")
+    sys.exit(1)
+
+# Emulate `-v <volume>:/data`.
+os.makedirs(DATA, exist_ok=True)
+script = script.replace("/data/", DATA.rstrip("/") + "/")
+
+sys.exit(subprocess.run(["bash", "-c", script], env=env).returncode)

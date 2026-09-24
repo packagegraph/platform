@@ -107,6 +107,29 @@ needs `podman`, `jq`, and `curl` installed there — everything else runs
 inside the `ghcr.io/packagegraph/qlever-rebuild` image, which already
 bundles `mc`, `jq`, and the `qlever-index` tool.
 
+It decides whether to reload by comparing two pieces of state, never by
+reading a status report:
+
+| Marker | Written by | Means |
+| --- | --- | --- |
+| `qlever-index/latest` | `qlever-rebuild-index.sh`, last step of a promotion | promoted |
+| `/data/index/.loaded` | `qlever-load-index.sh`, after its atomic swap | bytes are on disk |
+| `/data/index/.serving` | `qlever-refresh-if-changed.sh`, after a readiness check | qlever answered with them |
+
+The script is wired as `ExecStopPost=` on `qlever-rebuild-index.service`, not
+`ExecStartPost=`: systemd runs `ExecStartPost=` only after a successful
+`ExecStart=`, and the run that most needs a reload is one that promoted and
+then failed. `TimeoutStopSec=` is raised to outlast the script's own readiness
+poll, which `ExecStopPost=` is bounded by.
+
+A reload happens whenever `latest` differs from `.serving`, and `.serving`
+advances only after the reloaded server answers a query — so a failed loader,
+a failed restart or a readiness timeout all leave it retryable. `.loaded` is
+kept separate so a host reboot does not re-download the whole index. The one
+visible consequence: the first rebuild after a reboot bounces qlever once even
+if nothing changed, because a boot-time load writes `.loaded` and never
+`.serving`.
+
 Rootless deployment (`~/.config/containers/systemd/` + `systemctl --user`)
 works the same way, except `qlever-refresh-if-changed.sh`'s
 `systemctl restart` calls need `systemctl --user restart` instead — edit the
