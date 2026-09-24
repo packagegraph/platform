@@ -13,11 +13,14 @@ what lets a test assert that a source object was never written to.
 
 Failure injection: FAKE_MC_FAIL holds comma-separated substrings; any
 pipe/cp whose destination path contains one of them fails the way the real
-client fails on a rejected PUT.
+client fails on a rejected PUT, and any ls or download whose SOURCE path
+contains one fails the way it does on a rejected GET -- which is a different
+thing from an absent prefix, and readers have to tell them apart.
 """
 import json
 import os
 import shutil
+import subprocess
 import sys
 import hashlib
 
@@ -75,6 +78,20 @@ def main(argv):
 
     if verb == "cp":
         src, dest = argv[-2], argv[-1]
+        # Downloads (remote source, local destination) are how a committed
+        # generation is fetched; uploads are everything else.
+        if src.startswith("pgraph/"):
+            log("get", src)
+            if should_fail(src):
+                sys.stderr.write(f"mc: <ERROR> Unable to read {src}: AccessDenied\n")
+                return 1
+            path = local(src)
+            if not os.path.isfile(path):
+                sys.stderr.write(f"mc: <ERROR> Unable to read {src}: NoSuchKey\n")
+                return 1
+            os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+            shutil.copy2(path, dest)
+            return 0
         log("cp", dest)
         if should_fail(dest):
             sys.stderr.write(f"mc: <ERROR> Unable to write {dest}: AccessDenied\n")
@@ -85,7 +102,17 @@ def main(argv):
         return 0
 
     if verb == "ls":
-        prefix = local(argv[-1]).rstrip("/")
+        target = argv[-1]
+        prefix = local(target).rstrip("/")
+        if should_fail(target):
+            # A transport/permission failure, NOT an absent prefix: the two
+            # must not look alike to a reader deciding what is published.
+            sys.stderr.write(f"mc: <ERROR> Unable to list {target}: AccessDenied\n")
+            return 1
+        if not os.path.isdir(prefix) and not os.path.isfile(prefix):
+            # What the real client says for a prefix nothing has written to.
+            sys.stderr.write(f"mc: <ERROR> Unable to list {target}: Object does not exist\n")
+            return 1
         for dirpath, _, names in os.walk(prefix):
             for name in sorted(names):
                 full = os.path.join(dirpath, name)
@@ -110,6 +137,15 @@ def main(argv):
                 out = os.path.join(dst, os.path.relpath(full, src))
                 os.makedirs(os.path.dirname(out), exist_ok=True)
                 shutil.copy2(full, out)
+        # A concurrent writer landing mid-download, which is what the
+        # before/after listing comparison exists to catch. Running it here
+        # puts it inside the window rather than around it; a test that
+        # mutated the store before or after the run would not exercise the
+        # check at all.
+        hook = os.environ.get("FAKE_MC_HOOK")
+        if hook:
+            os.environ.pop("FAKE_MC_HOOK")
+            return subprocess.call(["/bin/sh", "-c", hook], env=dict(os.environ))
         return 0
 
     sys.exit(f"mc: stub does not implement {verb!r} (argv={argv})")

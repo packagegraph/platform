@@ -2,6 +2,12 @@
 # Generate .graph sidecar files for existing .nt files in Minio.
 # Run once to migrate from the old graphs.json approach to per-file sidecars.
 #
+# HISTORICAL. Sidecars are no longer how a graph is published: a graph is
+# committed by its manifest under graphs/<slug>/manifest.json, and readers
+# fall back to a sidecar only for graphs nothing has re-published since
+# (docs/GRAPH-PUBLICATION.md, #72). This script is kept because the corpus
+# still contains sidecar-only graphs it created; do not extend it.
+#
 # Usage: MINIO_ENDPOINT=http://localhost:9000 ./migrate-graph-sidecars.sh
 set -euo pipefail
 
