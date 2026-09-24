@@ -852,7 +852,7 @@ pub fn detect_ecosystem(spec: &SpecData, source_name: &str) -> Option<EcosystemD
             || lower.contains("pypi.org")
             || lower.contains("pypi.io")
         {
-            let pkg = strip_ecosystem_prefix(source_name, &["python3-", "python-", "py"]);
+            let pkg = strip_ecosystem_prefix(source_name, &["python3-", "python-"]);
             return Some(EcosystemDetection {
                 ecosystem: "pypi",
                 package_name: Some(pkg),
@@ -1009,7 +1009,7 @@ pub fn detect_ecosystem_by_name(
             || lower.contains("pypi.org")
             || lower.contains("pypi.io")
         {
-            let pkg = strip_ecosystem_prefix(package_name, &["python3-", "python-", "py"]);
+            let pkg = strip_ecosystem_prefix(package_name, &["python3-", "python-"]);
             return Some(EcosystemDetection {
                 ecosystem: "pypi",
                 package_name: Some(pkg),
@@ -1047,7 +1047,7 @@ pub fn detect_ecosystem_by_name(
             || lower.contains("search.cpan.org")
             || lower.contains("cpan.org")
         {
-            let pkg = strip_ecosystem_prefix(package_name, &["perl-", "lib"]);
+            let pkg = strip_perl_packaging(package_name);
             return Some(EcosystemDetection {
                 ecosystem: "cpan",
                 package_name: Some(pkg),
@@ -1100,12 +1100,9 @@ pub fn detect_ecosystem_by_name(
 
     // Perl: lib*-perl pattern
     if package_name.ends_with("-perl") && package_name.starts_with("lib") {
-        // libwww-perl → www (strip "lib" prefix and "-perl" suffix)
-        let without_lib = package_name.strip_prefix("lib").unwrap_or(package_name);
-        let without_suffix = without_lib.strip_suffix("-perl").unwrap_or(without_lib);
         return Some(EcosystemDetection {
             ecosystem: "cpan",
-            package_name: Some(without_suffix.to_string()),
+            package_name: Some(strip_perl_packaging(package_name)),
             detection_method: "name-prefix",
         });
     }
@@ -1206,14 +1203,60 @@ pub fn detect_ecosystem_by_name(
     None
 }
 
-/// Strip known ecosystem prefixes from a source name to get the upstream package name.
+/// A packaging prefix has to end in a separator to be one.
+///
+/// `python3-` is a convention; `py` is two letters that a great many upstream
+/// names begin with. Only the first can be stripped without reading the rest
+/// of the name.
+fn is_anchored_prefix(prefix: &str) -> bool {
+    prefix.ends_with(['-', '_', '.'])
+}
+
+/// Strip a known packaging prefix from a distro package name, leaving the
+/// upstream package name.
+///
+/// Unanchored prefixes are ignored. A bare `py` matched every name beginning
+/// with those two letters, so `pytest` was emitted as `test` and `pyyaml` as
+/// `yaml` (#40). That is not merely a wrong string: `seed.rs` reads
+/// `upstreamPackageName` back to decide what the registry collectors fetch,
+/// so a truncated name makes us collect whatever unrelated project happens to
+/// own it and attach that project's provenance here.
+///
+/// The longest match wins, so a caller's list need not be ordered, and a
+/// prefix that would consume the whole name is declined -- an empty upstream
+/// name is never an improvement on the one we were given.
 fn strip_ecosystem_prefix(source_name: &str, prefixes: &[&str]) -> String {
-    for prefix in prefixes {
-        if source_name.starts_with(prefix) {
-            return source_name[prefix.len()..].to_string();
+    debug_assert!(
+        prefixes.iter().all(|prefix| is_anchored_prefix(prefix)),
+        "unanchored ecosystem prefix in {prefixes:?} -- see #40"
+    );
+    prefixes
+        .iter()
+        .filter(|prefix| is_anchored_prefix(prefix))
+        .filter(|prefix| source_name.starts_with(**prefix))
+        .max_by_key(|prefix| prefix.len())
+        .map(|prefix| &source_name[prefix.len()..])
+        .filter(|upstream| !upstream.is_empty())
+        .unwrap_or(source_name)
+        .to_string()
+}
+
+/// Strip Perl packaging decoration, whichever distribution applied it.
+///
+/// Fedora names a CPAN distribution `perl-<Dist>`; Debian names it
+/// `lib<dist>-perl`. Both tokens are packaging rather than part of the
+/// distribution name, but only when the whole shape is present -- stripping a
+/// bare `lib` from anything that merely starts with those letters is the #40
+/// truncation again.
+fn strip_perl_packaging(package_name: &str) -> String {
+    if package_name.starts_with("lib") && package_name.ends_with("-perl") {
+        let without_lib = package_name.strip_prefix("lib").unwrap_or(package_name);
+        let without_suffix = without_lib.strip_suffix("-perl").unwrap_or(without_lib);
+        if !without_suffix.is_empty() {
+            return without_suffix.to_string();
         }
     }
-    source_name.to_string()
+    strip_ecosystem_prefix(package_name, &["perl-"])
 }
 
 /// Strip a `-dev` suffix and a `+<feature>` suffix from a Debian Rust
@@ -1457,6 +1500,174 @@ BuildRequires:  perl(Test::More)
         assert_eq!(detection.ecosystem, "cpan");
         // Should strip "lib" prefix and "-perl" suffix
         assert_eq!(detection.package_name, Some("www".to_string()));
+    }
+
+    // --- packaging prefixes are stripped, upstream names are not (#40) ---
+    //
+    // `upstreamPackageName` is not only recorded: seed.rs reads it back to
+    // decide what the registry collectors fetch. A name truncated here is a
+    // lookup for a different project whose provenance we then attach to this
+    // package, so these assert on the emitted name, not on the detection.
+
+    fn pypi_spec() -> SpecData {
+        SpecData {
+            source0_url: Some("https://files.pythonhosted.org/packages/x.tar.gz".to_string()),
+            all_sources: vec![],
+            patches: vec![],
+            commit_hash: None,
+            url_field: None,
+            name: None,
+            version: None,
+            build_requires: vec![],
+            changelog_entries: vec![],
+        }
+    }
+
+    /// A bare "py" prefix made every one of these a different project.
+    const NOT_PY_PREFIXED: [&str; 5] = ["pytest", "pyyaml", "pygments", "pyparsing", "py3dns"];
+
+    #[test]
+    fn a_name_that_merely_starts_with_py_is_not_truncated_via_source0() {
+        let spec = pypi_spec();
+        for name in NOT_PY_PREFIXED {
+            let detection = detect_ecosystem(&spec, name).unwrap();
+            assert_eq!(detection.ecosystem, "pypi");
+            assert_eq!(
+                detection.package_name,
+                Some(name.to_string()),
+                "{name} was truncated"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_that_merely_starts_with_py_is_not_truncated_via_homepage() {
+        for name in NOT_PY_PREFIXED {
+            let detection =
+                detect_ecosystem_by_name(name, Some("https://pypi.org/project/x/")).unwrap();
+            assert_eq!(
+                detection.package_name,
+                Some(name.to_string()),
+                "{name} was truncated"
+            );
+        }
+    }
+
+    #[test]
+    fn real_python_packaging_prefixes_are_still_stripped() {
+        // The point of the fix is not to strip less, it is to strip only
+        // what is packaging. If these regress the bare prefix was load-bearing.
+        let spec = pypi_spec();
+        for (packaged, upstream) in [
+            ("python3-requests", "requests"),
+            ("python-dateutil", "dateutil"),
+        ] {
+            assert_eq!(
+                detect_ecosystem(&spec, packaged).unwrap().package_name,
+                Some(upstream.to_string())
+            );
+            assert_eq!(
+                detect_ecosystem_by_name(packaged, Some("https://pypi.org/project/x/"))
+                    .unwrap()
+                    .package_name,
+                Some(upstream.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn a_cpan_homepage_does_not_license_stripping_a_bare_lib() {
+        // Anything whose homepage is on cpan.org took this branch, not only
+        // packages carrying a Perl packaging prefix.
+        let detection =
+            detect_ecosystem_by_name("libreoffice", Some("https://metacpan.org/dist/x")).unwrap();
+        assert_eq!(detection.ecosystem, "cpan");
+        assert_eq!(detection.package_name, Some("libreoffice".to_string()));
+    }
+
+    #[test]
+    fn both_cpan_strategies_agree_on_one_package() {
+        // The homepage strategy is checked first and is meant to be the more
+        // confident of the two. Two answers for one package is worse than
+        // either answer.
+        for name in ["libwww-perl", "libjson-perl", "perl-JSON"] {
+            let by_homepage =
+                detect_ecosystem_by_name(name, Some("https://metacpan.org/dist/x")).unwrap();
+            let by_prefix = detect_ecosystem_by_name(name, None);
+            assert_eq!(by_homepage.ecosystem, "cpan");
+            if let Some(by_prefix) = by_prefix {
+                assert_eq!(
+                    by_homepage.package_name, by_prefix.package_name,
+                    "{name} gets a different upstream name from each strategy"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn perl_packaging_is_stripped_from_both_distro_conventions() {
+        assert_eq!(strip_perl_packaging("libjson-perl"), "json");
+        assert_eq!(strip_perl_packaging("perl-JSON"), "JSON");
+        assert_eq!(strip_perl_packaging("perl-Test-More"), "Test-More");
+        // Nothing left over is not a name.
+        assert_eq!(strip_perl_packaging("lib-perl"), "lib-perl");
+        assert_eq!(strip_perl_packaging("perl-"), "perl-");
+    }
+
+    #[test]
+    fn the_longest_matching_prefix_wins_regardless_of_order() {
+        // Callers list prefixes by hand; first-match-wins made the order
+        // load-bearing and silently wrong when it was got wrong.
+        // Under first-match-wins this returns "red-dashboard", and nothing
+        // says so except the registry lookup that later finds nothing.
+        assert_eq!(
+            strip_ecosystem_prefix("node-red-dashboard", &["node-", "node-red-"]),
+            "dashboard"
+        );
+        assert_eq!(
+            strip_ecosystem_prefix("node-red-dashboard", &["node-red-", "node-"]),
+            "dashboard"
+        );
+    }
+
+    #[test]
+    fn a_prefix_that_would_consume_the_whole_name_is_declined() {
+        assert_eq!(
+            strip_ecosystem_prefix("python3-", &["python3-"]),
+            "python3-"
+        );
+    }
+
+    #[test]
+    fn every_prefix_list_in_this_file_is_anchored_to_a_separator() {
+        // The debug_assert only sees lists a test actually reaches. A list on
+        // an unexercised branch is exactly where the next bare "py" would
+        // hide, so check them where they are written. The needle is built by
+        // concat! so this scan does not match its own source.
+        let source = include_str!("collect_spec.rs");
+        let needle = concat!("strip_ecosystem_prefix", "(");
+        let mut checked = 0;
+        for call in source.split(needle).skip(1) {
+            let Some(open) = call.find("&[") else {
+                continue;
+            };
+            let Some(close) = call[open..].find(']') else {
+                continue;
+            };
+            for prefix in call[open..open + close].split('"').skip(1).step_by(2) {
+                checked += 1;
+                assert!(
+                    is_anchored_prefix(prefix),
+                    "unanchored prefix {prefix:?}: it truncates every name that \
+                     merely begins with those letters (#40)"
+                );
+            }
+        }
+        assert!(
+            checked >= 25,
+            "the scan found only {checked} prefixes -- it has stopped matching \
+             the call sites and now proves nothing"
+        );
     }
 
     #[test]
