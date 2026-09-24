@@ -37,7 +37,7 @@ fn test_emit_package_triples_basic() -> std::io::Result<()> {
         vec![],
     );
 
-    let triple_count = collector.emit_package_triples(
+    let (triple_count, _ecosystem_from_provides) = collector.emit_package_triples(
         &mut writer,
         &pkg_data,
         None,
@@ -251,7 +251,7 @@ fn test_emit_package_with_dependencies() -> std::io::Result<()> {
         deps,
     );
 
-    let triple_count = collector.emit_package_triples(
+    let (triple_count, _ecosystem_from_provides) = collector.emit_package_triples(
         &mut writer,
         &pkg_data,
         None,

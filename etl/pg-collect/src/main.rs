@@ -3949,6 +3949,11 @@ fn main() {
                 // Recorded anyway, so that is visible rather than implied.
                 let mut rpm_stage = pg_collect::stage_report::StageReport::new("rpm", true);
                 rpm_stage.attempted = urls.len() as u64;
+                // Source packages whose upstream ecosystem a Provides:
+                // capability already named outright. Accumulated across every
+                // arch, because a capability seen on one arch settles the SRPM.
+                let mut ecosystem_from_provides: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 for (i, url) in urls.iter().enumerate() {
                     eprintln!("\n--- Arch {} of {} ---", i + 1, urls.len());
                     let collector = if let (Some(cert), Some(key), Some(ca)) =
@@ -3978,6 +3983,7 @@ fn main() {
                         &mut srpm_nvrs,
                         &mut srpm_names,
                         &mut srpm_identity_map,
+                        &mut ecosystem_from_provides,
                         i > 0, // is_secondary for all after first
                         limit,
                     )?;
@@ -3998,7 +4004,17 @@ fn main() {
                     eprintln!("\n--- Spec File Collection ---");
                     let spec_collector =
                         SpecCollector::new(&distro, &release, cache_dir.as_deref())?;
-                    let existing_ecosystem = std::collections::HashSet::new(); // TODO: track from RPM Provides
+                    // The spec path can only domain-match a URL or
+                    // prefix-match a name; the RPM path reads the upstream
+                    // name straight out of the capability. Where both fire
+                    // they describe the same package with nothing in the
+                    // graph to rank them, so the weaker one stands down (#43).
+                    eprintln!(
+                        "Upstream ecosystem already named by Provides for {} of {} \
+                         source packages; spec heuristics will not re-derive those",
+                        ecosystem_from_provides.len(),
+                        srpm_names.len()
+                    );
                     // srpm_names is a HashSet; collect_checkpointed iterates it
                     // sorted so fragment order -- and therefore byte-identical
                     // replay -- does not depend on this process's hash seed.
@@ -4006,7 +4022,7 @@ fn main() {
                         &mut writer,
                         &srpm_names,
                         &srpm_identity_map,
-                        &existing_ecosystem,
+                        &ecosystem_from_provides,
                         with_buildrequires,
                         with_maintainers,
                         &open_cache("spec", pg_collect::collect_spec::SPEC_SCHEMA_VERSION),

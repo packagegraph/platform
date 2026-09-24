@@ -1746,6 +1746,91 @@ BuildRequires:  perl(Test::More)
         );
     }
 
+    // --- the RPM path outranks the spec heuristics (#43) ---
+
+    /// A spec whose Source0 domain makes the PyPI heuristic fire.
+    fn pythonhosted_spec(name: &str) -> String {
+        let upstream = name.strip_prefix("python-").unwrap();
+        format!(
+            "Name:           {name}\n\
+             Version:        1.0\n\
+             Source0:        https://files.pythonhosted.org/packages/source/{upstream}.tar.gz\n\
+             %description\n\
+             a package\n"
+        )
+    }
+
+    fn offline_spec_collector(base: String) -> SpecCollector {
+        SpecCollector {
+            transport: HttpTransport::new(),
+            distro: "fedora".to_string(),
+            release: "44".to_string(),
+            cache: None,
+            dist_git_base: Some(base),
+        }
+    }
+
+    #[test]
+    fn a_source_package_whose_ecosystem_came_from_provides_is_not_re_derived() {
+        // The guard has always been here; main.rs passed it a permanently
+        // empty set, so it never fired (#43). Both collectors run in the same
+        // pass for all nine RPM distros, and where both produced a result both
+        // were emitted to the same subject with no provenance to rank them.
+        let mut server = mockito::Server::new();
+        for name in ["python-requests", "python-urllib3"] {
+            server
+                .mock(
+                    "GET",
+                    format!("/rpms/{name}/raw/f44/f/{name}.spec").as_str(),
+                )
+                .with_status(200)
+                .with_body(pythonhosted_spec(name))
+                .create();
+        }
+        let collector = offline_spec_collector(server.url());
+
+        let names: HashSet<String> = ["python-requests", "python-urllib3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Only python-requests had a Provides: capability naming its upstream.
+        let from_provides: HashSet<String> = ["python-requests".to_string()].into_iter().collect();
+
+        // upstreamPackageName is emitted on each PackageIdentity of the
+        // source package, so without this map the spec path writes nothing
+        // and the test would pass by having nothing to suppress.
+        let identities: HashMap<String, Vec<String>> = names
+            .iter()
+            .map(|n| {
+                (
+                    n.clone(),
+                    vec![format!("{DATA}identity/fedora/44/x86_64/{n}")],
+                )
+            })
+            .collect();
+
+        let mut w = crate::ntriples::NTriplesWriter::new(Vec::<u8>::new());
+        let (specs, _triples) = collector
+            .collect(&mut w, &names, &identities, &from_provides, false, false)
+            .unwrap();
+        let body = w.into_string().unwrap();
+
+        assert_eq!(specs, 2, "both specs must still be fetched and processed");
+        assert!(
+            !body.contains("upstreamPackageName> \"requests\""),
+            "the spec heuristic re-derived an upstream name the capability \
+             had already stated:\n{body}"
+        );
+        // Non-vacuous: the same heuristic on the same shape of spec does fire
+        // for the package the RPM path said nothing about. Without this, an
+        // assertion that "requests" is absent would pass if detection were
+        // simply broken.
+        assert!(
+            body.contains("upstreamPackageName> \"urllib3\""),
+            "the heuristic must still run where it is the only evidence:\n{body}"
+        );
+    }
+
     // --- spec-stage checkpointing ---
 
     #[test]
