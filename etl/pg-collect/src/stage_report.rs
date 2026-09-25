@@ -16,6 +16,9 @@
 //!     completeness, which is what every graph published before this was.
 //!     Absence must not read as "complete" -- that is the status quo lie this
 //!     exists to stop telling.
+//!   * **A limited run is not a complete one.** `--limit` reduces
+//!     `attempted` and `completed` together, so the obvious check passes
+//!     trivially. `eligible` records the untruncated population.
 //!   * **A stage with any retryable or failed item is not complete**, even
 //!     when the run exits 0 and the graph publishes. Those are the same run.
 //!
@@ -53,6 +56,31 @@ pub struct StageReport {
     /// forgotten; a run could lose a hundred of them and still report success
     /// with no trace in its stage totals.
     pub failed: u64,
+    /// How many items this stage was eligible to process, before `--limit`
+    /// truncated it. `None` means no limit was in play and `attempted` is the
+    /// whole population.
+    ///
+    /// Without this a limited run is indistinguishable from a complete one:
+    /// `--limit` reduces `attempted` and `completed` together, so
+    /// `attempted == completed` holds trivially and the run publishes
+    /// claiming to have covered everything. Any caller that truncates its
+    /// work MUST set this, at the same place it applies the limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible: Option<u64>,
+    /// Set when the stage stopped short of its population but cannot say by
+    /// how much.
+    ///
+    /// `eligible` is the better signal and should be preferred wherever the
+    /// untruncated count is knowable. It is not always: the RPM stage counts
+    /// architecture URLs while `--limit` truncates *packages*, and the number
+    /// of packages an arch would have yielded is not known without collecting
+    /// them. This says "not exhaustive" without inventing a denominator.
+    ///
+    /// Deliberately conservative -- a limit larger than the population sets
+    /// this too, so an exhaustive run can read as partial. That direction is
+    /// safe; the reverse is the bug this exists to prevent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 impl StageReport {
@@ -71,7 +99,11 @@ impl StageReport {
     /// at all is a gap in the accounting, and a gap must read as incomplete
     /// rather than as success.
     pub fn is_complete(&self) -> bool {
-        self.retryable == 0 && self.failed == 0 && self.attempted == self.completed
+        self.retryable == 0
+            && self.failed == 0
+            && self.attempted == self.completed
+            && self.eligible.is_none_or(|e| e == self.attempted)
+            && !self.truncated
     }
 }
 
@@ -165,6 +197,15 @@ mod tests {
             completed,
             retryable,
             failed,
+            eligible: None,
+            truncated: false,
+        }
+    }
+
+    fn limited(attempted: u64, eligible: u64) -> StageReport {
+        StageReport {
+            eligible: Some(eligible),
+            ..stage(attempted, attempted, 0, 0)
         }
     }
 
@@ -190,6 +231,62 @@ mod tests {
         // 10 attempted, 9 classified. The missing one is a hole in the
         // accounting, and a hole must not read as success.
         assert!(!stage(10, 9, 0, 0).is_complete());
+    }
+
+    #[test]
+    fn a_limited_run_is_not_complete() {
+        // The whole point. --limit truncates attempted and completed
+        // together, so attempted == completed holds trivially and every
+        // other check passes. Without `eligible` this reports success for a
+        // run that touched 10 of 363,822 items.
+        assert!(!limited(10, 363_822).is_complete());
+    }
+
+    #[test]
+    fn a_truncated_stage_is_not_complete_even_with_matching_counts() {
+        // The RPM shape: every architecture URL it attempted also completed,
+        // so attempted == completed holds and there is no denominator to
+        // compare against -- the limit cut packages, not arches.
+        let mut st = stage(3, 3, 0, 0);
+        assert!(st.is_complete(), "precondition: counts alone look clean");
+        st.truncated = true;
+        assert!(!st.is_complete());
+    }
+
+    #[test]
+    fn truncated_is_omitted_from_the_sidecar_when_false() {
+        let json = serde_json::to_string(&stage(3, 3, 0, 0)).unwrap();
+        assert!(!json.contains("truncated"), "{json}");
+    }
+
+    #[test]
+    fn a_limit_larger_than_the_population_is_not_a_limit() {
+        // --limit 1000 against 10 eligible items processed all of them.
+        // Recording eligible must not make an exhaustive run look partial.
+        assert!(limited(10, 10).is_complete());
+    }
+
+    #[test]
+    fn eligible_is_omitted_from_the_sidecar_when_unset() {
+        // Schema 1 readers must keep working: an unlimited run's sidecar is
+        // byte-identical to what it was before this field existed.
+        let json = serde_json::to_string(&stage(10, 10, 0, 0)).unwrap();
+        assert!(!json.contains("eligible"), "{json}");
+    }
+
+    #[test]
+    fn a_sidecar_without_eligible_still_parses() {
+        let old = r#"{"stage":"koji","required":false,"attempted":10,
+                      "completed":10,"retryable":0,"failed":0}"#;
+        let parsed: StageReport = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.eligible, None);
+        assert!(parsed.is_complete());
+    }
+
+    #[test]
+    fn a_limited_stage_makes_the_whole_run_partial() {
+        let run = RunQuality::new(vec![stage(5, 5, 0, 0), limited(10, 999)]);
+        assert!(!run.complete);
     }
 
     #[test]

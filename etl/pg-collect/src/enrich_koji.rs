@@ -226,6 +226,20 @@ impl KojiEnricher {
         let mut report = crate::stage_report::StageReport::new("koji", false);
         let mut seen_nvrs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+        // The population this stage is responsible for, before --limit cuts
+        // it short. Recorded against the deduplicated count, because that is
+        // what the loop below would actually have attempted: 556,785 rows
+        // collapse to 363,822 distinct NVRs, and calling the larger number
+        // "eligible" would make an exhaustive run look permanently partial.
+        //
+        // Only set when a limit is in play. Without it, `attempted` is the
+        // whole population by definition, and an unlimited run's sidecar
+        // stays byte-identical to what schema 1 readers already expect.
+        if limit.is_some() {
+            let distinct = nvrs.iter().collect::<std::collections::HashSet<_>>().len();
+            report.eligible = Some(distinct as u64);
+        }
+
         for nvr in nvrs {
             if !seen_nvrs.insert(nvr.clone()) {
                 continue;
@@ -1517,6 +1531,80 @@ mod tests {
             enricher.sparql.is_none(),
             "Standalone enricher should not have SPARQL client"
         );
+    }
+
+    #[test]
+    fn a_limited_koji_run_does_not_report_itself_complete() {
+        // --limit truncates attempted and completed together, so every other
+        // completeness check passes trivially and the run publishes claiming
+        // to have covered the corpus. Against the real fedora graphs that is
+        // 10 of 363,822 NVRs reporting complete: true (#70).
+        let mut server = mockito::Server::new();
+        let _koji_mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?>
+<methodResponse>
+  <params><param><value><struct>
+    <member><name>owner_name</name><value><string>testuser</string></value></member>
+    <member><name>build_id</name><value><int>999</int></value></member>
+  </struct></value></param></params>
+</methodResponse>"#,
+            )
+            .expect_at_least(1)
+            .create();
+
+        let enricher = KojiEnricher::new_standalone(&server.url(), "fedora", "43", None);
+        let nvrs: Vec<String> = (0..10)
+            .map(|i| format!("pkg{i}-1.0-1.fc43"))
+            .collect();
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_str().unwrap().to_string();
+
+        let (_b, _t, report) = enricher
+            .enrich_from_nvrs(&nvrs, &path, Some(2), None)
+            .expect("limited run should still succeed");
+
+        assert_eq!(report.eligible, Some(10), "the untruncated population");
+        assert!(
+            report.attempted < 10,
+            "the limit should have stopped it short, got {}",
+            report.attempted
+        );
+        assert!(
+            !report.is_complete(),
+            "a run that saw {} of 10 must not read as complete",
+            report.attempted
+        );
+    }
+
+    #[test]
+    fn an_unlimited_koji_run_records_no_eligible_count() {
+        // Absence of a limit means attempted IS the population, and the
+        // sidecar stays byte-identical to what schema 1 readers expect.
+        let mut server = mockito::Server::new();
+        let _koji_mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?>
+<methodResponse><params><param><value><struct>
+  <member><name>build_id</name><value><int>1</int></value></member>
+</struct></value></param></params></methodResponse>"#,
+            )
+            .expect_at_least(1)
+            .create();
+
+        let enricher = KojiEnricher::new_standalone(&server.url(), "fedora", "43", None);
+        let nvrs = vec!["openssl-3.2.1-1.fc43".to_string()];
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_str().unwrap().to_string();
+
+        let (_b, _t, report) = enricher
+            .enrich_from_nvrs(&nvrs, &path, None, None)
+            .expect("unlimited run should succeed");
+        assert_eq!(report.eligible, None);
     }
 
     #[test]
