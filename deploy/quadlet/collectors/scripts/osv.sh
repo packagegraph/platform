@@ -20,7 +20,16 @@ GRAPH_URI="https://packagegraph.github.io/graph/security/osv"
 COMBINED="$RUN_DIR/osv-combined.nt"
 : > "$COMBINED"
 
-for spec in "npm:npm" "PyPI:pypi" "crates.io:cratesio" "Go:go" "Maven:maven" "NuGet:nuget" "Packagist:packagist" "RubyGems:rubygems" "Hex:hex" "Pub:pub" "Hackage:hackage" "SwiftURL:swifturl"; do
+# Debian and Alpine are the two ecosystems the corpus collects packages for
+# that OSV also publishes. They were fetched one advisory at a time by the
+# security ENRICHER, at 500ms pacing against the API -- ~73,000 advisories,
+# 13+ hours -- while the same data is 72 MB of ZIP on this job, which
+# already runs daily. See #59 and the security enricher's header.
+#
+# OSV has no Fedora ecosystem at all, so the RPM corpus is not covered here
+# and cannot be; AlmaLinux, Rocky Linux and Red Hat exist and are not yet
+# collected -- tracked separately.
+for spec in "npm:npm" "PyPI:pypi" "crates.io:cratesio" "Go:go" "Maven:maven" "NuGet:nuget" "Packagist:packagist" "RubyGems:rubygems" "Hex:hex" "Pub:pub" "Hackage:hackage" "SwiftURL:swifturl" "Debian:debian" "Alpine:alpine"; do
   eco="${spec%%:*}"
   slug="${spec#*:}"
   echo "=== OSV: $eco ==="
