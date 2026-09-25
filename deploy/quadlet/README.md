@@ -895,7 +895,8 @@ Minio, picked up by the same nightly `qlever-rebuild-index.timer`.
 
 **Ported from existing Kubernetes jobs** (`advisory`, `koji`,
 `npm-provenance`, `repology`): straightforward, all four already ran in
-production against Fuseki. `enrich-github` was *not* ported -- its
+production against Fuseki. (`repology` has since been retired -- see
+"Retired: repology".) `enrich-github` was *not* ported -- its
 Kubernetes version uses `--load-graph` to accumulate incrementally inside
 Fuseki itself across bounded weekly batches (rate-limited by GitHub's API),
 then does a full `CONSTRUCT` export for Minio archival; without a writable
@@ -984,7 +985,7 @@ done
 
 systemctl daemon-reload
 systemctl enable --now pg-enrich-advisory.timer pg-enrich-koji.timer pg-enrich-npm-provenance.timer \
-  pg-enrich-repology.timer pg-enrich-epss.timer pg-enrich-taxonomy.timer pg-enrich-security.timer \
+  pg-enrich-epss.timer pg-enrich-taxonomy.timer pg-enrich-security.timer \
   pg-enrich-forge-version.timer pg-enrich-nvd.timer pg-enrich-revdeps.timer pg-enrich-blast-radius.timer
 ```
 
@@ -1032,11 +1033,43 @@ unmeasured and stay conservative: a timeout below the real runtime is
 exactly how `koji` and `security` were lost, so guessing downward is worse
 than leaving the ceiling in place until a run measures it.
 
-`repology` is the deliberate exception. A complete pass needs ~90 hours,
-so every weekly run ends in a timeout kill BY DESIGN -- its value is the
-cache progress it flushes to Minio, not completion. Its drop-in clears
-`OnFailure=`, because a failure report that fires every week on healthy
-behaviour trains the reader to ignore failure reports.
+### Retired: repology
+
+`pg-enrich-repology` is **no longer scheduled**. Its timer, script and
+timeout drop-in are removed; `enrich_repology.rs` and the
+`pg-collect enrich-repology` subcommand remain, for the rework described
+below.
+
+It never published anything. `enrich_repology.rs` issues one
+`GET /api/v1/project/{name}` per distinct package name at a 1s pacing
+floor, and at its observed rate (~100 packages / 1.7 min against 314,416)
+a complete pass needs roughly 90 hours. No `TimeoutStartSec` can cover
+that, so every weekly run was SIGKILL'd -- and because the kill destroys
+the container before `repology.sh` reaches its `upload-nt.sh` line, no run
+ever reached the upload at all. Eight hours of host time per week, for
+cache and nothing else.
+
+The cost is also O(corpus): one request per package name, so it gets
+*slower* as collection completes, never faster.
+
+Removing the files from this repo does not uninstall anything. On a host
+that already has it, the retirement needs:
+
+```bash
+systemctl disable --now pg-enrich-repology.timer
+rm -f /etc/systemd/system/pg-enrich-repology.timer
+rm -f /etc/containers/systemd/scripts/enrichers/repology.sh
+rm -rf "/etc/systemd/system/pg-enrich@repology.service.d"
+systemctl daemon-reload
+```
+
+The `enricher-cache/repology` prefix in the object store can go too; it
+is the only thing the enricher ever produced.
+
+**The rework, if it happens**, has to replace per-name lookups with bulk
+enumeration -- Repology's paginated projects endpoint or its database
+dumps -- so the cost tracks Repology's dataset rather than ours. That is
+the same change `osv.sh` already embodies for vulnerabilities.
 
 **One-time ontology bootstrap**, needed before `revdeps`/`blast-radius` (or
 any future consumer of ontology-level declarations) will work -- not part
