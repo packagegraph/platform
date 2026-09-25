@@ -334,6 +334,24 @@ impl SparqlClient {
             .collect())
     }
 
+    /// Package name to identity URIs, across every graph under `prefix`.
+    ///
+    /// One name maps to SEVERAL identities, because identities are
+    /// arch-qualified (`pkg/debian/trixie/amd64/curl`) and the same release
+    /// is collected per architecture. A caller linking an advisory to "curl
+    /// in trixie" means all of them.
+    pub fn query_identities_by_type_under(
+        &self,
+        rdf_type: &str,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let bindings = self.query(&identities_by_type_under_query(rdf_type, prefix))?;
+        Ok(bindings
+            .into_iter()
+            .filter_map(|b| Some((b.get("name")?.clone(), b.get("identity")?.clone())))
+            .collect())
+    }
+
     /// Packages of a type across every graph belonging to one distro.
     ///
     /// `query_packages_by_type_in_graph` needs an exact graph URI, so a
@@ -784,6 +802,21 @@ impl SparqlClient {
                 format!("graph {graph} resolved {n} distribution IRIs via pkg:partOfDistribution; expected exactly 1"))),
         }
     }
+}
+
+/// The query behind `SparqlClient::query_identities_by_type_under`.
+fn identities_by_type_under_query(rdf_type: &str, prefix: &str) -> String {
+    format!(
+        "PREFIX pkg: <https://purl.org/packagegraph/ontology/core#>\n\
+         SELECT DISTINCT ?name ?identity WHERE {{\n\
+           GRAPH ?g {{\n\
+             ?pkg a <{rdf_type}> ;\n\
+                  pkg:packageName ?name ;\n\
+                  pkg:isVersionOf ?identity .\n\
+           }}\n\
+           FILTER(STRSTARTS(STR(?g), \"{prefix}\"))\n\
+         }}"
+    )
 }
 
 /// The query behind `SparqlClient::query_packages_by_type_in_distro`.

@@ -112,6 +112,107 @@ pub fn ecosystem_mapping(osv_ecosystem: &str) -> Option<EcosystemMapping> {
     }
 }
 
+/// The URI an advisory is published under: CVE-keyed when it carries a CVE
+/// alias, OSV-ID-keyed otherwise.
+///
+/// Public and shared because more than one producer has to agree on it. The
+/// security enricher links OUR packages to advisories this collector
+/// published, and a link is worth nothing if the two mint different
+/// subjects for the same advisory (#59).
+pub fn vulnerability_subject_uri(vuln: &OsvVulnerability) -> String {
+    vuln.aliases
+        .iter()
+        .find(|alias| alias.starts_with("CVE-"))
+        .map(|cve| cve_uri(cve))
+        .unwrap_or_else(|| vuln_uri(&vuln.id))
+}
+
+/// Download an OSV ecosystem archive.
+pub fn download_archive(transport: &HttpTransport, ecosystem: &str) -> Result<Vec<u8>> {
+    let url = format!(
+        "https://osv-vulnerabilities.storage.googleapis.com/{}/all.zip",
+        ecosystem
+    );
+    eprintln!("Downloading {} from {}...", ecosystem, url);
+    let bytes = download_with_retry(transport, &url)?;
+    eprintln!("Downloaded {:.2} MB", bytes.len() as f64 / 1_048_576.0);
+    Ok(bytes)
+}
+
+/// Walk every advisory in an OSV archive, handing each to `visit`.
+///
+/// `visit` returns how many triples it wrote; an entry that yields zero is
+/// not counted as a vulnerability. Malformed entries and visitor errors are
+/// warned about and skipped rather than failing the archive -- one bad
+/// record out of 68,000 should not lose the other 67,999.
+///
+/// Shared by the collector and the security enricher so there is one
+/// iteration path over an archive, not two that can disagree (#59).
+pub fn for_each_vulnerability<F>(zip_bytes: &[u8], mut visit: F) -> Result<(usize, usize)>
+where
+    F: FnMut(&OsvVulnerability) -> Result<usize>,
+{
+    use zip::ZipArchive;
+
+    let cursor = Cursor::new(zip_bytes);
+    let mut archive = ZipArchive::new(cursor).map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    let entry_count = archive.len();
+    eprintln!("Processing {} entries from ZIP...", entry_count);
+
+    let mut vuln_count = 0;
+    let mut emitted = 0;
+    let mut errors_skipped = 0;
+
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        if !file.name().ends_with(".json") {
+            continue;
+        }
+
+        let vuln: OsvVulnerability = match serde_json::from_reader(&mut file) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Warning: skipping malformed entry {}: {}", file.name(), e);
+                errors_skipped += 1;
+                continue;
+            }
+        };
+
+        match visit(&vuln) {
+            Ok(count) => {
+                emitted += count;
+                if count > 0 {
+                    vuln_count += 1;
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: error handling {}: {}", vuln.id, e);
+                errors_skipped += 1;
+            }
+        }
+
+        if (i + 1) % 10_000 == 0 {
+            eprintln!(
+                "Progress: {}/{} entries, {} vulnerabilities, {} triples",
+                i + 1,
+                entry_count,
+                vuln_count,
+                emitted
+            );
+        }
+    }
+
+    if errors_skipped > 0 {
+        eprintln!("Skipped {} entries due to errors", errors_skipped);
+    }
+
+    Ok((vuln_count, emitted))
+}
+
 /// Emit N-Triples for a single OSV vulnerability record.
 ///
 /// Returns the number of triples written.
@@ -131,13 +232,7 @@ pub fn emit_vulnerability_triples(
 
     let mut triples = 0;
 
-    // Resolve subject URI: CVE-keyed if CVE alias exists, else OSV-ID-keyed
-    let subject_uri = vuln
-        .aliases
-        .iter()
-        .find(|alias| alias.starts_with("CVE-"))
-        .map(|cve| cve_uri(cve))
-        .unwrap_or_else(|| vuln_uri(&vuln.id));
+    let subject_uri = vulnerability_subject_uri(vuln);
 
     // Type triple
     writer.write_triple(&subject_uri, RDF_TYPE, &format!("{}Vulnerability", SEC))?;
@@ -584,23 +679,10 @@ pub fn process_ecosystem(
     ecosystem: &str,
     writer: &mut NTriplesWriter,
 ) -> Result<(usize, usize)> {
-    let url = format!(
-        "https://osv-vulnerabilities.storage.googleapis.com/{}/all.zip",
-        ecosystem
-    );
-
-    eprintln!("Downloading {} from {}...", ecosystem, url);
-
-    // Download with retry logic
-    let zip_bytes = download_with_retry(transport, &url)?;
-
-    eprintln!("Downloaded {:.2} MB", zip_bytes.len() as f64 / 1_048_576.0);
-
-    // Process ZIP from memory
+    let zip_bytes = download_archive(transport, ecosystem)?;
     process_zip_from_bytes(&zip_bytes, writer)
 }
 
-/// Download a URL with retry logic (single retry on transient failure).
 /// Download an OSV archive.
 ///
 /// The retry-once-after-5s loop this used to carry is gone: the transport
@@ -624,69 +706,7 @@ pub fn process_zip_from_bytes(
     zip_bytes: &[u8],
     writer: &mut NTriplesWriter,
 ) -> Result<(usize, usize)> {
-    use zip::ZipArchive;
-
-    let cursor = Cursor::new(zip_bytes);
-    let mut archive = ZipArchive::new(cursor).map_err(|e| std::io::Error::other(e.to_string()))?;
-
-    let entry_count = archive.len();
-    eprintln!("Processing {} entries from ZIP...", entry_count);
-
-    let mut vuln_count = 0;
-    let mut triple_count = 0;
-    let mut errors_skipped = 0;
-
-    for i in 0..archive.len() {
-        let mut file = archive
-            .by_index(i)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        // Skip non-JSON files
-        if !file.name().ends_with(".json") {
-            continue;
-        }
-
-        // Deserialize OSV record
-        let vuln: OsvVulnerability = match serde_json::from_reader(&mut file) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("Warning: skipping malformed entry {}: {}", file.name(), e);
-                errors_skipped += 1;
-                continue;
-            }
-        };
-
-        // Emit triples
-        match emit_vulnerability_triples(writer, &vuln) {
-            Ok(count) => {
-                triple_count += count;
-                if count > 0 {
-                    vuln_count += 1;
-                }
-            }
-            Err(e) => {
-                eprintln!("Warning: error emitting triples for {}: {}", vuln.id, e);
-                errors_skipped += 1;
-            }
-        }
-
-        // Progress logging every 10,000 entries
-        if (i + 1) % 10_000 == 0 {
-            eprintln!(
-                "Progress: {}/{} entries, {} vulnerabilities, {} triples",
-                i + 1,
-                entry_count,
-                vuln_count,
-                triple_count
-            );
-        }
-    }
-
-    if errors_skipped > 0 {
-        eprintln!("Skipped {} entries due to errors", errors_skipped);
-    }
-
-    Ok((vuln_count, triple_count))
+    for_each_vulnerability(zip_bytes, |vuln| emit_vulnerability_triples(writer, vuln))
 }
 
 #[cfg(test)]

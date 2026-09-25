@@ -1,75 +1,84 @@
-//! OSV API security enricher.
+//! Links advisories to the packages this corpus actually holds.
 //!
-//! Queries the store for package names by ecosystem, asks OSV.dev which
-//! vulnerabilities affect them, and emits one record per distinct
-//! vulnerability. Complementary to the bulk OSV collector (osv.rs), which
-//! downloads ecosystem ZIPs from GCS.
+//! The bulk OSV collector (`osv.rs`) publishes the advisories themselves --
+//! summary, CVSS, CWE, dates -- for every ecosystem it pulls. What it cannot
+//! publish is which of OUR packages each advisory touches, because it does
+//! not know what we collected. That join is this enricher's whole job, and
+//! its only output is `sec:affectsPackage`.
 //!
-//! ## Why this is not one request per package (#59)
+//! ## Why it no longer calls the OSV API (#59)
 //!
-//! It used to be, and it could not finish. After 8 hours the run was 45,100
-//! packages into the FIRST of eleven ecosystems, at ~94 packages/minute;
-//! Debian alone is 464,223 packages in the corpus, so that ecosystem needed
-//! ~82 hours on its own. No timeout makes that complete.
+//! It used to ask `api.osv.dev` about every package in the corpus, one
+//! request at a time, at the 500ms pacing this repo applies to that host.
+//! Measured: 0.26s per GET, ~0.65s effective per advisory, against 347,563
+//! advisories across the ecosystems it looped -- roughly 63 hours, against
+//! an 8 hour timeout it had already been SIGKILL'd by.
 //!
-//! Almost all of that work was redundant:
+//! Most of that was redundant: the bulk collector had already downloaded the
+//! same records that morning, as ZIPs, for twelve of those ecosystems. So the
+//! API is gone. This reads the same archives -- 72 MB for Debian and Alpine,
+//! about 108 seconds -- and spends its time on the join instead.
 //!
-//!   - the OSV query is keyed by `{name, ecosystem}` and carries no version,
-//!     but the driving SPARQL returned one row per (package, VERSION) -- so
-//!     every version of `curl` issued a byte-identical request;
-//!   - `emit_vulnerability_triples` is a function of the vulnerability alone,
-//!     so each of those duplicates re-emitted an identical block of triples
-//!     into the output file;
-//!   - `security.sh` never passed `--cache-dir`, so the FileCache was always
-//!     None and nothing was reused within a run, let alone across runs.
+//! The important property is not that it got faster. It is that the cost now
+//! tracks how many advisories OSV publishes, not how many packages we hold.
+//! Every per-package path gets SLOWER as collection completes; this one does
+//! not move at all.
 //!
-//! So: distinct names, asked in batches through OSV's `querybatch` endpoint,
-//! reduced to the distinct vulnerability IDs they matched, and one detail
-//! fetch and one emission per ID. The output is the same set of triples with
-//! the duplication removed.
+//! ## Why the archives rather than the graph
+//!
+//! The affected-package data is in the archives but not in the graph:
+//! `emit_vulnerability_triples` drops the whole `affected[]` block for distro
+//! ecosystems, because `ecosystem_mapping` has no entry for them.
+//!
+//! Putting it there would mean editing a function twelve working ecosystems
+//! depend on, and would still lose the release. OSV names distro ecosystems
+//! with it -- `Debian:13`, `Alpine:v3.20` -- while `ecosystem_uri` is used
+//! everywhere else for bare names, so carrying `Debian:13` into the graph
+//! would need a new ontology property for a fact that is only ever an INPUT
+//! to this join. Reading the archive keeps the release precise and changes
+//! nothing anyone else depends on.
 
-use crate::cache::FileCache;
-use crate::http_transport::HttpTransport;
 use crate::ntriples::NTriplesWriter;
-use crate::osv::{emit_vulnerability_triples, OsvVulnerability};
+use crate::osv::{download_archive, for_each_vulnerability, vulnerability_subject_uri};
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
+use crate::uris::SEC;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Result;
 
-const OSV_API: &str = "https://api.osv.dev";
+/// Where a collected distro's packages live, and which OSV archive covers it.
+struct DistroTarget {
+    /// The OSV archive to read, e.g. "Debian".
+    archive: &'static str,
+    /// Graph URI prefix for the graphs holding these packages. No trailing
+    /// slash, so `.../graph/debian/trixie` also covers the per-architecture
+    /// graphs published beside it.
+    graph_prefix: &'static str,
+    /// The RDF type the packages carry in those graphs.
+    rdf_type: &'static str,
+}
+
+const DEB: &str = "https://purl.org/packagegraph/ontology/deb#BinaryPackage";
+const APK: &str = "https://purl.org/packagegraph/ontology/apk#ApkPackage";
 
 pub struct SecurityEnricher {
     sparql: SparqlClient,
-    transport: HttpTransport,
-    cache: Option<FileCache>,
-    ecosystem: String,
-    osv_api_base: String,
+    transport: crate::http_transport::HttpTransport,
     pub graph_uri: Option<String>,
 }
 
 impl SecurityEnricher {
-    pub fn new(
-        endpoint: &str,
-        ecosystem: &str,
-        cache_dir: Option<&str>,
-        auth: SparqlAuth,
-        backend: SparqlBackend,
-    ) -> Self {
-        let sparql = make_sparql_client(endpoint, &auth, backend);
-        // One namespace for every ecosystem, not one per ecosystem: the
-        // cached artefact is now an OSV vulnerability record keyed by its own
-        // ID, and that record is the same whoever asked for it. A CVE reached
-        // from both `deb` and `rpm` is fetched once (#59).
-        let cache = cache_dir.map(|dir| {
-            FileCache::new(dir, "security-osv", 24, None).expect("Failed to create cache")
-        });
+    pub fn new(endpoint: &str, auth: SparqlAuth, backend: SparqlBackend) -> Self {
+        // 300s, matching the collector: a run pulls whole ecosystem archives.
+        let client = crate::enricher::http_client_builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .expect("Failed to create HTTP client");
 
         Self {
-            sparql,
-            transport: HttpTransport::new(),
-            cache,
-            ecosystem: ecosystem.to_string(),
-            osv_api_base: OSV_API.to_string(),
+            sparql: make_sparql_client(endpoint, &auth, backend),
+            transport: crate::http_transport::HttpTransport::with_client(client),
             graph_uri: None,
         }
     }
@@ -84,439 +93,258 @@ impl SecurityEnricher {
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
 
-        // Map ecosystem name to RDF type — accepts both packaging system names (preferred)
-        // and legacy distro names for backward compatibility
-        let rdf_type = match self.ecosystem.as_str() {
-            // Packaging system names (preferred)
-            "deb" => "https://purl.org/packagegraph/ontology/deb#BinaryPackage",
-            "apk" => "https://purl.org/packagegraph/ontology/apk#ApkPackage",
-            "rpm" => "https://purl.org/packagegraph/ontology/rpm#BinaryRPM",
-            "npm" => "https://purl.org/packagegraph/ontology/npm#NpmPackage",
-            "pypi" => "https://purl.org/packagegraph/ontology/pypi#PythonPackage",
-            "cargo" => "https://purl.org/packagegraph/ontology/cargo#Crate",
-            "gomod" => "https://purl.org/packagegraph/ontology/gomod#GoModule",
-            "maven" => "https://purl.org/packagegraph/ontology/maven#MavenArtifact",
-            // Legacy distro names (backward compat)
-            "debian" => "https://purl.org/packagegraph/ontology/deb#BinaryPackage",
-            "alpine" => "https://purl.org/packagegraph/ontology/apk#ApkPackage",
-            "fedora" | "rhel" | "centos" | "opensuse" => "https://purl.org/packagegraph/ontology/rpm#BinaryRPM",
-            _ => return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Unsupported ecosystem: {}. Use packaging system name: deb, apk, rpm, npm, pypi, cargo, gomod, maven", self.ecosystem),
-            )),
-        };
-
-        let names = self.sparql.query_package_names_by_type(rdf_type)?;
-        eprintln!(
-            "Found {} distinct {} package names to check for vulnerabilities",
-            names.len(),
-            self.ecosystem
-        );
-
-        let (ids, truncated) = self.vulnerability_ids_for(&names)?;
-        eprintln!(
-            "OSV matched {} distinct vulnerabilities across {} names",
-            ids.len(),
-            names.len()
-        );
-        if truncated > 0 {
-            eprintln!(
-                "WARNING: {} of {} names had more matches than OSV returned in one page -- \
-                 this enricher is no longer seeing everything for them",
-                truncated,
-                names.len()
-            );
-        }
-
+        let mut linked_packages = 0;
         let mut total_triples = 0;
-        let mut fetched = 0;
-        for id in &ids {
-            fetched += 1;
-            if fetched % 100 == 0 {
+
+        for target in targets() {
+            let corpus = self.corpus_index(&target)?;
+            if corpus.is_empty() {
+                // Nothing collected for this distro: reading its archive
+                // could only produce links to packages we do not have.
                 eprintln!(
-                    "Progress: {} of {} vulnerabilities fetched",
-                    fetched,
-                    ids.len()
+                    "No packages under {} -- skipping the {} archive",
+                    target.graph_prefix, target.archive
                 );
+                continue;
             }
-            match self.fetch_vulnerability(id) {
-                Ok(Some(vuln)) => total_triples += emit_vulnerability_triples(&mut writer, &vuln)?,
-                // A record OSV named but will not serve is not an error here;
-                // the bulk collector covers the same ground from the ZIPs.
-                Ok(None) => {}
-                Err(e) => eprintln!("  Error fetching {}: {}", id, e),
-            }
+            eprintln!(
+                "{}: {} package names collected under {}",
+                target.archive,
+                corpus.len(),
+                target.graph_prefix
+            );
+
+            let zip_bytes = download_archive(&self.transport, target.archive)?;
+            let (_advisories, triples) = for_each_vulnerability(&zip_bytes, |vuln| {
+                let subject = vulnerability_subject_uri(vuln);
+                // Distinct, because one advisory carries an entry per
+                // affected RELEASE and they all name the same package:
+                // measured 23 identical entries for curl in a single Alpine
+                // record. The link is release-independent -- it says which
+                // identity is affected, not in which release -- so without
+                // this the output is the same statement 23 times.
+                let mut identities: BTreeSet<&str> = BTreeSet::new();
+                for name in affected_names(vuln, target.archive) {
+                    if let Some(found) = corpus.get(name) {
+                        identities.extend(found.iter().map(|s| s.as_str()));
+                    }
+                }
+                for identity in &identities {
+                    writer.write_triple(&subject, &format!("{SEC}affectsPackage"), identity)?;
+                }
+                Ok(identities.len())
+            })?;
+
+            linked_packages += corpus.len();
+            total_triples += triples;
+            eprintln!("{}: {} links emitted", target.archive, triples);
         }
 
         writer.flush()?;
-        // The first number is what was CHECKED, which is names, not versions:
-        // a caller comparing it against a package count will find it smaller
-        // for the reason in this module's header.
-        Ok((names.len(), total_triples))
+        Ok((linked_packages, total_triples))
     }
 
-    /// Every distinct vulnerability ID OSV reports for any of `names`, and
-    /// the number of names whose answer OSV had to truncate.
+    /// Package name to the identities we hold for it.
     ///
-    /// Batched: OSV's `querybatch` takes many package queries per request and
-    /// answers with IDs only, which is all that is needed to decide what to
-    /// fetch. One request per `BATCH` names replaces one per name.
-    fn vulnerability_ids_for(&self, names: &[String]) -> Result<(Vec<String>, usize)> {
-        const BATCH: usize = 1000;
-        let mut ids: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut truncated = 0;
+    /// Several identities per name is the normal case, not an edge case:
+    /// identities are arch-qualified and each architecture is collected into
+    /// its own graph, so `curl` in trixie is three identities.
+    fn corpus_index(&self, target: &DistroTarget) -> Result<HashMap<String, Vec<String>>> {
+        let rows = self
+            .sparql
+            .query_identities_by_type_under(target.rdf_type, target.graph_prefix)?;
 
-        for (chunk_no, chunk) in names.chunks(BATCH).enumerate() {
-            if chunk_no > 0 && chunk_no % 10 == 0 {
-                eprintln!(
-                    "Progress: {} of {} names queried",
-                    chunk_no * BATCH,
-                    names.len()
-                );
-            }
-            let (batch_ids, batch_truncated) = self.query_batch(chunk)?;
-            truncated += batch_truncated;
-            for id in batch_ids {
-                if seen.insert(id.clone()) {
-                    ids.push(id);
-                }
-            }
+        let mut index: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, identity) in rows {
+            index.entry(name).or_default().push(identity);
         }
-        Ok((ids, truncated))
+        Ok(index)
     }
+}
 
-    /// One `querybatch` request. Returns the IDs it named, in order, and how
-    /// many of its queries OSV answered with only a first page.
-    ///
-    /// A batch that fails outright yields nothing rather than aborting the
-    /// run: the bulk OSV collector covers the same ground, and losing an
-    /// ecosystem to one bad request is the failure mode this rewrite exists
-    /// to remove.
-    fn query_batch(&self, names: &[String]) -> Result<(Vec<String>, usize)> {
-        let payload = serde_json::json!({
-            "queries": names
-                .iter()
-                .map(|name| serde_json::json!({
-                    "package": {"name": name, "ecosystem": self.osv_ecosystem_name()}
-                }))
-                .collect::<Vec<_>>(),
-        });
-        let body = serde_json::to_vec(&payload)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+/// The distros this corpus collects that OSV also publishes.
+///
+/// OSV has no Fedora ecosystem at all, so the RPM corpus cannot appear here.
+/// AlmaLinux, Rocky Linux and Red Hat do exist in OSV and are not collected
+/// yet -- tracked separately.
+fn targets() -> Vec<DistroTarget> {
+    vec![
+        DistroTarget {
+            archive: "Debian",
+            graph_prefix: "https://packagegraph.github.io/graph/debian/trixie",
+            rdf_type: DEB,
+        },
+        DistroTarget {
+            archive: "Alpine",
+            graph_prefix: "https://packagegraph.github.io/graph/alpine/",
+            rdf_type: APK,
+        },
+    ]
+}
 
-        let url = format!("{}/v1/querybatch", self.osv_api_base);
-        let resp = match self
-            .transport
-            .post(&url, &[("Content-Type", "application/json")], body)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!(
-                    "  Warning: OSV batch of {} names failed: {}",
-                    names.len(),
-                    e
-                );
-                return Ok((Vec::new(), 0));
-            }
-        };
-
-        let data: serde_json::Value = serde_json::from_slice(&resp.bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-
-        let mut ids = Vec::new();
-        let mut truncated = 0;
-        for result in data
-            .get("results")
-            .and_then(|r| r.as_array())
-            .map(|a| a.as_slice())
-            .unwrap_or_default()
-        {
-            // A per-query page token means OSV had more matches than it
-            // returned. Counted rather than silently dropped -- the bulk
-            // collector is the backstop, but a growing count here means this
-            // enricher is no longer seeing everything.
-            if result.get("next_page_token").is_some() {
-                truncated += 1;
-            }
-            for vuln in result
-                .get("vulns")
-                .and_then(|v| v.as_array())
-                .map(|a| a.as_slice())
-                .unwrap_or_default()
-            {
-                if let Some(id) = vuln.get("id").and_then(|i| i.as_str()) {
-                    ids.push(id.to_string());
-                }
-            }
+/// The package names an advisory reports against `archive`.
+///
+/// OSV qualifies a distro ecosystem with its release -- `Debian:13`,
+/// `Alpine:v3.20` -- and one advisory usually carries an entry per affected
+/// release. Only entries whose ecosystem belongs to this archive count; the
+/// release itself is not filtered here, because the corpus index is already
+/// scoped to the releases we collected, so a name from a release we do not
+/// hold simply will not match.
+fn affected_names<'a>(
+    vuln: &'a crate::osv::OsvVulnerability,
+    archive: &str,
+) -> impl Iterator<Item = &'a str> {
+    let archive = archive.to_string();
+    vuln.affected.iter().filter_map(move |affected| {
+        let package = affected.package.as_ref()?;
+        if ecosystem_base(&package.ecosystem) != archive {
+            return None;
         }
-        Ok((ids, truncated))
-    }
+        Some(package.name.as_str())
+    })
+}
 
-    /// One vulnerability record, from the cache when it is there.
-    ///
-    /// Keyed by ID alone, not by ecosystem and package: the record is the
-    /// same whoever asked for it, and the same ID is reached from many
-    /// packages and many ecosystems.
-    fn fetch_vulnerability(&self, id: &str) -> Result<Option<OsvVulnerability>> {
-        let cache_key = format!("osv-vuln-{id}");
-        if let Some(v) = self.cached_get(&cache_key) {
-            return Ok(Some(v));
-        }
-
-        let url = format!("{}/v1/vulns/{id}", self.osv_api_base);
-        let resp = match self.transport.get(&url, None) {
-            Ok(r) => r,
-            // A record OSV named but will not serve is not an error.
-            Err(_) => return Ok(None),
-        };
-
-        let vuln: OsvVulnerability = serde_json::from_slice(&resp.bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        self.cache_put(&cache_key, &serde_json::to_value(&vuln).unwrap());
-        Ok(Some(vuln))
-    }
-
-    fn osv_ecosystem_name(&self) -> &str {
-        match self.ecosystem.as_str() {
-            "debian" => "Debian",
-            "alpine" => "Alpine",
-            "npm" => "npm",
-            "pypi" => "PyPI",
-            "cargo" => "crates.io",
-            "gomod" => "Go",
-            "maven" => "Maven",
-            _ => &self.ecosystem,
-        }
-    }
-
-    fn cached_get(&self, key: &str) -> Option<OsvVulnerability> {
-        let val = self.cache.as_ref()?.get(key)?;
-        serde_json::from_value(val).ok()
-    }
-
-    fn cache_put(&self, key: &str, data: &serde_json::Value) {
-        if let Some(ref cache) = self.cache {
-            cache.put(key, data);
-        }
-    }
+/// `Debian:13` -> `Debian`. The part before the colon is the ecosystem;
+/// anything after it is the release.
+fn ecosystem_base(ecosystem: &str) -> &str {
+    ecosystem.split(':').next().unwrap_or(ecosystem)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
-    use tempfile::NamedTempFile;
+    use crate::osv::{OsvAffected, OsvPackage, OsvVulnerability};
 
-    #[test]
-    fn test_osv_ecosystem_mapping() {
-        let enricher = SecurityEnricher::new(
-            "http://localhost:3030/test",
-            "debian",
-            None,
-            None,
-            SparqlBackend::Fuseki,
-        );
-        assert_eq!(enricher.osv_ecosystem_name(), "Debian");
-
-        let enricher2 = SecurityEnricher::new(
-            "http://localhost:3030/test",
-            "pypi",
-            None,
-            None,
-            SparqlBackend::Fuseki,
-        );
-        assert_eq!(enricher2.osv_ecosystem_name(), "PyPI");
-    }
-
-    #[test]
-    fn test_maven_ecosystem_mapping() {
-        let enricher = SecurityEnricher::new(
-            "http://localhost:3030/test",
-            "maven",
-            None,
-            None,
-            SparqlBackend::Fuseki,
-        );
-        assert_eq!(enricher.osv_ecosystem_name(), "Maven");
-    }
-
-    /// An enricher pointed at a mockito server for both SPARQL and OSV.
-    fn enricher_against(server: &mockito::Server, ecosystem: &str) -> SecurityEnricher {
-        SecurityEnricher {
-            sparql: SparqlClient::new(&server.url()),
-            transport: HttpTransport::new(),
-            cache: None,
-            ecosystem: ecosystem.to_string(),
-            osv_api_base: server.url(),
-            graph_uri: None,
+    fn vuln(id: &str, aliases: &[&str], affected: &[(&str, &str)]) -> OsvVulnerability {
+        OsvVulnerability {
+            id: id.to_string(),
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            summary: None,
+            details: None,
+            published: None,
+            modified: None,
+            withdrawn: None,
+            affected: affected
+                .iter()
+                .map(|(ecosystem, name)| OsvAffected {
+                    package: Some(OsvPackage {
+                        name: name.to_string(),
+                        ecosystem: ecosystem.to_string(),
+                        purl: None,
+                    }),
+                    versions: vec![],
+                    ranges: vec![],
+                    database_specific: None,
+                })
+                .collect(),
+            severity: vec![],
+            references: vec![],
+            database_specific: None,
         }
     }
 
-    fn names_binding(names: &[&str]) -> String {
-        let bindings: Vec<String> = names
-            .iter()
-            .map(|n| format!(r#"{{"name": {{"value": "{n}"}}}}"#))
-            .collect();
-        format!(r#"{{"results": {{"bindings": [{}]}}}}"#, bindings.join(","))
-    }
-
-    fn run(enricher: &SecurityEnricher) -> ((usize, usize), String) {
-        let temp_file = NamedTempFile::new().unwrap();
-        let counts = enricher
-            .enrich(temp_file.path().to_str().unwrap())
-            .expect("enrich should not fail");
-        let mut content = String::new();
-        temp_file
-            .reopen()
-            .unwrap()
-            .read_to_string(&mut content)
-            .unwrap();
-        (counts, content)
-    }
-
-    /// The shape #59 is about: three packages, one advisory between them.
-    /// The old code made three OSV queries and emitted the advisory three
-    /// times. One batch request, one detail fetch, one emission.
     #[test]
-    fn one_advisory_shared_by_three_names_is_fetched_and_emitted_once() {
-        let mut server = mockito::Server::new();
-        let _sparql = server
-            .mock("POST", "/sparql")
-            .with_status(200)
-            .with_body(names_binding(&["curl", "openssl", "zlib"]))
-            .create();
-        let batch = server
-            .mock("POST", "/v1/querybatch")
-            // One request carrying all three names, with the ecosystem
-            // translated to OSV's spelling.
-            .match_body(mockito::Matcher::Regex(
-                r#"curl[\s\S]*Debian[\s\S]*openssl[\s\S]*zlib"#.to_string(),
-            ))
-            .with_status(200)
-            .with_body(
-                r#"{"results": [
-                     {"vulns": [{"id": "OSV-1", "modified": "2026-01-01T00:00:00Z"}]},
-                     {"vulns": [{"id": "OSV-1", "modified": "2026-01-01T00:00:00Z"}]},
-                     {"vulns": [{"id": "OSV-1", "modified": "2026-01-01T00:00:00Z"}]}
-                   ]}"#,
-            )
-            .expect(1)
-            .create();
-        let detail = server
-            .mock("GET", "/v1/vulns/OSV-1")
-            .with_status(200)
-            .with_body(r#"{"id": "OSV-1", "aliases": ["CVE-2026-0001"], "summary": "bad"}"#)
-            .expect(1)
-            .create();
+    fn an_osv_release_qualified_ecosystem_reduces_to_its_archive() {
+        assert_eq!(ecosystem_base("Debian:13"), "Debian");
+        assert_eq!(ecosystem_base("Alpine:v3.20"), "Alpine");
+        // Language ecosystems carry no release and must survive unchanged.
+        assert_eq!(ecosystem_base("crates.io"), "crates.io");
+        assert_eq!(ecosystem_base("npm"), "npm");
+    }
 
-        let ((checked, triples), content) = run(&enricher_against(&server, "debian"));
+    #[test]
+    fn only_the_archives_own_entries_are_read() {
+        // One advisory routinely carries an entry per affected release, and
+        // records reached through the Debian archive can still name other
+        // ecosystems. Reading those would link an advisory to a package it
+        // does not describe.
+        let v = vuln(
+            "DEBIAN-CVE-2023-31102",
+            &["CVE-2023-31102"],
+            &[
+                ("Debian:12", "7zip"),
+                ("Debian:13", "7zip"),
+                ("Alpine:v3.20", "7zip"),
+                ("npm", "7zip-bin"),
+            ],
+        );
 
-        batch.assert();
-        detail.assert();
-        assert_eq!(checked, 3, "all three names were checked");
-        assert!(triples > 0, "the advisory should have been emitted");
+        let debian: Vec<&str> = affected_names(&v, "Debian").collect();
+        assert_eq!(debian, vec!["7zip", "7zip"], "both Debian releases");
+
+        let alpine: Vec<&str> = affected_names(&v, "Alpine").collect();
+        assert_eq!(alpine, vec!["7zip"]);
+    }
+
+    #[test]
+    fn an_advisory_is_linked_under_the_uri_the_collector_published_it_as() {
+        // The whole output is worthless if the two disagree: these links
+        // have to land on the same subject the bulk collector minted.
+        let with_cve = vuln("DEBIAN-CVE-2023-31102", &["CVE-2023-31102"], &[]);
+        assert!(
+            vulnerability_subject_uri(&with_cve).contains("CVE-2023-31102"),
+            "a CVE alias keys the advisory, not its OSV id"
+        );
+
+        let without = vuln("OSV-2020-111", &[], &[]);
+        assert!(vulnerability_subject_uri(&without).contains("OSV-2020-111"));
+    }
+
+    /// Measured against the real Alpine archive: one record carried 23
+    /// entries for curl, one per affected Alpine release. The link says
+    /// which identity is affected, not in which release, so emitting one
+    /// per entry writes the same statement 23 times.
+    #[test]
+    fn one_advisory_links_an_identity_once_however_many_releases_name_it() {
+        let releases = ["v3.17", "v3.18", "v3.19", "v3.20"];
+        let v = vuln(
+            "ALPINE-CVE-2017-7468",
+            &["CVE-2017-7468"],
+            &releases
+                .iter()
+                .map(|r| (format!("Alpine:{r}"), "curl".to_string()))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|(e, n)| (e.as_str(), n.as_str()))
+                .collect::<Vec<_>>(),
+        );
+
+        let mut corpus: HashMap<String, Vec<String>> = HashMap::new();
+        corpus.insert(
+            "curl".to_string(),
+            vec!["urn:curl-amd64".to_string(), "urn:curl-arm64".to_string()],
+        );
+
+        let mut identities: BTreeSet<&str> = BTreeSet::new();
+        for name in affected_names(&v, "Alpine") {
+            if let Some(found) = corpus.get(name) {
+                identities.extend(found.iter().map(|s| s.as_str()));
+            }
+        }
+
         assert_eq!(
-            content
-                .lines()
-                .filter(|line| line.contains("security#Vulnerability>"))
-                .count(),
-            1,
-            "the advisory should appear once, not once per name that reached it:\n{content}"
+            affected_names(&v, "Alpine").count(),
+            4,
+            "the record really does name curl once per release"
+        );
+        assert_eq!(
+            identities.len(),
+            2,
+            "but it is two identities, once each -- not eight"
         );
     }
 
-    /// Losing one batch must not lose the ecosystem. The bulk OSV collector
-    /// covers the same ground, so a refused request is a gap, not a failure.
     #[test]
-    fn a_refused_batch_does_not_abort_the_run() {
-        let mut server = mockito::Server::new();
-        let _sparql = server
-            .mock("POST", "/sparql")
-            .with_status(200)
-            .with_body(names_binding(&["curl"]))
-            .create();
-        // 400, not 500: a client error is not retried, so the test does not
-        // sit through the transport's backoff schedule.
-        let _batch = server
-            .mock("POST", "/v1/querybatch")
-            .with_status(400)
-            .with_body("no")
-            .create();
-
-        let ((checked, triples), _) = run(&enricher_against(&server, "debian"));
-
-        assert_eq!(checked, 1);
-        assert_eq!(triples, 0, "nothing to emit, but the run still completed");
-    }
-
-    /// An advisory OSV names but will not serve is a gap, not a failure,
-    /// for the same reason.
-    #[test]
-    fn an_unservable_advisory_does_not_abort_the_run() {
-        let mut server = mockito::Server::new();
-        let _sparql = server
-            .mock("POST", "/sparql")
-            .with_status(200)
-            .with_body(names_binding(&["curl"]))
-            .create();
-        let _batch = server
-            .mock("POST", "/v1/querybatch")
-            .with_status(200)
-            .with_body(r#"{"results": [{"vulns": [{"id": "OSV-GONE"}]}]}"#)
-            .create();
-        let _detail = server
-            .mock("GET", "/v1/vulns/OSV-GONE")
-            .with_status(404)
-            .create();
-
-        let ((checked, triples), _) = run(&enricher_against(&server, "debian"));
-
-        assert_eq!(checked, 1);
-        assert_eq!(triples, 0);
-    }
-
-    /// A page token means OSV had more matches than it returned. Counted, so
-    /// the operator sees a number rather than silence.
-    #[test]
-    fn a_truncated_answer_is_counted_not_swallowed() {
-        let mut server = mockito::Server::new();
-        let _batch = server
-            .mock("POST", "/v1/querybatch")
-            .with_status(200)
-            .with_body(
-                r#"{"results": [
-                     {"vulns": [{"id": "OSV-1"}], "next_page_token": "more"},
-                     {"vulns": [{"id": "OSV-2"}]}
-                   ]}"#,
-            )
-            .create();
-
-        let enricher = enricher_against(&server, "debian");
-        let (ids, truncated) = enricher
-            .vulnerability_ids_for(&["curl".to_string(), "openssl".to_string()])
-            .unwrap();
-
-        assert_eq!(ids, vec!["OSV-1".to_string(), "OSV-2".to_string()]);
-        assert_eq!(truncated, 1, "one of the two answers was a partial page");
-    }
-
-    #[test]
-    fn test_unsupported_ecosystem() {
-        let enricher = SecurityEnricher::new(
-            "http://localhost:3030/test",
-            "unsupported",
-            None,
-            None,
-            SparqlBackend::Fuseki,
+    fn a_name_we_do_not_hold_produces_no_link() {
+        let v = vuln(
+            "DEBIAN-CVE-1",
+            &["CVE-1"],
+            &[("Debian:13", "not-collected")],
         );
-        let temp_file = NamedTempFile::new().unwrap();
-        let result = enricher.enrich(temp_file.path().to_str().unwrap());
-
-        assert!(result.is_err(), "Should reject unsupported ecosystem");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unsupported ecosystem"));
+        let corpus: HashMap<String, Vec<String>> = HashMap::new();
+        let matched: Vec<&str> = affected_names(&v, "Debian")
+            .filter(|n| corpus.contains_key(*n))
+            .collect();
+        assert!(matched.is_empty());
     }
 }
