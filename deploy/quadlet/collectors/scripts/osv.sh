@@ -2,7 +2,7 @@
 # Collector: osv
 # Ported from deploy/overlays/dev/jobs/collect-osv.yaml.
 #
-# All 12 ecosystems share one graph, so they must accumulate into ONE local
+# Every ecosystem shares one graph, so they must accumulate into ONE local
 # file before a SINGLE upload-nt.sh call at the end -- upload-nt.sh derives
 # the Minio object key from the graph URI, so calling it once per ecosystem
 # with the same GRAPH_URI would have each upload silently overwrite the
@@ -20,16 +20,32 @@ GRAPH_URI="https://packagegraph.github.io/graph/security/osv"
 COMBINED="$RUN_DIR/osv-combined.nt"
 : > "$COMBINED"
 
-# Debian and Alpine are the two ecosystems the corpus collects packages for
-# that OSV also publishes. They were fetched one advisory at a time by the
-# security ENRICHER, at 500ms pacing against the API -- ~73,000 advisories,
-# 13+ hours -- while the same data is 72 MB of ZIP on this job, which
-# already runs daily. See #59 and the security enricher's header.
+# Debian and Alpine were fetched one advisory at a time by the security
+# ENRICHER, at 500ms pacing against the API -- ~73,000 advisories, 13+
+# hours -- while the same data is 72 MB of ZIP on this job, which already
+# runs daily. See #59 and the security enricher's header.
 #
-# OSV has no Fedora ecosystem at all, so the RPM corpus is not covered here
-# and cannot be; AlmaLinux, Rocky Linux and Red Hat exist and are not yet
-# collected -- tracked separately.
-for spec in "npm:npm" "PyPI:pypi" "crates.io:cratesio" "Go:go" "Maven:maven" "NuGet:nuget" "Packagist:packagist" "RubyGems:rubygems" "Hex:hex" "Pub:pub" "Hackage:hackage" "SwiftURL:swifturl" "Debian:debian" "Alpine:alpine"; do
+# AlmaLinux, Rocky Linux and Red Hat are the RPM-side ecosystems OSV
+# actually publishes, and this corpus collects packages for all three
+# (almalinux/{9,10}, rocky/{9,10}, rhel/{9,10}). Measured against the live
+# archives, 2026-09-24:
+#
+#   AlmaLinux      6.06 MB   5,935 advisories   29,670 triples   2.4s
+#   Rocky Linux    4.73 MB   4,276 advisories   43,274 triples   1.1s
+#   Red Hat       25.53 MB  23,285 advisories  230,739 triples  14.8s
+#
+# Every name here must be one OSV publishes an archive for -- an unknown
+# name is a 404, not a warning. These three have NO release-qualified
+# prefixes in the bucket (unlike Debian:13 / Alpine:v3.20, which do): the
+# release lives inside each record's affected[].package.ecosystem
+# (`AlmaLinux:9`, `Rocky Linux:10`, `Red Hat:enterprise_linux:9::appstream`),
+# so the bare name is the whole archive. Spaces are fine -- the URL is
+# percent-encoded on the way out, verified against the live bucket.
+#
+# OSV has no Fedora ecosystem at all, so fedora/{43,44} is still not
+# covered here and cannot be -- see #97, and #101 for where its advisories
+# would have to come from instead.
+for spec in "npm:npm" "PyPI:pypi" "crates.io:cratesio" "Go:go" "Maven:maven" "NuGet:nuget" "Packagist:packagist" "RubyGems:rubygems" "Hex:hex" "Pub:pub" "Hackage:hackage" "SwiftURL:swifturl" "Debian:debian" "Alpine:alpine" "AlmaLinux:almalinux" "Rocky Linux:rockylinux" "Red Hat:redhat"; do
   eco="${spec%%:*}"
   slug="${spec#*:}"
   echo "=== OSV: $eco ==="

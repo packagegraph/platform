@@ -162,11 +162,24 @@ impl SecurityEnricher {
     }
 }
 
-/// The distros this corpus collects that OSV also publishes.
+/// The distros this corpus collects that OSV also publishes, and whose
+/// advisories this enricher links to our packages.
 ///
-/// OSV has no Fedora ecosystem at all, so the RPM corpus cannot appear here.
-/// AlmaLinux, Rocky Linux and Red Hat do exist in OSV and are not collected
-/// yet -- tracked separately.
+/// OSV has no Fedora ecosystem at all, so fedora/{43,44} cannot appear here
+/// at any point (#97); #101 has where its advisories would come from.
+///
+/// AlmaLinux, Rocky Linux and Red Hat are absent for a different reason: the
+/// OSV collector now pulls all three archives, so their advisory nodes are
+/// published, but wiring them into THIS join is separate, unvalidated work.
+/// `ecosystem_base` already handles their names, and the `affected[]` names
+/// are binary RPM names rather than source ones, so the shape fits -- what
+/// does not yet fit is the release. OSV qualifies these per product variant,
+/// not per release (`Red Hat:enterprise_linux:9::appstream`; 917 distinct
+/// strings across 23,285 records), and the corpus index for a prefix like
+/// `.../graph/rhel/` would span rhel/9 and rhel/10 at once, so a name shared
+/// by a release we hold and one we do not links anyway. That is tolerable
+/// for two Debian releases and is not for six RHEL generations. Tracked
+/// separately.
 fn targets() -> Vec<DistroTarget> {
     vec![
         DistroTarget {

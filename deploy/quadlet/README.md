@@ -958,8 +958,8 @@ Each was smoke-tested live against this host's QLever instance
   via a live QLever query (rather than reading Minio directly) needs this
   same one-rebuild-cycle gap, not just a same-day offset.
 
-**A real bug this caught in the collector side too:** `osv.sh` loops 12
-OSV ecosystems into one shared graph the same way `security.sh` now does
+**A real bug this caught in the collector side too:** `osv.sh` loops every
+OSV ecosystem it tracks into one shared graph (seventeen of them as of #97)
 -- but its original form called `upload-nt.sh` once *per ecosystem* with
 the *same* `GRAPH_URI`. Since `upload-nt.sh` derives the Minio object key
 from the graph URI, every ecosystem's upload silently overwrote the

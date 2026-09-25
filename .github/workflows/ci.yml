@@ -76,6 +76,13 @@ jobs:
         run: python3 deploy/quadlet/collectors/tests/test_collector_run_dirs.py -v
       - name: Concurrent collectors must not publish each other's bytes
         run: python3 deploy/quadlet/collectors/tests/test_collector_concurrency.py -v
+      # An ecosystem name OSV does not publish is invisible: the old security
+      # enricher asked for `deb`, `apk`, `rpm` and `fedora` for months and got
+      # HTTP 400 every time (#97). Checks the OSV job's list statically, both
+      # for the RPM-side ecosystems that do exist and against the four that
+      # never did. Directly invoked, for the reason given above.
+      - name: The OSV job must ask for ecosystems OSV publishes
+        run: python3 deploy/quadlet/collectors/tests/test_osv_ecosystems.py -v
       # Whether to reload qlever must follow promoted-vs-serving state, not a
       # best-effort status report that a promoting run can die before writing
       # (#73). Drives the real host script against fake podman/systemctl/curl,
