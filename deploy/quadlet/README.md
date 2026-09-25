@@ -72,6 +72,26 @@ restorecon -Rv /var/lib/packagegraph
 
 ## Install (system-wide; requires root)
 
+**To re-sync a host that already has this stack, use `host-sync.sh`** rather
+than replaying the blocks below:
+
+```bash
+./deploy/quadlet/host-sync.sh          # as root, on the host
+```
+
+It applies the collector/enricher templates, scripts, timers and the
+per-enricher timeout drop-ins, installs the failure notifier, removes the
+retired repology files, reloads systemd, and prints a verification block.
+It is idempotent and deliberately starts nothing -- a collector mid-run is
+left to finish, and enabling timers stays an explicit separate step. Files
+are renamed into place rather than written through, because these scripts
+are bind-mounted into running containers (see "Atomic script deploy" in the
+incident notes). `deploy/quadlet/tests/test_host_sync.py` covers it.
+
+The blocks below remain the reference for what a *first* install needs,
+including the one-time host bootstrap (disk, SELinux, firewall, certs) that
+`host-sync.sh` does not touch.
+
 ```bash
 install -d /etc/containers/systemd/scripts
 install -m 644 deploy/quadlet/*.container deploy/quadlet/*.volume /etc/containers/systemd/
@@ -926,10 +946,16 @@ Each was smoke-tested live against this host's QLever instance
 - `forge-version` -- worked, but only reaches 2 of 17 known forge
   instances without a `GITLAB_TOKEN` for self-hosted GitLab auth (14
   triples). Fine to run as-is; a token would substantially widen coverage.
-- `security` -- worked. Loops all 11 ecosystems `EnrichSecurity` supports
-  into one shared graph (`enrichment/security`) -- **same accumulate-into-
-  one-file-then-upload-once pattern `collectors/scripts/osv.sh` needed**,
-  see below.
+- `security` -- worked, in the form it had then: a loop over all 11
+  ecosystems `EnrichSecurity` supported, one OSV API request per package,
+  into one shared graph (`enrichment/security`). That shape is gone. The
+  loop needed ~63h at `api.osv.dev`'s 500ms pacing, four of its eleven
+  arms (`deb`, `apk`, `rpm`, `fedora`) were not OSV ecosystem names and
+  could only return HTTP 400 (#97), and five of the seven that did work
+  were already covered daily by `collectors/scripts/osv.sh`. #99 rewrote
+  it to read the Debian and Alpine archives that collector publishes and
+  join them against the corpus, emitting only `sec:affectsPackage` for
+  packages we actually hold -- no API, no cache, one graph, 103s measured.
 - `revdeps` and `blast-radius` -- **unblocked and scheduled as of
   2026-09-10.** Both previously failed fast on `met:reverseDependencyCount`/
   `sec:blastRadius` "not declared in the ontology", because *the ontology's
@@ -1019,7 +1045,7 @@ systemctl daemon-reload
 ```
 
 `enrichers/dropins/pg-enrich@<name>.service.d/timeout.conf` then gives each
-enricher its own `TimeoutStartSec`. One number shared by eleven enrichers
+enricher its own `TimeoutStartSec`. One number shared by ten enrichers
 is what let `koji` and `security` be SIGKILL'd mid-run while `taxonomy`,
 which finishes in about a minute, would have sat undetected for eight hours
 if it hung. Every drop-in states whether its number is MEASURED, ESTIMATED
@@ -1027,11 +1053,15 @@ or UNMEASURED, and `tests/test_unit_failure_notifier.py` fails if a new
 enricher arrives without one, or if a drop-in carries a number with no
 stated basis.
 
-Only `taxonomy` (1h, measured) and `security` (4h, estimated from the
-redesign) are currently below the shared 8h ceiling. The rest are honestly
-unmeasured and stay conservative: a timeout below the real runtime is
-exactly how `koji` and `security` were lost, so guessing downward is worse
-than leaving the ceiling in place until a run measures it.
+Only `taxonomy` (1h, MEASURED at 72s) and `security` (1h, ESTIMATED from
+measurement of its parts -- 108s to download and walk both OSV archives,
+with the corpus-index query unmeasured) are currently below the shared 8h
+ceiling. The other eight are honestly unmeasured and stay conservative: a
+timeout below the real runtime is exactly how `koji` and `security` were
+lost, so guessing downward is worse than leaving the ceiling in place
+until a run measures it. `security`'s earlier 4h was sized for the OSV API
+path that #99 removed, and was wrong even for that -- the real figure was
+~63h.
 
 ### Retired: repology
 

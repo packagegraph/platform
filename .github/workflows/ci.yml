@@ -110,6 +110,11 @@ jobs:
       # above.
       - name: A failed unit must report itself somewhere a human looks
         run: python3 deploy/quadlet/tests/test_unit_failure_notifier.py -v
+      # The units above only help once they are on the host, and a partial
+      # install is worse than none. Runs the real host-sync.sh against a
+      # throwaway tree via PG_SYNC_ROOT. Directly invoked, same reason.
+      - name: The host sync must apply the whole delta, and not write through
+        run: python3 deploy/quadlet/tests/test_host_sync.py -v
       - name: Verify exclusion with the image's pinned mc
         run: |
           set -euo pipefail
