@@ -7,7 +7,8 @@
 [Unit]
 Description=Schedule for pg-collect@osv.service
 
-# Cadence: OSV ingests vendor advisories continuously across all 12 tracked ecosystems.
+# Cadence: OSV ingests vendor advisories continuously across every tracked
+# ecosystem. The list lives in scripts/osv.sh, not here.
 [Timer]
 OnCalendar=*-*-* 09:00:00
 RandomizedDelaySec=120
