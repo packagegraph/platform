@@ -11,9 +11,14 @@ ships.
 
 ## What the corpus actually contains
 
-All `COUNT(*)` against the served index, 454,980,557 triples total.
-These are **corpus-wide totals across all graphs**, not attributed to a
-single collector — see "Attribution is unfinished" below.
+All `COUNT(*)` against the served index. The corpus serves
+**386,964,067 distinct triples**. (The 2026-09-25 rebuild reported
+454,980,557; that is the count it *ingested*, which double-counts
+triples appearing in more than one named graph. The served distinct
+count is the right denominator and is what is used below.)
+
+These are corpus-wide totals; per-graph attribution is in
+"Attribution" below.
 
 | predicate | count | declared in ontology? |
 |---|---|---|
@@ -357,25 +362,70 @@ resolver-selected providers, no-provider-found, and
 resolution-not-performed are four distinct outcomes needing an evidenced
 result structure. That is its own design.
 
-## Attribution is unfinished
+## Attribution
 
-The counts above are corpus-wide and are **not** yet attributed to the
-RPM collector.
+Measured per graph against the public endpoint, 2026-09-25
+(`~/.cache/capgap.sh`). Quad counts — each occurrence in each named
+graph, so these sum higher than the distinct totals above.
 
-`pkg:directlyProvides` (81,197,282) exceeds `rpm:rpmProvides`
-(80,894,928) by 302,354. `debian.rs:1000` writes `directlyProvides`
-alongside `deb:debProvides`, which accounts for the shape of the
-difference, but the arithmetic has not been confirmed against a
-`debProvides` count or a per-graph breakdown.
+**`directlyProvides` is exactly `rpmProvides` + `debProvides`, in every
+graph and in total.** 81,936,448 = 81,572,865 + 363,583. `debian.rs:1000`
+is the only other writer; no third source exists.
 
-**Release blocker: the 941,388 gap.** `rpm:rpmProvides` (80,894,928) and
-`pkg:providesCapability` (79,953,540) are written one-for-one in the
-same loop (`rpm.rs:1601` and `rpm.rs:1613`), so within a single run they
-cannot disagree. They do. Until a graph-by-graph comparison establishes
-which records have a capability replacement and which do not, the claim
-that removing `rpmProvides` and `directlyProvides` "loses no
-information" is **unsupported**, and that claim is what the subtractive
-change rests on. `~/.cache/capgap.sh` runs the per-graph comparison.
+**The `providesCapability` shortfall is four graphs, and only four.**
+
+| graph | rpmProvides | providesCapability | gap |
+|---|---|---|---|
+| `fedora/rawhide` | 538,544 | 0 | 538,544 |
+| `fedora/42` | 450,931 | 0 | 450,931 |
+| `fedora/42/aarch64` | 425,070 | 0 | 425,070 |
+| `fedora/44/aarch64` | 423,827 | 0 | 423,827 |
+| **every other graph (19)** | | | **0** |
+| total | | | **1,838,372** |
+
+In all nineteen graphs the current collector produces — `rhel/9`,
+`rhel/10`, `almalinux/*`, `rocky/*`, `centos-stream/*`,
+`opensuse/tumbleweed`, `fedora/43`, `fedora/44`, `fedora/44/riscv64`,
+`debian/*`, `ubuntu/*` — `rpmProvides` (or `debProvides`),
+`directlyProvides` and `providesCapability` agree **exactly, to the
+triple**.
+
+The four outliers are a pre-capability generation. `fedora/42` has
+450,931 `directlyProvides`, 648,661 `directlyDependsOn` and 440,264
+`PackageIdentity` nodes, and **zero** `pkg:Capability` instances and
+zero `providesCapability`. `fedora/43`, from the current collector, has
+373,333 capabilities and `providesCapability` equal to
+`directlyProvides` at 734,484. The capability layer was added in
+`74fcf0a`; these four predate it.
+
+**None of the four has a collector.** `deploy/quadlet/collectors/scripts/`
+contains `fedora-43-full.sh` and `fedora-44-full.sh` and nothing else
+for Fedora. `fedora/42`, `fedora/42/aarch64`, `fedora/44/aarch64` and
+`fedora/rawhide` are legacy graph files, sole copies, with nothing able
+to regenerate them — the population already tracked as stale duplicate
+graph files.
+
+So the subtractive change has two different consequences, and the
+contract must not average them:
+
+- **For the nineteen regenerable graphs, removal loses nothing.**
+  `providesCapability` is a verified one-for-one replacement, per graph.
+  This is what the earlier draft asserted without evidence; it now has
+  evidence, scoped to where it holds.
+- **For the four legacy graphs, removal has no replacement.** They have
+  no capability layer and cannot be rebuilt. Their 1,838,372 provides
+  and 81,197,282-corpus-wide share of the range problem would persist
+  after the emission fix, because the emission fix cannot reach a static
+  file.
+
+That makes it a retire-or-except decision, not a correctness blocker:
+either the four graphs are dropped from the served union, or the
+release gates below are scoped to regenerated graphs and the four are
+carried as a named, documented exception. **They must not be silently
+excluded from the gate query.** Note also that they contribute
+`directlyDependsOn` (648,661 from `fedora/42` alone), so they feed
+`revdeps` today and retiring them changes those counts independently of
+anything in this contract.
 
 ## Release gates
 
@@ -386,8 +436,10 @@ change rests on. `~/.cache/capgap.sh` runs the per-graph comparison.
 - A capability declaration does not mint a `pkg:PackageIdentity`.
 - Every `pkg:Capability` node satisfies `CapabilityShape`, label
   included. Currently none do.
-- The 941,388 gap is attributed, per graph, with a replacement
-  established for every removed record.
+- The retire-or-except decision on `fedora/42`, `fedora/42/aarch64`,
+  `fedora/44/aarch64` and `fedora/rawhide` is made and recorded. If
+  excepted, the gate query names them explicitly rather than filtering
+  them out by a predicate that happens to exclude them.
 - The consumer decision (withhold / replace / approximate) is
   implemented, and every dependent derived graph is regenerated or
   retired.
