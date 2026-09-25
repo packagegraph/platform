@@ -1010,9 +1010,27 @@ for d in deploy/quadlet/enrichers/dropins/*.service.d; do
 done
 
 systemctl daemon-reload
-systemctl enable --now pg-enrich-advisory.timer pg-enrich-koji.timer pg-enrich-npm-provenance.timer \
+systemctl enable --now pg-enrich-advisory.timer pg-enrich-npm-provenance.timer \
   pg-enrich-epss.timer pg-enrich-taxonomy.timer pg-enrich-security.timer \
   pg-enrich-forge-version.timer pg-enrich-nvd.timer pg-enrich-revdeps.timer pg-enrich-blast-radius.timer
+```
+
+**`pg-enrich-koji.timer` is deliberately not in that list.** It is
+installed but disabled, since 2026-09-25. Measured against the production
+endpoint, `--distro fedora` is 363,822 distinct NVRs, and `enrich_koji.rs`
+makes one `getBuild` XML-RPC call each at the 500ms pacing
+`http_transport.rs` applies to `koji.fedoraproject.org` -- 50.5 hours for
+one pass, against an 8h ceiling. No timeout value fixes that, so every
+weekly run was 8 hours of host time ending in a SIGKILL with nothing
+published.
+
+Unlike repology (retired, see below), koji has a verified fix waiting:
+Fedora's hub implements `system.multicall`, so 364 batched requests
+replace 363,822 individual ones. Its unit, script and drop-in therefore
+stay installed and only the timer is off. Re-enable it when #104 lands:
+
+```bash
+systemctl enable --now pg-enrich-koji.timer
 ```
 
 ### Failure visibility and per-enricher timeouts
