@@ -1030,23 +1030,22 @@ enum Commands {
         cache_dir: Option<String>,
     },
 
-    /// Enrich packages with OSV vulnerability data via per-package API queries
+    /// Link collected packages to the advisories that affect them
+    ///
+    /// Reads the OSV archives the bulk collector already publishes and joins
+    /// them against what this corpus holds. Takes no --ecosystem: the
+    /// distros it covers are the ones collected here, and OSV names them
+    /// with their release (Debian:13), which is a per-graph fact rather than
+    /// a per-run one. Takes no --cache-dir either: there is no per-item
+    /// fetch left to cache (#59).
     EnrichSecurity {
         /// Fuseki SPARQL endpoint URL
         #[arg(long, required = true)]
         endpoint: String,
 
-        /// Ecosystem to enrich
-        #[arg(long, required = true, value_parser = ["deb", "apk", "rpm", "npm", "pypi", "cargo", "gomod", "maven", "debian", "alpine", "fedora"])]
-        ecosystem: String,
-
         /// Output N-Triples file
         #[arg(short, long, required = true)]
         output: String,
-
-        /// Cache directory
-        #[arg(long)]
-        cache_dir: Option<String>,
     },
 
     /// Enrich CVE entities with NVD canonical metadata (publishedDate, CVSS, CWE)
@@ -3271,26 +3270,14 @@ fn main() {
             enricher.enrich(&output)
         }
 
-        Commands::EnrichSecurity {
-            endpoint,
-            ecosystem,
-            output,
-            cache_dir,
-        } => {
+        Commands::EnrichSecurity { endpoint, output } => {
             eprintln!("=== PackageGraph Security Enricher ===");
             eprintln!("Endpoint: {}", endpoint);
-            eprintln!("Ecosystem: {}", ecosystem);
             eprintln!("Output: {}", output);
             eprintln!();
 
-            let enricher = SecurityEnricher::new(
-                &endpoint,
-                &ecosystem,
-                cache_dir.as_deref(),
-                auth.clone(),
-                make_backend(),
-            )
-            .with_graph(graph_uri.clone());
+            let enricher = SecurityEnricher::new(&endpoint, auth.clone(), make_backend())
+                .with_graph(graph_uri.clone());
             enricher.enrich(&output)
         }
 
