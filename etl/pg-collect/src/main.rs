@@ -1570,16 +1570,37 @@ mod graph_publication_tests {
 /// that the graph publishes with completeness *unknown* -- which is what
 /// every graph published before this was, and is specifically not the same
 /// as publishing it marked complete.
-fn record_run_quality(output: &str, stages: Vec<pg_collect::stage_report::StageReport>) {
+/// Write the completeness sidecar, and fail the run if it cannot be written.
+///
+/// This used to warn and carry on. The uploader reads a missing sidecar as
+/// "unknown", which is honest for a complete run but silently discards the
+/// marking on a partial one -- and a partial run publishing as unknown is
+/// exactly what #70 exists to prevent. The sidecar is a few hundred bytes
+/// beside an output file that was just written successfully, so a failure
+/// here means something real (disk, permissions) rather than something to
+/// shrug at.
+///
+/// The wrapper scripts skip `upload-nt.sh` on a non-zero exit, so returning
+/// an error here holds the previous generation rather than replacing it with
+/// one whose completeness nobody can determine.
+fn record_run_quality(
+    output: &str,
+    stages: Vec<pg_collect::stage_report::StageReport>,
+) -> std::io::Result<()> {
     let quality = pg_collect::stage_report::RunQuality::new(stages);
     quality.report();
-    if let Err(e) = quality.write_sidecar(std::path::Path::new(output)) {
-        eprintln!(
-            "Warning: stage completeness not recorded ({}); this graph will \
-             publish with unknown completeness",
-            e
-        );
-    }
+    quality
+        .write_sidecar(std::path::Path::new(output))
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "stage completeness could not be recorded ({e}); refusing to \
+                     publish a graph whose completeness cannot be determined"
+                ),
+            )
+        })
+        .map(|_| ())
 }
 
 fn main() {
@@ -3226,12 +3247,12 @@ fn main() {
                 .with_graph_uri(graph_uri.clone());
                 // Standalone enrich-koji has no commit-after-publish
                 // lifecycle, so it never checkpoints.
-                enricher.enrich_from_nvrs(&nvrs, &output, limit, None).map(
-                    |(builds, triples, report)| {
-                        record_run_quality(&output, vec![report]);
-                        (builds, triples)
-                    },
-                )
+                enricher
+                    .enrich_from_nvrs(&nvrs, &output, limit, None)
+                    .and_then(|(builds, triples, report)| {
+                        record_run_quality(&output, vec![report])?;
+                        Ok((builds, triples))
+                    })
             } else {
                 if endpoint.is_empty() {
                     panic!("Either --endpoint or --srpm-list is required for enrich-koji");
@@ -3936,6 +3957,14 @@ fn main() {
                 // Recorded anyway, so that is visible rather than implied.
                 let mut rpm_stage = pg_collect::stage_report::StageReport::new("rpm", true);
                 rpm_stage.attempted = urls.len() as u64;
+                // This stage counts architecture URLs, but --limit truncates
+                // *packages* inside each one. So every arch can complete while
+                // the run covered a handful of packages per arch, and the
+                // counts alone would read as a complete collection (#70).
+                // The untruncated package population is not knowable without
+                // collecting it, so record that it was cut short rather than
+                // inventing a denominator.
+                rpm_stage.truncated = limit.is_some();
                 // Source packages whose upstream ecosystem a Provides:
                 // capability already named outright. Accumulated across every
                 // arch, because a capability seen on one arch settles the SRPM.
@@ -4068,7 +4097,7 @@ fn main() {
                 }
 
                 writer.flush()?;
-                record_run_quality(&output, stages);
+                record_run_quality(&output, stages)?;
                 Ok((total_packages, total_triples))
             })()
         }
