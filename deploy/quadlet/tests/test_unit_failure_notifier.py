@@ -14,10 +14,9 @@ Two properties here, and the second is the one that decays quietly:
      it ended, and the tail of its journal -- without depending on anything
      leaving the host.
   2. The wiring holds. Every template names the notifier; the notifier does
-     not name itself; every enricher has a timeout drop-in and every drop-in
-     has an enricher; and repology, which is EXPECTED to be killed by its
-     timeout every week, is exempted from the notifier so it cannot train
-     the reader to ignore it.
+     not name itself; script, timer and drop-in exist together for every
+     enricher, so a retired one leaves nothing behind that still reads as
+     live; and nothing suppresses its own failure reporting.
 
 The real script runs. `systemctl`, `journalctl` and `logger` are faked into
 a temp bin dir, and the state directory comes from PG_FAILED_UNITS_DIR.
@@ -44,6 +43,7 @@ COLLECT_TEMPLATES = [
 ]
 ENRICH_SCRIPTS = os.path.join(QUADLET, "enrichers", "scripts")
 DROPINS = os.path.join(QUADLET, "enrichers", "dropins")
+TIMERS = os.path.join(QUADLET, "enrichers", "timers")
 
 FAKE_SYSTEMCTL = """#!/bin/sh
 # `systemctl show <unit> --property=X --value` and the multi-property form.
@@ -209,25 +209,30 @@ class TheWiringHolds(unittest.TestCase):
                 # invented.
                 self.assertRegex(body, r"(?m)^# Basis: (MEASURED|ESTIMATED|UNMEASURED)")
 
-    def test_repology_is_exempt_because_its_timeout_kill_is_expected(self):
-        # A complete Repology pass needs ~90h; every weekly run is killed by
-        # design and is valuable only for the cache progress it leaves. A
-        # failure report that fires every week on healthy behaviour trains
-        # the reader to ignore failure reports.
-        body = open(
-            os.path.join(DROPINS, "pg-enrich@repology.service.d", "timeout.conf")
-        ).read()
-        self.assertRegex(body, r"(?m)^OnFailure=\s*$")
-
-    def test_no_other_enricher_silences_the_notifier(self):
+    def test_no_enricher_silences_the_notifier(self):
+        # repology used to be exempt, because a ~90h pass meant a weekly
+        # timeout kill was expected and a weekly failure report would have
+        # trained the reader to ignore reports. It is retired rather than
+        # exempted now, so nothing left here should be suppressing its own
+        # failures -- an enricher worth running is one worth hearing about.
         for name in enricher_names():
-            if name == "repology":
-                continue
-            body = open(
+            body = read(
                 os.path.join(DROPINS, f"pg-enrich@{name}.service.d", "timeout.conf")
-            ).read()
+            )
             with self.subTest(enricher=name):
                 self.assertNotRegex(body, r"(?m)^OnFailure=")
+
+    def test_every_enricher_script_still_has_a_timer(self):
+        # A script with no timer is dead weight that reads as live: still
+        # installed, still mounted by the template, still looking like
+        # something that runs. Retiring an enricher means removing the
+        # script, the timer and the drop-in together.
+        timers = sorted(
+            f[len("pg-enrich-"):-len(".timer")]
+            for f in os.listdir(TIMERS)
+            if f.startswith("pg-enrich-") and f.endswith(".timer")
+        )
+        self.assertEqual(timers, enricher_names())
 
     def test_a_drop_in_timeout_is_not_longer_than_the_template_default(self):
         # The template's number is the conservative ceiling. A drop-in above
