@@ -128,6 +128,30 @@ Also out of scope: `<rpm:entry pre="1"/>` (pre-install ordering) and
 `filelists.xml` / `other.xml`, neither of which the dependency path
 touches.
 
+**RPM-internal tokens are declared, not discarded.** The collector
+currently drops `config(...)`, `rpmlib(...)` and `rtld(...)` entries
+outright (`rpm.rs:1467`, `rpm.rs:1574`), on both the provides and
+requires paths. Those filters predate the declaration model, and
+inheriting them would contradict the per-`rpm:entry` preservation
+contract this request is built on — a declaration would silently not
+exist for an entry that does.
+
+So: **a `rpm:DependencyDeclaration` is emitted for every `rpm:entry` in
+the four supported sections, with no exceptions.** Suppressing the
+*convenience* edges for RPM-internal tokens — the `pkg:Capability` node
+and the `providesCapability`/`requiresCapability` shortcut — is a
+separate and explicit decision, made because those tokens describe
+RPM's own machinery rather than inter-package functionality.
+
+This requires one carve-out in the shape. Constraint 2 (§3.5) demands a
+`declaredCapability` for any non-rich token, which an internal token
+would not have. The constraint is therefore conditioned on the token not
+matching the internal prefixes, and the exclusion is itself testable
+(§3.7) rather than invisible.
+
+The volume is not measurable from the served corpus, because these
+entries are filtered at ingestion and have never been published.
+
 ### 3.2 The fields actually received
 
 There is **no original RPM spec string**. `primary.xml` gives one XML
@@ -215,8 +239,8 @@ as one that appeared with an empty value, and a key that joins them
 would silently merge two different declarations. The platform will use a
 canonical encoding in which absence is a distinct sentinel rather than
 the empty string; the ontology does not need to mandate the encoding,
-only that identity covers all six components and that absence is
-distinguished.
+only that identity covers all seven components — declaring package,
+kind, and the five attributes — and that absence is distinguished.
 
 This is stated here because it is a contract the fixtures must test —
 see the repeated-name fixture in §3.7 — not because it constrains the
@@ -253,8 +277,9 @@ constraint and its own negative fixture:
 treated a missing `rpm:declaredCapability` as evidence that the token
 was an unparsed expression. It is not — the shape accepted a plain `foo`
 declaration with no capability link at all, so absence proved nothing.
-In this bounded profile the link is **mandatory when the token is not a
-rich expression**, which is what makes its absence meaningful.
+In this bounded profile the link is **mandatory when the token is
+neither a rich expression nor an RPM-internal token** (§3.1), which is
+what makes its absence meaningful.
 
 ```turtle
 rpm:DependencyDeclarationShape a sh:NodeShape ;
@@ -290,12 +315,15 @@ rpm:DependencyDeclarationShape a sh:NodeShape ;
                     FILTER(STRSTARTS(?t, "("))
                   }""" ] ,
 
-    # 2. A plain token must have one.
-              [ sh:message "A declaration whose token is not a rich expression must have exactly one declaredCapability."@en ;
+    # 2. A plain, non-internal token must have one.
+              [ sh:message "A declaration whose token is neither a rich expression nor an RPM-internal token must have exactly one declaredCapability."@en ;
                 sh:select """
                   SELECT $this WHERE {
                     $this <https://purl.org/packagegraph/ontology/rpm#declaredToken> ?t .
                     FILTER(!STRSTARTS(?t, "("))
+                    FILTER(!STRSTARTS(?t, "config("))
+                    FILTER(!STRSTARTS(?t, "rpmlib("))
+                    FILTER(!STRSTARTS(?t, "rtld("))
                     FILTER NOT EXISTS { $this <https://purl.org/packagegraph/ontology/rpm#declaredCapability> ?c }
                   }""" ] ,
 
@@ -385,6 +413,10 @@ Capability shortcuts are emitted **only** when
   emitted alongside
 - a rich-expression `Requires` — `declaredToken` beginning `(`, **no**
   `declaredCapability`
+- an RPM-internal `Requires` — `rpmlib(CompressedFileNames)` — present
+  as a declaration, with **no** `declaredCapability` and no capability
+  node; the entry is recorded even though its convenience edge is
+  suppressed
 - **repeated name, different constraints**: one package with
   `Requires: foo >= 1` and `Requires: foo < 2`. Both declarations must
   be present and distinct, and each must carry its own single
@@ -395,7 +427,11 @@ Capability shortcuts are emitted **only** when
 
 - a rich expression that also carries `rpm:declaredCapability`
   (constraint 1)
-- a plain token with **no** `rpm:declaredCapability` (constraint 2)
+- a plain, non-internal token with **no** `rpm:declaredCapability`
+  (constraint 2)
+- an `rpm:entry` in a supported section with **no** declaration emitted
+  at all — a coverage test, not a shape test, asserting the per-entry
+  contract holds for internal tokens too
 - `declarationFlags` with no `declarationVersion` (constraint 3)
 - `declarationVersion` with no `declarationFlags` (constraint 4)
 - `declarationEpoch` with no `declarationVersion` (constraint 5)
@@ -565,22 +601,54 @@ wait on the decision.
 Not a purge. **Collect replacements → validate → switch, retaining
 rollback data.**
 
-Four Fedora graphs — `fedora/42`, `fedora/42/aarch64`,
-`fedora/44/aarch64`, `fedora/rawhide` — predate the capability emission
-and carry no `pkg:Capability` nodes at all, so their provenance and
-shape cannot be attested. They are replaced, in this order:
+**The replacement population is every RPM graph generation, not a
+historical subset.** An earlier version of this section named four
+Fedora graphs and described the other nineteen as agreeing between the
+existing provision representations. That agreement is between
+`rpmProvides`, `directlyProvides` and `providesCapability` **under the
+current model**, and establishes nothing about compliance with the
+contract in this request. Every RPM generation still needs
+naming-system-qualified capability identifiers, declaration nodes, and
+removal of the manufactured package dependencies — so every one is
+replaced.
 
-1. Collect replacement generations from source, under the new contract.
-2. Validate each replacement against the shapes and against the legacy
-   generation, attributing every difference rather than accepting the
-   delta wholesale.
+Sixteen graph generations carry RPM-path output. They fall into three
+categories, which differ in what has to happen first, not in whether
+they are replaced:
+
+| category | graphs | state | prerequisite |
+|---|---|---|---|
+| **A** — collector exists, current vintage | `rhel/9`, `rhel/10`, `almalinux/9`, `almalinux/10`, `rocky/9`, `rocky/10`, `centos-stream/9`, `centos-stream/10`, `fedora/43`, `fedora/44` | 10 generations, capability layer present | none — recollect under the new contract |
+| **B** — no collector, current vintage | `opensuse/tumbleweed`, `fedora/44/riscv64` | 2 generations, capability layer present | a collector must be written, or the generation retired |
+| **C** — no collector, pre-capability | `fedora/rawhide`, `fedora/42`, `fedora/42/aarch64`, `fedora/44/aarch64` | 4 generations, **zero `pkg:Capability` nodes** | a collector must be written, or the generation retired |
+
+Category C is the special historical subset: it predates the capability
+emission entirely and accounts for the whole 1,838,372-quad discrepancy
+between `rpmProvides` and `providesCapability`. It is not the
+replacement population; it is the part of it whose current contents
+cannot be attested at all.
+
+Categories B and C together are six generations with no collector in
+`deploy/quadlet/collectors/scripts/`. Each needs an explicit
+write-a-collector-or-retire decision **before** the switch, not after —
+otherwise the switch silently drops them.
+
+Procedure, per generation:
+
+1. Collect a replacement from source, under the new contract.
+2. Validate the replacement against the shapes **and against the
+   generation it replaces**, attributing every difference rather than
+   accepting the delta wholesale.
 3. Switch the served union to the replacement set.
-4. Retain the legacy generations and the prior index for rollback; they
-   are removed only after the replacement set has been verified in
-   service.
+4. Retain the superseded generation and the prior index for rollback;
+   remove only after the replacement is verified in service.
 
 At no point is the only copy of a graph deleted before its replacement
 is validated.
+
+Debian and Ubuntu generations are **not** in this population. The Debian
+collector is unchanged by this delivery and its defects are tracked
+separately (§8).
 
 ### Consumer handling
 
@@ -624,6 +692,13 @@ it can be tracked, and this document is not that issue.
   `<rpm:supplements>`, `<rpm:enhances>`; additive when needed.
 - **Capability scoping for non-RPM ecosystems**, including the Debian
   collector's current use of the unqualified capability path.
+- **Debian's own emission defects**, unchanged by this delivery and not
+  covered by its acceptance: `debian.rs:1000` emits `directlyProvides`
+  to identities that carry `identityName` rather than `packageName`, and
+  `debian.rs:1004` mints capability nodes with `capabilityName` and no
+  `rdfs:label`, so they fail `pkg:CapabilityShape` exactly as the RPM
+  ones do. These are **not** fixed by adding `packageName` to satisfy a
+  check; they need the same declaration treatment RPM is getting here.
 - **`rpm:RPMGroup` used as a predicate** — the remaining RPM entry in
   the platform's `KNOWN_BAD` ratchet.
 
@@ -638,8 +713,11 @@ fixture in §3.7 fails; and `rpm:DependencyDeclaration` is not entailed
 to be a `pkg:Dependency`.
 
 Decision 2 is delivered when `URI-POLICY.md` carries the capability row
-with its encoding, and `pkg:Capability`'s definition states the scope
-and the non-compatibility caveat.
+with its encoding, and a **scoped annotation** — an `rdfs:comment` or
+`skos:scopeNote` on `pkg:Capability` naming the RPM ingestion
+convention — records the scope and the non-compatibility caveat.
+`pkg:Capability`'s `IAO:0000115` is **unchanged**; delivering this by
+amending the global definition would not satisfy the acceptance.
 
 Decision 3 is delivered when DD-VirtualPackage's example uses
 `pkg:providesCapability`.

@@ -125,14 +125,31 @@ Consequence: the 3,815,106 identities that nothing `isVersionOf` are an
 collected version may be a real package in a repository we have not
 collected.
 
-### Filtered internals
+### RPM-internal tokens: declared, shortcuts suppressed
 
-`config(...)`, `rpmlib(...)` and `rtld(...)` are dropped on both the
-provides and requires paths (`rpm.rs:1467`, `rpm.rs:1574`). This is
-deliberate — they describe RPM's own machinery — and is adopted
-explicitly: **no capability node and no declaration node**. The filter
-list becomes a named constant with a test, rather than three inline
-`starts_with` calls duplicated across two loops.
+`config(...)`, `rpmlib(...)` and `rtld(...)` are currently dropped
+outright on both paths (`rpm.rs:1467`, `rpm.rs:1574`). An earlier
+version of this document inherited that wholesale — no capability node
+**and no declaration node**.
+
+That contradicts the per-`rpm:entry` preservation contract. The filters
+predate the declaration model, and keeping them would mean an entry
+exists in the metadata with no declaration recorded anywhere, which is
+the failure mode this whole design exists to remove.
+
+Corrected: **a declaration is emitted for every `rpm:entry` in the four
+supported sections, with no exceptions.** What is suppressed for
+internal tokens is only the *convenience* layer — the `pkg:Capability`
+node and the `providesCapability`/`requiresCapability` shortcut —
+because those tokens describe RPM's own machinery rather than
+inter-package functionality. That suppression is a separate, explicit
+decision, carved out of shape constraint 2 (ontology#19 §3.5) and
+tested rather than assumed.
+
+The filter list becomes a named constant with a test, rather than three
+inline `starts_with` calls duplicated across two loops. Its volume is
+not measurable from the served corpus: these entries have been filtered
+at ingestion and never published.
 
 ### Declaration identity
 
@@ -195,23 +212,46 @@ resolution is modelled, the projection is withheld.
 Not a purge. **Collect replacements → validate → switch, retaining
 rollback data.**
 
-Four graphs — `fedora/42`, `fedora/42/aarch64`, `fedora/44/aarch64`,
-`fedora/rawhide` — predate the capability emission and carry zero
-`pkg:Capability` nodes, so their provenance and shape cannot be
-attested. They account for the entire 1,838,372-quad discrepancy between
-`rpmProvides` and `providesCapability`; the other nineteen graphs agree
-exactly, to the triple.
+**Every RPM graph generation is replaced.** An earlier version of this
+document named four Fedora graphs and treated the other nineteen as
+already agreeing. That agreement is between `rpmProvides`,
+`directlyProvides` and `providesCapability` **under the current model**;
+it says nothing about compliance with the new contract. All sixteen
+RPM-path generations still need qualified capability identifiers,
+declaration nodes, and removal of the manufactured package
+dependencies.
 
-1. Collect replacement generations from source, under the new contract.
-2. Validate each replacement against the shapes **and against the legacy
-   generation**, attributing every difference rather than accepting the
+| category | graphs | prerequisite |
+|---|---|---|
+| **A** — collector exists | `rhel/9`, `rhel/10`, `almalinux/9`, `almalinux/10`, `rocky/9`, `rocky/10`, `centos-stream/9`, `centos-stream/10`, `fedora/43`, `fedora/44` | none — recollect |
+| **B** — no collector, capability layer present | `opensuse/tumbleweed`, `fedora/44/riscv64` | write a collector, or retire |
+| **C** — no collector, pre-capability | `fedora/rawhide`, `fedora/42`, `fedora/42/aarch64`, `fedora/44/aarch64` | write a collector, or retire |
+
+Category C is a special historical subset, not the replacement
+population: it has **zero** `pkg:Capability` nodes and accounts for the
+entire 1,838,372-quad `rpmProvides`/`providesCapability` discrepancy.
+Its contents cannot be attested at all.
+
+Categories B and C are six generations with no script in
+`deploy/quadlet/collectors/scripts/`. Each needs an explicit
+write-a-collector-or-retire decision **before** the switch; otherwise
+the switch silently drops them.
+
+Per generation:
+
+1. Collect a replacement from source, under the new contract.
+2. Validate against the shapes **and against the generation it
+   replaces**, attributing every difference rather than accepting the
    delta wholesale.
 3. Switch the served union to the replacement set.
-4. Retain legacy generations and the prior index for rollback; remove
-   only after the replacement set is verified in service.
+4. Retain the superseded generation and the prior index for rollback;
+   remove only after the replacement is verified in service.
 
 At no point is the only copy of a graph deleted before its replacement
 is validated.
+
+Debian and Ubuntu generations are not in this population; the Debian
+collector is unchanged by this delivery.
 
 ## Sequencing
 
@@ -233,23 +273,58 @@ consumer withholding; identification of stale derived results.
 
 ## Release gates
 
-- No `pkg:directlyProvides` assertion whose target lacks
-  `pkg:packageName`. Today 1,545,695 of 3,611,932 distinct targets.
-- Four `rpm:rpm*` entries gone from `vocab.rs` `KNOWN_BAD` because the
-  emission is gone, not because the ontology declared them.
+**Scope: the migrated RPM generations, not the corpus.** An earlier
+version of this document wrote "every `pkg:Capability` node satisfies
+`CapabilityShape`" and "no `pkg:directlyProvides` target lacks
+`packageName`" as corpus-wide conditions. They cannot be met by an
+RPM-only change. `debian.rs:1004` mints capability nodes with no
+`rdfs:label`, and `debian.rs:1000` emits `directlyProvides` to
+identities carrying `identityName` rather than `packageName`. The
+Debian collector is untouched by this delivery, so a corpus-wide gate
+would either block indefinitely or invite the wrong fix.
+
+**Explicitly: do not add `packageName` to identity nodes to make a
+check pass.** That would manufacture the very `Package` membership this
+work exists to stop asserting. Debian's defects are tracked separately
+and need the same declaration treatment RPM is getting here.
+
+Evaluated over each migrated RPM generation:
+
+- No `pkg:directlyProvides` assertion. The RPM path stops emitting it
+  entirely; the gate is absence, not a reduced count.
 - No `pkg:PackageIdentity` minted from a declaration.
-- Every `pkg:Capability` node satisfies `pkg:CapabilityShape`, label
-  included. Today none do.
 - No rich expression appears as a `pkg:PackageIdentity`. Today 23,587
-  do.
+  do, corpus-wide.
+- Every `pkg:Capability` node **minted by the RPM path** satisfies
+  `pkg:CapabilityShape`, `rdfs:label` included.
+- Every `rpm:entry` in the four supported sections has a declaration,
+  RPM-internal tokens included.
 - `Requires: foo >= 1` and `Requires: foo < 2` on one package survive as
   two declarations.
 - Conflicts and Obsoletes emit no capability shortcut.
+- Capability identifiers are `d/capability/rpm/{encoded-token}`.
+
+Evaluated over the build, not the data:
+
+- Four `rpm:rpm*` entries gone from `vocab.rs` `KNOWN_BAD` because the
+  emission is gone, not because the ontology declared them.
+
+Evaluated over the transition:
+
+- Every one of the sixteen RPM generations has either a validated
+  replacement or a recorded retire decision. None is dropped silently.
+- Each replacement validated against the generation it replaces, with
+  differences attributed, before the switch.
+- Rollback data retained until the replacement is verified in service.
+
+Consumer gate:
+
 - RPM reverse-dependency metrics are absent or distinctly named — never
   silently reduced.
-- Replacement generations validated against their legacy counterparts,
-  with differences attributed, before the switch. Rollback data
-  retained.
+
+Corpus-wide conditions — including Debian's unlabelled capabilities and
+its `directlyProvides` edges — are **not** gates for this release and
+are tracked as deferred items.
 
 ## Deferred
 
@@ -265,6 +340,11 @@ Recorded, not filed. None has an issue yet.
 - Weak dependency sections.
 - Capability scoping for non-RPM ecosystems, including Debian's current
   use of the unqualified capability path.
+- Debian's own emission defects, out of scope for this release's
+  acceptance: `debian.rs:1004` mints capability nodes with no
+  `rdfs:label`, and `debian.rs:1000` emits `directlyProvides` to
+  identities without `packageName`. Same shape of problem, same
+  treatment needed; not fixable by adding `packageName`.
 - `rpm:RPMGroup` used as a predicate.
 - `pkg:provides` emitted with a **literal** object by `alpine.rs:351`
   and `arch.rs:343` — 107,822 assertions putting a literal on an
