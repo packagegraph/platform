@@ -4,6 +4,7 @@ From: packagegraph/platform
 Date: 2026-09-25
 Against: ontology `v0.15.0` (`60017af`), the revision
 `etl/ONTOLOGY_VERSION` pins
+Filed as: packagegraph/ontology#19
 Related: platform#62 (open), platform#109 (draft design document)
 
 ---

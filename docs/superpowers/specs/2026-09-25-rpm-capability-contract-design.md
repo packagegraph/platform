@@ -1,475 +1,274 @@
-# RPM capability and dependency contract
+# RPM capability and dependency emission: platform design
 
-Status: proposed, 2026-09-25. Covers #62 and the emission half of the
-RPM modelling work. Written against ontology `v0.15.0`
-(`60017af`, the revision `etl/ONTOLOGY_VERSION` pins) and measured
-against the production endpoint after the 2026-09-25 rebuild.
+Status: proposed, 2026-09-25 (revised 2026-09-26). Covers the
+platform-side half of #62.
 
-This is the contract document. It settles what RPM metadata maps to,
-what terms carry it, and what has to hold before the emission change
-ships.
+**The ontology contract lives in
+[`docs/ontology-request-rpm-capability-contract.md`](../../ontology-request-rpm-capability-contract.md),
+filed as packagegraph/ontology#19.** This document does not restate it.
+Where the two overlap, the request document is authoritative — term
+names, shapes and fixtures are settled there, and duplicating them here
+would guarantee drift.
 
-## What the corpus actually contains
+This document covers what the platform does: what to stop emitting,
+what to start emitting, how consumers are handled, and how the
+transition runs.
 
-All `COUNT(*)` against the served index. The corpus serves
-**386,964,067 distinct triples**. (The 2026-09-25 rebuild reported
-454,980,557; that is the count it *ingested*, which double-counts
-triples appearing in more than one named graph. The served distinct
-count is the right denominator and is what is used below.)
+## The problem, in one measurement
 
-These are corpus-wide totals; per-graph attribution is in
-"Attribution" below.
+RPM rich (boolean) dependencies are live in the corpus and the current
+model turns each one into a package.
 
-| predicate | count | declared in ontology? |
+| | |
+|---|---|
+| distinct rich-expression texts | 14,037 |
+| distinct `pkg:PackageIdentity` nodes minted from them | 23,587 |
+| `pkg:directlyDependsOn` assertions targeting those nodes | 58,865 |
+
+Their `identityName` values are, verbatim, `(ansible-core or ansible)`,
+`(adcli-selinux if selinux-policy-targeted)`,
+`((adobe-afdko >= 4.0.1) with (adobe-afdko < 5~~))`. A disjunction and a
+conditional, each asserted as a package that something depends on.
+
+Flattening is not available as a fix: splitting `(a or b)` into two
+`directlyDependsOn` edges asserts both are required, which is a stronger
+and different claim than the metadata makes.
+
+## What is wrong today, stated accurately
+
+Three claims about this that appear in #62 and in earlier drafts of this
+document are **withdrawn**, and are recorded here so they are not
+recycled:
+
+- *"100% range violation"* — `rdfs:range` assertions **infer** class
+  membership; they do not fail. The accurate statement is that
+  `pkg:directlyProvides` infers `pkg:Package` membership the producer
+  did not intend.
+- *"Unsatisfiable Packages, 81,197,282 of them"* — wrong on both counts.
+  Under the open-world assumption a missing `packageName` may exist
+  unstated, so `owl:cardinality 1` is not breached. And 81,197,282 edges
+  resolve to **3,611,932 distinct targets**, of which **1,545,695**
+  carry no `packageName`. Completeness of the inferred members is a
+  separate SHACL question.
+- *"A `Capability` cannot be a `pkg:PackageEntity`"* — does not follow
+  from `Package`/`Capability` disjointness, which says nothing about
+  their shared superclass. Keeping declarations out of the generic
+  dependency hierarchy is a **design choice** resting on
+  `pkg:DependencyShape` and on a resource bound for this release, not a
+  logical prohibition.
+
+What does hold, and is measured:
+
+| fact | figure |
+|---|---|
+| `pkg:requiresCapability` assertions | **0** — never exercised |
+| `pkg:Capability` nodes with `rdfs:label` | **0 of 1,013,026** — all fail `pkg:CapabilityShape` |
+| `rpm:provides`/`requires`/`conflicts`/`obsoletes` | 0 each; the collector uses four undeclared spellings instead |
+| `pkg:directlyProvides` | = `rpm:rpmProvides` + `deb:debProvides`, exactly, per graph |
+
+## Emission changes
+
+### Stop
+
+| today | why |
+|---|---|
+| `pkg:directlyProvides` → `PackageIdentity` for a provided name | infers unintended `pkg:Package` membership |
+| `rpm:rpmProvides` / `rpmRequires` / `rpmConflicts` / `rpmObsoletes` | four undeclared spellings; retires four `vocab.rs` `KNOWN_BAD` entries (`rpm:RPMGroup`, the fifth RPM entry, is a separate defect and out of scope) |
+| minting a `PackageIdentity` from any dependency or provides string | identities come from collected package records only |
+
+### Start
+
+- `rpm:DependencyDeclaration` per `rpm:entry`, per
+  packagegraph/ontology#19 §3.
+- `rdfs:label` on every `pkg:Capability` node — today none have one.
+- Self-provides. `rpm.rs:1582` currently drops a provide whose name
+  equals the package name, *before* the capability node is minted. Every
+  RPM implicitly provides its own name, and that is how `Requires: bash`
+  finds a provider, so the capability graph has no provider for ordinary
+  package-name requirements today. This is the majority case.
+- Versioned provides carry their version on the declaration.
+
+### By kind
+
+| kind | capability shortcut | declaration node |
 |---|---|---|
-| `rpm:rpmProvides` | 80,894,928 | **no** |
-| `rpm:provides` | 0 | yes, `⊑ pkg:provides` |
-| `rpm:rpmRequires` | 5,403,816 | **no** |
-| `rpm:requires` | 0 | yes, `⊑ pkg:dependsOn` |
-| `rpm:rpmConflicts` | 30,716 | **no** |
-| `rpm:conflicts` | 0 | yes, `⊑ pkg:conflicts` |
-| `rpm:rpmObsoletes` | 92,803 | **no** |
-| `rpm:obsoletes` | 0 | yes, `⊑ pkg:replaces` |
-| `pkg:directlyProvides` | 81,197,282 | yes |
-| … whose target is typed `PackageIdentity` | **81,197,282 (100%)** | |
-| `pkg:providesCapability` | 79,953,540 | yes |
-| `pkg:requiresCapability` | **0** | yes |
-| `pkg:Capability` instances | 1,013,026 | yes |
+| `rpm:Provides` | `pkg:providesCapability` | yes |
+| `rpm:Requires` | `pkg:requiresCapability` | yes |
+| `rpm:Conflicts` | **none** | yes |
+| `rpm:Obsoletes` | **none** | yes |
 
-**The collector has never used the declared spellings.** It writes
-`rpmProvides`/`rpmRequires`/`rpmConflicts`/`rpmObsoletes`; the ontology
-declares `provides`/`requires`/`conflicts`/`obsoletes`. All four
-declared properties sit at zero.
+**Conflicts and Obsoletes emit no capability shortcut.** An earlier
+draft of this document said every simple declaration also emits
+`pkg:requiresCapability`, which would have turned "conflicts with X"
+into "requires X". Their meaning is carried by `rpm:declarationKind`
+alone.
 
-These four are **not invisible to validation**. The vocabulary gate in
-`etl/pg-collect/src/vocab.rs` detects exactly this class of defect —
-undeclared terms, and declared terms used in the wrong role — at `cargo
-test` time. All four are listed in its `KNOWN_BAD` table
-(`vocab.rs:169-173`), one of 60 entries. That table is a ratchet: it
-lets the gate pass on what was already wrong while refusing anything
-new, and its own doc comment calls it the work queue. So this is
-**recorded, exempted technical debt, not an undetected hole**. The
-contract's job is to retire five of those entries, not to discover them.
+Capability shortcuts are emitted **only** when a declaration has a
+`rpm:declaredCapability` — never for a rich expression.
 
-## The reasoning that actually justifies the repair
-
-Three arguments that look available here are not, and the contract does
-not rest on them.
-
-**`?o a pkg:PackageIdentity` does not establish that `?o` is not a
-`Package`.** The measurement establishes identity *typing*. Nothing in
-the ontology forbids a node from being both, and `rdfs:range :Package`
-on `directlyProvides` means an RDFS reasoner would *infer* `:Package`
-membership for every one of those 81,197,282 targets rather than flag
-them.
-
-**`PackageEntity` is not a closed union.** `core.ttl:1659` declares it
-as a plain `owl:Class`, and `Package` (`:1666`) and `PackageIdentity`
-(`:1471`) declare themselves `rdfs:subClassOf` it. There is no
-`owl:unionOf`, `owl:equivalentClass`, or disjointness closure. Two
-declared subclasses do not prohibit a third member.
-
-**`Package`/`Capability` disjointness is real, and is a separate
-argument.** `core.ttl` asserts `owl:AllDisjointClasses ( :Package
-:Distribution :Repository :License :Architecture :Capability )`. That
-one holds and is load-bearing below.
-
-So the case against the current emission is the entailment it causes,
-not a violation it commits:
-
-1. `directlyProvides` has `rdfs:range :Package`, so asserting it
-   *entails* that every provided name is a `:Package`.
-2. `:Package` carries `rdfs:subClassOf [ owl:cardinality 1 ; owl:onProperty
-   :packageName ]` (`core.ttl:1671`).
-3. `write_package_identity` (`emit/rdf.rs:57`) emits `identityName` and
-   `rdfs:label`, never `packageName`.
-
-The emission therefore manufactures 81,197,282 entailed `:Package`
-instances that cannot satisfy `:Package`'s own cardinality restriction.
-A capability token is asserted to be a package by the act of being
-provided. That is the defect, stated as what the ontology actually says.
-
-The SHACL side is a second, independent argument and is where the
-`rpm:Dependency` decision below comes from.
-
-## Constraints that decide the design
-
-Read from `core/core.ttl` and `core/core.shacl.ttl` at v0.15.0, and
-`ecosystems/rpm/rpm.ttl`:
-
-| term | domain | range |
-|---|---|---|
-| `pkg:directlyProvides` | `Package` | `Package` |
-| `pkg:provides` | `Package` | `Package` |
-| `pkg:directlyDependsOn` | `Package` | `PackageEntity` |
-| `pkg:dependencyTarget` | `Dependency` | `PackageEntity` |
-| `pkg:providesCapability` | `Package` | `Capability` |
-| `pkg:requiresCapability` | `Package` | `Capability` |
-| `rpm:versionConstraint` | `rpm:Dependency` | `xsd:string` |
-| `rpm:onPackage` | `rpm:Dependency` | `rpm:RPMPackage` |
-
-- `rpm:Dependency rdfs:subClassOf pkg:Dependency` (`rpm.ttl:497`).
-- `pkg:DependencyShape` (`core.shacl.ttl:132`) targets class
-  `pkg:Dependency` and requires **exactly one** `pkg:dependencyTarget`
-  of `sh:class pkg:PackageEntity`, at most one `pkg:hasVersionConstraint`,
-  and a `pkg:dependencyType` drawn from a fixed `sh:in` list.
-- `pkg:CapabilityShape` (`core.shacl.ttl:54`) requires **at least one
-  `rdfs:label`** and exactly one `pkg:capabilityName`.
-- `pkg:directlyDependsOn` carries `owl:propertyChainAxiom ( :hasDependency
-  :dependencyTarget )`, so anything reachable through a reified
-  `pkg:Dependency` is projected onto it automatically.
-
-## Contract
-
-### Capabilities do not reuse the `pkg:Dependency` hierarchy
-
-A capability declaration cannot be an `rpm:Dependency`. `rpm:Dependency
-⊑ pkg:Dependency`, so `DependencyShape` applies to it and demands a
-`dependencyTarget` that is a `PackageEntity`. A `Capability` is not one,
-and `Package`/`Capability` disjointness means making it one is not
-available either.
-
-`rpm:versionConstraint` cannot be borrowed either: its `rdfs:domain` is
-`rpm:Dependency`, so asserting it drags the node into that class and the
-shape with it, whatever type the declaration was minted with.
-
-So the contract introduces terms that sit **outside** that hierarchy.
-`pkg:Dependency` and `rpm:Dependency` are retained unchanged, for
-relationships that genuinely meet the package-target contract.
-
-New in `ecosystems/rpm/rpm.ttl`:
-
-| term | kind | domain | range |
-|---|---|---|---|
-| `rpm:DependencyDeclaration` | `owl:Class`, `⊑ owl:Thing` | — | — |
-| `rpm:declaringPackage` | `owl:ObjectProperty` | `rpm:DependencyDeclaration` | `pkg:Package` |
-| `rpm:declarationKind` | `owl:ObjectProperty` | `rpm:DependencyDeclaration` | `rpm:DeclarationKind` |
-| `rpm:declaredCapability` | `owl:ObjectProperty` | `rpm:DependencyDeclaration` | `pkg:Capability` |
-| `rpm:declarationExpression` | `owl:DatatypeProperty` | `rpm:DependencyDeclaration` | `xsd:string` |
-| `rpm:declarationConstraint` | `owl:DatatypeProperty` | `rpm:DependencyDeclaration` | `xsd:string` |
-| `rpm:declarationEpoch` | `owl:DatatypeProperty` | `rpm:DependencyDeclaration` | `xsd:string` |
-| `rpm:declarationUnparsed` | `owl:DatatypeProperty` | `rpm:DependencyDeclaration` | `xsd:boolean` |
-| `rpm:applicableArchitecture` | `owl:ObjectProperty` | `rpm:DependencyDeclaration` | `pkg:Architecture` |
-| `rpm:hasDeclaration` | `owl:ObjectProperty` | `pkg:Package` | `rpm:DependencyDeclaration` |
-
-`rpm:DeclarationKind` is a class with exactly five named individuals —
-`rpm:Requires`, `rpm:Provides`, `rpm:Conflicts`, `rpm:Obsoletes`,
-`rpm:Recommends` — so the relation kind is a first-class term and not a
-string. Conflicts and Obsoletes are kinds in their own right, not
-variants of "depends".
-
-`rpm:DependencyDeclarationShape` (new, in `ecosystems/rpm/rpm.shacl.ttl`):
-
-- exactly one `rpm:declaringPackage`, `sh:class pkg:Package`
-- exactly one `rpm:declarationKind`, `sh:in` the five individuals
-- exactly one `rpm:declarationExpression` (the verbatim RPM string)
-- at most one `rpm:declaredCapability`, `sh:class pkg:Capability`,
-  **absent** when the expression is boolean or otherwise unparsed
-- at most one each of `rpm:declarationConstraint`, `rpm:declarationEpoch`
-- `rpm:declarationUnparsed` `true` iff `rpm:declaredCapability` is absent
-- at least one `rdfs:label`
-
-Note the declaration deliberately does **not** carry a
-`pkg:dependencyTarget`. It is a statement about a capability token, not
-about a package, and it must not be typeable as a `pkg:Dependency`.
-
-**Declaration identity.** The declaration URI is derived from
-`(declaring package URI, kind, verbatim expression)`, not from
-`(package, name)`. The current reified-dependency path derives its blank
-node from `bnode_id("dep", "{pkg_uri}_{dep.name}")` (`rpm.rs:1487`),
-which collapses `Requires: foo >= 1` and `Requires: foo < 2` into one
-node — and then hangs two `hasVersionConstraint` values off it, against
-`DependencyShape`'s `sh:maxCount 1`. Repeated names with different
-constraints must remain distinct declarations.
-
-**Boolean dependencies must not be flattened.** RPM supports them, and
-decomposing `(a or b)` into two independent mandatory edges changes a
-choice into a conjunction. A declaration whose expression cannot be
-represented is preserved verbatim in `rpm:declarationExpression` with
-`rpm:declarationUnparsed true` and no `declaredCapability`, rather than
-silently approximated.
-
-**Epoch, version and release are preserved in full.**
+Weak dependencies (`recommends`, `suggests`, `supplements`, `enhances`)
+are not parsed by the collector and are out of scope. When added, a weak
+dependency will not be folded into `pkg:requiresCapability`.
 
 ### Identity minting
 
 A `pkg:PackageIdentity` is minted **only from a collected package
-record** — something we have a version of. It is never minted from a
-dependency or provides string.
+record** — something we have a version of. Never from a dependency or
+provides string.
 
-Shape-based filtering (exclude parenthesised names, sonames, absolute
-paths) is explicitly rejected as the mechanism. `mail-transport-agent`
-has no parenthesis, no soname and no slash, and is not a package; a
-shape filter admits it. The test is provenance, not syntax.
+Shape-based filtering is rejected as the mechanism: `mail-transport-agent`
+has no parenthesis, no soname and no slash, and is not a package. The
+test is provenance, not syntax.
 
 Consequence: the 3,815,106 identities that nothing `isVersionOf` are an
 **investigation population, not a deletion list**. An identity with no
 collected version may be a real package in a repository we have not
-collected. Emission changes going forward; existing nodes are audited
-separately.
+collected.
 
-### `Provides:`
+### Filtered internals
 
-| today | contract |
-|---|---|
-| mint `PackageIdentity` for the provided name | **stop** |
-| `pkg:directlyProvides` → identity | **stop** (entails an unsatisfiable `:Package`) |
-| `rpm:rpmProvides` → identity | **stop** (retires a `KNOWN_BAD` entry) |
-| `pkg:providesCapability` → `Capability` | **keep, with the fixes below** |
-| `pkg:Capability` + `pkg:capabilityName` | **keep, with the fixes below** |
+`config(...)`, `rpmlib(...)` and `rtld(...)` are dropped on both the
+provides and requires paths (`rpm.rs:1467`, `rpm.rs:1574`). This is
+deliberate — they describe RPM's own machinery — and is adopted
+explicitly: **no capability node and no declaration node**. The filter
+list becomes a named constant with a test, rather than three inline
+`starts_with` calls duplicated across two loops.
 
-Keeping the existing capability emission unchanged is not sufficient.
-Four defects in it have to be fixed in the same change:
+### Declaration identity
 
-1. **Self-provides are skipped.** `rpm.rs:1582` drops any provide whose
-   name equals the package name, before the capability node is emitted.
-   Every RPM implicitly provides its own name, and that is how an
-   ordinary `Requires: bash` finds a provider. Skipping it means the
-   capability graph has no provider for ordinary package-name
-   requirements — the majority case. Self-provides must be emitted.
-2. **Capability nodes have no label.** The loop writes
-   `pkg:capabilityName` only. `CapabilityShape` requires at least one
-   `rdfs:label`, so all 1,013,026 capability nodes violate it today.
-   Emit a label.
-3. **Versioned provides lose their version.** `Provides: foo = 1.2-3` is
-   a different claim from `Provides: foo`, and `providesCapability`
-   cannot carry the difference. Versioned provides get an
-   `rpm:DependencyDeclaration` of kind `rpm:Provides` carrying the
-   constraint and epoch, in addition to the capability edge.
-4. **Filtered internal capabilities are undocumented.** `config(...)`,
-   `rpmlib(...)` and `rtld(...)` are dropped on both the provides and
-   requires paths (`rpm.rs:1467`, `:1574`). This is deliberate — they
-   describe RPM's own machinery, not inter-package functionality — and
-   the contract adopts it explicitly: **they are not emitted as
-   capabilities and not emitted as declarations**, and the filter list
-   is a named constant with a test, not three inline `starts_with` calls
-   duplicated across two loops.
+Per packagegraph/ontology#19 §3.4: declaring package URI, relation kind,
+and all five preserved attributes, with absence distinguished from
+present-but-empty.
 
-### `Requires:` / `Conflicts:` / `Obsoletes:`
+This is a behaviour change, not a restatement. `rpm.rs:1487` derives its
+reified node from `bnode_id("dep", "{pkg_uri}_{dep.name}")`, keyed on
+package and name only, so `Requires: foo >= 1` and `Requires: foo < 2`
+collapse into one node carrying two version constraints — against
+`pkg:DependencyShape`'s `sh:maxCount 1`.
 
-Each declaration becomes an `rpm:DependencyDeclaration` plus, where the
-expression names a single capability, a `pkg:requiresCapability` edge
-(currently at **zero** — the property built for this has never been
-used). `pkg:directlyDependsOn` and the reified `pkg:Dependency` are
-retained **only** where the target is a collected package identity, so
-they continue to satisfy `DependencyShape`.
+## Capability identity
 
-### Predicate policy (settled, not deferred)
+`d/capability/rpm/{encoded-token}`, pending packagegraph/ontology#19
+decision 2.
 
-The four `KNOWN_BAD` spellings are **removed, not declared**.
+The node identifies *this capability token within the RPM naming
+system*. **Matching the identifier does not establish that a provider is
+compatible with a requirer** — the same SONAME across architectures,
+distributions or repositories is the same token, not the same binary
+contract.
 
-Renaming the emission to the declared spellings is not an option on its
-own: `rpm:provides ⊑ pkg:provides` inherits `rdfs:range :Package`, so it
-would trade four exempted undeclared predicates for 80.9M assertions
-carrying the same bad entailment the repair exists to remove. Declaring
-`rpmProvides` in the ontology would bless the same thing.
-
-So:
-
-- `rpm:rpmProvides`, `rpm:rpmRequires`, `rpm:rpmConflicts`,
-  `rpm:rpmObsoletes` — **deleted from emission**, and their `KNOWN_BAD`
-  entries deleted with them.
-- `rpm:provides` / `requires` / `conflicts` / `obsoletes` — retained in
-  the ontology, used **only** for assertions that satisfy their
-  published `rdfs:range :Package`, i.e. where the target is a collected
-  package. They stay at zero until such an assertion exists.
-- Capability relationships use `pkg:providesCapability` /
-  `pkg:requiresCapability`, whose published semantics already match.
-- Everything the shortcuts cannot express uses
-  `rpm:DependencyDeclaration`.
-
-`rpm:RPMGroup`-as-predicate (`vocab.rs:169`) is the fifth rpm entry in
-`KNOWN_BAD` and is a distinct defect; it is out of scope here.
-
-### Capability identity is an RPM-scoped symbol
-
-`{DATA}capability/{encoded-name}` — one global node per capability name,
-no distro, release or arch qualifier, against arch-qualified package
-identities.
-
-The contract adopts this URI shape, and **narrows what it means**. The
-node denotes *this capability token in the RPM naming system*. It does
-**not** assert that every occurrence denotes interchangeable
-functionality.
-
-- The same SONAME does not establish ABI compatibility across
-  architectures, distributions, or repositories. `libc.so.6()(64bit)` in
-  Fedora 43 aarch64 and in RHEL 9 x86_64 are the same token, not the
-  same binary contract.
-- Provision and requirement assertions stay contextual: they are made by
-  an arch- and release-qualified package, and that context is what
-  carries the compatibility claim.
-- **Global name equality must not be used to establish provider
-  suitability.** Any query or enricher that joins
-  `providesCapability`/`requiresCapability` on the capability node alone
-  is computing candidate providers, not compatible ones, and must say
-  so.
-
-**Namespace audit.** `etl/pg-collect/src/debian.rs:1004` mints into the
-same `{DATA}capability/` namespace with the same `uris::encode`, so
-Debian and RPM capability tokens already collide by construction — a
-Debian virtual package named `foo` and an RPM `Provides: foo` are one
-node today. No other ecosystem in the tree uses the namespace. Calling
-this node "RPM-scoped" while Debian shares it is a contradiction that
-must be resolved in the ontology PR: either the namespace is qualified
-per naming system, or the node is redefined as a cross-ecosystem token
-with the compatibility caveats above applying equally. This is a
-1,013,026-node decision and changing it later is a migration.
+Note for the migration: `rpm.rs:1606` and `debian.rs:1004` currently
+mint into the same unqualified `{DATA}capability/` namespace with the
+same encoder, so an RPM `Provides: foo` and a Debian virtual package
+`foo` are one node today. Only the RPM side is qualified by this
+delivery; Debian's convention is a deferred item.
 
 ## Consumers
 
-Not out of scope. The emission change removes inputs these read.
+`revdeps` does not resolve providers. `enrich_revdeps.rs:103` counts
+distinct dependents with `pkg:directlyDependsOn` into a
+`pkg:PackageIdentity`; `enrich_blast_radius.rs:84` consumes
+`met:reverseDependencyCount`.
 
-**`revdeps` does not resolve providers.**
-`etl/pg-collect/src/enrich_revdeps.rs:103` counts, per target identity,
-the distinct `?depIdentity` of packages with
-`pkg:directlyDependsOn ?targetIdentity`, filtered to
-`?targetIdentity a pkg:PackageIdentity`. `blast-radius`
-(`enrich_blast_radius.rs:84`) consumes `met:reverseDependencyCount` and
-performs no resolution either. The earlier draft of this document
-described both as treating every provider as a required package; that is
-not what the code does.
+The impact is on the **requires** side. `rpm.rs:1476` mints an identity
+for every required name — including all 23,587 rich-expression nodes —
+and points `directlyDependsOn` at it. When that stops, the counts fall.
 
-The impact is on the **requires** side, not the provides side. The RPM
-requires loop mints a `PackageIdentity` for every required name
-(`rpm.rs:1476`) including capability tokens, then points
-`directlyDependsOn` at it. Under this contract those identities are no
-longer minted, so those `directlyDependsOn` edges disappear and the
-counts fall.
+**Decision: RPM package-level reverse-dependency metrics are withheld
+visibly** until resolution semantics exist, rather than silently
+recomputed over a changed input. Withholding needs no ontology change.
+Derived graphs computed over manufactured identities are retired, not
+left in place — a stale `revdeps` graph is indistinguishable from a
+fresh one.
 
-This release must state which of three it does, and the choice is a
-release gate, not an implementation detail:
+**The platform will not project `pkg:directlyDependsOn` on a name
+match.** An earlier draft retained the projection wherever the target
+was a collected package identity. That is insufficient: finding a
+package with the same name does not establish that it satisfies the
+declaration's version constraint, or that it applies in the declaring
+package's architecture and repository context. Satisfying the target's
+class constraint is not the same as satisfying the declaration. Until
+resolution is modelled, the projection is withheld.
 
-1. **Withhold** — stop publishing `met:reverseDependencyCount` for RPM
-   identities until a resolver exists. Honest, and visibly a gap.
-2. **Replace** — publish explicitly named declaration metrics
-   (`met:reverseDeclarationCount` over `rpm:declaredCapability`)
-   alongside the package-target counts, so the two are never summed by
-   accident.
-3. **Approximate** — keep a single count over capability-name joins,
-   documented at the term as candidate-provider-based and not
-   resolution-based.
+## Transition
 
-Whichever is chosen, **existing derived graphs must be regenerated or
-retired**, not left in place. A stale `revdeps` graph computed over
-manufactured identities is indistinguishable from a fresh one.
+Not a purge. **Collect replacements → validate → switch, retaining
+rollback data.**
 
-## Out of scope
+Four graphs — `fedora/42`, `fedora/42/aarch64`, `fedora/44/aarch64`,
+`fedora/rawhide` — predate the capability emission and carry zero
+`pkg:Capability` nodes, so their provenance and shape cannot be
+attested. They account for the entire 1,838,372-quad discrepancy between
+`rpmProvides` and `providesCapability`; the other nineteen graphs agree
+exactly, to the triple.
 
-**Resolution.** "Requires capability X ≥ Y" is true regardless of which
-provider is selected, and stays a declaration. Candidate providers,
-resolver-selected providers, no-provider-found, and
-resolution-not-performed are four distinct outcomes needing an evidenced
-result structure. That is its own design.
+1. Collect replacement generations from source, under the new contract.
+2. Validate each replacement against the shapes **and against the legacy
+   generation**, attributing every difference rather than accepting the
+   delta wholesale.
+3. Switch the served union to the replacement set.
+4. Retain legacy generations and the prior index for rollback; remove
+   only after the replacement set is verified in service.
 
-## Attribution
+At no point is the only copy of a graph deleted before its replacement
+is validated.
 
-Measured per graph against the public endpoint, 2026-09-25
-(`~/.cache/capgap.sh`). Quad counts — each occurrence in each named
-graph, so these sum higher than the distinct totals above.
+## Sequencing
 
-**`directlyProvides` is exactly `rpmProvides` + `debProvides`, in every
-graph and in total.** 81,936,448 = 81,572,865 + 363,583. `debian.rs:1000`
-is the only other writer; no third source exists.
+`G1` — packagegraph/ontology#19 decision 1 released, `ONTOLOGY_VERSION`
+bumped — is a **publication gate, not a development blocker**. Collector
+work proceeds against the agreed proposal; publishing changed RDF
+requires the released pin and passing integration checks.
 
-**The `providesCapability` shortfall is four graphs, and only four.**
+`G2` — decision 2 — gates **final identifiers and publication, not
+acquisition**. Repodata capture and source-preserving fixtures start
+immediately.
 
-| graph | rpmProvides | providesCapability | gap |
-|---|---|---|---|
-| `fedora/rawhide` | 538,544 | 0 | 538,544 |
-| `fedora/42` | 450,931 | 0 | 450,931 |
-| `fedora/42/aarch64` | 425,070 | 0 | 425,070 |
-| `fedora/44/aarch64` | 423,827 | 0 | 423,827 |
-| **every other graph (19)** | | | **0** |
-| total | | | **1,838,372** |
+`G3` — decision 3 — needs an answer, not a release.
 
-In all nineteen graphs the current collector produces — `rhel/9`,
-`rhel/10`, `almalinux/*`, `rocky/*`, `centos-stream/*`,
-`opensuse/tumbleweed`, `fedora/43`, `fedora/44`, `fedora/44/riscv64`,
-`debian/*`, `ubuntu/*` — `rpmProvides` (or `debProvides`),
-`directlyProvides` and `providesCapability` agree **exactly, to the
-triple**.
-
-The four outliers are a pre-capability generation. `fedora/42` has
-450,931 `directlyProvides`, 648,661 `directlyDependsOn` and 440,264
-`PackageIdentity` nodes, and **zero** `pkg:Capability` instances and
-zero `providesCapability`. `fedora/43`, from the current collector, has
-373,333 capabilities and `providesCapability` equal to
-`directlyProvides` at 734,484. The capability layer was added in
-`74fcf0a`; these four predate it.
-
-**None of the four has a collector.** `deploy/quadlet/collectors/scripts/`
-contains `fedora-43-full.sh` and `fedora-44-full.sh` and nothing else
-for Fedora. `fedora/42`, `fedora/42/aarch64`, `fedora/44/aarch64` and
-`fedora/rawhide` are legacy graph files, sole copies, with nothing able
-to regenerate them — the population already tracked as stale duplicate
-graph files.
-
-So the subtractive change has two different consequences, and the
-contract must not average them:
-
-- **For the nineteen regenerable graphs, removal loses nothing.**
-  `providesCapability` is a verified one-for-one replacement, per graph.
-  This is what the earlier draft asserted without evidence; it now has
-  evidence, scoped to where it holds.
-- **For the four legacy graphs, removal has no replacement.** They have
-  no capability layer and cannot be rebuilt. Their 1,838,372 provides
-  and 81,197,282-corpus-wide share of the range problem would persist
-  after the emission fix, because the emission fix cannot reach a static
-  file.
-
-That makes it a retire-or-except decision, not a correctness blocker:
-either the four graphs are dropped from the served union, or the
-release gates below are scoped to regenerated graphs and the four are
-carried as a named, documented exception. **They must not be silently
-excluded from the gate query.** Note also that they contribute
-`directlyDependsOn` (648,661 from `fedora/42` alone), so they feed
-`revdeps` today and retiring them changes those counts independently of
-anything in this contract.
+Work that starts now, before any gate: source-preserving fixtures from
+real repodata; the capability-label fix; the self-provides fix; the
+filtered-internals constant; removal of the four undeclared predicates;
+consumer withholding; identification of stale derived results.
 
 ## Release gates
 
-- No `pkg:directlyProvides` assertion whose target lacks `pkg:packageName`.
-  Currently 81,197,282.
-- The four `rpm:rpm*` entries are gone from `vocab.rs` `KNOWN_BAD`,
-  because the emission is gone — not because the ontology declared them.
-- A capability declaration does not mint a `pkg:PackageIdentity`.
-- Every `pkg:Capability` node satisfies `CapabilityShape`, label
-  included. Currently none do.
-- The retire-or-except decision on `fedora/42`, `fedora/42/aarch64`,
-  `fedora/44/aarch64` and `fedora/rawhide` is made and recorded. If
-  excepted, the gate query names them explicitly rather than filtering
-  them out by a predicate that happens to exclude them.
-- The consumer decision (withhold / replace / approximate) is
-  implemented, and every dependent derived graph is regenerated or
-  retired.
-- Prior generations and index retained for rollback.
+- No `pkg:directlyProvides` assertion whose target lacks
+  `pkg:packageName`. Today 1,545,695 of 3,611,932 distinct targets.
+- Four `rpm:rpm*` entries gone from `vocab.rs` `KNOWN_BAD` because the
+  emission is gone, not because the ontology declared them.
+- No `pkg:PackageIdentity` minted from a declaration.
+- Every `pkg:Capability` node satisfies `pkg:CapabilityShape`, label
+  included. Today none do.
+- No rich expression appears as a `pkg:PackageIdentity`. Today 23,587
+  do.
+- `Requires: foo >= 1` and `Requires: foo < 2` on one package survive as
+  two declarations.
+- Conflicts and Obsoletes emit no capability shortcut.
+- RPM reverse-dependency metrics are absent or distinctly named — never
+  silently reduced.
+- Replacement generations validated against their legacy counterparts,
+  with differences attributed, before the switch. Rollback data
+  retained.
 
-## Release fixtures
+## Deferred
 
-Acceptance fixtures, each a repodata sample plus expected N-Triples:
+Recorded, not filed. None has an issue yet.
 
-| fixture | proves |
-|---|---|
-| self-provide | `Requires: bash` finds a provider through `bash`'s own implicit provide |
-| versioned provide | `Provides: foo = 1.2-3` keeps the version and is distinguishable from `Provides: foo` |
-| epoch | `Requires: foo >= 2:1.0-1` preserves the epoch |
-| repeated name, different constraints | `Requires: foo >= 1` and `Requires: foo < 2` are two declarations, not one node with two constraints |
-| boolean expression | `Requires: (a or b)` round-trips verbatim with `declarationUnparsed true`, and emits no mandatory edge to either operand |
-| unresolved requirement | a required capability with no provider in the corpus yields a declaration and no `PackageIdentity` |
-| architecture context | the same capability name required by an x86_64 and an aarch64 package yields two contextual declarations against one capability node |
-| filtered internals | `rpmlib(...)`, `config(...)`, `rtld(...)` produce neither capability nor declaration |
+- Resolution as an evidenced result — candidate providers,
+  resolver-selected, no-provider-found, resolution-not-performed, with
+  repository snapshot, architecture, resolver version and policy as
+  evidence.
+- Whether RPM declarations should eventually unify with
+  `pkg:Dependency`. Deliberately left open; this delivery neither
+  forecloses it nor argues against it.
+- Weak dependency sections.
+- Capability scoping for non-RPM ecosystems, including Debian's current
+  use of the unqualified capability path.
+- `rpm:RPMGroup` used as a predicate.
+- `pkg:provides` emitted with a **literal** object by `alpine.rs:351`
+  and `arch.rs:343` — 107,822 assertions putting a literal on an
+  `owl:ObjectProperty`.
 
-Plus two kinds of test the fixtures alone do not cover:
-
-- **Inference tests.** Run an RDFS/OWL reasoner over a fixture's output
-  and assert that no `pkg:Capability` node is entailed to be a
-  `pkg:Package`, and that no node is entailed into `:Package` without a
-  `:packageName`. This is the test that would have caught the current
-  defect.
-- **Consumer tests.** Assert that changed coverage cannot appear
-  silently as a lower dependency count: given a fixture whose required
-  names are all capabilities, the chosen consumer strategy either
-  withholds the metric, emits a distinctly-named one, or emits the
-  documented approximation — and never emits `met:reverseDependencyCount`
-  reduced without a signal.
+#62 stays open until the corrected collector output and the published
+graph are both verified.
