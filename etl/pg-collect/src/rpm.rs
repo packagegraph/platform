@@ -41,18 +41,27 @@ fn distro_display_name(distro_id: &str) -> &str {
 /// require them. Measured against AlmaLinux 9 BaseOS `primary.xml`, 2,996
 /// packages:
 ///
-/// | prefix | provides blocks | requires blocks |
-/// |---|---|---|
-/// | `rtld(` | 10 (all `glibc`, token `rtld(GNU_HASH)`) | 1,199 |
-/// | `config(` | 433, over 175 distinct tokens | 2 |
-/// | `rpmlib(` | 0 | 0 -- createrepo strips these from primary.xml, so this prefix never reaches the repodata path at all |
+/// Counted by entry name prefix, over `primary.xml` with uncompressed SHA-256
+/// `2991b157fe0a1edc84269a516547918135851f5c379fd9b4918405a321a3b87b`:
+///
+/// | prefix | provides entries | requires entries | distinct provided tokens |
+/// |---|---:|---:|---:|
+/// | `rtld(` | 10 (all `glibc`) | 1,199 | 1 |
+/// | `config(` | 423 | 0 | 175 |
+/// | `rpmlib(` | 0 | 0 | 0 |
+///
+/// `rpmlib(` is absent because createrepo_c filters it in its *requires*
+/// branch, so it never reaches this route. That is a property of this producer,
+/// not a rule about RPM or XML.
 ///
 /// So `rtld(GNU_HASH)` has a genuine provider and 1,199 requirers. Suppressing
 /// it loses a real provider/consumer relationship; we do it because these
 /// tokens describe the packaging system's own contract rather than
 /// functionality a user would resolve against, and carrying them would add
 /// ~1,200 edges per repo to one node. That trade is reviewable and reversible,
-/// which a claim of impossibility would not be.
+/// which a claim of impossibility would not be. An independent audit
+/// recommends removing the exception from canonical preservation entirely and
+/// filtering only presentation views; that is an open decision.
 ///
 /// The suppression is of the *convenience* layer only. Once
 /// `rpm:DependencyDeclaration` lands (packagegraph/ontology#19), every
