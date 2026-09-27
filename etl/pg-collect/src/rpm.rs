@@ -623,10 +623,9 @@ impl RpmCollector {
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) if e.name().as_ref() == b"data" => {
-                    for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"type"
-                            && attr.value.as_ref() == metadata_type.as_bytes()
-                        {
+                    for attr in e.attributes() {
+                        let (key, value) = decode_attribute(attr)?;
+                        if key == "type" && value == metadata_type {
                             in_correct_data = true;
                             break;
                         }
@@ -635,9 +634,9 @@ impl RpmCollector {
                 Ok(Event::Start(ref e) | Event::Empty(ref e))
                     if in_correct_data && e.name().as_ref() == b"location" =>
                 {
-                    for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"href" {
-                            let href = String::from_utf8_lossy(&attr.value).to_string();
+                    for attr in e.attributes() {
+                        let (key, href) = decode_attribute(attr)?;
+                        if key == "href" {
                             return Ok(format!("{}/{}", self.repo_url.trim_end_matches('/'), href));
                         }
                     }
@@ -767,6 +766,41 @@ fn decode_stream<'a, R: std::io::BufRead + 'a>(
     }
 }
 
+/// Decode one XML attribute into `(key, value)`.
+///
+/// quick-xml hands back the bytes between the quotes exactly as they appear,
+/// so a rich dependency written
+/// `name="((adobe-afdko &gt;= 4.0.1) with (adobe-afdko &lt; 5~~))"` arrived
+/// with its entities intact and went into the graph that way: the served
+/// corpus holds 12,857 identity names containing a literal `&gt;` against
+/// four containing a real `>`. `unescape_value` applies the XML rules, named
+/// entities and numeric character references alike.
+///
+/// A malformed attribute is an error, not something to skip. Flattening the
+/// iterator discarded them, which turns a record we cannot read into a record
+/// we are confidently wrong about.
+fn decode_attribute(
+    attr: std::result::Result<
+        quick_xml::events::attributes::Attribute,
+        quick_xml::events::attributes::AttrError,
+    >,
+) -> Result<(String, String)> {
+    let attr = attr.map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("malformed XML attribute: {e}"),
+        )
+    })?;
+    let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+    let value = attr.unescape_value().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("malformed XML attribute value for {key}: {e}"),
+        )
+    })?;
+    Ok((key, value.into_owned()))
+}
+
 /// Parse a repodata `primary.xml` stream, invoking `on_package` for each
 /// `<package>` element as it completes.
 ///
@@ -822,10 +856,8 @@ pub fn stream_primary_packages<R: std::io::BufRead>(
                                     rel: None,
                                     dep_type: dep_type.clone(),
                                 };
-                                for attr in e.attributes().flatten() {
-                                    let key =
-                                        String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                                    let value = String::from_utf8_lossy(&attr.value).to_string();
+                                for attr in e.attributes() {
+                                    let (key, value) = decode_attribute(attr)?;
                                     match key.as_str() {
                                         "name" => dep.name = value,
                                         "flags" => dep.flags = Some(value),
@@ -842,9 +874,8 @@ pub fn stream_primary_packages<R: std::io::BufRead>(
                         }
                         _ => {
                             // version, location, size, time — capture attributes
-                            for attr in e.attributes().flatten() {
-                                let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                                let value = String::from_utf8_lossy(&attr.value).to_string();
+                            for attr in e.attributes() {
+                                let (key, value) = decode_attribute(attr)?;
                                 if name == "version"
                                     || name == "location"
                                     || name == "size"
@@ -958,10 +989,10 @@ impl RpmCollector {
                 Ok(Event::Start(ref e) | Event::Empty(ref e)) => {
                     if e.name().as_ref() == b"package" {
                         // Extract package name attribute
-                        for attr in e.attributes().flatten() {
-                            if attr.key.as_ref() == b"name" {
-                                current_package_name =
-                                    Some(String::from_utf8_lossy(&attr.value).to_string());
+                        for attr in e.attributes() {
+                            let (key, value) = decode_attribute(attr)?;
+                            if key == "name" {
+                                current_package_name = Some(value);
                                 break;
                             }
                         }
@@ -1684,10 +1715,10 @@ impl RpmCollector {
                         b"update" => {
                             // Extract type attribute - only process security updates
                             let mut update_type: Option<String> = None;
-                            for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"type" {
-                                    update_type =
-                                        Some(String::from_utf8_lossy(&attr.value).to_string());
+                            for attr in e.attributes() {
+                                let (key, value) = decode_attribute(attr)?;
+                                if key == "type" {
+                                    update_type = Some(value);
                                 }
                             }
 
@@ -1718,11 +1749,11 @@ impl RpmCollector {
                             }
                         }
                         b"issued" if current_update.is_some() => {
-                            for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"date" {
+                            for attr in e.attributes() {
+                                let (key, value) = decode_attribute(attr)?;
+                                if key == "date" {
                                     if let Some(ref mut adv) = current_update {
-                                        adv.issued_date =
-                                            String::from_utf8_lossy(&attr.value).to_string();
+                                        adv.issued_date = value;
                                     }
                                 }
                             }
@@ -1734,10 +1765,10 @@ impl RpmCollector {
                         b"reference" if current_update.is_some() => {
                             in_reference = true;
                             ref_title = None;
-                            for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"title" {
-                                    ref_title =
-                                        Some(String::from_utf8_lossy(&attr.value).to_string());
+                            for attr in e.attributes() {
+                                let (key, value) = decode_attribute(attr)?;
+                                if key == "title" {
+                                    ref_title = Some(value);
                                 }
                             }
 
@@ -1762,25 +1793,14 @@ impl RpmCollector {
                                 arch: String::new(),
                             };
 
-                            for attr in e.attributes().flatten() {
-                                match attr.key.as_ref() {
-                                    b"name" => {
-                                        pkg.name = String::from_utf8_lossy(&attr.value).to_string()
-                                    }
-                                    b"version" => {
-                                        pkg.version =
-                                            String::from_utf8_lossy(&attr.value).to_string()
-                                    }
-                                    b"release" => {
-                                        pkg.release =
-                                            String::from_utf8_lossy(&attr.value).to_string()
-                                    }
-                                    b"epoch" => {
-                                        pkg.epoch = String::from_utf8_lossy(&attr.value).to_string()
-                                    }
-                                    b"arch" => {
-                                        pkg.arch = String::from_utf8_lossy(&attr.value).to_string()
-                                    }
+                            for attr in e.attributes() {
+                                let (key, value) = decode_attribute(attr)?;
+                                match key.as_str() {
+                                    "name" => pkg.name = value,
+                                    "version" => pkg.version = value,
+                                    "release" => pkg.release = value,
+                                    "epoch" => pkg.epoch = value,
+                                    "arch" => pkg.arch = value,
                                     _ => {}
                                 }
                             }
