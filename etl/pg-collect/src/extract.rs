@@ -1,6 +1,6 @@
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
 
@@ -161,6 +161,49 @@ const BFS_PREDICATES: &[&str] = &[
     "https://purl.org/packagegraph/ontology/core#memberOfPackageSet",
 ];
 
+/// How many triples one selected URI is worth, for the estimate that stops
+/// expansion before `max_triples`.
+///
+/// Measured, not assumed: a full `test-corpus.toml` run against the live
+/// endpoint on 2026-09-27 selected 64,358 URIs and extracted 10,608,101
+/// triples, or 165 apiece. The previous figure of 50 dated from when the
+/// object filter deleted 83.6% of every record, and it let that run finish
+/// 3.5 times over its own 3,000,000 ceiling.
+///
+/// No single figure can bound the corpus. A one-seed, one-hop run over the
+/// same endpoint came out at 5,328 triples per URI, because a small selection
+/// is all hubs: `openssl` alone carries thousands of version nodes. This
+/// constant is a better average, not a guarantee, which is why
+/// `Manifest::exceeded_max_triples` records what actually happened.
+const TRIPLES_PER_URI: usize = 165;
+
+/// What a BFS expansion had to leave out.
+///
+/// The fan-out cap is a silent truncation: a subject with more neighbors than
+/// `fan_out` on one predicate contributes a subset, and nothing in the
+/// extracted files records that the rest exist. Counting the cuts is what lets
+/// the manifest call a selection partial instead of implying it is the whole
+/// neighborhood.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct SelectionReport {
+    /// Neighbors discovered but dropped because a (subject, predicate) pair
+    /// held more than `fan_out` of them.
+    pub fan_out_cuts: usize,
+    /// How many (subject, predicate) pairs were truncated.
+    pub capped_pairs: usize,
+    /// Hops actually walked before the frontier emptied.
+    pub hops_walked: usize,
+}
+
+impl SelectionReport {
+    /// Fold another graph's expansion into a corpus-wide total.
+    pub fn absorb(&mut self, other: &SelectionReport) {
+        self.fan_out_cuts += other.fan_out_cuts;
+        self.capped_pairs += other.capped_pairs;
+        self.hops_walked = self.hops_walked.max(other.hops_walked);
+    }
+}
+
 /// BFS-expand a seed set within a single named graph.
 ///
 /// Walks outward from `seeds` along `BFS_PREDICATES` for `depth` hops,
@@ -173,8 +216,26 @@ pub fn bfs_expand(
     depth: usize,
     fan_out: usize,
 ) -> Result<HashSet<String>> {
+    Ok(bfs_expand_reporting(client, graph_uri, seeds, depth, fan_out)?.0)
+}
+
+/// BFS-expand a seed set, reporting what the fan-out cap discarded.
+///
+/// Neighbors are sorted before the cap applies, so which ones survive is a
+/// function of the data rather than of the order the endpoint happened to
+/// return rows in. Two runs over an unchanged graph select the same subset,
+/// and the count of what was cut travels with the corpus.
+pub fn bfs_expand_reporting(
+    client: &SparqlClient,
+    graph_uri: &str,
+    seeds: &HashSet<String>,
+    depth: usize,
+    fan_out: usize,
+) -> Result<(HashSet<String>, SelectionReport)> {
     let mut visited = seeds.clone();
     let mut frontier: Vec<String> = seeds.iter().cloned().collect();
+    frontier.sort();
+    let mut report = SelectionReport::default();
 
     let predicates_values: String = BFS_PREDICATES
         .iter()
@@ -212,7 +273,7 @@ pub fn bfs_expand(
             let bindings = client.query(&sparql)?;
 
             // Group by (seed, predicate) and enforce fan-out cap
-            let mut groups: HashMap<(String, String), Vec<String>> = HashMap::new();
+            let mut groups: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
             for binding in &bindings {
                 if let (Some(seed), Some(pred), Some(neighbor)) = (
                     binding.get("seed"),
@@ -226,41 +287,92 @@ pub fn bfs_expand(
                 }
             }
 
-            for ((_seed, _pred), neighbors) in &groups {
-                for neighbor in neighbors.iter().take(fan_out) {
+            for (_pair, mut neighbors) in groups {
+                neighbors.sort();
+                neighbors.dedup();
+                if neighbors.len() > fan_out {
+                    report.fan_out_cuts += neighbors.len() - fan_out;
+                    report.capped_pairs += 1;
+                }
+                for neighbor in neighbors.into_iter().take(fan_out) {
                     if visited.insert(neighbor.clone()) {
-                        next_frontier.push(neighbor.clone());
+                        next_frontier.push(neighbor);
                     }
                 }
             }
         }
 
+        next_frontier.sort();
+        report.hops_walked = hop + 1;
         eprintln!(
-            "  Hop {}: +{} URIs (total {})",
+            "  Hop {}: +{} URIs (total {}){}",
             hop + 1,
             next_frontier.len(),
-            visited.len()
+            visited.len(),
+            if report.fan_out_cuts > 0 {
+                format!(", {} neighbors cut by fan_out", report.fan_out_cuts)
+            } else {
+                String::new()
+            }
         );
         frontier = next_frontier;
     }
 
-    Ok(visited)
+    Ok((visited, report))
 }
 
-/// Extract all triples for a set of URIs from a named graph.
+/// What an extracted graph points at but does not contain.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct ExtractionReport {
+    /// Triples written for this graph.
+    pub triples: usize,
+    /// Distinct data URIs referenced as objects that are not themselves in the
+    /// selection: the edges that leave the corpus.
+    pub dangling_targets: usize,
+}
+
+/// Extract the complete description of a set of URIs from a named graph.
 ///
-/// Issues batched CONSTRUCT queries where the subject is in the URI set.
-/// Only includes triples where both subject and object (if a URI) are in the set,
-/// preventing dangling references. Deduplicates across batches.
+/// Every triple whose subject is selected is retained, `rdf:type` included.
+/// Objects outside the selection stay as references and are counted in the
+/// returned report rather than deleted.
+///
+/// This replaces an object filter that searched each returned N-Triples line
+/// for `"> <"`, took the tail as the object, and dropped the triple unless
+/// that text named a selected URI. Two things went wrong with it. A class IRI
+/// is never a selected instance, so it deleted every `rdf:type` assertion, and
+/// a corpus without types validates vacuously: `sh:targetClass` selects no
+/// focus node, so every shape conforms over nothing. It also turned a
+/// predicate's absence from `BFS_PREDICATES` into deletion of the edge rather
+/// than into leaving it unexpanded, which is how `providesCapability`
+/// relationships vanished from test corpora once the RPM collector emitted
+/// them.
+///
+/// Membership is not pushed into the query as a `VALUES` block. Measured on
+/// the live endpoint with `test-corpus.toml`, the largest per-graph selection
+/// is 9,662 URIs; at the ~90 bytes a rendered term costs, that is around
+/// 870 KB against the SPARQL proxy's 1 MB request-body limit, and it would
+/// have to be repeated in every subject batch.
 pub fn extract_triples(
     client: &SparqlClient,
     graph_uri: &str,
     uris: &HashSet<String>,
 ) -> Result<Vec<String>> {
-    let mut all_triples: HashSet<String> = HashSet::new();
-    let uri_list: Vec<&String> = uris.iter().collect();
+    Ok(extract_triples_reporting(client, graph_uri, uris)?.0)
+}
 
-    // Extract triples where subject is in our set
+/// Extract a graph's selected description and report what it references but
+/// does not carry.
+pub fn extract_triples_reporting(
+    client: &SparqlClient,
+    graph_uri: &str,
+    uris: &HashSet<String>,
+) -> Result<(Vec<String>, ExtractionReport)> {
+    let mut all_triples: HashSet<String> = HashSet::new();
+    let mut dangling: HashSet<String> = HashSet::new();
+    let mut uri_list: Vec<&String> = uris.iter().collect();
+    uri_list.sort();
+
     for batch in uri_list.chunks(50) {
         let values: String = batch
             .iter()
@@ -279,35 +391,47 @@ pub fn extract_triples(
             graph_uri, values
         );
 
-        let triples = client.query_construct(&sparql)?;
-        for triple in triples {
+        for triple in client.query_construct(&sparql)? {
             all_triples.insert(triple);
+        }
+
+        // Ask the endpoint for the object terms instead of recovering them
+        // from the serialised output. A binding's value is the IRI itself, so
+        // there is nothing to parse and no typed literal whose datatype can be
+        // mistaken for an object.
+        let objects = format!(
+            "SELECT DISTINCT ?o\n\
+             WHERE {{\n\
+               GRAPH <{}> {{\n\
+                 VALUES ?s {{ {} }}\n\
+                 ?s ?p ?o .\n\
+               }}\n\
+               FILTER(isIRI(?o) && STRSTARTS(STR(?o), \"{}\"))\n\
+             }}",
+            graph_uri,
+            values,
+            crate::uris::DATA
+        );
+        for binding in client.query(&objects)? {
+            if let Some(object) = binding.get("o") {
+                if !uris.contains(object) {
+                    dangling.insert(object.clone());
+                }
+            }
         }
     }
 
-    // Filter: keep only triples where object URIs are also in our set
-    // (literal objects are always kept)
-    let filtered: Vec<String> = all_triples
-        .into_iter()
-        .filter(|triple| {
-            // If the object is a URI (starts with <, ends with > before the dot),
-            // check it's in our extraction set
-            if let Some(obj_start) = triple.rfind("> <") {
-                // Object is a URI — extract it
-                if let Some(obj) = triple.get(obj_start + 2..) {
-                    let obj = obj.trim_end_matches(" .").trim();
-                    if obj.starts_with('<') && obj.ends_with('>') {
-                        let uri = &obj[1..obj.len() - 1];
-                        return uris.contains(uri);
-                    }
-                }
-            }
-            // Literal objects or unparseable lines: keep them
-            true
-        })
-        .collect();
+    // Sorting makes the written file a function of the selection rather than
+    // of hash iteration order, so two runs over an unchanged graph produce
+    // byte-identical output.
+    let mut triples: Vec<String> = all_triples.into_iter().collect();
+    triples.sort();
 
-    Ok(filtered)
+    let report = ExtractionReport {
+        triples: triples.len(),
+        dangling_targets: dangling.len(),
+    };
+    Ok((triples, report))
 }
 
 /// Reference set of classes and predicates from the ontology.
@@ -501,6 +625,8 @@ pub struct ManifestEntry {
     pub path: String,
     pub graph: String,
     pub triples: usize,
+    /// Distinct data URIs this file references but does not describe.
+    pub dangling_targets: usize,
 }
 
 /// Full manifest for the test corpus.
@@ -513,6 +639,18 @@ pub struct Manifest {
     pub depth: usize,
     pub fan_out: usize,
     pub total_triples: usize,
+    /// The ceiling the run was given.
+    pub max_triples: usize,
+    /// Whether the corpus came out over that ceiling. The expansion stop is
+    /// driven by an estimate made before any triple is fetched, so it can be
+    /// wrong; the manifest records the outcome rather than the guess.
+    pub exceeded_max_triples: bool,
+    /// What the fan-out cap discarded, summed over every graph.
+    pub selection: SelectionReport,
+    /// Graphs whose expansion was abandoned because the running size estimate
+    /// passed `max_triples`. A corpus that stopped early is not the corpus the
+    /// seeds describe, and the manifest has to say so.
+    pub graphs_unexpanded: usize,
     pub files: Vec<ManifestEntry>,
 }
 
@@ -560,27 +698,36 @@ pub fn run(
     eprintln!("\n--- Phase 2: BFS Expansion ---");
     let mut graph_uris: HashMap<String, HashSet<String>> = HashMap::new();
     let mut total_uri_count = 0;
+    let mut selection = SelectionReport::default();
+    let mut graphs_unexpanded = 0;
 
     for (graph, seeds) in &graph_seeds {
         eprintln!("Graph <{}>: {} seeds", graph, seeds.len());
-        let expanded = bfs_expand(&client, graph, seeds, depth, fan_out)?;
+        let (expanded, graph_selection) =
+            bfs_expand_reporting(&client, graph, seeds, depth, fan_out)?;
+        selection.absorb(&graph_selection);
         total_uri_count += expanded.len();
         graph_uris.insert(graph.clone(), expanded);
 
         // Size check
-        let estimated = total_uri_count * 50;
+        let estimated = total_uri_count * TRIPLES_PER_URI;
         if estimated > max_triples {
+            graphs_unexpanded = graph_seeds.len() - graph_uris.len();
             eprintln!(
-                "  Size estimate ({}) exceeds max_triples ({}), stopping expansion",
-                estimated, max_triples
+                "  Size estimate ({}) exceeds max_triples ({}), stopping expansion \
+                 with {} graphs unexpanded",
+                estimated, max_triples, graphs_unexpanded
             );
             break;
         }
     }
     eprintln!(
-        "Phase 2: {} total URIs across {} graphs",
+        "Phase 2: {} total URIs across {} graphs ({} neighbors cut by fan_out \
+         across {} capped pairs)",
         total_uri_count,
-        graph_uris.len()
+        graph_uris.len(),
+        selection.fan_out_cuts,
+        selection.capped_pairs
     );
 
     // Phase 3: Triple extraction
@@ -592,7 +739,7 @@ pub fn run(
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
 
     for (graph, uris) in &graph_uris {
-        let triples = extract_triples(&client, graph, uris)?;
+        let (triples, extraction) = extract_triples_reporting(&client, graph, uris)?;
         let count = triples.len();
 
         // Determine output file path from graph URI
@@ -612,12 +759,16 @@ pub fn run(
             writeln!(file, "{}", triple)?;
         }
 
-        eprintln!("  {} — {} triples", rel_path, count);
+        eprintln!(
+            "  {} — {} triples, {} references leaving the corpus",
+            rel_path, count, extraction.dangling_targets
+        );
 
         manifest_entries.push(ManifestEntry {
             path: rel_path,
             graph: graph.clone(),
             triples: count,
+            dangling_targets: extraction.dangling_targets,
         });
 
         all_triples.extend(triples);
@@ -642,6 +793,15 @@ pub fn run(
     }
 
     let total_triples = all_triples.len();
+    let exceeded_max_triples = total_triples > max_triples;
+    if exceeded_max_triples {
+        eprintln!(
+            "WARNING: extracted {} triples against a max_triples of {}. The \
+             expansion stop uses a per-URI estimate made before extraction; \
+             lower depth or fan_out to bring the corpus under the ceiling.",
+            total_triples, max_triples
+        );
+    }
     eprintln!(
         "Coverage: {}/{} classes, {}/{} predicates, {}/{} SHACL shapes",
         report.classes_covered,
@@ -681,6 +841,10 @@ pub fn run(
         depth,
         fan_out,
         total_triples,
+        max_triples,
+        exceeded_max_triples,
+        selection,
+        graphs_unexpanded,
         files: manifest_entries,
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)
@@ -774,6 +938,7 @@ fn gap_fill(
             path: "collector/gap-fill.nt".to_string(),
             graph: "gap-fill".to_string(),
             triples: gap_triples,
+            dangling_targets: 0,
         });
     }
 
@@ -986,39 +1151,161 @@ alpine = ["openssl", "busybox"]
         );
     }
 
-    #[test]
-    fn a_capability_edge_survives_extraction_only_if_the_capability_was_visited() {
-        // The other half of the same regression, at the filtering step: this is
-        // *why* the traversal above matters.
+    /// A capability description as the endpoint would serialise it. The two
+    /// type assertions are the triples the old filter deleted.
+    const CAPABILITY_DESCRIPTION: &str = concat!(
+        "<https://packagegraph.github.io/d/pkg/f/openssl> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#Package> .\n",
+        "<https://packagegraph.github.io/d/pkg/f/openssl> <https://purl.org/packagegraph/ontology/core#packageName> \"openssl\" .\n",
+        "<https://packagegraph.github.io/d/pkg/f/openssl> <https://purl.org/packagegraph/ontology/core#providesCapability> <https://packagegraph.github.io/d/capability/libssl.so.3> .\n",
+        "<https://packagegraph.github.io/d/capability/libssl.so.3> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#Capability> .\n",
+        "<https://packagegraph.github.io/d/capability/libssl.so.3> <https://purl.org/packagegraph/ontology/core#capabilityName> \"libssl.so.3\" .\n",
+        "<https://packagegraph.github.io/d/capability/libssl.so.3> <http://www.w3.org/2000/01/rdf-schema#label> \"libssl.so.3\" .\n",
+    );
+
+    /// Serve a fixed CONSTRUCT body and a fixed object list for the companion
+    /// SELECT, so a test can state what the endpoint holds and assert what
+    /// extraction keeps.
+    fn extraction_server(
+        construct_body: &str,
+        object_bindings: &str,
+    ) -> (mockito::ServerGuard, Vec<mockito::Mock>) {
         let mut server = mockito::Server::new();
-        let _mock = server
+        let construct = server
             .mock("POST", "/sparql")
             .match_header("accept", "application/n-triples")
             .with_status(200)
             .with_header("content-type", "application/n-triples")
-            .with_body(
-                "<http://ex/pkg1> <https://purl.org/packagegraph/ontology/core#packageName> \"openssl\" .\n\
-                 <http://ex/pkg1> <https://purl.org/packagegraph/ontology/core#providesCapability> <http://ex/cap1> .\n",
-            )
+            .with_body(construct_body)
+            .expect_at_least(1)
+            .create();
+        let select = server
+            .mock("POST", "/sparql")
+            .match_header("accept", "application/sparql-results+json")
+            .with_status(200)
+            .with_header("content-type", "application/sparql-results+json")
+            .with_body(format!(
+                r#"{{"results": {{"bindings": [{}]}}}}"#,
+                object_bindings
+            ))
+            .create();
+        (server, vec![construct, select])
+    }
+
+    #[test]
+    fn extraction_keeps_the_type_assertions_that_make_shapes_apply() {
+        // The regression that let a corpus certify itself: the old object
+        // filter compared every URI object against the visited set, and a
+        // class IRI is never a visited instance, so `rdf:type` was deleted
+        // from every record. With no typed node left, `sh:targetClass` selects
+        // no focus node and every shape conforms over nothing.
+        let (server, _mocks) = extraction_server(CAPABILITY_DESCRIPTION, "");
+        let client = crate::sparql::SparqlClient::new(&server.url());
+
+        let mut uris = HashSet::new();
+        uris.insert("https://packagegraph.github.io/d/pkg/f/openssl".to_string());
+        uris.insert("https://packagegraph.github.io/d/capability/libssl.so.3".to_string());
+
+        let kept = extract_triples(&client, "http://ex/graph/test", &uris).unwrap();
+
+        for expected in CAPABILITY_DESCRIPTION.lines() {
+            assert!(
+                kept.iter().any(|t| t == expected),
+                "extraction dropped {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_edge_leaving_the_corpus_is_kept_and_counted() {
+        // Deleting the edge was how `providesCapability` relationships
+        // disappeared when the RPM collector started emitting them: a
+        // predicate missing from BFS_PREDICATES removed the fact rather than
+        // leaving it unexpanded. An edge out of the selection is now retained
+        // and reported, so a partial corpus says it is partial.
+        let (server, _mocks) = extraction_server(
+            CAPABILITY_DESCRIPTION,
+            r#"{"o": {"type": "uri", "value": "https://packagegraph.github.io/d/capability/libssl.so.3"}}"#,
+        );
+        let client = crate::sparql::SparqlClient::new(&server.url());
+
+        let mut uris = HashSet::new();
+        uris.insert("https://packagegraph.github.io/d/pkg/f/openssl".to_string());
+
+        let (kept, report) =
+            extract_triples_reporting(&client, "http://ex/graph/test", &uris).unwrap();
+
+        assert!(
+            kept.iter().any(|t| t.contains("providesCapability")),
+            "an edge out of the selection must survive, not be silently deleted"
+        );
+        assert_eq!(
+            report.dangling_targets, 1,
+            "and the corpus must record that it points somewhere it does not describe"
+        );
+    }
+
+    #[test]
+    fn extraction_output_does_not_depend_on_hash_iteration_order() {
+        let (server, _mocks) = extraction_server(CAPABILITY_DESCRIPTION, "");
+        let client = crate::sparql::SparqlClient::new(&server.url());
+
+        let mut uris = HashSet::new();
+        for n in 0..64 {
+            uris.insert(format!("https://packagegraph.github.io/d/pkg/f/p{n}"));
+        }
+        uris.insert("https://packagegraph.github.io/d/pkg/f/openssl".to_string());
+
+        let first = extract_triples(&client, "http://ex/graph/test", &uris).unwrap();
+        let second = extract_triples(&client, "http://ex/graph/test", &uris).unwrap();
+        assert_eq!(first, second, "two runs over one selection must agree");
+        let mut sorted = first.clone();
+        sorted.sort();
+        assert_eq!(first, sorted, "output must be ordered, not hash-ordered");
+    }
+
+    #[test]
+    fn the_fan_out_cap_reports_and_repeats_its_cut() {
+        // A capped neighbourhood is a partial record. Which neighbours survive
+        // has to be a function of the data, and how many were dropped has to
+        // reach the manifest, or the corpus implies a completeness it does not
+        // have.
+        let bindings: Vec<String> = (0..10)
+            .map(|n| {
+                format!(
+                    r#"{{"seed": {{"type": "uri", "value": "http://ex/pkg1"}},
+                        "predicate": {{"type": "uri", "value": "https://purl.org/packagegraph/ontology/core#providesCapability"}},
+                        "neighbor": {{"type": "uri", "value": "http://ex/cap{n}"}}}}"#
+                )
+            })
+            .collect();
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/sparql")
+            .with_status(200)
+            .with_header("content-type", "application/sparql-results+json")
+            .with_body(format!(
+                r#"{{"results": {{"bindings": [{}]}}}}"#,
+                bindings.join(",")
+            ))
             .expect_at_least(1)
             .create();
 
         let client = crate::sparql::SparqlClient::new(&server.url());
+        let mut seeds = HashSet::new();
+        seeds.insert("http://ex/pkg1".to_string());
 
-        let mut without_cap = HashSet::new();
-        without_cap.insert("http://ex/pkg1".to_string());
-        let kept = extract_triples(&client, "http://ex/graph/test", &without_cap).unwrap();
-        assert!(
-            !kept.iter().any(|t| t.contains("providesCapability")),
-            "an unvisited capability must be filtered out -- this is the loss"
-        );
+        let (first, report) =
+            bfs_expand_reporting(&client, "http://ex/graph/test", &seeds, 1, 3).unwrap();
 
-        let mut with_cap = without_cap.clone();
-        with_cap.insert("http://ex/cap1".to_string());
-        let kept = extract_triples(&client, "http://ex/graph/test", &with_cap).unwrap();
-        assert!(
-            kept.iter().any(|t| t.contains("providesCapability")),
-            "a visited capability keeps its edge"
+        assert_eq!(report.fan_out_cuts, 7, "ten neighbours capped at three");
+        assert_eq!(report.capped_pairs, 1);
+        assert_eq!(report.hops_walked, 1);
+
+        let (second, _) =
+            bfs_expand_reporting(&client, "http://ex/graph/test", &seeds, 1, 3).unwrap();
+        assert_eq!(
+            first, second,
+            "the cap must choose the same three every run"
         );
     }
 
@@ -1032,6 +1319,13 @@ alpine = ["openssl", "busybox"]
             .with_header("content-type", "application/n-triples")
             .with_body("<http://ex/pkg1> <http://ex/name> \"openssl\" .\n<http://ex/pkg1> <http://ex/dep> <http://ex/pkg2> .\n")
             .expect_at_least(1)
+            .create();
+        let _objects = server
+            .mock("POST", "/sparql")
+            .match_header("accept", "application/sparql-results+json")
+            .with_status(200)
+            .with_header("content-type", "application/sparql-results+json")
+            .with_body(r#"{"results": {"bindings": []}}"#)
             .create();
 
         let client = crate::sparql::SparqlClient::new(&server.url());
