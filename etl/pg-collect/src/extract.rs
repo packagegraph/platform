@@ -130,6 +130,17 @@ pub fn resolve_seeds(
 }
 
 /// Predicates to follow during BFS expansion.
+///
+/// Capability edges are in this list because `extract_triples` drops any
+/// triple whose object URI was not visited. A predicate that BFS does not
+/// follow therefore does not merely go unexpanded -- the edge itself is
+/// filtered out of the extracted corpus. When the RPM collector stopped
+/// emitting `directlyProvides` in favour of `providesCapability`, that made
+/// provision relationships vanish from test corpora entirely, leaving the
+/// provider with a `packageName` and nothing else.
+///
+/// `requiresCapability` is listed for the same reason ahead of the requires
+/// half of the same change, so the gap cannot reopen on the other side.
 const BFS_PREDICATES: &[&str] = &[
     "https://purl.org/packagegraph/ontology/core#directlyDependsOn",
     "https://purl.org/packagegraph/ontology/core#buildDependsOn",
@@ -139,6 +150,8 @@ const BFS_PREDICATES: &[&str] = &[
     "https://purl.org/packagegraph/ontology/core#isVersionOf",
     "https://purl.org/packagegraph/ontology/core#provides",
     "https://purl.org/packagegraph/ontology/core#directlyProvides",
+    "https://purl.org/packagegraph/ontology/core#providesCapability",
+    "https://purl.org/packagegraph/ontology/core#requiresCapability",
     "https://purl.org/packagegraph/ontology/core#conflicts",
     "https://purl.org/packagegraph/ontology/core#partOfDistribution",
     "https://purl.org/packagegraph/ontology/core#partOfRelease",
@@ -928,6 +941,85 @@ alpine = ["openssl", "busybox"]
         assert!(expanded.contains("http://ex/pkg1"));
         // Total should be seed (1) + capped neighbors (2) = 3
         assert!(expanded.len() <= 3);
+    }
+
+    #[test]
+    fn bfs_follows_capability_edges() {
+        // Regression: extract_triples drops any triple whose object URI was not
+        // visited, so a predicate missing from BFS_PREDICATES removes the edge
+        // from the extracted corpus rather than merely leaving it unexpanded.
+        // When the RPM collector moved from directlyProvides to
+        // providesCapability, provision relationships disappeared from test
+        // corpora. This asserts the generated query asks for them: the mock
+        // only matches when the predicate is present, so a regression fails the
+        // request rather than silently returning nothing.
+        let mut server = mockito::Server::new();
+
+        let _mock = server
+            .mock("POST", "/sparql")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("core%23providesCapability".to_string()),
+                mockito::Matcher::Regex("core%23requiresCapability".to_string()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/sparql-results+json")
+            .with_body(
+                r#"{"results": {"bindings": [{
+                     "seed": {"type": "uri", "value": "http://ex/pkg1"},
+                     "predicate": {"type": "uri", "value": "https://purl.org/packagegraph/ontology/core#providesCapability"},
+                     "neighbor": {"type": "uri", "value": "http://ex/capability/libssl.so.3"}
+                   }]}}"#,
+            )
+            .expect_at_least(1)
+            .create();
+
+        let client = crate::sparql::SparqlClient::new(&server.url());
+        let mut seeds = HashSet::new();
+        seeds.insert("http://ex/pkg1".to_string());
+
+        let expanded = bfs_expand(&client, "http://ex/graph/test", &seeds, 1, 10).unwrap();
+
+        assert!(
+            expanded.contains("http://ex/capability/libssl.so.3"),
+            "BFS must reach the capability node, or extract_triples will filter \
+             the providesCapability edge out of the corpus"
+        );
+    }
+
+    #[test]
+    fn a_capability_edge_survives_extraction_only_if_the_capability_was_visited() {
+        // The other half of the same regression, at the filtering step: this is
+        // *why* the traversal above matters.
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/sparql")
+            .match_header("accept", "application/n-triples")
+            .with_status(200)
+            .with_header("content-type", "application/n-triples")
+            .with_body(
+                "<http://ex/pkg1> <https://purl.org/packagegraph/ontology/core#packageName> \"openssl\" .\n\
+                 <http://ex/pkg1> <https://purl.org/packagegraph/ontology/core#providesCapability> <http://ex/cap1> .\n",
+            )
+            .expect_at_least(1)
+            .create();
+
+        let client = crate::sparql::SparqlClient::new(&server.url());
+
+        let mut without_cap = HashSet::new();
+        without_cap.insert("http://ex/pkg1".to_string());
+        let kept = extract_triples(&client, "http://ex/graph/test", &without_cap).unwrap();
+        assert!(
+            !kept.iter().any(|t| t.contains("providesCapability")),
+            "an unvisited capability must be filtered out -- this is the loss"
+        );
+
+        let mut with_cap = without_cap.clone();
+        with_cap.insert("http://ex/cap1".to_string());
+        let kept = extract_triples(&client, "http://ex/graph/test", &with_cap).unwrap();
+        assert!(
+            kept.iter().any(|t| t.contains("providesCapability")),
+            "a visited capability keeps its edge"
+        );
     }
 
     #[test]

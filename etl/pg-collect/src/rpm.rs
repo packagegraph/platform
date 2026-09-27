@@ -34,20 +34,32 @@ fn distro_display_name(distro_id: &str) -> &str {
     }
 }
 
-/// Token prefixes that name RPM's own machinery rather than inter-package
-/// functionality.
+/// Token prefixes suppressed from the capability layer by policy.
 ///
-/// `config(foo)` marks a package's config-file dependency on itself,
-/// `rpmlib(...)` states which rpm features the package format needs, and
-/// `rtld(GNU_HASH)` is the dynamic-linker marker. None denotes something
-/// another package can provide, so none gets a `pkg:Capability` node or a
-/// `providesCapability`/`requiresCapability` shortcut.
+/// This is a **bounded policy choice, not a semantic claim**. These tokens are
+/// ordinary RPM capabilities: real packages declare them and real packages
+/// require them. Measured against AlmaLinux 9 BaseOS `primary.xml`, 2,996
+/// packages:
 ///
-/// This is suppression of the *convenience* layer only. Once
+/// | prefix | provides blocks | requires blocks |
+/// |---|---|---|
+/// | `rtld(` | 10 (all `glibc`, token `rtld(GNU_HASH)`) | 1,199 |
+/// | `config(` | 433, over 175 distinct tokens | 2 |
+/// | `rpmlib(` | 0 | 0 -- createrepo strips these from primary.xml, so this prefix never reaches the repodata path at all |
+///
+/// So `rtld(GNU_HASH)` has a genuine provider and 1,199 requirers. Suppressing
+/// it loses a real provider/consumer relationship; we do it because these
+/// tokens describe the packaging system's own contract rather than
+/// functionality a user would resolve against, and carrying them would add
+/// ~1,200 edges per repo to one node. That trade is reviewable and reversible,
+/// which a claim of impossibility would not be.
+///
+/// The suppression is of the *convenience* layer only. Once
 /// `rpm:DependencyDeclaration` lands (packagegraph/ontology#19), every
 /// `rpm:entry` gets a declaration including these -- the per-entry
-/// preservation contract has no exceptions. Until then they are dropped, as
-/// they always have been.
+/// preservation contract has no exceptions. Until then they are dropped
+/// entirely, as they always have been, and that remaining gap is the reason
+/// the declaration work is not optional.
 pub const RPM_INTERNAL_TOKEN_PREFIXES: &[&str] = &["config(", "rpmlib(", "rtld("];
 
 /// Whether a dependency token names RPM's own machinery.
@@ -1478,7 +1490,8 @@ impl RpmCollector {
         let requires: Vec<&RpmDep> = deps.iter().filter(|d| d.dep_type == "requires").collect();
 
         for dep in &requires {
-            // RPM internals name the packaging system, not a provider.
+            // Suppressed from the capability layer by policy, not because
+            // they lack providers. See RPM_INTERNAL_TOKEN_PREFIXES.
             if is_rpm_internal_token(&dep.name) {
                 continue;
             }
@@ -1583,8 +1596,8 @@ impl RpmCollector {
         // Emit provides
         let provides: Vec<&RpmDep> = deps.iter().filter(|d| d.dep_type == "provides").collect();
         for dep in &provides {
-            // RPM internals name the packaging system, not a capability another
-            // package can satisfy. See RPM_INTERNAL_TOKEN_PREFIXES.
+            // Suppressed from the capability layer by policy -- these tokens
+            // do have real providers. See RPM_INTERNAL_TOKEN_PREFIXES.
             if is_rpm_internal_token(&dep.name) {
                 continue;
             }
