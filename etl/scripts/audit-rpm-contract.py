@@ -13,9 +13,12 @@ Seven gates always run against the two files. Each can fail the run:
   edges      The count of `providesCapability` edges equals the source's
              Provides occurrences less the suppressed ones, exactly. Distinct
              tokens can agree while a per-provider edge is missing.
-  types      The graph carries `rdf:type` for its packages and capabilities.
-             A corpus stripped of types satisfies every class-targeted shape
-             over zero nodes, so a SHACL pass alone cannot establish this.
+  types      The graph carries `rdf:type` for its packages and capabilities,
+             and every typed capability has both an `rdfs:label` and a
+             `capabilityName`. A corpus stripped of types satisfies every
+             class-targeted shape over zero nodes, so a SHACL pass alone
+             cannot establish this. Checked as set equality against the typed
+             nodes, so a name on some untyped subject cannot make it up.
   encoding   No literal carries an undecoded XML entity. RPM's rich dependency
              syntax uses `<` and `>`, which XML escapes; reading the raw
              attribute bytes put `&gt;` into 9,919 identity names.
@@ -210,6 +213,7 @@ def stream_graph(rdf_path, capability_names_out):
         "undecoded_literals": [],
         "prohibited": {p: 0 for p in PROHIBITED_PREDICATES},
         "capabilities_without_label": 0,
+        "capabilities_without_name": 0,
         "identity_types": 0,
         "entity_in_prose": 0,
         "undecoded_name_count": 0,
@@ -218,7 +222,11 @@ def stream_graph(rdf_path, capability_names_out):
         "suppressed_token_count": 0,
         "suppressed_tokens_present": [],
     }
+    # Sets, not counters: the gate is set equality against the typed nodes, so
+    # a capabilityName sitting on some untyped subject cannot make the counts
+    # coincide. ~46.5k URIs for BaseOS, ~1M corpus-wide -- well within reach.
     labelled = set()
+    named = set()
     typed = set()
 
     with open(rdf_path, "r", encoding="utf-8") as handle:
@@ -266,6 +274,7 @@ def stream_graph(rdf_path, capability_names_out):
                     state["entity_in_prose"] += 1
             if predicate == f"{PKG}capabilityName":
                 state["capability_names"] += 1
+                named.add(subject)
                 token = unescape_nt(value)
                 if is_rpm_internal_token(token):
                     state["suppressed_token_count"] += 1
@@ -278,6 +287,7 @@ def stream_graph(rdf_path, capability_names_out):
 
     state["capability_labels"] = len(labelled & typed)
     state["capabilities_without_label"] = len(typed - labelled)
+    state["capabilities_without_name"] = len(typed - named)
     return state
 
 
@@ -481,12 +491,14 @@ def audit(primary_path, rdf_path, ontology_root=None, manifest_path=None):
     report["gates"]["types"] = {
         "pass": graph["capability_types"] > 0
         and graph["package_types"] > 0
-        and graph["capabilities_without_label"] == 0,
+        and graph["capabilities_without_label"] == 0
+        and graph["capabilities_without_name"] == 0,
         "detail": (
             f"{graph['package_types']} typed packages, "
             f"{graph['identity_types']} typed identities, "
             f"{graph['capability_types']} typed capabilities, "
-            f"{graph['capabilities_without_label']} capabilities without a label"
+            f"{graph['capabilities_without_label']} without a label, "
+            f"{graph['capabilities_without_name']} without a capabilityName"
         ),
     }
 

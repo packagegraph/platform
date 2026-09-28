@@ -317,6 +317,55 @@ class LabelErasure(MutationCase):
         self.assertOnlyGateFails(report, "types")
 
 
+class NameErasure(MutationCase):
+    def test_a_typed_capability_without_a_name_fails_the_type_gate(self):
+        # A node can carry rdf:type pkg:Capability and nothing else. Counting
+        # types and names separately would let that through whenever some
+        # other subject happened to carry a capabilityName, so the gate is set
+        # equality against the typed nodes.
+        kept, dropped = [], 0
+        for line in self.lines():
+            if (
+                "/capability/" in line
+                and f"<{PKG}capabilityName>" in line
+                and dropped == 0
+            ):
+                dropped += 1
+                continue
+            kept.append(line)
+        self.assertEqual(1, dropped)
+        self.rewrite(kept)
+
+        report = run_audit(self.graph)
+        self.assertEqual(1, report["graph"]["capabilities_without_name"])
+        # fidelity also fires: the token is gone from the graph side. Both are
+        # correct readings of the same deletion.
+        self.assertGatesFail(report, ["fidelity", "types"])
+
+    def test_a_capability_name_on_an_untyped_subject_does_not_cover_for_it(self):
+        # The count-based version of this gate passed here. Set equality does
+        # not: the orphan name raises the name count without covering the
+        # typed node that lost its own.
+        from urllib.parse import quote
+
+        cap = "https://packagegraph.github.io/d/capability/" + quote("glibc", safe="")
+        kept = [
+            line
+            for line in self.lines()
+            if not (line.startswith(f"<{cap}>") and f"<{PKG}capabilityName>" in line)
+        ]
+        orphan = "https://packagegraph.github.io/d/not-a-capability"
+        kept.append(f'<{orphan}> <{PKG}capabilityName> "glibc" .')
+        self.rewrite(kept)
+
+        report = run_audit(self.graph)
+        self.assertEqual(
+            report["graph"]["capability_types"], report["graph"]["capability_names"]
+        )
+        self.assertEqual(1, report["graph"]["capabilities_without_name"])
+        self.assertGateFails(report, "types")
+
+
 class Encoding(MutationCase):
     def test_an_undecoded_entity_in_a_name_fails_the_encoding_gate(self):
         # The live defect: reading the raw attribute bytes left `&gt;` in

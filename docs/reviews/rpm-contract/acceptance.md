@@ -68,7 +68,7 @@ etl/scripts/audit-rpm-contract.py \
 |---|---|---|
 | `fidelity` | Every non-suppressed `Provides` token in the source is a capability in the graph, and every capability in the graph traces back to a source token | A capability layer silently narrower than the source |
 | `edges` | The `providesCapability` edge count equals the source's `Provides` occurrences less the suppressed ones, exactly | A lost per-provider edge. Distinct tokens can all agree while an edge is missing, because another package still provides the same token |
-| `types` | `rdf:type` is present for packages, identities and capabilities; no capability lacks an `rdfs:label` | All 1,013,026 capability nodes failed `CapabilityShape`'s label requirement while SHACL reported conformance |
+| `types` | `rdf:type` is present for packages, identities and capabilities, and every typed capability has both an `rdfs:label` and a `capabilityName` — checked as set equality against the typed nodes, so a name on some untyped subject cannot make it up | All 1,013,026 capability nodes failed `CapabilityShape`'s label requirement while SHACL reported conformance |
 | `encoding` | No name-bearing literal carries an XML entity reference | 9,919 of `fedora/43`'s identity names contained `&gt;` |
 | `prohibited` | Neither `rpm:rpmProvides` nor `pkg:directlyProvides` is emitted on the provides path | `rpmProvides` was undeclared in every ontology module; `directlyProvides` has `rdfs:range :Package`, so pointing it at a capability token entailed `:Package` membership |
 | `policy` | The tokens the collector documents as suppressed are absent, and the audit's mirrored prefix list still matches `rpm.rs` | The collector drifting from its own stated policy in either direction |
@@ -100,7 +100,7 @@ the preserved AlmaLinux 9 BaseOS repodata (`primary.xml.gz`
 |---|---|
 | `fidelity` | 46,547 tokens agree; 0 source-only, 0 graph-only |
 | `edges` | 3,210,293 edges = 3,210,726 source occurrences − 433 suppressed, exactly |
-| `types` | 11,984 typed packages, 27,850 typed identities, 46,547 typed capabilities, 0 unlabelled |
+| `types` | 11,984 typed packages, 27,850 typed identities, 46,547 typed capabilities, 0 unlabelled, 0 unnamed |
 | `encoding` | 0 name literals carry an entity reference; 0 outside the name predicates |
 | `prohibited` | 0 `rpm:rpmProvides`, 0 `pkg:directlyProvides` |
 | `policy` | 1,632 suppressed occurrences in the source, 0 in the graph |
@@ -191,7 +191,7 @@ Reported as `not_run` with a reason, never as a pass:
 
 `etl/scripts/tests/test_audit_rpm_contract.py` takes a clean fixture pair and
 breaks exactly one thing per test, asserting the matching gate goes red. A gate
-that cannot fail is decoration. 31 tests, all of which fail if the gate they
+that cannot fail is decoration. 33 tests, all of which fail if the gate they
 target is removed.
 
 The fixture deliberately contains a capability two packages both provide
