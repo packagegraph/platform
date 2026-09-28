@@ -110,6 +110,43 @@ class CleanPair(unittest.TestCase):
         )
 
 
+class ReportScope(unittest.TestCase):
+    """The report has to say what it did not check, not only that it passed."""
+
+    def test_only_provides_is_reported_as_compared(self):
+        report = run_audit(GRAPH)
+        self.assertEqual(["provides"], report["coverage"]["kinds_compared"])
+        self.assertEqual(
+            ["requires", "conflicts", "obsoletes"],
+            report["coverage"]["kinds_not_compared"],
+        )
+
+    def test_the_uncompared_kinds_declare_null_not_zero(self):
+        # A consumer reading 0 cannot tell "none found" from "never looked".
+        report = run_audit(GRAPH)
+        for kind in ("requires", "conflicts", "obsoletes"):
+            entry = report["per_kind"][kind]
+            self.assertIsNone(entry["declared"], kind)
+            self.assertEqual("not_run", entry["status"])
+            self.assertIn("ontology#19", entry["reason"])
+            self.assertGreater(entry["source"], 0, kind)
+
+    def test_the_provides_kind_carries_real_numbers(self):
+        report = run_audit(GRAPH)
+        entry = report["per_kind"]["provides"]
+        self.assertEqual("compared", entry["status"])
+        self.assertEqual(9, entry["source"])
+        self.assertEqual(2, entry["rejected_by_policy"])
+        self.assertEqual(7, entry["expected"])
+        self.assertEqual(entry["expected"], entry["declared"])
+
+    def test_a_shacl_run_that_did_not_happen_shows_in_the_coverage_block(self):
+        report = run_audit(GRAPH)
+        self.assertEqual("not_requested", report["coverage"]["shacl"])
+        self.assertEqual("no manifest given", report["coverage"]["budget"])
+        self.assertNotIn("shacl", report["coverage"]["gates_run"])
+
+
 class TypeErasure(MutationCase):
     """The mutation the reviewer asked for by name."""
 

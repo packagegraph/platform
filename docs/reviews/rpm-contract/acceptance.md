@@ -119,6 +119,20 @@ practical, and the report records `shacl` as absent rather than passing. The
 class-targeted vacuity problem is covered by the `types` gate, which is the
 point of having it.
 
+## What the report says about its own scope
+
+`pass: true` on its own invites the reading that everything was checked, so the
+report carries the scope as data rather than only as prose here:
+
+- `per_kind` gives `source`, `rejected_by_policy`, `expected`, `declared` and
+  `status` for all four sections. `declared` is `null` — not `0` — for the three
+  kinds with no term to assert, because a consumer cannot tell "none found"
+  from "never looked" otherwise. On the BaseOS run: `provides` compared at
+  3,210,293 declared against 3,210,293 expected; `requires` 24,619 in source
+  with 1,199 rejected and `declared: null`; `conflicts` 560; `obsoletes` 874.
+- `coverage` lists `kinds_compared`, `kinds_not_compared`, `gates_run`,
+  `gates_not_run`, and whether SHACL and the budget check ran at all.
+
 ## What is not checked
 
 Reported as `not_run` with a reason, never as a pass:
@@ -142,7 +156,7 @@ Reported as `not_run` with a reason, never as a pass:
 
 `etl/scripts/tests/test_audit_rpm_contract.py` takes a clean fixture pair and
 breaks exactly one thing per test, asserting the matching gate goes red. A gate
-that cannot fail is decoration. 24 tests, all of which fail if the gate they
+that cannot fail is decoration. 28 tests, all of which fail if the gate they
 target is removed.
 
 The fixture deliberately contains a capability two packages both provide

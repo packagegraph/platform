@@ -510,6 +510,26 @@ def audit(primary_path, rdf_path, ontology_root=None, manifest_path=None):
                 ),
             }
 
+    # --- per-kind accounting ---------------------------------------------
+    # `declared` is the number the graph asserts for that kind. It is null,
+    # not 0, for the three kinds with no term to assert: 0 would be a
+    # measurement of an absence, and a consumer cannot tell the two apart.
+    report["per_kind"] = {
+        kind: {
+            "source": section_counts[kind],
+            "rejected_by_policy": suppressed[kind],
+            "expected": section_counts[kind] - suppressed[kind],
+            "declared": graph["provides_edges"] if kind == "provides" else None,
+            "status": "compared" if kind == "provides" else "not_run",
+            "reason": (
+                None
+                if kind == "provides"
+                else "rpm:DependencyDeclaration is undecided (ontology#19)"
+            ),
+        }
+        for kind in SECTIONS
+    }
+
     # --- deferred, reported rather than silently passed -------------------
     report["deferred"] = {
         "declarations": {
@@ -528,6 +548,26 @@ def audit(primary_path, rdf_path, ontology_root=None, manifest_path=None):
 
     failures = [name for name, gate in report["gates"].items() if gate["pass"] is False]
     report["failed_gates"] = failures
+
+    # What this run actually covered, in the report rather than only in prose.
+    # `pass: true` on its own invites the reading that everything was checked.
+    report["coverage"] = {
+        "kinds_compared": [
+            k for k, v in report["per_kind"].items() if v["status"] == "compared"
+        ],
+        "kinds_not_compared": [
+            k for k, v in report["per_kind"].items() if v["status"] != "compared"
+        ],
+        "gates_run": sorted(
+            name for name, g in report["gates"].items() if g["pass"] is not None
+        ),
+        "gates_not_run": sorted(
+            name for name, g in report["gates"].items() if g["pass"] is None
+        ),
+        "shacl": report.get("shacl", {}).get("status", "not_requested"),
+        "budget": "checked" if "budget" in report["gates"] else "no manifest given",
+    }
+
     report["pass"] = not failures
     return report
 
