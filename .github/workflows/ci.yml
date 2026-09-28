@@ -130,9 +130,75 @@ jobs:
           chmod +x "$mc_test_dir/$asset"
           python3 deploy/quadlet/collectors/tests/check_mc_exclusion.py "$mc_test_dir/$asset"
 
+  # A SHACL run was reporting conformance over a corpus that had lost the
+  # capability types its shapes target: `sh:targetClass` with no focus nodes
+  # conforms, so a class-targeted validation cannot tell "correct" from
+  # "empty" (#62). This job runs the acceptance audit against a fixture pair
+  # and mutations of it, including the one that matters -- deleting every
+  # `rdf:type pkg:Capability` triple, which pySHACL calls conforming and the
+  # audit's type gate must still reject.
+  #
+  # Criteria and scope: docs/reviews/rpm-contract/acceptance.md.
+  test-rpm-contract-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # pySHACL is what makes the vacuous-conformance assertion real. Without
+      # it that test skips rather than passes, which would leave this job
+      # green while never checking the thing it exists for.
+      - name: Install pySHACL
+        run: python3 -m pip install pyshacl==0.40.1
+      # Validated against the ONTOLOGY_VERSION pin, not ontology main: a PR
+      # can otherwise go green against shapes that never ship. Same fetch the
+      # build-etl job uses.
+      - name: Fetch the pinned ontology shapes
+        run: |
+          set -euo pipefail
+          ref="$(sed -e 's/#.*//' -e 's/[[:space:]]//g' etl/ONTOLOGY_VERSION | grep -m1 . || true)"
+          if [ -z "${ref}" ]; then
+            echo "etl/ONTOLOGY_VERSION contains no version value" >&2
+            exit 1
+          fi
+          echo "ontology ref: ${ref}"
+          git init /tmp/ontology
+          git -C /tmp/ontology remote add origin https://github.com/packagegraph/ontology.git
+          git -C /tmp/ontology fetch --depth 1 origin "${ref}"
+          git -C /tmp/ontology checkout --detach FETCH_HEAD
+          test -f /tmp/ontology/core/core.shacl.ttl
+      # Invoked directly, not via `unittest discover`: discover exits 0 when it
+      # matches nothing, so a rename would leave this step green while testing
+      # nothing. Same reasoning as the steps in the job above.
+      #
+      # A skip is also not a pass. The vacuous-conformance assertion is the
+      # whole point of the audit and it skips when pySHACL or the shapes are
+      # missing, so this fails the step on any skip rather than letting the
+      # job go green having checked less than it claims.
+      - name: Every acceptance gate must be able to fail
+        env:
+          ONTOLOGY_REPO: /tmp/ontology
+        run: |
+          set -euo pipefail
+          out=$(python3 etl/scripts/tests/test_audit_rpm_contract.py -v 2>&1) || {
+            echo "${out}"
+            exit 1
+          }
+          echo "${out}"
+          if echo "${out}" | grep -qi "skipped"; then
+            echo "a test skipped, but every dependency is installed above" >&2
+            exit 1
+          fi
+      - name: The audit must pass on the clean fixture pair
+        env:
+          ONTOLOGY_REPO: /tmp/ontology
+        run: |
+          python3 etl/scripts/audit-rpm-contract.py \
+            --primary etl/scripts/tests/fixtures/audit-primary.xml \
+            --rdf etl/scripts/tests/fixtures/audit-graph.nt \
+            --ontology-root /tmp/ontology
+
   build-etl:
     runs-on: ubuntu-latest
-    needs: [test-rust, test-wrapper-checkpoint-contract]
+    needs: [test-rust, test-wrapper-checkpoint-contract, test-rpm-contract-audit]
     steps:
       - uses: actions/checkout@v4
       - name: Sync ontology files for container build

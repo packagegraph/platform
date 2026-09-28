@@ -1,0 +1,57 @@
+<https://packagegraph.github.io/d/capability/%28shell-if-bash%20%3E%3D%205.0%20with%20shell-if-bash%20%3C%206%29> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#Capability> .
+<https://packagegraph.github.io/d/capability/%28shell-if-bash%20%3E%3D%205.0%20with%20shell-if-bash%20%3C%206%29> <http://www.w3.org/2000/01/rdf-schema#label> "(shell-if-bash >= 5.0 with shell-if-bash < 6)" .
+<https://packagegraph.github.io/d/capability/%28shell-if-bash%20%3E%3D%205.0%20with%20shell-if-bash%20%3C%206%29> <https://purl.org/packagegraph/ontology/core#capabilityName> "(shell-if-bash >= 5.0 with shell-if-bash < 6)" .
+<https://packagegraph.github.io/d/capability/bash%28x86-64%29> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#Capability> .
+<https://packagegraph.github.io/d/capability/bash%28x86-64%29> <http://www.w3.org/2000/01/rdf-schema#label> "bash(x86-64)" .
+<https://packagegraph.github.io/d/capability/bash%28x86-64%29> <https://purl.org/packagegraph/ontology/core#capabilityName> "bash(x86-64)" .
+<https://packagegraph.github.io/d/capability/bash> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#Capability> .
+<https://packagegraph.github.io/d/capability/bash> <http://www.w3.org/2000/01/rdf-schema#label> "bash" .
+<https://packagegraph.github.io/d/capability/bash> <https://purl.org/packagegraph/ontology/core#capabilityName> "bash" .
+<https://packagegraph.github.io/d/capability/bundled%28gnulib%29> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#Capability> .
+<https://packagegraph.github.io/d/capability/bundled%28gnulib%29> <http://www.w3.org/2000/01/rdf-schema#label> "bundled(gnulib)" .
+<https://packagegraph.github.io/d/capability/bundled%28gnulib%29> <https://purl.org/packagegraph/ontology/core#capabilityName> "bundled(gnulib)" .
+<https://packagegraph.github.io/d/capability/glibc> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#Capability> .
+<https://packagegraph.github.io/d/capability/glibc> <http://www.w3.org/2000/01/rdf-schema#label> "glibc" .
+<https://packagegraph.github.io/d/capability/glibc> <https://purl.org/packagegraph/ontology/core#capabilityName> "glibc" .
+<https://packagegraph.github.io/d/capability/libc.so.6%28GLIBC_2.34%29%2864bit%29> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#Capability> .
+<https://packagegraph.github.io/d/capability/libc.so.6%28GLIBC_2.34%29%2864bit%29> <http://www.w3.org/2000/01/rdf-schema#label> "libc.so.6(GLIBC_2.34)(64bit)" .
+<https://packagegraph.github.io/d/capability/libc.so.6%28GLIBC_2.34%29%2864bit%29> <https://purl.org/packagegraph/ontology/core#capabilityName> "libc.so.6(GLIBC_2.34)(64bit)" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/basesystem> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#PackageIdentity> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/basesystem> <http://www.w3.org/2000/01/rdf-schema#label> "basesystem Package Identity" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/basesystem> <https://purl.org/packagegraph/ontology/core#identityName> "basesystem" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash-completion> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#PackageIdentity> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash-completion> <http://www.w3.org/2000/01/rdf-schema#label> "bash-completion Package Identity" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash-completion> <https://purl.org/packagegraph/ontology/core#identityName> "bash-completion" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/0%3A5.1.8-9.el9> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#BinaryPackage> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/0%3A5.1.8-9.el9> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/rpm#BinaryRPM> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/0%3A5.1.8-9.el9> <http://www.w3.org/2000/01/rdf-schema#label> "bash" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/0%3A5.1.8-9.el9> <https://purl.org/packagegraph/ontology/core#isVersionOf> <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/0%3A5.1.8-9.el9> <https://purl.org/packagegraph/ontology/core#packageName> "bash" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/0%3A5.1.8-9.el9> <https://purl.org/packagegraph/ontology/core#providesCapability> <https://packagegraph.github.io/d/capability/%28shell-if-bash%20%3E%3D%205.0%20with%20shell-if-bash%20%3C%206%29> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/0%3A5.1.8-9.el9> <https://purl.org/packagegraph/ontology/core#providesCapability> <https://packagegraph.github.io/d/capability/bash%28x86-64%29> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/0%3A5.1.8-9.el9> <https://purl.org/packagegraph/ontology/core#providesCapability> <https://packagegraph.github.io/d/capability/bash> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/0%3A5.1.8-9.el9> <https://purl.org/packagegraph/ontology/core#providesCapability> <https://packagegraph.github.io/d/capability/bundled%28gnulib%29> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/0%3A5.1.8-9.el9> <https://purl.org/packagegraph/ontology/rpm#rpmConflicts> <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash-completion> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/0%3A5.1.8-9.el9> <https://purl.org/packagegraph/ontology/rpm#rpmRequires> <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/libc.so.6%28GLIBC_2.34%29%2864bit%29> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#PackageIdentity> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash> <http://www.w3.org/2000/01/rdf-schema#label> "bash Package Identity" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash> <https://purl.org/packagegraph/ontology/core#identityName> "bash" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc-debuginfo> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#PackageIdentity> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc-debuginfo> <http://www.w3.org/2000/01/rdf-schema#label> "glibc-debuginfo Package Identity" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc-debuginfo> <https://purl.org/packagegraph/ontology/core#identityName> "glibc-debuginfo" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc/0%3A2.34-60.el9> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#BinaryPackage> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc/0%3A2.34-60.el9> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/rpm#BinaryRPM> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc/0%3A2.34-60.el9> <http://www.w3.org/2000/01/rdf-schema#label> "glibc" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc/0%3A2.34-60.el9> <https://purl.org/packagegraph/ontology/core#isVersionOf> <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc/0%3A2.34-60.el9> <https://purl.org/packagegraph/ontology/core#packageName> "glibc" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc/0%3A2.34-60.el9> <https://purl.org/packagegraph/ontology/core#providesCapability> <https://packagegraph.github.io/d/capability/bundled%28gnulib%29> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc/0%3A2.34-60.el9> <https://purl.org/packagegraph/ontology/core#providesCapability> <https://packagegraph.github.io/d/capability/glibc> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc/0%3A2.34-60.el9> <https://purl.org/packagegraph/ontology/core#providesCapability> <https://packagegraph.github.io/d/capability/libc.so.6%28GLIBC_2.34%29%2864bit%29> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc/0%3A2.34-60.el9> <https://purl.org/packagegraph/ontology/rpm#rpmObsoletes> <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc-debuginfo> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc/0%3A2.34-60.el9> <https://purl.org/packagegraph/ontology/rpm#rpmRequires> <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/basesystem> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#PackageIdentity> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc> <http://www.w3.org/2000/01/rdf-schema#label> "glibc Package Identity" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/glibc> <https://purl.org/packagegraph/ontology/core#identityName> "glibc" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/libc.so.6%28GLIBC_2.34%29%2864bit%29> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#PackageIdentity> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/libc.so.6%28GLIBC_2.34%29%2864bit%29> <http://www.w3.org/2000/01/rdf-schema#label> "libc.so.6(GLIBC_2.34)(64bit) Package Identity" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/libc.so.6%28GLIBC_2.34%29%2864bit%29> <https://purl.org/packagegraph/ontology/core#identityName> "libc.so.6(GLIBC_2.34)(64bit)" .

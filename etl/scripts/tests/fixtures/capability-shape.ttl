@@ -1,0 +1,21 @@
+# pkg:CapabilityShape, copied verbatim from core/core.shacl.ttl in the ontology
+# repository at 81f88aa.
+#
+# Committed here so the vacuity test runs without an ontology checkout. It is a
+# copy, so it can go stale; the test prefers the real shapes whenever
+# ONTOLOGY_REPO points at a checkout and says which source it used.
+@prefix pkg: <https://purl.org/packagegraph/ontology/core#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+pkg:CapabilityShape a sh:NodeShape ;
+    sh:property [ sh:message "A capability must have at least one label."@en ;
+            sh:minCount 1 ;
+            sh:path rdfs:label ],
+        [ sh:datatype xsd:string ;
+            sh:maxCount 1 ;
+            sh:message "A capability must have exactly one capability name."@en ;
+            sh:minCount 1 ;
+            sh:path pkg:capabilityName ] ;
+    sh:targetClass pkg:Capability .
