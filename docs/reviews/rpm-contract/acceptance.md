@@ -24,6 +24,33 @@ The audit therefore counts focus nodes before it trusts a conformance result,
 and reads `primary.xml` with the Python standard library rather than through
 the collector — comparing two outputs of the same parser is not independence.
 
+### The problem has a second form
+
+`inference="none"` is the honest reading of the bytes on disk, and it is also
+blind in a way the empty-focus-node case does not cover. `PackageShape` targets
+`pkg:Package`; the RPM collector writes `pkg:BinaryPackage` and
+`pkg:SourcePackage`. Without subclass entailment that shape reaches **no
+package node in the corpus at all** — a second silent zero, from a corpus that
+is fully populated.
+
+So the audit runs both regimes and reports them separately:
+
+- `none` — what is written down. Gates as `shacl`.
+- `rdfs` — the regime the ontology declares ("all examples pass validation —
+  pyshacl with RDFS inference"), with `core.ttl`, `skos-schemes.ttl` and
+  `rpm.ttl` merged in so the entailments are available. Gates as `shacl_rdfs`.
+
+`*.examples.ttl` is excluded from both. Merging `core.examples.ttl` in added 2
+violations that belong to the ontology's own example data; an audit that reports
+someone else's defects as yours is not usable. Both `core.shacl.ttl` and
+`ecosystems/rpm/rpm.shacl.ttl` are applied — the first version of this loaded
+only core's.
+
+Measured on the type-erased fixture: **both** regimes report conformance. RDFS
+does not rescue the missing types, because nothing entails `pkg:Capability`
+membership from a capability's name or its provides edge. The `types` gate is
+the only thing that catches it, under either regime.
+
 ## Release gates
 
 Each gate fails the run and exits nonzero. Run:
@@ -47,6 +74,7 @@ etl/scripts/audit-rpm-contract.py \
 | `policy` | The tokens the collector documents as suppressed are absent, and the audit's mirrored prefix list still matches `rpm.rs` | The collector drifting from its own stated policy in either direction |
 | `budget` | `total_triples <= max_triples` in the manifest, and both keys are present | A run wrote 10,608,101 triples against a 3,000,000 ceiling and exited 0. A manifest missing either key fails rather than being read as within budget |
 | `shacl` | Conforms with `inference="none"` | — reported as `not run`, never as a pass, when pySHACL or the shapes are unavailable |
+| `shacl_rdfs` | Conforms under the regime the ontology declares | A superclass-targeted shape that no instance reaches without entailment |
 
 `encoding` deliberately gates only on `capabilityName`, `identityName`,
 `packageName` and `rdfs:label`. A description can legitimately contain the text
@@ -114,10 +142,17 @@ Two caveats on that run, stated because they are substitutions:
   was synthesized for that href. It is inert for every gate here, all of which
   concern the provides/capability layer, but it is not the repository's bytes.
 
-SHACL was not run against this corpus. 3.7M triples through rdflib is not
-practical, and the report records `shacl` as absent rather than passing. The
-class-targeted vacuity problem is covered by the `types` gate, which is the
-point of having it.
+Neither SHACL regime was run against this corpus. 3.7M triples through rdflib
+is not practical, and the report records both as absent rather than passing.
+The class-targeted vacuity problem is covered by the `types` gate, which is the
+point of having it. The fixture pair is where the SHACL gates run, under both
+regimes, in CI.
+
+The fixture was also corrected in the course of this: it originally omitted
+`pkg:hasVersion` and the `pkg:Version` node the collector really does emit, so
+the RDFS run failed on the fixture's own gaps rather than on anything the
+collector does. A fixture that is not a faithful miniature produces findings
+about the fixture.
 
 ## What the report says about its own scope
 
@@ -156,7 +191,7 @@ Reported as `not_run` with a reason, never as a pass:
 
 `etl/scripts/tests/test_audit_rpm_contract.py` takes a clean fixture pair and
 breaks exactly one thing per test, asserting the matching gate goes red. A gate
-that cannot fail is decoration. 28 tests, all of which fail if the gate they
+that cannot fail is decoration. 31 tests, all of which fail if the gate they
 target is removed.
 
 The fixture deliberately contains a capability two packages both provide

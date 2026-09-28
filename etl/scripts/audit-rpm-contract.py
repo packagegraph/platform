@@ -320,34 +320,79 @@ def compare_sorted(left_path, right_path, limit=20):
     }
 
 
-def run_shacl(rdf_path, ontology_root):
-    """Validate with no inference, or say plainly that it did not run."""
+# Shape graphs the audit applies, and the axioms the declared regime needs.
+# `*.examples.ttl` is excluded from both: it is the ontology's own instance
+# data, and merging it in added 2 violations that belong to the examples rather
+# than to any corpus. An audit that reports someone else's defects as yours is
+# not usable.
+SHAPE_FILES = ("core/core.shacl.ttl", "ecosystems/rpm/rpm.shacl.ttl")
+AXIOM_FILES = ("core/core.ttl", "core/skos-schemes.ttl", "ecosystems/rpm/rpm.ttl")
+
+
+def run_shacl(rdf_path, ontology_root, regime):
+    """Validate under one entailment regime, or say plainly that it did not run.
+
+    Two regimes, reported separately, because they fail differently.
+
+    `none` is the honest reading of the bytes on disk. It is also blind in a
+    second way beyond the empty-focus-node problem: `sh:targetClass pkg:Package`
+    reaches no `pkg:BinaryPackage` node at all without subclass entailment, so
+    `PackageShape` never runs against a single package in the corpus.
+
+    `rdfs` is the regime the ontology declares ("all examples pass validation --
+    pyshacl with RDFS inference"). It makes the superclass shapes apply. It does
+    not rescue the missing-type case: measured on the type-erased fixture, RDFS
+    reports conformance too, because nothing entails `pkg:Capability`
+    membership from a capability's name or its provides edge. The type gate is
+    what catches that, under either regime.
+    """
     try:
         import pyshacl  # noqa: F401
         import rdflib
     except ImportError as exc:
-        return {"status": "not_run", "reason": f"missing dependency: {exc.name}"}
+        return {"status": "not_run", "regime": regime, "reason": f"missing dependency: {exc.name}"}
 
-    shapes_path = Path(ontology_root) / "core" / "core.shacl.ttl"
-    if not shapes_path.is_file():
-        return {"status": "not_run", "reason": f"no shapes at {shapes_path}"}
+    root = Path(ontology_root)
+    missing = [f for f in SHAPE_FILES if not (root / f).is_file()]
+    if missing:
+        return {
+            "status": "not_run",
+            "regime": regime,
+            "reason": f"no shapes at {', '.join(str(root / m) for m in missing)}",
+        }
 
     import pyshacl
 
     data = rdflib.Graph()
     data.parse(rdf_path, format="nt")
+    triples_read = len(data)
+
+    if regime != "none":
+        absent = [f for f in AXIOM_FILES if not (root / f).is_file()]
+        if absent:
+            return {
+                "status": "not_run",
+                "regime": regime,
+                "reason": f"no axioms at {', '.join(str(root / a) for a in absent)}",
+            }
+        for name in AXIOM_FILES:
+            data.parse(str(root / name), format="turtle")
+
     shapes = rdflib.Graph()
-    shapes.parse(str(shapes_path), format="turtle")
+    for name in SHAPE_FILES:
+        shapes.parse(str(root / name), format="turtle")
 
     conforms, _results_graph, text = pyshacl.validate(
-        data, shacl_graph=shapes, inference="none", abort_on_first=False
+        data, shacl_graph=shapes, inference=regime, abort_on_first=False
     )
-    violations = text.count("Constraint Violation")
     return {
         "status": "ran",
-        "inference": "none",
+        "regime": regime,
         "conforms": bool(conforms),
-        "violations": violations,
+        "violations": text.count("Constraint Violation"),
+        "corpus_triples": triples_read,
+        "shape_files": list(SHAPE_FILES),
+        "axiom_files": list(AXIOM_FILES) if regime != "none" else [],
         "report_head": text[:2000],
     }
 
@@ -464,21 +509,27 @@ def audit(primary_path, rdf_path, ontology_root=None, manifest_path=None):
     }
 
     if ontology_root:
-        shacl = run_shacl(rdf_path, ontology_root)
-        report["shacl"] = shacl
-        # A SHACL run that did not happen is not a pass. A run that passes
-        # over zero focus nodes is not a pass either -- the types gate above
-        # is what makes conformance mean something.
-        if shacl["status"] == "ran":
-            report["gates"]["shacl"] = {
-                "pass": shacl["conforms"],
-                "detail": f"{shacl['violations']} violations, inference=none",
-            }
-        else:
-            report["gates"]["shacl"] = {
-                "pass": None,
-                "detail": f"not run: {shacl['reason']}",
-            }
+        # No inference first, then the declared regime, separately. A SHACL run
+        # that did not happen is not a pass, and neither is one that passed
+        # over zero focus nodes -- the types gate above is what makes either
+        # conformance result mean anything.
+        report["shacl"] = {}
+        for regime, gate in (("none", "shacl"), ("rdfs", "shacl_rdfs")):
+            result = run_shacl(rdf_path, ontology_root, regime)
+            report["shacl"][regime] = result
+            if result["status"] == "ran":
+                report["gates"][gate] = {
+                    "pass": result["conforms"],
+                    "detail": (
+                        f"{result['violations']} violations, inference={regime}, "
+                        f"{result['corpus_triples']} corpus triples"
+                    ),
+                }
+            else:
+                report["gates"][gate] = {
+                    "pass": None,
+                    "detail": f"not run: {result['reason']}",
+                }
 
     if manifest_path:
         with open(manifest_path, encoding="utf-8") as handle:
@@ -564,7 +615,11 @@ def audit(primary_path, rdf_path, ontology_root=None, manifest_path=None):
         "gates_not_run": sorted(
             name for name, g in report["gates"].items() if g["pass"] is None
         ),
-        "shacl": report.get("shacl", {}).get("status", "not_requested"),
+        "shacl": {
+            regime: result["status"]
+            for regime, result in report.get("shacl", {}).items()
+        }
+        or "not_requested",
         "budget": "checked" if "budget" in report["gates"] else "no manifest given",
     }
 

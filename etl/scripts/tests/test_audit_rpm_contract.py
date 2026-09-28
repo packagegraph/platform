@@ -208,6 +208,54 @@ class TypeErasure(MutationCase):
         # The point: SHACL says yes, the audit says no, and the audit is right.
         self.assertGateFails(run_audit(self.graph), "types")
 
+    def test_neither_regime_rescues_the_erased_corpus(self):
+        # The sharper claim, driven through the audit's own SHACL path rather
+        # than a hand-rolled one: with every capability type deleted, both
+        # `inference=none` and the declared RDFS regime report conformance,
+        # because nothing entails pkg:Capability membership from a
+        # capability's name or its provides edge.
+        try:
+            import pyshacl  # noqa: F401
+        except ImportError as exc:
+            self.skipTest(f"pySHACL unavailable ({exc.name})")
+        root = self.ontology_root()
+        if root is None:
+            self.skipTest("no ontology checkout; the declared regime needs its axioms")
+
+        self.erase_capability_types()
+        report = run_audit(self.graph, ontology_root=root)
+
+        for gate in ("shacl", "shacl_rdfs"):
+            self.assertTrue(report["gates"][gate]["pass"], report["gates"][gate])
+        self.assertGateFails(report, "types")
+        self.assertEqual(
+            {"none": "ran", "rdfs": "ran"}, report["coverage"]["shacl"]
+        )
+
+    def test_the_ontologys_own_examples_are_kept_out_of_the_axioms(self):
+        # Merging core.examples.ttl added 2 violations that belong to the
+        # examples, not to any corpus. An audit that reports someone else's
+        # defects as yours is not usable. Asserted both ways: the file exists,
+        # and it is not in the axiom list.
+        root = self.ontology_root()
+        if root is None:
+            self.skipTest("no ontology checkout")
+        self.assertTrue(
+            (Path(root) / "core" / "core.examples.ttl").is_file(),
+            "core.examples.ttl is gone, so this exclusion may be stale",
+        )
+        for name in audit_module.AXIOM_FILES + audit_module.SHAPE_FILES:
+            self.assertNotIn("examples", name, name)
+
+    @staticmethod
+    def ontology_root():
+        import os
+
+        root = os.environ.get(
+            "ONTOLOGY_REPO", str(SCRIPTS_DIR.parent.parent.parent / "ontology")
+        )
+        return root if (Path(root) / "core" / "core.shacl.ttl").is_file() else None
+
     def test_the_vacuity_shape_copy_still_matches_the_ontology(self):
         # The copy exists so the test above can run without a checkout. When a
         # checkout is here, hold the copy to it.
@@ -481,16 +529,47 @@ class Budget(MutationCase):
 
 
 class ShaclReporting(MutationCase):
+    def test_both_regimes_are_reported_separately(self):
+        # The plan asks for no inference first and the declared regime checked
+        # separately. They fail differently: `none` reads the bytes as written
+        # but leaves every superclass-targeted shape with no focus nodes, so
+        # PackageShape never reaches a single pkg:BinaryPackage.
+        try:
+            import pyshacl  # noqa: F401
+        except ImportError as exc:
+            self.skipTest(f"pySHACL unavailable ({exc.name})")
+        root = TypeErasure.ontology_root()
+        if root is None:
+            self.skipTest("no ontology checkout")
+
+        report = run_audit(GRAPH, ontology_root=root)
+        self.assertEqual({"none", "rdfs"}, set(report["shacl"]))
+        self.assertEqual([], report["shacl"]["none"]["axiom_files"])
+        self.assertEqual(
+            list(audit_module.AXIOM_FILES), report["shacl"]["rdfs"]["axiom_files"]
+        )
+        # Both shape graphs, not only core's. The rpm module has its own.
+        for regime in ("none", "rdfs"):
+            self.assertEqual(
+                list(audit_module.SHAPE_FILES),
+                report["shacl"][regime]["shape_files"],
+            )
+            self.assertTrue(report["gates"][
+                "shacl" if regime == "none" else "shacl_rdfs"
+            ]["pass"])
+
     def test_a_shacl_run_that_did_not_happen_is_not_a_pass(self):
         # `pass: None` prints as "not run" and is excluded from failed_gates.
         # It must never read as true.
         report = run_audit(
             self.graph, ontology_root=str(Path(self.tmp.name) / "no-such-ontology")
         )
-        gate = report["gates"]["shacl"]
-        self.assertIsNone(gate["pass"])
-        self.assertIn("not run", gate["detail"])
-        self.assertNotIn("shacl", report["failed_gates"])
+        for name in ("shacl", "shacl_rdfs"):
+            gate = report["gates"][name]
+            self.assertIsNone(gate["pass"], name)
+            self.assertIn("not run", gate["detail"])
+            self.assertNotIn(name, report["failed_gates"])
+            self.assertIn(name, report["coverage"]["gates_not_run"])
 
 
 class CommandLine(MutationCase):
