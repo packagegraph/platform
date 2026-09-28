@@ -6,7 +6,7 @@ source says to what the graph asserts. Comparing two outputs of the same
 parser is not independence, so this reads `primary.xml` with the standard
 library and never imports the collector.
 
-Seven gates, each of which can fail the run:
+Seven gates always run against the two files. Each can fail the run:
 
   fidelity   Every Provides token in the source is a capability in the graph,
              and every capability in the graph traces to a source token.
@@ -27,6 +27,18 @@ Seven gates, each of which can fail the run:
              and every token it does not suppress is present. The suppression
              list is mirrored from the Rust source, so the two can disagree --
              that disagreement is what this gate exists to surface.
+
+Three more run only when their input is supplied, and report `not_run` rather
+than passing when it is not:
+
+  budget     `total_triples <= max_triples` in `--manifest`, with both keys
+             present. A manifest of a shape this audit does not understand
+             fails rather than reading as unlimited.
+  shacl      Conforms under `inference="none"` against `--ontology-root`.
+  shacl_rdfs Conforms under the regime the ontology declares. Checked
+             separately because the two are blind to different things:
+             `none` leaves every superclass-targeted shape with no focus
+             nodes, so `PackageShape` reaches no `pkg:BinaryPackage` at all.
 
 What is *not* checked, and is reported as `not_run` rather than passing:
 declaration occurrences, `pre`, and per-kind Requires/Conflicts/Obsoletes
