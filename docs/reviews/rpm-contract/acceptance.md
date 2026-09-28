@@ -45,7 +45,7 @@ etl/scripts/audit-rpm-contract.py \
 | `encoding` | No name-bearing literal carries an XML entity reference | 9,919 of `fedora/43`'s identity names contained `&gt;` |
 | `prohibited` | Neither `rpm:rpmProvides` nor `pkg:directlyProvides` is emitted on the provides path | `rpmProvides` was undeclared in every ontology module; `directlyProvides` has `rdfs:range :Package`, so pointing it at a capability token entailed `:Package` membership |
 | `policy` | The tokens the collector documents as suppressed are absent, and the audit's mirrored prefix list still matches `rpm.rs` | The collector drifting from its own stated policy in either direction |
-| `budget` | `total_triples <= max_triples` in the manifest | A run wrote 10,608,101 triples against a 3,000,000 ceiling and exited 0 |
+| `budget` | `total_triples <= max_triples` in the manifest, and both keys are present | A run wrote 10,608,101 triples against a 3,000,000 ceiling and exited 0. A manifest missing either key fails rather than being read as within budget |
 | `shacl` | Conforms with `inference="none"` | — reported as `not run`, never as a pass, when pySHACL or the shapes are unavailable |
 
 `encoding` deliberately gates only on `capabilityName`, `identityName`,
@@ -142,7 +142,7 @@ Reported as `not_run` with a reason, never as a pass:
 
 `etl/scripts/tests/test_audit_rpm_contract.py` takes a clean fixture pair and
 breaks exactly one thing per test, asserting the matching gate goes red. A gate
-that cannot fail is decoration. 22 tests, all of which fail if the gate they
+that cannot fail is decoration. 24 tests, all of which fail if the gate they
 target is removed.
 
 The fixture deliberately contains a capability two packages both provide

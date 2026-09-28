@@ -491,17 +491,24 @@ def audit(primary_path, rdf_path, ontology_root=None, manifest_path=None):
             "classes_over_budget": len(manifest.get("classes_over_budget", [])),
             "fan_out_cuts": manifest.get("selection", {}).get("fan_out_cuts"),
         }
-        within = (
-            manifest.get("max_triples") is None
-            or manifest.get("total_triples", 0) <= manifest["max_triples"]
-        )
-        report["gates"]["budget"] = {
-            "pass": within,
-            "detail": (
-                f"{manifest.get('total_triples')} triples against "
-                f"{manifest.get('max_triples')}"
-            ),
-        }
+        # Both keys are non-Option fields on extract.rs's `Manifest`, so a
+        # missing one means the manifest is not the one this audit understands.
+        # Treating that as "within budget" would be a silent pass, which is the
+        # failure mode this whole script exists to remove.
+        missing = [k for k in ("total_triples", "max_triples") if k not in manifest]
+        if missing:
+            report["gates"]["budget"] = {
+                "pass": False,
+                "detail": f"manifest has no {', '.join(missing)}",
+            }
+        else:
+            report["gates"]["budget"] = {
+                "pass": manifest["total_triples"] <= manifest["max_triples"],
+                "detail": (
+                    f"{manifest['total_triples']} triples against "
+                    f"{manifest['max_triples']}"
+                ),
+            }
 
     # --- deferred, reported rather than silently passed -------------------
     report["deferred"] = {

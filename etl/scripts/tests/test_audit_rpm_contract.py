@@ -413,6 +413,31 @@ class Budget(MutationCase):
         report = run_audit(self.graph, manifest=self.write_manifest(10_608_101, 3_000_000))
         self.assertGateFails(report, "budget")
 
+    def test_a_manifest_missing_the_keys_fails_rather_than_passing(self):
+        # extract.rs declares both as non-Option, so an absent key means this
+        # is not the manifest the audit understands. "Within budget" would be
+        # the wrong conclusion to draw from a manifest it cannot read.
+        path = Path(self.tmp.name) / "partial.json"
+        path.write_text(json.dumps({"files": []}), encoding="utf-8")
+        report = run_audit(self.graph, manifest=str(path))
+        self.assertGateFails(report, "budget")
+        self.assertIn("total_triples", report["gates"]["budget"]["detail"])
+        self.assertIn("max_triples", report["gates"]["budget"]["detail"])
+
+    def test_the_gate_reads_the_key_names_extract_rs_writes(self):
+        # A gate that reads a key nobody writes is a gate that always passes.
+        rust = (
+            SCRIPTS_DIR.parent / "pg-collect" / "src" / "extract.rs"
+        ).read_text(encoding="utf-8")
+        for field in ("total_triples", "max_triples", "graphs_over_budget",
+                      "classes_over_budget"):
+            self.assertIn(
+                f"pub {field}:", rust, f"extract.rs no longer has {field}"
+            )
+        self.assertNotIn(
+            "serde(rename", rust, "a serde rename would change the JSON keys"
+        )
+
     def test_a_corpus_within_its_ceiling_passes(self):
         report = run_audit(self.graph, manifest=self.write_manifest(2_000_000, 3_000_000))
         self.assertEqual([], report["failed_gates"])
