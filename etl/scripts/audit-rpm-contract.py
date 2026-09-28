@@ -368,11 +368,17 @@ def run_shacl(rdf_path, ontology_root, regime):
     membership from a capability's name or its provides edge. The type gate is
     what catches that, under either regime.
     """
+    # Imported here, not at module scope: the audit's other nine gates must
+    # keep working without pySHACL installed, reporting these two as not_run.
     try:
-        import pyshacl  # noqa: F401
+        import pyshacl
         import rdflib
     except ImportError as exc:
-        return {"status": "not_run", "regime": regime, "reason": f"missing dependency: {exc.name}"}
+        return {
+            "status": "not_run",
+            "regime": regime,
+            "reason": f"missing dependency: {exc.name}",
+        }
 
     root = Path(ontology_root)
     missing = [f for f in SHAPE_FILES if not (root / f).is_file()]
@@ -382,8 +388,6 @@ def run_shacl(rdf_path, ontology_root, regime):
             "regime": regime,
             "reason": f"no shapes at {', '.join(str(root / m) for m in missing)}",
         }
-
-    import pyshacl
 
     data = rdflib.Graph()
     data.parse(rdf_path, format="nt")

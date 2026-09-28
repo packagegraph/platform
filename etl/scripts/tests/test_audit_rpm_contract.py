@@ -184,7 +184,7 @@ class TypeErasure(MutationCase):
         # when pySHACL is absent: a check that did not run is not a check that
         # passed, and this is the one assertion that cannot be faked.
         try:
-            import pyshacl  # noqa: F401
+            import pyshacl
             import rdflib
         except ImportError as exc:
             self.skipTest(f"pySHACL/rdflib unavailable ({exc.name})")
@@ -269,7 +269,7 @@ class TypeErasure(MutationCase):
         target = re.search(
             r"pkg:CapabilityShape a sh:NodeShape ;.*?sh:targetClass pkg:Capability \.",
             real.read_text(encoding="utf-8"),
-            re.S,
+            re.DOTALL,
         )
         self.assertIsNotNone(target, "CapabilityShape is no longer in core.shacl.ttl")
         self.assertIn(
@@ -640,6 +640,7 @@ class CommandLine(MutationCase):
             ],
             capture_output=True,
             text=True,
+            check=False,  # the returncode is what this test asserts on
         )
         self.assertEqual(1, proc.returncode, proc.stderr)
         self.assertIn("FAILED: ", proc.stderr)
@@ -660,6 +661,7 @@ class CommandLine(MutationCase):
             ],
             capture_output=True,
             text=True,
+            check=False,  # the returncode is what this test asserts on
         )
         self.assertEqual(0, proc.returncode, proc.stderr)
 
