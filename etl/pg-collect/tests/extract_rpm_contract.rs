@@ -7,7 +7,9 @@
 //!
 //! The record that matters most here is the type assertion. `sh:targetClass`
 //! is the only way a shape acquires focus nodes, so a corpus whose
-//! `rdf:type` triples were stripped conforms to every shape over zero nodes.
+//! `rdf:type` triples were stripped satisfies every class-targeted shape over
+//! zero nodes. Shapes that reach their targets another way -- `sh:targetNode`,
+//! `sh:targetSubjectsOf` -- are not affected by this.
 //! The unlabelled capability is in the fixture to make that concrete: it
 //! violates `pkg:CapabilityShape`'s `sh:minCount 1` on `rdfs:label` at the
 //! source, and it has to keep violating it after extraction rather than
@@ -148,8 +150,8 @@ fn the_extracted_corpus_still_gives_capability_shape_something_to_target() {
         .count();
     assert_eq!(
         targets, 3,
-        "CapabilityShape must keep all three focus nodes; with none, every \
-         shape conforms vacuously"
+        "CapabilityShape must keep all three focus nodes; with none it \
+         conforms vacuously"
     );
 }
 

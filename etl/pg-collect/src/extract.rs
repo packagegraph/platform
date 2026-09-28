@@ -340,9 +340,11 @@ pub struct ExtractionReport {
 /// This replaces an object filter that searched each returned N-Triples line
 /// for `"> <"`, took the tail as the object, and dropped the triple unless
 /// that text named a selected URI. Two things went wrong with it. A class IRI
-/// is never a selected instance, so it deleted every `rdf:type` assertion, and
-/// a corpus without types validates vacuously: `sh:targetClass` selects no
-/// focus node, so every shape conforms over nothing. It also turned a
+/// is never a selected instance, so it deleted every `rdf:type` assertion.
+/// Class-targeted validation then passes vacuously: `sh:targetClass` and
+/// `sh:targetObjectsOf` on a typed range select no focus node, so those
+/// shapes conform over nothing. Shapes reaching their targets another way --
+/// `sh:targetNode`, `sh:targetSubjectsOf` -- are unaffected. It also turned a
 /// predicate's absence from `BFS_PREDICATES` into deletion of the edge rather
 /// than into leaving it unexpanded, which is how `providesCapability`
 /// relationships vanished from test corpora once the RPM collector emitted
@@ -588,21 +590,27 @@ pub fn compute_coverage(triples: &[String], ref_set: &OntologyReferenceSet) -> C
         }
     }
 
-    let classes_missing: Vec<String> = ref_set
+    // Sorted, not hash-ordered: gap fill walks `classes_missing` in order and
+    // spends a shared budget doing it, so an unstable order would change which
+    // classes get covered from run to run.
+    let mut classes_missing: Vec<String> = ref_set
         .classes
         .difference(&found_classes)
         .cloned()
         .collect();
-    let predicates_missing: Vec<String> = ref_set
+    classes_missing.sort();
+    let mut predicates_missing: Vec<String> = ref_set
         .predicates
         .difference(&found_predicates)
         .cloned()
         .collect();
-    let shacl_missing: Vec<String> = ref_set
+    predicates_missing.sort();
+    let mut shacl_missing: Vec<String> = ref_set
         .shacl_targets
         .difference(&found_classes)
         .cloned()
         .collect();
+    shacl_missing.sort();
 
     CoverageReport {
         generated_at: String::new(),
@@ -639,19 +647,28 @@ pub struct Manifest {
     pub depth: usize,
     pub fan_out: usize,
     pub total_triples: usize,
-    /// The ceiling the run was given.
+    /// The ceiling the run was given. `total_triples` never exceeds it.
     pub max_triples: usize,
-    /// Whether the corpus came out over that ceiling. The expansion stop is
-    /// driven by an estimate made before any triple is fetched, so it can be
-    /// wrong; the manifest records the outcome rather than the guess.
-    pub exceeded_max_triples: bool,
     /// What the fan-out cap discarded, summed over every graph.
     pub selection: SelectionReport,
     /// Graphs whose expansion was abandoned because the running size estimate
     /// passed `max_triples`. A corpus that stopped early is not the corpus the
     /// seeds describe, and the manifest has to say so.
     pub graphs_unexpanded: usize,
+    /// Graphs extracted in full and then left out because they did not fit in
+    /// the remaining budget. Whole graphs are dropped rather than trimmed:
+    /// a half-described package is worse than an absent one.
+    pub graphs_over_budget: Vec<BudgetOmission>,
+    /// Classes gap fill could not cover before the budget ran out.
+    pub classes_over_budget: Vec<String>,
     pub files: Vec<ManifestEntry>,
+}
+
+/// A graph the budget could not accommodate, and what it would have cost.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BudgetOmission {
+    pub graph: String,
+    pub triples: usize,
 }
 
 /// Run the full test corpus extraction pipeline.
@@ -701,15 +718,24 @@ pub fn run(
     let mut selection = SelectionReport::default();
     let mut graphs_unexpanded = 0;
 
-    for (graph, seeds) in &graph_seeds {
+    // Sorted, because the loop below stops partway through: iterating a
+    // HashMap would make *which* graphs are in the corpus depend on hash
+    // order, and two runs over an unchanged endpoint would disagree.
+    let mut ordered_graphs: Vec<&String> = graph_seeds.keys().collect();
+    ordered_graphs.sort();
+
+    for graph in &ordered_graphs {
+        let seeds = &graph_seeds[*graph];
         eprintln!("Graph <{}>: {} seeds", graph, seeds.len());
         let (expanded, graph_selection) =
             bfs_expand_reporting(&client, graph, seeds, depth, fan_out)?;
         selection.absorb(&graph_selection);
         total_uri_count += expanded.len();
-        graph_uris.insert(graph.clone(), expanded);
+        graph_uris.insert((*graph).clone(), expanded);
 
-        // Size check
+        // A cheap pre-filter, not the budget. Expanding a graph the budget
+        // could never hold wastes queries, but the estimate is only an
+        // estimate; Phase 3 enforces `max_triples` against real counts.
         let estimated = total_uri_count * TRIPLES_PER_URI;
         if estimated > max_triples {
             graphs_unexpanded = graph_seeds.len() - graph_uris.len();
@@ -737,8 +763,14 @@ pub fn run(
 
     let mut all_triples: Vec<String> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
+    let mut graphs_over_budget: Vec<BudgetOmission> = Vec::new();
+    let mut budget_remaining = max_triples;
 
-    for (graph, uris) in &graph_uris {
+    let mut extraction_order: Vec<&String> = graph_uris.keys().collect();
+    extraction_order.sort();
+
+    for graph in extraction_order {
+        let uris = &graph_uris[graph];
         let (triples, extraction) = extract_triples_reporting(&client, graph, uris)?;
         let count = triples.len();
 
@@ -751,6 +783,27 @@ pub fn run(
         };
         let rel_path = format!("{}/{}", subdir, file_name);
         let full_path = output_dir.join(&rel_path);
+
+        // `max_triples` is a budget on the finished corpus, enforced at whole
+        // graph granularity. Writing the graph and reporting the overrun
+        // afterwards leaves an over-budget corpus on disk for the next step to
+        // consume; trimming it would leave half-described packages. Dropping
+        // the graph keeps every retained record complete and the total under
+        // the ceiling.
+        if count > budget_remaining {
+            eprintln!(
+                "  {} — {} triples, over the remaining budget of {}; omitted",
+                rel_path, count, budget_remaining
+            );
+            graphs_over_budget.push(BudgetOmission {
+                graph: graph.clone(),
+                triples: count,
+            });
+            // An earlier run may have left this graph's file behind.
+            let _ = std::fs::remove_file(&full_path);
+            continue;
+        }
+        budget_remaining -= count;
 
         // Write triples to file
         let mut file = std::fs::File::create(&full_path)?;
@@ -774,32 +827,60 @@ pub fn run(
         all_triples.extend(triples);
     }
 
+    if manifest_entries.is_empty() && !graph_uris.is_empty() {
+        return Err(Error::new(
+            ErrorKind::Other,
+            format!(
+                "no graph fits a max_triples of {}: the smallest extracted \
+                 description is {} triples. Raise max_triples or lower depth \
+                 and fan_out; this run has produced no corpus.",
+                max_triples,
+                graphs_over_budget
+                    .iter()
+                    .map(|o| o.triples)
+                    .min()
+                    .unwrap_or(0)
+            ),
+        ));
+    }
+
     // Phase 4: Coverage audit
     eprintln!("\n--- Phase 4: Coverage Audit ---");
     let mut report = compute_coverage(&all_triples, &ref_set);
 
     // Gap fill for missing classes
-    let gap_fill_count = gap_fill(
+    let gap = gap_fill(
         &client,
         &ref_set,
         &report,
         &mut all_triples,
         output_dir,
         &mut manifest_entries,
+        budget_remaining,
     )?;
-    if gap_fill_count > 0 {
+    selection.absorb(&gap.selection);
+    if gap.triples > 0 {
         // Recompute coverage after gap fill
         report = compute_coverage(&all_triples, &ref_set);
     }
+    if !gap.classes_over_budget.is_empty() {
+        eprintln!(
+            "  Gap fill: {} classes left uncovered by the budget",
+            gap.classes_over_budget.len()
+        );
+    }
 
     let total_triples = all_triples.len();
-    let exceeded_max_triples = total_triples > max_triples;
-    if exceeded_max_triples {
+    if !graphs_over_budget.is_empty() {
         eprintln!(
-            "WARNING: extracted {} triples against a max_triples of {}. The \
-             expansion stop uses a per-URI estimate made before extraction; \
-             lower depth or fan_out to bring the corpus under the ceiling.",
-            total_triples, max_triples
+            "{} graph(s) omitted to keep the corpus within max_triples ({}): {}",
+            graphs_over_budget.len(),
+            max_triples,
+            graphs_over_budget
+                .iter()
+                .map(|o| format!("{} ({} triples)", o.graph, o.triples))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     eprintln!(
@@ -842,9 +923,10 @@ pub fn run(
         fan_out,
         total_triples,
         max_triples,
-        exceeded_max_triples,
         selection,
         graphs_unexpanded,
+        graphs_over_budget,
+        classes_over_budget: gap.classes_over_budget,
         files: manifest_entries,
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)
@@ -868,7 +950,24 @@ fn graph_uri_to_filename(graph_uri: &str) -> String {
     format!("{}.nt", path.replace('/', "-"))
 }
 
+/// What gap fill added, and what it could not.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct GapFillReport {
+    pub triples: usize,
+    pub dangling_targets: usize,
+    pub selection: SelectionReport,
+    /// Classes an exemplar existed for, but the budget could not hold.
+    pub classes_over_budget: Vec<String>,
+}
+
 /// Attempt to fill coverage gaps by finding packages that use missing classes.
+///
+/// Gap fill runs after the main extraction and draws on the same corpus
+/// budget, so it takes what is left rather than a fresh allowance. Its cuts
+/// and dangling references are reported like any other graph's: it used to
+/// call the non-reporting wrappers and then write a hardcoded zero into the
+/// manifest, which made a partial corpus claim it had omitted nothing.
+#[allow(clippy::too_many_arguments)]
 fn gap_fill(
     client: &SparqlClient,
     _ref_set: &OntologyReferenceSet,
@@ -876,22 +975,31 @@ fn gap_fill(
     all_triples: &mut Vec<String>,
     output_dir: &Path,
     manifest_entries: &mut Vec<ManifestEntry>,
-) -> Result<usize> {
+    budget: usize,
+) -> Result<GapFillReport> {
+    let mut gap = GapFillReport::default();
     if report.classes_missing.is_empty() {
-        return Ok(0);
+        return Ok(gap);
     }
+
+    // The file is opened for append below, once per covered class. Left from a
+    // previous run it would carry that run's triples into this corpus.
+    let _ = std::fs::remove_file(output_dir.join("collector/gap-fill.nt"));
 
     eprintln!(
         "  Gap fill: {} missing classes",
         report.classes_missing.len()
     );
-    let mut gap_triples = 0;
+    let mut budget_remaining = budget;
 
     for missing_class in &report.classes_missing {
+        // ORDER BY makes the exemplar a function of the data. Without it the
+        // endpoint is free to return any instance, so the corpus contains a
+        // different package on each run.
         let sparql = format!(
             "SELECT ?pkg ?g WHERE {{\n\
                GRAPH ?g {{ ?pkg a <{}> . }}\n\
-             }} LIMIT 1",
+             }} ORDER BY ?g ?pkg LIMIT 1",
             missing_class
         );
 
@@ -901,9 +1009,23 @@ fn gap_fill(
                     // Mini BFS depth 1 around this package
                     let mut mini_seeds = HashSet::new();
                     mini_seeds.insert(pkg.clone());
-                    let expanded = bfs_expand(client, g, &mini_seeds, 1, 5)?;
-                    let triples = extract_triples(client, g, &expanded)?;
+                    let (expanded, mini_selection) =
+                        bfs_expand_reporting(client, g, &mini_seeds, 1, 5)?;
+                    let (triples, extraction) = extract_triples_reporting(client, g, &expanded)?;
                     let count = triples.len();
+
+                    if count > budget_remaining {
+                        eprintln!(
+                            "    {} — found in <{}>, {} triples, over the remaining \
+                             budget of {}; omitted",
+                            missing_class, g, count, budget_remaining
+                        );
+                        gap.classes_over_budget.push(missing_class.clone());
+                        continue;
+                    }
+                    budget_remaining -= count;
+                    gap.selection.absorb(&mini_selection);
+                    gap.dangling_targets += extraction.dangling_targets;
 
                     // Append to gap-fill file
                     let gap_path = output_dir.join("collector/gap-fill.nt");
@@ -917,10 +1039,11 @@ fn gap_fill(
                     }
 
                     all_triples.extend(triples);
-                    gap_triples += count;
+                    gap.triples += count;
                     eprintln!(
-                        "    {} — found in <{}>, +{} triples",
-                        missing_class, g, count
+                        "    {} — found in <{}>, +{} triples, {} references leaving \
+                         the corpus",
+                        missing_class, g, count, extraction.dangling_targets
                     );
                 }
             }
@@ -933,16 +1056,16 @@ fn gap_fill(
         }
     }
 
-    if gap_triples > 0 {
+    if gap.triples > 0 {
         manifest_entries.push(ManifestEntry {
             path: "collector/gap-fill.nt".to_string(),
             graph: "gap-fill".to_string(),
-            triples: gap_triples,
-            dangling_targets: 0,
+            triples: gap.triples,
+            dangling_targets: gap.dangling_targets,
         });
     }
 
-    Ok(gap_triples)
+    Ok(gap)
 }
 
 #[cfg(test)]
@@ -1196,8 +1319,9 @@ alpine = ["openssl", "busybox"]
         // The regression that let a corpus certify itself: the old object
         // filter compared every URI object against the visited set, and a
         // class IRI is never a visited instance, so `rdf:type` was deleted
-        // from every record. With no typed node left, `sh:targetClass` selects
-        // no focus node and every shape conforms over nothing.
+        // from every record. With no typed node left, `sh:targetClass`
+        // selects no focus node, so every class-targeted shape conforms over
+        // nothing.
         let (server, _mocks) = extraction_server(CAPABILITY_DESCRIPTION, "");
         let client = crate::sparql::SparqlClient::new(&server.url());
 
