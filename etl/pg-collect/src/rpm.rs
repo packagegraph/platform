@@ -1,4 +1,4 @@
-use crate::emit::rdf::{write_package_identity, write_package_identity_once};
+use crate::emit::rdf::write_package_identity;
 use crate::forge::emit_dq_issue;
 use crate::http_transport::HttpTransport;
 use crate::ntriples::{bnode_id, NTriplesWriter};
@@ -32,6 +32,50 @@ fn distro_display_name(distro_id: &str) -> &str {
         "gentoo" => "Gentoo",
         _ => distro_id,
     }
+}
+
+/// Token prefixes suppressed from the capability layer by policy.
+///
+/// This is a **bounded policy choice, not a semantic claim**. These tokens are
+/// ordinary RPM capabilities: real packages declare them and real packages
+/// require them. Measured against AlmaLinux 9 BaseOS `primary.xml`, 2,996
+/// packages:
+///
+/// Counted by entry name prefix, over `primary.xml` with uncompressed SHA-256
+/// `2991b157fe0a1edc84269a516547918135851f5c379fd9b4918405a321a3b87b`:
+///
+/// | prefix | provides entries | requires entries | distinct provided tokens |
+/// |---|---:|---:|---:|
+/// | `rtld(` | 10 (all `glibc`) | 1,199 | 1 |
+/// | `config(` | 423 | 0 | 175 |
+/// | `rpmlib(` | 0 | 0 | 0 |
+///
+/// `rpmlib(` is absent because createrepo_c filters it in its *requires*
+/// branch, so it never reaches this route. That is a property of this producer,
+/// not a rule about RPM or XML.
+///
+/// So `rtld(GNU_HASH)` has a genuine provider and 1,199 requirers. Suppressing
+/// it loses a real provider/consumer relationship; we do it because these
+/// tokens describe the packaging system's own contract rather than
+/// functionality a user would resolve against, and carrying them would add
+/// ~1,200 edges per repo to one node. That trade is reviewable and reversible,
+/// which a claim of impossibility would not be. An independent audit
+/// recommends removing the exception from canonical preservation entirely and
+/// filtering only presentation views; that is an open decision.
+///
+/// The suppression is of the *convenience* layer only. Once
+/// `rpm:DependencyDeclaration` lands (packagegraph/ontology#19), every
+/// `rpm:entry` gets a declaration including these -- the per-entry
+/// preservation contract has no exceptions. Until then they are dropped
+/// entirely, as they always have been, and that remaining gap is the reason
+/// the declaration work is not optional.
+pub const RPM_INTERNAL_TOKEN_PREFIXES: &[&str] = &["config(", "rpmlib(", "rtld("];
+
+/// Whether a dependency token names RPM's own machinery.
+pub fn is_rpm_internal_token(name: &str) -> bool {
+    RPM_INTERNAL_TOKEN_PREFIXES
+        .iter()
+        .any(|p| name.starts_with(p))
 }
 
 /// A parsed RPM dependency entry from primary.xml.
@@ -579,10 +623,9 @@ impl RpmCollector {
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) if e.name().as_ref() == b"data" => {
-                    for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"type"
-                            && attr.value.as_ref() == metadata_type.as_bytes()
-                        {
+                    for attr in e.attributes() {
+                        let (key, value) = decode_attribute(attr)?;
+                        if key == "type" && value == metadata_type {
                             in_correct_data = true;
                             break;
                         }
@@ -591,9 +634,9 @@ impl RpmCollector {
                 Ok(Event::Start(ref e) | Event::Empty(ref e))
                     if in_correct_data && e.name().as_ref() == b"location" =>
                 {
-                    for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"href" {
-                            let href = String::from_utf8_lossy(&attr.value).to_string();
+                    for attr in e.attributes() {
+                        let (key, href) = decode_attribute(attr)?;
+                        if key == "href" {
                             return Ok(format!("{}/{}", self.repo_url.trim_end_matches('/'), href));
                         }
                     }
@@ -723,6 +766,41 @@ fn decode_stream<'a, R: std::io::BufRead + 'a>(
     }
 }
 
+/// Decode one XML attribute into `(key, value)`.
+///
+/// quick-xml hands back the bytes between the quotes exactly as they appear,
+/// so a rich dependency written
+/// `name="((adobe-afdko &gt;= 4.0.1) with (adobe-afdko &lt; 5~~))"` arrived
+/// with its entities intact and went into the graph that way: the served
+/// corpus holds 12,857 identity names containing a literal `&gt;` against
+/// four containing a real `>`. `unescape_value` applies the XML rules, named
+/// entities and numeric character references alike.
+///
+/// A malformed attribute is an error, not something to skip. Flattening the
+/// iterator discarded them, which turns a record we cannot read into a record
+/// we are confidently wrong about.
+fn decode_attribute(
+    attr: std::result::Result<
+        quick_xml::events::attributes::Attribute,
+        quick_xml::events::attributes::AttrError,
+    >,
+) -> Result<(String, String)> {
+    let attr = attr.map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("malformed XML attribute: {e}"),
+        )
+    })?;
+    let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+    let value = attr.unescape_value().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("malformed XML attribute value for {key}: {e}"),
+        )
+    })?;
+    Ok((key, value.into_owned()))
+}
+
 /// Parse a repodata `primary.xml` stream, invoking `on_package` for each
 /// `<package>` element as it completes.
 ///
@@ -778,10 +856,8 @@ pub fn stream_primary_packages<R: std::io::BufRead>(
                                     rel: None,
                                     dep_type: dep_type.clone(),
                                 };
-                                for attr in e.attributes().flatten() {
-                                    let key =
-                                        String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                                    let value = String::from_utf8_lossy(&attr.value).to_string();
+                                for attr in e.attributes() {
+                                    let (key, value) = decode_attribute(attr)?;
                                     match key.as_str() {
                                         "name" => dep.name = value,
                                         "flags" => dep.flags = Some(value),
@@ -798,9 +874,8 @@ pub fn stream_primary_packages<R: std::io::BufRead>(
                         }
                         _ => {
                             // version, location, size, time — capture attributes
-                            for attr in e.attributes().flatten() {
-                                let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                                let value = String::from_utf8_lossy(&attr.value).to_string();
+                            for attr in e.attributes() {
+                                let (key, value) = decode_attribute(attr)?;
                                 if name == "version"
                                     || name == "location"
                                     || name == "size"
@@ -914,10 +989,10 @@ impl RpmCollector {
                 Ok(Event::Start(ref e) | Event::Empty(ref e)) => {
                     if e.name().as_ref() == b"package" {
                         // Extract package name attribute
-                        for attr in e.attributes().flatten() {
-                            if attr.key.as_ref() == b"name" {
-                                current_package_name =
-                                    Some(String::from_utf8_lossy(&attr.value).to_string());
+                        for attr in e.attributes() {
+                            let (key, value) = decode_attribute(attr)?;
+                            if key == "name" {
+                                current_package_name = Some(value);
                                 break;
                             }
                         }
@@ -1199,14 +1274,8 @@ impl RpmCollector {
         triples += ecosystem_triples;
 
         // Dependencies
-        triples += self.emit_dependency_triples(
-            writer,
-            &pkg_uri,
-            &pkg_data.deps,
-            release_name,
-            arch,
-            name,
-        )?;
+        triples +=
+            self.emit_dependency_triples(writer, &pkg_uri, &pkg_data.deps, release_name, arch)?;
 
         Ok((triples, ecosystem_named_by_provides))
     }
@@ -1454,7 +1523,6 @@ impl RpmCollector {
         deps: &[RpmDep],
         release_name: &str,
         arch: &str,
-        pkg_name: &str,
     ) -> Result<usize> {
         let mut triples = 0;
 
@@ -1462,11 +1530,9 @@ impl RpmCollector {
         let requires: Vec<&RpmDep> = deps.iter().filter(|d| d.dep_type == "requires").collect();
 
         for dep in &requires {
-            // Skip rpmlib() and config() virtual deps — these are RPM internals
-            if dep.name.starts_with("rpmlib(")
-                || dep.name.starts_with("config(")
-                || dep.name.starts_with("rtld(")
-            {
+            // Suppressed from the capability layer by policy, not because
+            // they lack providers. See RPM_INTERNAL_TOKEN_PREFIXES.
+            if is_rpm_internal_token(&dep.name) {
                 continue;
             }
 
@@ -1570,46 +1636,46 @@ impl RpmCollector {
         // Emit provides
         let provides: Vec<&RpmDep> = deps.iter().filter(|d| d.dep_type == "provides").collect();
         for dep in &provides {
-            // Skip internal provides
-            if dep.name.starts_with("config(")
-                || dep.name.starts_with("rpmlib(")
-                || dep.name.starts_with("rtld(")
-            {
+            // Suppressed from the capability layer by policy -- these tokens
+            // do have real providers. See RPM_INTERNAL_TOKEN_PREFIXES.
+            if is_rpm_internal_token(&dep.name) {
                 continue;
             }
 
-            // Skip self-provides (where provides name matches package name)
-            if dep.name == pkg_name {
-                continue;
-            }
-
-            let dep_uri = package_identity_uri(&self.distro_name, release_name, arch, &dep.name);
-
-            // Definition triples for the provided identity are a pure function of
-            // dep_uri; emit them once per distinct identity rather than once per
-            // providing package (see write_package_identity_once).
+            // A provided name is a capability token, not a package. It gets a
+            // pkg:Capability node and nothing else.
             //
-            // identityName + rdfs:label, not packageName: see
-            // emit::rdf::write_package_identity for why. This path kept writing
-            // packageName after the 2026-09-11 migration because it uses the
-            // _once writers, which that migration's pattern did not match --
-            // leaving the domain violation live on the highest-volume route in
-            // the corpus (rpmProvides, 6,558,436 triples).
-            triples += write_package_identity_once(writer, &dep_uri, &dep.name)?;
-            // Provides edges are per (package, capability) and are never deduplicated.
-            writer.write_triple(pkg_uri, &format!("{PKG}directlyProvides"), &dep_uri)?;
-            writer.write_triple(pkg_uri, &format!("{RPM}rpmProvides"), &dep_uri)?;
-            triples += 2;
-
-            // Also emit Capability entity for CQ-PM-03. Its definition is likewise a
-            // pure function of cap_uri and emitted once per distinct capability.
+            // This path used to mint a PackageIdentity per provided name and
+            // point pkg:directlyProvides and rpm:rpmProvides at it. Both are
+            // gone. directlyProvides has rdfs:range :Package, so asserting it
+            // entailed :Package membership for every capability token -- and
+            // :Package carries owl:cardinality 1 on :packageName, which an
+            // identity minted here never had. rpmProvides was undeclared in
+            // every ontology module. pkg:providesCapability was already being
+            // written alongside them, one for one, so nothing is lost.
+            // See docs/superpowers/specs/2026-09-25-rpm-capability-contract-design.md.
+            //
+            // Self-provides are NOT skipped. Every RPM implicitly provides its
+            // own name, and that is how an ordinary `Requires: bash` finds a
+            // provider. Filtering them left the capability graph with no
+            // provider for the majority case.
             let cap_uri = format!("{DATA}capability/{}", crate::uris::encode(&dep.name));
+
+            // The capability's definition is a pure function of cap_uri, so it is
+            // emitted once per distinct capability rather than once per provider.
             if writer.write_triple_once(&cap_uri, RDF_TYPE, &format!("{PKG}Capability"))? {
                 triples += 1;
             }
             if writer.write_literal_once(&cap_uri, &format!("{PKG}capabilityName"), &dep.name)? {
                 triples += 1;
             }
+            // pkg:CapabilityShape requires at least one rdfs:label. The token is
+            // the only honest label we can derive; we have no prose for it.
+            if writer.write_literal_once(&cap_uri, RDFS_LABEL, &dep.name)? {
+                triples += 1;
+            }
+
+            // The provides edge is per (package, capability) and is never deduplicated.
             writer.write_triple(pkg_uri, &format!("{PKG}providesCapability"), &cap_uri)?;
             triples += 1;
         }
@@ -1649,10 +1715,10 @@ impl RpmCollector {
                         b"update" => {
                             // Extract type attribute - only process security updates
                             let mut update_type: Option<String> = None;
-                            for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"type" {
-                                    update_type =
-                                        Some(String::from_utf8_lossy(&attr.value).to_string());
+                            for attr in e.attributes() {
+                                let (key, value) = decode_attribute(attr)?;
+                                if key == "type" {
+                                    update_type = Some(value);
                                 }
                             }
 
@@ -1683,11 +1749,11 @@ impl RpmCollector {
                             }
                         }
                         b"issued" if current_update.is_some() => {
-                            for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"date" {
+                            for attr in e.attributes() {
+                                let (key, value) = decode_attribute(attr)?;
+                                if key == "date" {
                                     if let Some(ref mut adv) = current_update {
-                                        adv.issued_date =
-                                            String::from_utf8_lossy(&attr.value).to_string();
+                                        adv.issued_date = value;
                                     }
                                 }
                             }
@@ -1699,10 +1765,10 @@ impl RpmCollector {
                         b"reference" if current_update.is_some() => {
                             in_reference = true;
                             ref_title = None;
-                            for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"title" {
-                                    ref_title =
-                                        Some(String::from_utf8_lossy(&attr.value).to_string());
+                            for attr in e.attributes() {
+                                let (key, value) = decode_attribute(attr)?;
+                                if key == "title" {
+                                    ref_title = Some(value);
                                 }
                             }
 
@@ -1727,25 +1793,14 @@ impl RpmCollector {
                                 arch: String::new(),
                             };
 
-                            for attr in e.attributes().flatten() {
-                                match attr.key.as_ref() {
-                                    b"name" => {
-                                        pkg.name = String::from_utf8_lossy(&attr.value).to_string()
-                                    }
-                                    b"version" => {
-                                        pkg.version =
-                                            String::from_utf8_lossy(&attr.value).to_string()
-                                    }
-                                    b"release" => {
-                                        pkg.release =
-                                            String::from_utf8_lossy(&attr.value).to_string()
-                                    }
-                                    b"epoch" => {
-                                        pkg.epoch = String::from_utf8_lossy(&attr.value).to_string()
-                                    }
-                                    b"arch" => {
-                                        pkg.arch = String::from_utf8_lossy(&attr.value).to_string()
-                                    }
+                            for attr in e.attributes() {
+                                let (key, value) = decode_attribute(attr)?;
+                                match key.as_str() {
+                                    "name" => pkg.name = value,
+                                    "version" => pkg.version = value,
+                                    "release" => pkg.release = value,
+                                    "epoch" => pkg.epoch = value,
+                                    "arch" => pkg.arch = value,
                                     _ => {}
                                 }
                             }
@@ -2674,6 +2729,151 @@ mod tests {
             provides_edges, 2,
             "providesCapability edges should be preserved per package, got {}",
             provides_edges
+        );
+    }
+
+    /// Build a one-package fixture whose Provides list covers every case the
+    /// contract distinguishes: the package's own name, a soname, and an
+    /// RPM-internal token.
+    #[cfg(test)]
+    fn provides_fixture(pkg: &str, provides: &[&str]) -> RpmPackageData {
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), pkg.to_string());
+        fields.insert("arch".to_string(), "x86_64".to_string());
+        fields.insert("ver".to_string(), "1.0".to_string());
+        fields.insert("rel".to_string(), "1.el9".to_string());
+        RpmPackageData {
+            fields,
+            deps: provides
+                .iter()
+                .map(|n| RpmDep {
+                    name: n.to_string(),
+                    flags: None,
+                    epoch: None,
+                    ver: None,
+                    rel: None,
+                    dep_type: "provides".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[cfg(test)]
+    fn emit_provides(pkg: &str, provides: &[&str]) -> String {
+        use std::io::Read;
+        use tempfile::NamedTempFile;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let mut writer = NTriplesWriter::new(tmp.reopen().unwrap());
+        let collector = RpmCollector::new(
+            "https://example.com".to_string(),
+            "rhel".to_string(),
+            "9".to_string(),
+        );
+        let mut emitted: HashSet<(String, String, String, String, String)> = HashSet::new();
+        collector
+            .emit_package_triples(
+                &mut writer,
+                &provides_fixture(pkg, provides),
+                None,
+                &mut emitted,
+            )
+            .unwrap();
+        writer.flush().unwrap();
+        let mut content = String::new();
+        tmp.reopen().unwrap().read_to_string(&mut content).unwrap();
+        content
+    }
+
+    #[test]
+    fn a_capability_carries_the_label_its_shape_requires() {
+        // pkg:CapabilityShape requires sh:minCount 1 on rdfs:label. Every one of
+        // the 1,013,026 capability nodes in the corpus fails it today, because
+        // this path wrote capabilityName and nothing else.
+        let content = emit_provides("bash", &["libtinfo.so.6()(64bit)"]);
+
+        let cap_line = content
+            .lines()
+            .find(|l| l.contains("/capability/") && l.contains("rdf-schema#label"))
+            .unwrap_or_else(|| {
+                panic!("capability node has no rdfs:label; CapabilityShape requires one")
+            });
+        assert!(
+            cap_line.contains("libtinfo.so.6()(64bit)"),
+            "the label should name the capability token, got {cap_line}"
+        );
+    }
+
+    #[test]
+    fn a_package_provides_its_own_name_as_a_capability() {
+        // Every RPM implicitly provides its own name, and that is how an
+        // ordinary `Requires: bash` finds a provider. This path used to drop
+        // self-provides before minting the capability, leaving the capability
+        // graph with no provider for the majority case.
+        let content = emit_provides("bash", &["bash", "libtinfo.so.6()(64bit)"]);
+
+        assert!(
+            content.contains("#capabilityName> \"bash\""),
+            "the package's own name must become a capability"
+        );
+        let edges = content.matches("#providesCapability>").count();
+        assert_eq!(
+            edges, 2,
+            "expected a providesCapability edge for both the self-provide and the \
+             soname, got {edges}"
+        );
+    }
+
+    #[test]
+    fn the_provides_path_mints_no_package_identity_and_no_provides_edge() {
+        // A provided name is a capability token, not a package. Minting an
+        // identity for it and pointing directlyProvides at it entailed
+        // pkg:Package membership for every soname in the corpus.
+        let content = emit_provides("bash", &["libtinfo.so.6()(64bit)"]);
+
+        assert!(
+            !content.contains("#directlyProvides>"),
+            "the provides path must not emit pkg:directlyProvides"
+        );
+        assert!(
+            !content.contains("#rpmProvides>"),
+            "the provides path must not emit the undeclared rpm:rpmProvides"
+        );
+        assert!(
+            !content.contains("libtinfo.so.6()(64bit) Package Identity"),
+            "a provided name must not be minted as a PackageIdentity"
+        );
+        // and the replacement edge is still there
+        assert_eq!(
+            content.matches("#providesCapability>").count(),
+            1,
+            "providesCapability is the surviving edge"
+        );
+    }
+
+    #[test]
+    fn rpm_internal_tokens_get_no_capability() {
+        // The is_rpm_internal_token assertions below are a guard on the named
+        // constant, so the three prefixes cannot drift apart between the
+        // provides and requires loops. The emission assertions are
+        // discriminating: against the pre-change code this test fails, because
+        // the self-provide was skipped and the edge count was 0, not 1.
+        assert!(is_rpm_internal_token("rpmlib(CompressedFileNames)"));
+        assert!(is_rpm_internal_token("config(bash)"));
+        assert!(is_rpm_internal_token("rtld(GNU_HASH)"));
+        assert!(!is_rpm_internal_token("bash"));
+        assert!(!is_rpm_internal_token("libtinfo.so.6()(64bit)"));
+        assert!(!is_rpm_internal_token("(a or b)"));
+
+        let content = emit_provides("bash", &["rpmlib(CompressedFileNames)", "bash"]);
+        assert!(
+            !content.contains("rpmlib(CompressedFileNames)"),
+            "an RPM-internal token gets no capability node"
+        );
+        assert_eq!(
+            content.matches("#providesCapability>").count(),
+            1,
+            "only the self-provide survives"
         );
     }
 

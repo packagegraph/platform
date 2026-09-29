@@ -169,7 +169,6 @@ mod tests {
         ("https://purl.org/packagegraph/ontology/rpm#RPMGroup", "property"),
         ("https://purl.org/packagegraph/ontology/rpm#rpmConflicts", "property"),
         ("https://purl.org/packagegraph/ontology/rpm#rpmObsoletes", "property"),
-        ("https://purl.org/packagegraph/ontology/rpm#rpmProvides", "property"),
         ("https://purl.org/packagegraph/ontology/rpm#rpmRequires", "property"),
         // vcs
         ("https://purl.org/packagegraph/ontology/vcs#commitCount", "property"),

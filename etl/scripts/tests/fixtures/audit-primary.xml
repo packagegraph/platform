@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A hand-cut primary.xml covering the cases the audit gates exist for:
+  an ordinary token, a self-provide, an arch-qualified provide, one token
+  per suppressed prefix, a rich-dependency name carrying the < and > that
+  XML must escape, and a shared capability two packages both provide.
+
+  rpmlib( appears here even though AlmaLinux 9 BaseOS has zero occurrences:
+  createrepo_c filters it in its requires branch, which is a property of that
+  producer rather than a rule about RPM. A different producer may emit it.
+-->
+<metadata xmlns="http://linux.duke.edu/metadata/common"
+          xmlns:rpm="http://linux.duke.edu/metadata/rpm" packages="2">
+  <package type="rpm">
+    <name>bash</name>
+    <arch>x86_64</arch>
+    <version epoch="0" ver="5.1.8" rel="9.el9"/>
+    <format>
+      <rpm:provides>
+        <rpm:entry name="bash" flags="EQ" epoch="0" ver="5.1.8" rel="9.el9"/>
+        <rpm:entry name="bash(x86-64)" flags="EQ" epoch="0" ver="5.1.8" rel="9.el9"/>
+        <rpm:entry name="config(bash)" flags="EQ" epoch="0" ver="5.1.8" rel="9.el9"/>
+        <rpm:entry name="(shell-if-bash &gt;= 5.0 with shell-if-bash &lt; 6)"/>
+        <rpm:entry name="bundled(gnulib)"/>
+      </rpm:provides>
+      <rpm:requires>
+        <rpm:entry name="libc.so.6(GLIBC_2.34)(64bit)"/>
+        <rpm:entry name="rpmlib(CompressedFileNames)" flags="LE" epoch="0" ver="3.0.4" rel="1"/>
+        <rpm:entry name="basesystem"/>
+      </rpm:requires>
+      <rpm:conflicts>
+        <rpm:entry name="bash-completion" flags="LT" epoch="0" ver="2.11"/>
+      </rpm:conflicts>
+    </format>
+  </package>
+  <package type="rpm">
+    <name>glibc</name>
+    <arch>x86_64</arch>
+    <version epoch="0" ver="2.34" rel="60.el9"/>
+    <format>
+      <rpm:provides>
+        <rpm:entry name="glibc" flags="EQ" epoch="0" ver="2.34" rel="60.el9"/>
+        <rpm:entry name="libc.so.6(GLIBC_2.34)(64bit)"/>
+        <rpm:entry name="rtld(GNU_HASH)"/>
+        <rpm:entry name="bundled(gnulib)"/>
+      </rpm:provides>
+      <rpm:requires>
+        <rpm:entry name="basesystem"/>
+      </rpm:requires>
+      <rpm:obsoletes>
+        <rpm:entry name="glibc-debuginfo" flags="LT" epoch="0" ver="2.34"/>
+      </rpm:obsoletes>
+    </format>
+  </package>
+</metadata>

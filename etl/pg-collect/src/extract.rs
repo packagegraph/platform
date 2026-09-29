@@ -1,6 +1,6 @@
 use crate::sparql::{make_sparql_client, SparqlAuth, SparqlBackend, SparqlClient};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
 
@@ -130,6 +130,17 @@ pub fn resolve_seeds(
 }
 
 /// Predicates to follow during BFS expansion.
+///
+/// Capability edges are in this list because `extract_triples` drops any
+/// triple whose object URI was not visited. A predicate that BFS does not
+/// follow therefore does not merely go unexpanded -- the edge itself is
+/// filtered out of the extracted corpus. When the RPM collector stopped
+/// emitting `directlyProvides` in favour of `providesCapability`, that made
+/// provision relationships vanish from test corpora entirely, leaving the
+/// provider with a `packageName` and nothing else.
+///
+/// `requiresCapability` is listed for the same reason ahead of the requires
+/// half of the same change, so the gap cannot reopen on the other side.
 const BFS_PREDICATES: &[&str] = &[
     "https://purl.org/packagegraph/ontology/core#directlyDependsOn",
     "https://purl.org/packagegraph/ontology/core#buildDependsOn",
@@ -139,6 +150,8 @@ const BFS_PREDICATES: &[&str] = &[
     "https://purl.org/packagegraph/ontology/core#isVersionOf",
     "https://purl.org/packagegraph/ontology/core#provides",
     "https://purl.org/packagegraph/ontology/core#directlyProvides",
+    "https://purl.org/packagegraph/ontology/core#providesCapability",
+    "https://purl.org/packagegraph/ontology/core#requiresCapability",
     "https://purl.org/packagegraph/ontology/core#conflicts",
     "https://purl.org/packagegraph/ontology/core#partOfDistribution",
     "https://purl.org/packagegraph/ontology/core#partOfRelease",
@@ -147,6 +160,49 @@ const BFS_PREDICATES: &[&str] = &[
     "https://purl.org/packagegraph/ontology/core#builtFromSource",
     "https://purl.org/packagegraph/ontology/core#memberOfPackageSet",
 ];
+
+/// How many triples one selected URI is worth, for the estimate that stops
+/// expansion before `max_triples`.
+///
+/// Measured, not assumed: a full `test-corpus.toml` run against the live
+/// endpoint on 2026-09-27 selected 64,358 URIs and extracted 10,608,101
+/// triples, or 165 apiece. The previous figure of 50 dated from when the
+/// object filter deleted 83.6% of every record, and it let that run finish
+/// 3.5 times over its own 3,000,000 ceiling.
+///
+/// No single figure can bound the corpus. A one-seed, one-hop run over the
+/// same endpoint came out at 5,328 triples per URI, because a small selection
+/// is all hubs: `openssl` alone carries thousands of version nodes. This
+/// constant is a better average, not a guarantee, which is why
+/// `Manifest::exceeded_max_triples` records what actually happened.
+const TRIPLES_PER_URI: usize = 165;
+
+/// What a BFS expansion had to leave out.
+///
+/// The fan-out cap is a silent truncation: a subject with more neighbors than
+/// `fan_out` on one predicate contributes a subset, and nothing in the
+/// extracted files records that the rest exist. Counting the cuts is what lets
+/// the manifest call a selection partial instead of implying it is the whole
+/// neighborhood.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct SelectionReport {
+    /// Neighbors discovered but dropped because a (subject, predicate) pair
+    /// held more than `fan_out` of them.
+    pub fan_out_cuts: usize,
+    /// How many (subject, predicate) pairs were truncated.
+    pub capped_pairs: usize,
+    /// Hops actually walked before the frontier emptied.
+    pub hops_walked: usize,
+}
+
+impl SelectionReport {
+    /// Fold another graph's expansion into a corpus-wide total.
+    pub fn absorb(&mut self, other: &SelectionReport) {
+        self.fan_out_cuts += other.fan_out_cuts;
+        self.capped_pairs += other.capped_pairs;
+        self.hops_walked = self.hops_walked.max(other.hops_walked);
+    }
+}
 
 /// BFS-expand a seed set within a single named graph.
 ///
@@ -160,8 +216,26 @@ pub fn bfs_expand(
     depth: usize,
     fan_out: usize,
 ) -> Result<HashSet<String>> {
+    Ok(bfs_expand_reporting(client, graph_uri, seeds, depth, fan_out)?.0)
+}
+
+/// BFS-expand a seed set, reporting what the fan-out cap discarded.
+///
+/// Neighbors are sorted before the cap applies, so which ones survive is a
+/// function of the data rather than of the order the endpoint happened to
+/// return rows in. Two runs over an unchanged graph select the same subset,
+/// and the count of what was cut travels with the corpus.
+pub fn bfs_expand_reporting(
+    client: &SparqlClient,
+    graph_uri: &str,
+    seeds: &HashSet<String>,
+    depth: usize,
+    fan_out: usize,
+) -> Result<(HashSet<String>, SelectionReport)> {
     let mut visited = seeds.clone();
     let mut frontier: Vec<String> = seeds.iter().cloned().collect();
+    frontier.sort();
+    let mut report = SelectionReport::default();
 
     let predicates_values: String = BFS_PREDICATES
         .iter()
@@ -199,7 +273,7 @@ pub fn bfs_expand(
             let bindings = client.query(&sparql)?;
 
             // Group by (seed, predicate) and enforce fan-out cap
-            let mut groups: HashMap<(String, String), Vec<String>> = HashMap::new();
+            let mut groups: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
             for binding in &bindings {
                 if let (Some(seed), Some(pred), Some(neighbor)) = (
                     binding.get("seed"),
@@ -213,41 +287,94 @@ pub fn bfs_expand(
                 }
             }
 
-            for ((_seed, _pred), neighbors) in &groups {
-                for neighbor in neighbors.iter().take(fan_out) {
+            for (_pair, mut neighbors) in groups {
+                neighbors.sort();
+                neighbors.dedup();
+                if neighbors.len() > fan_out {
+                    report.fan_out_cuts += neighbors.len() - fan_out;
+                    report.capped_pairs += 1;
+                }
+                for neighbor in neighbors.into_iter().take(fan_out) {
                     if visited.insert(neighbor.clone()) {
-                        next_frontier.push(neighbor.clone());
+                        next_frontier.push(neighbor);
                     }
                 }
             }
         }
 
+        next_frontier.sort();
+        report.hops_walked = hop + 1;
         eprintln!(
-            "  Hop {}: +{} URIs (total {})",
+            "  Hop {}: +{} URIs (total {}){}",
             hop + 1,
             next_frontier.len(),
-            visited.len()
+            visited.len(),
+            if report.fan_out_cuts > 0 {
+                format!(", {} neighbors cut by fan_out", report.fan_out_cuts)
+            } else {
+                String::new()
+            }
         );
         frontier = next_frontier;
     }
 
-    Ok(visited)
+    Ok((visited, report))
 }
 
-/// Extract all triples for a set of URIs from a named graph.
+/// What an extracted graph points at but does not contain.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct ExtractionReport {
+    /// Triples written for this graph.
+    pub triples: usize,
+    /// Distinct data URIs referenced as objects that are not themselves in the
+    /// selection: the edges that leave the corpus.
+    pub dangling_targets: usize,
+}
+
+/// Extract the complete description of a set of URIs from a named graph.
 ///
-/// Issues batched CONSTRUCT queries where the subject is in the URI set.
-/// Only includes triples where both subject and object (if a URI) are in the set,
-/// preventing dangling references. Deduplicates across batches.
+/// Every triple whose subject is selected is retained, `rdf:type` included.
+/// Objects outside the selection stay as references and are counted in the
+/// returned report rather than deleted.
+///
+/// This replaces an object filter that searched each returned N-Triples line
+/// for `"> <"`, took the tail as the object, and dropped the triple unless
+/// that text named a selected URI. Two things went wrong with it. A class IRI
+/// is never a selected instance, so it deleted every `rdf:type` assertion.
+/// Class-targeted validation then passes vacuously: `sh:targetClass` and
+/// `sh:targetObjectsOf` on a typed range select no focus node, so those
+/// shapes conform over nothing. Shapes reaching their targets another way --
+/// `sh:targetNode`, `sh:targetSubjectsOf` -- are unaffected. It also turned a
+/// predicate's absence from `BFS_PREDICATES` into deletion of the edge rather
+/// than into leaving it unexpanded, which is how `providesCapability`
+/// relationships vanished from test corpora once the RPM collector emitted
+/// them.
+///
+/// Membership is not pushed into the query as a `VALUES` block. Measured on
+/// the live endpoint with `test-corpus.toml`, the largest per-graph selection
+/// is 9,662 URIs; at the ~90 bytes a rendered term costs, that is around
+/// 870 KB against the SPARQL proxy's 1 MB request-body limit, and it would
+/// have to be repeated in every subject batch.
 pub fn extract_triples(
     client: &SparqlClient,
     graph_uri: &str,
     uris: &HashSet<String>,
 ) -> Result<Vec<String>> {
-    let mut all_triples: HashSet<String> = HashSet::new();
-    let uri_list: Vec<&String> = uris.iter().collect();
+    Ok(extract_triples_reporting(client, graph_uri, uris)?.0)
+}
 
-    // Extract triples where subject is in our set
+/// Extract a graph's selected description and report what it references but
+/// does not carry.
+pub fn extract_triples_reporting(
+    client: &SparqlClient,
+    graph_uri: &str,
+    uris: &HashSet<String>,
+) -> Result<(Vec<String>, ExtractionReport)> {
+    let mut all_triples: HashSet<String> = HashSet::new();
+    let mut dangling: HashSet<String> = HashSet::new();
+    let mut uri_list: Vec<&String> = uris.iter().collect();
+    uri_list.sort();
+
     for batch in uri_list.chunks(50) {
         let values: String = batch
             .iter()
@@ -266,35 +393,47 @@ pub fn extract_triples(
             graph_uri, values
         );
 
-        let triples = client.query_construct(&sparql)?;
-        for triple in triples {
+        for triple in client.query_construct(&sparql)? {
             all_triples.insert(triple);
+        }
+
+        // Ask the endpoint for the object terms instead of recovering them
+        // from the serialised output. A binding's value is the IRI itself, so
+        // there is nothing to parse and no typed literal whose datatype can be
+        // mistaken for an object.
+        let objects = format!(
+            "SELECT DISTINCT ?o\n\
+             WHERE {{\n\
+               GRAPH <{}> {{\n\
+                 VALUES ?s {{ {} }}\n\
+                 ?s ?p ?o .\n\
+               }}\n\
+               FILTER(isIRI(?o) && STRSTARTS(STR(?o), \"{}\"))\n\
+             }}",
+            graph_uri,
+            values,
+            crate::uris::DATA
+        );
+        for binding in client.query(&objects)? {
+            if let Some(object) = binding.get("o") {
+                if !uris.contains(object) {
+                    dangling.insert(object.clone());
+                }
+            }
         }
     }
 
-    // Filter: keep only triples where object URIs are also in our set
-    // (literal objects are always kept)
-    let filtered: Vec<String> = all_triples
-        .into_iter()
-        .filter(|triple| {
-            // If the object is a URI (starts with <, ends with > before the dot),
-            // check it's in our extraction set
-            if let Some(obj_start) = triple.rfind("> <") {
-                // Object is a URI — extract it
-                if let Some(obj) = triple.get(obj_start + 2..) {
-                    let obj = obj.trim_end_matches(" .").trim();
-                    if obj.starts_with('<') && obj.ends_with('>') {
-                        let uri = &obj[1..obj.len() - 1];
-                        return uris.contains(uri);
-                    }
-                }
-            }
-            // Literal objects or unparseable lines: keep them
-            true
-        })
-        .collect();
+    // Sorting makes the written file a function of the selection rather than
+    // of hash iteration order, so two runs over an unchanged graph produce
+    // byte-identical output.
+    let mut triples: Vec<String> = all_triples.into_iter().collect();
+    triples.sort();
 
-    Ok(filtered)
+    let report = ExtractionReport {
+        triples: triples.len(),
+        dangling_targets: dangling.len(),
+    };
+    Ok((triples, report))
 }
 
 /// Reference set of classes and predicates from the ontology.
@@ -451,21 +590,27 @@ pub fn compute_coverage(triples: &[String], ref_set: &OntologyReferenceSet) -> C
         }
     }
 
-    let classes_missing: Vec<String> = ref_set
+    // Sorted, not hash-ordered: gap fill walks `classes_missing` in order and
+    // spends a shared budget doing it, so an unstable order would change which
+    // classes get covered from run to run.
+    let mut classes_missing: Vec<String> = ref_set
         .classes
         .difference(&found_classes)
         .cloned()
         .collect();
-    let predicates_missing: Vec<String> = ref_set
+    classes_missing.sort();
+    let mut predicates_missing: Vec<String> = ref_set
         .predicates
         .difference(&found_predicates)
         .cloned()
         .collect();
-    let shacl_missing: Vec<String> = ref_set
+    predicates_missing.sort();
+    let mut shacl_missing: Vec<String> = ref_set
         .shacl_targets
         .difference(&found_classes)
         .cloned()
         .collect();
+    shacl_missing.sort();
 
     CoverageReport {
         generated_at: String::new(),
@@ -488,6 +633,8 @@ pub struct ManifestEntry {
     pub path: String,
     pub graph: String,
     pub triples: usize,
+    /// Distinct data URIs this file references but does not describe.
+    pub dangling_targets: usize,
 }
 
 /// Full manifest for the test corpus.
@@ -500,7 +647,28 @@ pub struct Manifest {
     pub depth: usize,
     pub fan_out: usize,
     pub total_triples: usize,
+    /// The ceiling the run was given. `total_triples` never exceeds it.
+    pub max_triples: usize,
+    /// What the fan-out cap discarded, summed over every graph.
+    pub selection: SelectionReport,
+    /// Graphs whose expansion was abandoned because the running size estimate
+    /// passed `max_triples`. A corpus that stopped early is not the corpus the
+    /// seeds describe, and the manifest has to say so.
+    pub graphs_unexpanded: usize,
+    /// Graphs extracted in full and then left out because they did not fit in
+    /// the remaining budget. Whole graphs are dropped rather than trimmed:
+    /// a half-described package is worse than an absent one.
+    pub graphs_over_budget: Vec<BudgetOmission>,
+    /// Classes gap fill could not cover before the budget ran out.
+    pub classes_over_budget: Vec<String>,
     pub files: Vec<ManifestEntry>,
+}
+
+/// A graph the budget could not accommodate, and what it would have cost.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BudgetOmission {
+    pub graph: String,
+    pub triples: usize,
 }
 
 /// Run the full test corpus extraction pipeline.
@@ -547,27 +715,45 @@ pub fn run(
     eprintln!("\n--- Phase 2: BFS Expansion ---");
     let mut graph_uris: HashMap<String, HashSet<String>> = HashMap::new();
     let mut total_uri_count = 0;
+    let mut selection = SelectionReport::default();
+    let mut graphs_unexpanded = 0;
 
-    for (graph, seeds) in &graph_seeds {
+    // Sorted, because the loop below stops partway through: iterating a
+    // HashMap would make *which* graphs are in the corpus depend on hash
+    // order, and two runs over an unchanged endpoint would disagree.
+    let mut ordered_graphs: Vec<&String> = graph_seeds.keys().collect();
+    ordered_graphs.sort();
+
+    for graph in &ordered_graphs {
+        let seeds = &graph_seeds[*graph];
         eprintln!("Graph <{}>: {} seeds", graph, seeds.len());
-        let expanded = bfs_expand(&client, graph, seeds, depth, fan_out)?;
+        let (expanded, graph_selection) =
+            bfs_expand_reporting(&client, graph, seeds, depth, fan_out)?;
+        selection.absorb(&graph_selection);
         total_uri_count += expanded.len();
-        graph_uris.insert(graph.clone(), expanded);
+        graph_uris.insert((*graph).clone(), expanded);
 
-        // Size check
-        let estimated = total_uri_count * 50;
+        // A cheap pre-filter, not the budget. Expanding a graph the budget
+        // could never hold wastes queries, but the estimate is only an
+        // estimate; Phase 3 enforces `max_triples` against real counts.
+        let estimated = total_uri_count * TRIPLES_PER_URI;
         if estimated > max_triples {
+            graphs_unexpanded = graph_seeds.len() - graph_uris.len();
             eprintln!(
-                "  Size estimate ({}) exceeds max_triples ({}), stopping expansion",
-                estimated, max_triples
+                "  Size estimate ({}) exceeds max_triples ({}), stopping expansion \
+                 with {} graphs unexpanded",
+                estimated, max_triples, graphs_unexpanded
             );
             break;
         }
     }
     eprintln!(
-        "Phase 2: {} total URIs across {} graphs",
+        "Phase 2: {} total URIs across {} graphs ({} neighbors cut by fan_out \
+         across {} capped pairs)",
         total_uri_count,
-        graph_uris.len()
+        graph_uris.len(),
+        selection.fan_out_cuts,
+        selection.capped_pairs
     );
 
     // Phase 3: Triple extraction
@@ -577,9 +763,15 @@ pub fn run(
 
     let mut all_triples: Vec<String> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
+    let mut graphs_over_budget: Vec<BudgetOmission> = Vec::new();
+    let mut budget_remaining = max_triples;
 
-    for (graph, uris) in &graph_uris {
-        let triples = extract_triples(&client, graph, uris)?;
+    let mut extraction_order: Vec<&String> = graph_uris.keys().collect();
+    extraction_order.sort();
+
+    for graph in extraction_order {
+        let uris = &graph_uris[graph];
+        let (triples, extraction) = extract_triples_reporting(&client, graph, uris)?;
         let count = triples.len();
 
         // Determine output file path from graph URI
@@ -592,6 +784,27 @@ pub fn run(
         let rel_path = format!("{}/{}", subdir, file_name);
         let full_path = output_dir.join(&rel_path);
 
+        // `max_triples` is a budget on the finished corpus, enforced at whole
+        // graph granularity. Writing the graph and reporting the overrun
+        // afterwards leaves an over-budget corpus on disk for the next step to
+        // consume; trimming it would leave half-described packages. Dropping
+        // the graph keeps every retained record complete and the total under
+        // the ceiling.
+        if count > budget_remaining {
+            eprintln!(
+                "  {} — {} triples, over the remaining budget of {}; omitted",
+                rel_path, count, budget_remaining
+            );
+            graphs_over_budget.push(BudgetOmission {
+                graph: graph.clone(),
+                triples: count,
+            });
+            // An earlier run may have left this graph's file behind.
+            let _ = std::fs::remove_file(&full_path);
+            continue;
+        }
+        budget_remaining -= count;
+
         // Write triples to file
         let mut file = std::fs::File::create(&full_path)?;
         use std::io::Write;
@@ -599,15 +812,36 @@ pub fn run(
             writeln!(file, "{}", triple)?;
         }
 
-        eprintln!("  {} — {} triples", rel_path, count);
+        eprintln!(
+            "  {} — {} triples, {} references leaving the corpus",
+            rel_path, count, extraction.dangling_targets
+        );
 
         manifest_entries.push(ManifestEntry {
             path: rel_path,
             graph: graph.clone(),
             triples: count,
+            dangling_targets: extraction.dangling_targets,
         });
 
         all_triples.extend(triples);
+    }
+
+    if manifest_entries.is_empty() && !graph_uris.is_empty() {
+        return Err(Error::new(
+            ErrorKind::Other,
+            format!(
+                "no graph fits a max_triples of {}: the smallest extracted \
+                 description is {} triples. Raise max_triples or lower depth \
+                 and fan_out; this run has produced no corpus.",
+                max_triples,
+                graphs_over_budget
+                    .iter()
+                    .map(|o| o.triples)
+                    .min()
+                    .unwrap_or(0)
+            ),
+        ));
     }
 
     // Phase 4: Coverage audit
@@ -615,20 +849,40 @@ pub fn run(
     let mut report = compute_coverage(&all_triples, &ref_set);
 
     // Gap fill for missing classes
-    let gap_fill_count = gap_fill(
+    let gap = gap_fill(
         &client,
         &ref_set,
         &report,
         &mut all_triples,
         output_dir,
         &mut manifest_entries,
+        budget_remaining,
     )?;
-    if gap_fill_count > 0 {
+    selection.absorb(&gap.selection);
+    if gap.triples > 0 {
         // Recompute coverage after gap fill
         report = compute_coverage(&all_triples, &ref_set);
     }
+    if !gap.classes_over_budget.is_empty() {
+        eprintln!(
+            "  Gap fill: {} classes left uncovered by the budget",
+            gap.classes_over_budget.len()
+        );
+    }
 
     let total_triples = all_triples.len();
+    if !graphs_over_budget.is_empty() {
+        eprintln!(
+            "{} graph(s) omitted to keep the corpus within max_triples ({}): {}",
+            graphs_over_budget.len(),
+            max_triples,
+            graphs_over_budget
+                .iter()
+                .map(|o| format!("{} ({} triples)", o.graph, o.triples))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     eprintln!(
         "Coverage: {}/{} classes, {}/{} predicates, {}/{} SHACL shapes",
         report.classes_covered,
@@ -668,6 +922,11 @@ pub fn run(
         depth,
         fan_out,
         total_triples,
+        max_triples,
+        selection,
+        graphs_unexpanded,
+        graphs_over_budget,
+        classes_over_budget: gap.classes_over_budget,
         files: manifest_entries,
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)
@@ -691,7 +950,24 @@ fn graph_uri_to_filename(graph_uri: &str) -> String {
     format!("{}.nt", path.replace('/', "-"))
 }
 
+/// What gap fill added, and what it could not.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct GapFillReport {
+    pub triples: usize,
+    pub dangling_targets: usize,
+    pub selection: SelectionReport,
+    /// Classes an exemplar existed for, but the budget could not hold.
+    pub classes_over_budget: Vec<String>,
+}
+
 /// Attempt to fill coverage gaps by finding packages that use missing classes.
+///
+/// Gap fill runs after the main extraction and draws on the same corpus
+/// budget, so it takes what is left rather than a fresh allowance. Its cuts
+/// and dangling references are reported like any other graph's: it used to
+/// call the non-reporting wrappers and then write a hardcoded zero into the
+/// manifest, which made a partial corpus claim it had omitted nothing.
+#[allow(clippy::too_many_arguments)]
 fn gap_fill(
     client: &SparqlClient,
     _ref_set: &OntologyReferenceSet,
@@ -699,22 +975,31 @@ fn gap_fill(
     all_triples: &mut Vec<String>,
     output_dir: &Path,
     manifest_entries: &mut Vec<ManifestEntry>,
-) -> Result<usize> {
+    budget: usize,
+) -> Result<GapFillReport> {
+    let mut gap = GapFillReport::default();
     if report.classes_missing.is_empty() {
-        return Ok(0);
+        return Ok(gap);
     }
+
+    // The file is opened for append below, once per covered class. Left from a
+    // previous run it would carry that run's triples into this corpus.
+    let _ = std::fs::remove_file(output_dir.join("collector/gap-fill.nt"));
 
     eprintln!(
         "  Gap fill: {} missing classes",
         report.classes_missing.len()
     );
-    let mut gap_triples = 0;
+    let mut budget_remaining = budget;
 
     for missing_class in &report.classes_missing {
+        // ORDER BY makes the exemplar a function of the data. Without it the
+        // endpoint is free to return any instance, so the corpus contains a
+        // different package on each run.
         let sparql = format!(
             "SELECT ?pkg ?g WHERE {{\n\
                GRAPH ?g {{ ?pkg a <{}> . }}\n\
-             }} LIMIT 1",
+             }} ORDER BY ?g ?pkg LIMIT 1",
             missing_class
         );
 
@@ -724,9 +1009,23 @@ fn gap_fill(
                     // Mini BFS depth 1 around this package
                     let mut mini_seeds = HashSet::new();
                     mini_seeds.insert(pkg.clone());
-                    let expanded = bfs_expand(client, g, &mini_seeds, 1, 5)?;
-                    let triples = extract_triples(client, g, &expanded)?;
+                    let (expanded, mini_selection) =
+                        bfs_expand_reporting(client, g, &mini_seeds, 1, 5)?;
+                    let (triples, extraction) = extract_triples_reporting(client, g, &expanded)?;
                     let count = triples.len();
+
+                    if count > budget_remaining {
+                        eprintln!(
+                            "    {} — found in <{}>, {} triples, over the remaining \
+                             budget of {}; omitted",
+                            missing_class, g, count, budget_remaining
+                        );
+                        gap.classes_over_budget.push(missing_class.clone());
+                        continue;
+                    }
+                    budget_remaining -= count;
+                    gap.selection.absorb(&mini_selection);
+                    gap.dangling_targets += extraction.dangling_targets;
 
                     // Append to gap-fill file
                     let gap_path = output_dir.join("collector/gap-fill.nt");
@@ -740,10 +1039,11 @@ fn gap_fill(
                     }
 
                     all_triples.extend(triples);
-                    gap_triples += count;
+                    gap.triples += count;
                     eprintln!(
-                        "    {} — found in <{}>, +{} triples",
-                        missing_class, g, count
+                        "    {} — found in <{}>, +{} triples, {} references leaving \
+                         the corpus",
+                        missing_class, g, count, extraction.dangling_targets
                     );
                 }
             }
@@ -756,15 +1056,16 @@ fn gap_fill(
         }
     }
 
-    if gap_triples > 0 {
+    if gap.triples > 0 {
         manifest_entries.push(ManifestEntry {
             path: "collector/gap-fill.nt".to_string(),
             graph: "gap-fill".to_string(),
-            triples: gap_triples,
+            triples: gap.triples,
+            dangling_targets: gap.dangling_targets,
         });
     }
 
-    Ok(gap_triples)
+    Ok(gap)
 }
 
 #[cfg(test)]
@@ -931,6 +1232,208 @@ alpine = ["openssl", "busybox"]
     }
 
     #[test]
+    fn bfs_follows_capability_edges() {
+        // Regression: extract_triples drops any triple whose object URI was not
+        // visited, so a predicate missing from BFS_PREDICATES removes the edge
+        // from the extracted corpus rather than merely leaving it unexpanded.
+        // When the RPM collector moved from directlyProvides to
+        // providesCapability, provision relationships disappeared from test
+        // corpora. This asserts the generated query asks for them: the mock
+        // only matches when the predicate is present, so a regression fails the
+        // request rather than silently returning nothing.
+        let mut server = mockito::Server::new();
+
+        let _mock = server
+            .mock("POST", "/sparql")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("core%23providesCapability".to_string()),
+                mockito::Matcher::Regex("core%23requiresCapability".to_string()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/sparql-results+json")
+            .with_body(
+                r#"{"results": {"bindings": [{
+                     "seed": {"type": "uri", "value": "http://ex/pkg1"},
+                     "predicate": {"type": "uri", "value": "https://purl.org/packagegraph/ontology/core#providesCapability"},
+                     "neighbor": {"type": "uri", "value": "http://ex/capability/libssl.so.3"}
+                   }]}}"#,
+            )
+            .expect_at_least(1)
+            .create();
+
+        let client = crate::sparql::SparqlClient::new(&server.url());
+        let mut seeds = HashSet::new();
+        seeds.insert("http://ex/pkg1".to_string());
+
+        let expanded = bfs_expand(&client, "http://ex/graph/test", &seeds, 1, 10).unwrap();
+
+        assert!(
+            expanded.contains("http://ex/capability/libssl.so.3"),
+            "BFS must reach the capability node, or extract_triples will filter \
+             the providesCapability edge out of the corpus"
+        );
+    }
+
+    /// A capability description as the endpoint would serialise it. The two
+    /// type assertions are the triples the old filter deleted.
+    const CAPABILITY_DESCRIPTION: &str = concat!(
+        "<https://packagegraph.github.io/d/pkg/f/openssl> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#Package> .\n",
+        "<https://packagegraph.github.io/d/pkg/f/openssl> <https://purl.org/packagegraph/ontology/core#packageName> \"openssl\" .\n",
+        "<https://packagegraph.github.io/d/pkg/f/openssl> <https://purl.org/packagegraph/ontology/core#providesCapability> <https://packagegraph.github.io/d/capability/libssl.so.3> .\n",
+        "<https://packagegraph.github.io/d/capability/libssl.so.3> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#Capability> .\n",
+        "<https://packagegraph.github.io/d/capability/libssl.so.3> <https://purl.org/packagegraph/ontology/core#capabilityName> \"libssl.so.3\" .\n",
+        "<https://packagegraph.github.io/d/capability/libssl.so.3> <http://www.w3.org/2000/01/rdf-schema#label> \"libssl.so.3\" .\n",
+    );
+
+    /// Serve a fixed CONSTRUCT body and a fixed object list for the companion
+    /// SELECT, so a test can state what the endpoint holds and assert what
+    /// extraction keeps.
+    fn extraction_server(
+        construct_body: &str,
+        object_bindings: &str,
+    ) -> (mockito::ServerGuard, Vec<mockito::Mock>) {
+        let mut server = mockito::Server::new();
+        let construct = server
+            .mock("POST", "/sparql")
+            .match_header("accept", "application/n-triples")
+            .with_status(200)
+            .with_header("content-type", "application/n-triples")
+            .with_body(construct_body)
+            .expect_at_least(1)
+            .create();
+        let select = server
+            .mock("POST", "/sparql")
+            .match_header("accept", "application/sparql-results+json")
+            .with_status(200)
+            .with_header("content-type", "application/sparql-results+json")
+            .with_body(format!(
+                r#"{{"results": {{"bindings": [{}]}}}}"#,
+                object_bindings
+            ))
+            .create();
+        (server, vec![construct, select])
+    }
+
+    #[test]
+    fn extraction_keeps_the_type_assertions_that_make_shapes_apply() {
+        // The regression that let a corpus certify itself: the old object
+        // filter compared every URI object against the visited set, and a
+        // class IRI is never a visited instance, so `rdf:type` was deleted
+        // from every record. With no typed node left, `sh:targetClass`
+        // selects no focus node, so every class-targeted shape conforms over
+        // nothing.
+        let (server, _mocks) = extraction_server(CAPABILITY_DESCRIPTION, "");
+        let client = crate::sparql::SparqlClient::new(&server.url());
+
+        let mut uris = HashSet::new();
+        uris.insert("https://packagegraph.github.io/d/pkg/f/openssl".to_string());
+        uris.insert("https://packagegraph.github.io/d/capability/libssl.so.3".to_string());
+
+        let kept = extract_triples(&client, "http://ex/graph/test", &uris).unwrap();
+
+        for expected in CAPABILITY_DESCRIPTION.lines() {
+            assert!(
+                kept.iter().any(|t| t == expected),
+                "extraction dropped {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_edge_leaving_the_corpus_is_kept_and_counted() {
+        // Deleting the edge was how `providesCapability` relationships
+        // disappeared when the RPM collector started emitting them: a
+        // predicate missing from BFS_PREDICATES removed the fact rather than
+        // leaving it unexpanded. An edge out of the selection is now retained
+        // and reported, so a partial corpus says it is partial.
+        let (server, _mocks) = extraction_server(
+            CAPABILITY_DESCRIPTION,
+            r#"{"o": {"type": "uri", "value": "https://packagegraph.github.io/d/capability/libssl.so.3"}}"#,
+        );
+        let client = crate::sparql::SparqlClient::new(&server.url());
+
+        let mut uris = HashSet::new();
+        uris.insert("https://packagegraph.github.io/d/pkg/f/openssl".to_string());
+
+        let (kept, report) =
+            extract_triples_reporting(&client, "http://ex/graph/test", &uris).unwrap();
+
+        assert!(
+            kept.iter().any(|t| t.contains("providesCapability")),
+            "an edge out of the selection must survive, not be silently deleted"
+        );
+        assert_eq!(
+            report.dangling_targets, 1,
+            "and the corpus must record that it points somewhere it does not describe"
+        );
+    }
+
+    #[test]
+    fn extraction_output_does_not_depend_on_hash_iteration_order() {
+        let (server, _mocks) = extraction_server(CAPABILITY_DESCRIPTION, "");
+        let client = crate::sparql::SparqlClient::new(&server.url());
+
+        let mut uris = HashSet::new();
+        for n in 0..64 {
+            uris.insert(format!("https://packagegraph.github.io/d/pkg/f/p{n}"));
+        }
+        uris.insert("https://packagegraph.github.io/d/pkg/f/openssl".to_string());
+
+        let first = extract_triples(&client, "http://ex/graph/test", &uris).unwrap();
+        let second = extract_triples(&client, "http://ex/graph/test", &uris).unwrap();
+        assert_eq!(first, second, "two runs over one selection must agree");
+        let mut sorted = first.clone();
+        sorted.sort();
+        assert_eq!(first, sorted, "output must be ordered, not hash-ordered");
+    }
+
+    #[test]
+    fn the_fan_out_cap_reports_and_repeats_its_cut() {
+        // A capped neighbourhood is a partial record. Which neighbours survive
+        // has to be a function of the data, and how many were dropped has to
+        // reach the manifest, or the corpus implies a completeness it does not
+        // have.
+        let bindings: Vec<String> = (0..10)
+            .map(|n| {
+                format!(
+                    r#"{{"seed": {{"type": "uri", "value": "http://ex/pkg1"}},
+                        "predicate": {{"type": "uri", "value": "https://purl.org/packagegraph/ontology/core#providesCapability"}},
+                        "neighbor": {{"type": "uri", "value": "http://ex/cap{n}"}}}}"#
+                )
+            })
+            .collect();
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/sparql")
+            .with_status(200)
+            .with_header("content-type", "application/sparql-results+json")
+            .with_body(format!(
+                r#"{{"results": {{"bindings": [{}]}}}}"#,
+                bindings.join(",")
+            ))
+            .expect_at_least(1)
+            .create();
+
+        let client = crate::sparql::SparqlClient::new(&server.url());
+        let mut seeds = HashSet::new();
+        seeds.insert("http://ex/pkg1".to_string());
+
+        let (first, report) =
+            bfs_expand_reporting(&client, "http://ex/graph/test", &seeds, 1, 3).unwrap();
+
+        assert_eq!(report.fan_out_cuts, 7, "ten neighbours capped at three");
+        assert_eq!(report.capped_pairs, 1);
+        assert_eq!(report.hops_walked, 1);
+
+        let (second, _) =
+            bfs_expand_reporting(&client, "http://ex/graph/test", &seeds, 1, 3).unwrap();
+        assert_eq!(
+            first, second,
+            "the cap must choose the same three every run"
+        );
+    }
+
+    #[test]
     fn test_extract_triples_for_uris() {
         let mut server = mockito::Server::new();
 
@@ -940,6 +1443,13 @@ alpine = ["openssl", "busybox"]
             .with_header("content-type", "application/n-triples")
             .with_body("<http://ex/pkg1> <http://ex/name> \"openssl\" .\n<http://ex/pkg1> <http://ex/dep> <http://ex/pkg2> .\n")
             .expect_at_least(1)
+            .create();
+        let _objects = server
+            .mock("POST", "/sparql")
+            .match_header("accept", "application/sparql-results+json")
+            .with_status(200)
+            .with_header("content-type", "application/sparql-results+json")
+            .with_body(r#"{"results": {"bindings": []}}"#)
             .create();
 
         let client = crate::sparql::SparqlClient::new(&server.url());
