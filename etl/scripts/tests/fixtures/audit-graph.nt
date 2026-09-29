@@ -17,7 +17,10 @@
 <https://packagegraph.github.io/d/capability/libc.so.6%28GLIBC_2.34%29%2864bit%29> <http://www.w3.org/2000/01/rdf-schema#label> "libc.so.6(GLIBC_2.34)(64bit)" .
 <https://packagegraph.github.io/d/capability/libc.so.6%28GLIBC_2.34%29%2864bit%29> <https://purl.org/packagegraph/ontology/core#capabilityName> "libc.so.6(GLIBC_2.34)(64bit)" .
 <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/basesystem> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#PackageIdentity> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/basesystem> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#PackageIdentity> .
 <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/basesystem> <http://www.w3.org/2000/01/rdf-schema#label> "basesystem Package Identity" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/basesystem> <http://www.w3.org/2000/01/rdf-schema#label> "basesystem Package Identity" .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/basesystem> <https://purl.org/packagegraph/ontology/core#identityName> "basesystem" .
 <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/basesystem> <https://purl.org/packagegraph/ontology/core#identityName> "basesystem" .
 <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash-completion> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#PackageIdentity> .
 <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash-completion> <http://www.w3.org/2000/01/rdf-schema#label> "bash-completion Package Identity" .
@@ -35,6 +38,7 @@
 <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/5.1.8-9.el9.x86_64> <https://purl.org/packagegraph/ontology/core#providesCapability> <https://packagegraph.github.io/d/capability/bundled%28gnulib%29> .
 <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/5.1.8-9.el9.x86_64> <https://purl.org/packagegraph/ontology/core#purl> "pkg:rpm/almalinux/bash@5.1.8-9.el9?arch=x86_64"^^<http://www.w3.org/2001/XMLSchema#anyURI> .
 <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/5.1.8-9.el9.x86_64> <https://purl.org/packagegraph/ontology/rpm#rpmConflicts> <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash-completion> .
+<https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/5.1.8-9.el9.x86_64> <https://purl.org/packagegraph/ontology/rpm#rpmRequires> <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/basesystem> .
 <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash/5.1.8-9.el9.x86_64> <https://purl.org/packagegraph/ontology/rpm#rpmRequires> <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/libc.so.6%28GLIBC_2.34%29%2864bit%29> .
 <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://purl.org/packagegraph/ontology/core#PackageIdentity> .
 <https://packagegraph.github.io/d/pkg/almalinux/9/x86_64/bash> <http://www.w3.org/2000/01/rdf-schema#label> "bash Package Identity" .

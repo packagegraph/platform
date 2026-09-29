@@ -26,6 +26,7 @@
       <rpm:requires>
         <rpm:entry name="libc.so.6(GLIBC_2.34)(64bit)"/>
         <rpm:entry name="rpmlib(CompressedFileNames)" flags="LE" epoch="0" ver="3.0.4" rel="1"/>
+        <rpm:entry name="basesystem"/>
       </rpm:requires>
       <rpm:conflicts>
         <rpm:entry name="bash-completion" flags="LT" epoch="0" ver="2.11"/>
