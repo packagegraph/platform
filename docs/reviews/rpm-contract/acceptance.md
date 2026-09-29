@@ -56,6 +56,27 @@ before any inference. The audit reports the asserted and effective focus
 counts beside every conformance result rather than inferring either from a
 boolean.
 
+**Names are not nodes.** Asking only "is every expected token on some typed
+node, and is every typed node's token expected" is still a question about
+names. A graph can satisfy it and have stripped the `rdf:type` off the node
+its own `providesCapability` edge points at, as long as an identical-looking
+node sits somewhere else in the file. So `coverage` also compares the nodes
+the graph's own edges *reach* against the nodes that are *typed*:
+
+| Direction | Meaning | Gated for |
+|---|---|---|
+| referenced − typed | the node an edge relies on has no explicit type | `Capability`, `BinaryPackage`, `PackageIdentity` |
+| typed − referenced | a typed node nothing refers to: orphaned, or a stand-in for one that lost its type | `Capability`, `PackageIdentity` |
+
+The second direction is not gated for `BinaryPackage`: the graph reaches a
+package through the capabilities it provides, and an RPM declaring no
+`Provides` at all would legitimately sit outside that. The package set is
+already pinned in both directions by the source-derived keys. On BaseOS the
+referencing predicates — `providesCapability` for the first two classes,
+`isVersionOf` / `directlyDependsOn` / `dependencyTarget` / `rpmRequires` /
+`rpmConflicts` / `rpmObsoletes` for identities — reach exactly the 46,547 /
+2,996 / 3,787 nodes that are typed, with nothing on either side.
+
 The audit also reads `primary.xml` with the Python standard library rather
 than through the collector — comparing two outputs of the same parser is not
 independence.
@@ -78,7 +99,7 @@ etl/scripts/audit-rpm-contract.py \
 |---|---|---|
 | `pairs` | Every `(declaring package, capability token)` relation the source states is in the graph and the reverse, with no edge whose ends cannot be named | A capability credited to the wrong package. Token inventories and all counts are unchanged by that mutation |
 | `edges` | `providesCapability` line count equals the source's non-suppressed occurrences, exactly | A lost duplicate occurrence, which the relation set cannot see |
-| `coverage` | Every capability token, binary package and package identity the source implies carries its `rdf:type` explicitly — expected sets derived from the source, compared against asserted subjects before inference, counting distinct nodes | One capability's type triple deleted, or every `PackageIdentity` type deleted. A nonzero check sees neither |
+| `coverage` | Every capability token, binary package and package identity the source implies carries its `rdf:type` explicitly and nothing else does — expected sets derived from the source, compared against asserted subjects before inference in **both** directions, counting distinct nodes; and separately, the node an edge actually reaches is the node that carries the type | One capability's type triple deleted, or every `PackageIdentity` type deleted. A nonzero check sees neither. A type stripped off a referenced node with a same-named node parked beside it, or a capability the source never states: a one-directional name check sees neither of those |
 | `types` | Nonzero asserted nodes per gated class, and every asserted capability has both an `rdfs:label` and a `capabilityName` | All 1,013,026 capability nodes failed `CapabilityShape`'s label requirement while SHACL reported conformance |
 | `encoding` | No name-bearing literal carries an XML entity reference | 9,919 of `fedora/43`'s identity names contained `&gt;` |
 | `prohibited` | Neither `rpm:rpmProvides` nor `pkg:directlyProvides` is emitted | `rpmProvides` was undeclared in every ontology module; `directlyProvides` has `rdfs:range :Package`, so pointing it at a capability token entailed `:Package` membership |
@@ -136,7 +157,7 @@ the preserved AlmaLinux 9 BaseOS repodata (`primary.xml.gz`
 |---|---|
 | `pairs` | 3,209,727 relations agree; 0 source-only, 0 graph-only, 0 unnameable edges |
 | `edges` | 3,210,293 lines = 3,210,726 source occurrences − 433 suppressed, exactly |
-| `coverage` | 46,547/46,547 capability types, 2,996/2,996 binary packages, 3,787/3,787 identity nodes, 3,232/3,232 identity names |
+| `coverage` | 46,547/46,547 capability types, 2,996/2,996 binary packages, 3,787/3,787 identity nodes, 3,232/3,232 identity names; 0 unexpected of any kind; 0 referenced-but-untyped and 0 typed-but-unreferenced nodes across all three classes |
 | `types` | 2,996 package nodes, 3,787 identity nodes, 46,547 capability nodes, 0 unlabelled, 0 unnamed |
 | `encoding` | 0 name literals carry an entity reference |
 | `prohibited` | 0 `rpm:rpmProvides`, 0 `pkg:directlyProvides` |
@@ -144,7 +165,7 @@ the preserved AlmaLinux 9 BaseOS repodata (`primary.xml.gz`
 | `policy` | 1,632 suppressed occurrences in the source, 0 in the graph |
 | `keys` | all three mirrored derivations match |
 
-Two passes over the corpus, 37 seconds, 651 MB peak RSS. The pair comparison
+Two passes over the corpus, 41 seconds, 651 MB peak RSS. The pair comparison
 is an external sorted merge, so the 3.2M-relation sets never sit in memory;
 the in-memory maps are bounded by distinct names, not occurrences.
 
@@ -156,7 +177,7 @@ decoding fix, over identical repodata. It exits 1:
 | Gate | Result at `1aa0f12` |
 |---|---|
 | `pairs` | **FAIL** — 3,204,577 agree; 5,150 source-only and 5,150 graph-only |
-| `coverage` | **FAIL** — 1,726 capability types and 8 identity names missing |
+| `coverage` | **FAIL** — 1,726 capability types and 8 identity names missing, and the same counts *unexpected*: each entity-escaped variant is a token the source never states, standing in for one it does |
 | `encoding` | **FAIL** — 3,606 name literals carry an entity reference |
 | `edges`, `types`, `policy`, `prohibited`, `parse`, `keys` | pass |
 
@@ -229,10 +250,10 @@ nothing in this branch changes them.
 
 `etl/scripts/tests/test_audit_rpm_contract.py` takes a clean fixture pair and
 breaks exactly one thing per test, asserting the matching gate goes red. A gate
-that cannot fail is decoration. 40 tests.
+that cannot fail is decoration. 50 tests.
 
-Four of those mutations are regression cases: each passed every gate of an
-earlier version of this audit.
+Twelve of those mutations are regression cases: each passed every gate of an
+earlier version of this audit. Four from the first review:
 
 - a capability reassigned from `bash` to `glibc` — now fails `pairs` **only**,
   since nothing else about the graph changes;
@@ -242,6 +263,17 @@ earlier version of this audit.
   restoration measured rather than assumed, and the missing-label negative
   control retained.
 
+Eight from the second, which found `coverage` was still a check on names and
+ran in one direction only. Detached substitutes — the type stripped off the
+node an edge points at, with an identically named and labelled node parked
+beside it that nothing refers to — for a capability, an identity and a
+providing package; and subjects the source never states — a capability, a
+binary package, an identity. All six now fail `coverage`; the capability
+cases fail it and nothing else. The remaining two pin the two deliberate
+asymmetries: a typed package that provides nothing is reported rather than
+gated, and an `identityName` read off an untyped node does not count towards
+coverage.
+
 The fixture is a faithful miniature in the respects the gates check: it
 carries a capability two packages both provide, a dependency target two
 packages both name (so identity type assertions exceed identity nodes, as they
@@ -249,6 +281,14 @@ do at corpus scale), the `pkg:hasVersion` and `pkg:Version` nodes the
 collector emits for both binary and source packages, and the legacy
 `rpm:rpm*` predicates that are still part of today's contract. A fixture that
 is not faithful produces findings about the fixture.
+
+Two more are about the audit rather than the corpus. The pair comparison
+writes close to a gigabyte of scratch per run, and the first implementation
+called `mkdtemp` without ever removing it — one directory per audit, and one
+per test. 1,165 of them exhausted a 12.6 GB tmpfs quota, which fails writes
+across the machine rather than anywhere the audit would report. The scratch
+is now a context manager, and two tests assert it is gone afterwards,
+including when a gate raises.
 
 The SHACL tests require pySHACL and an ontology checkout; without either they
 **skip**, they do not pass. CI installs pySHACL, fetches the shapes at the

@@ -11,6 +11,14 @@ them. They are kept as the regression set:
   * one capability's type triple deleted (five typed instead of six)
   * every PackageIdentity type deleted (zero typed identities)
   * every Capability type deleted, which RDFS then restores
+
+A second review found `coverage` was still a check on names rather than on
+nodes, and ran in one direction only. Those mutations are the regression set
+in `DetachedSubstitutes` and `UnexpectedSubjects`:
+
+  * the type stripped off the node an edge points at, with an identically
+    named node parked beside it that nothing refers to
+  * a capability, package or identity the source never states
 """
 
 import json
@@ -282,6 +290,196 @@ class ExplicitTypeCoverage(MutationCase):
         self.assertEqual(
             report["source"]["expected_capability_tokens"],
             report["graph"]["asserted_nodes"]["Capability"],
+        )
+
+
+class DetachedSubstitutes(MutationCase):
+    """Second review of `coverage`: a name check is not a node check.
+
+    Every mutation here leaves the source-derived name sets exactly as they
+    were. It strips the type off the node an edge actually points at and
+    parks an identically-named, identically-labelled node beside it, which
+    nothing refers to. Each one passed every gate of the first `coverage`
+    implementation.
+    """
+
+    def add(self, *lines):
+        self.rewrite(self.lines() + list(lines))
+
+    def test_a_stand_in_does_not_cover_the_capability_an_edge_points_at(self):
+        token = "bash(x86-64)"
+        referenced = capability_uri(token)
+        stand_in = f"{DATA}capability/detached-stand-in"
+        self.drop_matching(
+            lambda l: l == f"<{referenced}> <{TYPE}> <{PKG}Capability> .", 1
+        )
+        self.add(
+            f"<{stand_in}> <{TYPE}> <{PKG}Capability> .",
+            f'<{stand_in}> <{LABEL}> "{token}" .',
+            f'<{stand_in}> <{PKG}capabilityName> "{token}" .',
+        )
+        report = run_audit(self.graph)
+        self.assertOnlyGateFails(report, "coverage")
+
+        detail = report["coverage_detail"]
+        # The old checks see nothing: the token is present, the count is
+        # right, and every typed capability still has a name and a label.
+        self.assertEqual(0, detail["capability_tokens_missing_count"])
+        self.assertEqual(0, detail["capability_tokens_unexpected_count"])
+        self.assertEqual(6, report["graph"]["asserted_nodes"]["Capability"])
+        self.assertTrue(report["gates"]["types"]["pass"])
+        # What does see it, from both sides.
+        self.assertEqual(1, detail["referenced_but_untyped"]["Capability"]["count"])
+        self.assertEqual(1, detail["typed_but_unreferenced"]["Capability"]["count"])
+        self.assertEqual(
+            ["detached-stand-in"],
+            detail["typed_but_unreferenced"]["Capability"]["sample"],
+        )
+
+    def test_a_stand_in_does_not_cover_the_identity_a_requirement_names(self):
+        referenced = f"{DATA}pkg/almalinux/9/x86_64/basesystem"
+        stand_in = f"{DATA}pkg/almalinux/9/x86_64/basesystem-stand-in"
+        # basesystem is required by both fixture packages, so its definition
+        # is written twice -- the mutation has to take both assertions.
+        self.drop_matching(
+            lambda l: l == f"<{referenced}> <{TYPE}> <{PKG}PackageIdentity> .", 2
+        )
+        self.add(
+            f"<{stand_in}> <{TYPE}> <{PKG}PackageIdentity> .",
+            f'<{stand_in}> <{LABEL}> "basesystem Package Identity" .',
+            f'<{stand_in}> <{PKG}identityName> "basesystem" .',
+        )
+        report = run_audit(self.graph)
+        self.assertOnlyGateFails(report, "coverage")
+
+        detail = report["coverage_detail"]
+        self.assertEqual(0, detail["identity_names_missing_count"])
+        self.assertEqual(0, detail["identity_names_unexpected_count"])
+        self.assertEqual(0, detail["identity_node_shortfall"])
+        self.assertEqual(
+            1, detail["referenced_but_untyped"]["PackageIdentity"]["count"]
+        )
+        self.assertEqual(
+            1, detail["typed_but_unreferenced"]["PackageIdentity"]["count"]
+        )
+
+    def test_a_stand_in_does_not_cover_the_package_that_provides(self):
+        stand_in = f"{DATA}pkg/almalinux/9/x86_64/bash/stand-in"
+        version = f"{DATA}ver/almalinux/9/bash/5.1.8-9.el9.x86_64"
+        self.drop_matching(
+            lambda l: l == f"<{BASH}> <{TYPE}> <{PKG}BinaryPackage> .", 1
+        )
+        self.add(
+            f"<{stand_in}> <{TYPE}> <{PKG}BinaryPackage> .",
+            f'<{stand_in}> <{PKG}packageName> "bash" .',
+            f"<{stand_in}> <{PKG}hasVersion> <{version}> .",
+        )
+        report = run_audit(self.graph)
+        self.assertGateFails(report, "coverage")
+
+        detail = report["coverage_detail"]
+        self.assertEqual(0, detail["binary_packages_missing_count"])
+        self.assertEqual(0, detail["binary_packages_unexpected_count"])
+        self.assertEqual(
+            1, detail["referenced_but_untyped"]["BinaryPackage"]["count"]
+        )
+
+    def test_a_package_that_provides_nothing_is_reported_but_not_gated(self):
+        # The converse is deliberately NOT a failure for packages: the graph
+        # reaches a package through the capabilities it provides, and an RPM
+        # with no Provides at all would legitimately sit outside that.
+        report = run_audit(GRAPH)
+        self.assertFalse(
+            report["coverage_detail"]["typed_but_unreferenced"]["BinaryPackage"][
+                "gated"
+            ]
+        )
+        self.assertTrue(
+            report["coverage_detail"]["typed_but_unreferenced"]["Capability"]["gated"]
+        )
+        self.assertIn(
+            "BinaryPackage", report["coverage"]["classes_checked_by_reference"]
+        )
+        self.assertNotIn(
+            "BinaryPackage", report["coverage"]["classes_gated_on_detached_nodes"]
+        )
+
+
+class UnexpectedSubjects(MutationCase):
+    """Second review of `coverage`: the comparison has to run both ways.
+
+    The first implementation only asked whether every expected subject was
+    present. A graph could assert anything it liked in addition.
+    """
+
+    def add(self, *lines):
+        self.rewrite(self.lines() + list(lines))
+
+    def test_a_capability_the_source_never_states_fails_coverage(self):
+        token = "never-declared-anywhere"
+        uri = capability_uri(token)
+        self.add(
+            f"<{uri}> <{TYPE}> <{PKG}Capability> .",
+            f'<{uri}> <{LABEL}> "{token}" .',
+            f'<{uri}> <{PKG}capabilityName> "{token}" .',
+        )
+        report = run_audit(self.graph)
+        self.assertOnlyGateFails(report, "coverage")
+
+        detail = report["coverage_detail"]
+        self.assertEqual(0, detail["capability_tokens_missing_count"])
+        self.assertEqual(1, detail["capability_tokens_unexpected_count"])
+        self.assertEqual([token], detail["capability_tokens_unexpected"])
+        # Seven typed capabilities against six expected. The old gate printed
+        # exactly that and passed anyway.
+        self.assertEqual(7, report["graph"]["asserted_nodes"]["Capability"])
+        self.assertEqual(6, report["source"]["expected_capability_tokens"])
+
+    def test_a_binary_package_the_source_never_ships_fails_coverage(self):
+        uri = f"{DATA}pkg/almalinux/9/x86_64/phantom/1.0-1.el9.x86_64"
+        version = f"{DATA}ver/almalinux/9/phantom/1.0-1.el9.x86_64"
+        self.add(
+            f"<{uri}> <{TYPE}> <{PKG}BinaryPackage> .",
+            f'<{uri}> <{PKG}packageName> "phantom" .',
+            f"<{uri}> <{PKG}hasVersion> <{version}> .",
+            f'<{version}> <{PKG}versionString> "1.0-1.el9.x86_64" .',
+        )
+        report = run_audit(self.graph)
+        self.assertGateFails(report, "coverage")
+        self.assertEqual(
+            ["phantom\t1.0-1.el9.x86_64"],
+            report["coverage_detail"]["binary_packages_unexpected"],
+        )
+
+    def test_an_identity_nothing_refers_to_fails_coverage(self):
+        uri = f"{DATA}pkg/almalinux/9/x86_64/phantom"
+        self.add(
+            f"<{uri}> <{TYPE}> <{PKG}PackageIdentity> .",
+            f'<{uri}> <{LABEL}> "phantom Package Identity" .',
+            f'<{uri}> <{PKG}identityName> "phantom" .',
+        )
+        report = run_audit(self.graph)
+        self.assertGateFails(report, "coverage")
+        detail = report["coverage_detail"]
+        self.assertEqual(["phantom"], detail["identity_names_unexpected"])
+        self.assertEqual(
+            1, detail["typed_but_unreferenced"]["PackageIdentity"]["count"]
+        )
+
+    def test_an_identity_name_read_off_an_untyped_node_does_not_count(self):
+        # identityName literals are read per subject, not into a bare name
+        # set: a name on an untyped node must not stand in for the type the
+        # gate is checking for.
+        referenced = f"{DATA}pkg/almalinux/9/x86_64/bash-completion"
+        self.drop_matching(
+            lambda l: l == f"<{referenced}> <{TYPE}> <{PKG}PackageIdentity> .", 1
+        )
+        report = run_audit(self.graph)
+        self.assertGateFails(report, "coverage")
+        detail = report["coverage_detail"]
+        self.assertEqual(["bash-completion"], detail["identity_names_missing"])
+        self.assertEqual(
+            1, detail["referenced_but_untyped"]["PackageIdentity"]["count"]
         )
 
 
@@ -618,6 +816,30 @@ class ReportScope(unittest.TestCase):
         self.assertIn("SourcePackage", report["coverage"]["classes_counted_only"])
         self.assertEqual("not_requested", report["coverage"]["shacl"])
         self.assertEqual("no manifest given", report["coverage"]["budget"])
+
+
+class Scratch(unittest.TestCase):
+    def test_the_audit_removes_its_scratch_directory(self):
+        # It did not. Every run left ~1 GB of pair files behind, and the
+        # test suite left one per test; 1,165 of them exhausted a 12.6 GB
+        # tmpfs quota, which fails writes across the whole machine rather
+        # than anywhere the audit would notice.
+        import glob
+
+        before = set(glob.glob(str(Path(tempfile.gettempdir()) / "rpm-contract-audit.*")))
+        report = run_audit(GRAPH)
+        self.assertTrue(report["pass"])
+        after = set(glob.glob(str(Path(tempfile.gettempdir()) / "rpm-contract-audit.*")))
+        self.assertEqual(set(), after - before, "the audit left its scratch behind")
+
+    def test_the_scratch_goes_even_when_a_gate_raises(self):
+        import glob
+
+        before = set(glob.glob(str(Path(tempfile.gettempdir()) / "rpm-contract-audit.*")))
+        with self.assertRaises(Exception):
+            run_audit(GRAPH, primary_path=TESTS_DIR / "fixtures" / "does-not-exist.xml")
+        after = set(glob.glob(str(Path(tempfile.gettempdir()) / "rpm-contract-audit.*")))
+        self.assertEqual(set(), after - before, "a raising run left its scratch behind")
 
 
 class CommandLine(MutationCase):

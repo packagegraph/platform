@@ -32,10 +32,13 @@ Nine gates run against the two files. Each can fail the run:
              non-suppressed Provides occurrences, exactly. Catches a lost
              duplicate occurrence, which `pairs` cannot see.
   coverage   Every capability token, binary package and package identity the
-             source implies carries its `rdf:type` explicitly. Expected
-             subject sets derived from the source, compared against asserted
-             subjects before any inference, counting distinct nodes rather
-             than type-assertion lines.
+             source implies carries its `rdf:type` explicitly, and nothing
+             else does. Expected subject sets derived from the source,
+             compared against asserted subjects before any inference in both
+             directions, counting distinct nodes rather than type-assertion
+             lines -- and separately, the nodes the graph's own edges reach
+             must be the nodes that carry the type, so a stand-in parked
+             beside a stripped node is a failure rather than a substitute.
   types      Nonzero asserted subjects per gated class, and every asserted
              capability has both an `rdfs:label` and a `capabilityName`.
              Completeness among nodes that are already typed; `coverage` is
@@ -122,6 +125,22 @@ COVERED_CLASSES = (
     f"{PKG}Capability",
     f"{PKG}BinaryPackage",
     f"{PKG}PackageIdentity",
+)
+
+# The predicates that make a node a capability, a package or an identity *in
+# the graph itself*, independent of what the source says. A node reached
+# through one of these is a node the corpus is relying on, so it is the node
+# that has to carry the type -- a same-named node off to one side does not
+# substitute for it. Measured on AlmaLinux 9 BaseOS, these reach exactly the
+# 46,547 / 2,996 / 3,787 nodes that are typed, in both directions.
+CAPABILITY_REFERENCE = f"{PKG}providesCapability"
+IDENTITY_REFERENCES = (
+    f"{PKG}isVersionOf",
+    f"{PKG}directlyDependsOn",
+    f"{PKG}dependencyTarget",
+    f"{RPM}rpmRequires",
+    f"{RPM}rpmConflicts",
+    f"{RPM}rpmObsoletes",
 )
 
 # Counted and reported, but not held to an expectation: a source RPM is shared
@@ -314,6 +333,11 @@ class GraphFacts:
     instead reported 11,984 "typed packages" for 2,996 package nodes and
     27,850 "identities" for 3,787, because the collector writes an identity's
     type once per reference.
+
+    `referenced` holds the nodes the graph's own edges reach, per class.
+    Comparing it against `asserted` is what makes the coverage gate about
+    nodes rather than about names: a graph can carry every expected token
+    and still have stripped the type off the node an edge points at.
     """
 
     def __init__(self):
@@ -328,11 +352,12 @@ class GraphFacts:
         self.suppressed_tokens_present = []
         self.provides_edge_lines = 0
         self.asserted = {c: set() for c in COVERED_CLASSES + REPORTED_CLASSES}
+        self.referenced = {c: set() for c in COVERED_CLASSES}
         self.capability_token = {}
         self.package_name = {}
         self.has_version = {}
         self.version_literal = {}
-        self.identity_names = set()
+        self.identity_name_of = {}
         self.labelled = set()
         self.named = set()
 
@@ -358,8 +383,14 @@ def stream_graph_facts(rdf_path):
                 elif predicate == RDF_TYPE:
                     if obj in facts.asserted:
                         facts.asserted[obj].add(subject)
-                elif predicate == f"{PKG}providesCapability":
+                elif predicate == CAPABILITY_REFERENCE:
                     facts.provides_edge_lines += 1
+                    # The two ends of a provides edge are the nodes the graph
+                    # is actually relying on to be a capability and a package.
+                    facts.referenced[f"{PKG}Capability"].add(obj)
+                    facts.referenced[f"{PKG}BinaryPackage"].add(subject)
+                elif predicate in IDENTITY_REFERENCES:
+                    facts.referenced[f"{PKG}PackageIdentity"].add(obj)
                 elif predicate == f"{PKG}hasVersion":
                     facts.has_version[subject] = obj
                 continue
@@ -403,7 +434,10 @@ def stream_graph_facts(rdf_path):
             elif predicate == f"{PKG}versionString":
                 facts.version_literal[subject] = unescape_nt(value)
             elif predicate == f"{PKG}identityName":
-                facts.identity_names.add(unescape_nt(value))
+                # Kept per subject, not as a bare name set: a name read off an
+                # untyped node would let that node stand in for the typed one
+                # the gate is supposed to be checking.
+                facts.identity_name_of[subject] = unescape_nt(value)
             elif predicate == RDFS_LABEL:
                 facts.labelled.add(subject)
 
@@ -641,13 +675,29 @@ def check_mirrored_keys(repo_root):
 def audit(
     primary_path, rdf_path, ontology_root=None, manifest_path=None, repo_root=None
 ):
+    """Run every gate and return the report.
+
+    The scratch directory holds the two pair streams and their sorted
+    copies -- close to a gigabyte for a BaseOS-sized corpus -- and is
+    removed on the way out, including when a gate raises. An earlier
+    version called `mkdtemp` and never cleaned up, which left 1,165
+    directories behind and exhausted a 12.6 GB tmpfs quota on /tmp.
+    """
+    with tempfile.TemporaryDirectory(prefix="rpm-contract-audit.") as workdir:
+        return _audit_in(
+            workdir, primary_path, rdf_path, ontology_root, manifest_path, repo_root
+        )
+
+
+def _audit_in(
+    workdir, primary_path, rdf_path, ontology_root, manifest_path, repo_root
+):
     report = {
         "source": {"path": str(primary_path)},
         "graph": {"path": str(rdf_path)},
         "gates": {},
     }
 
-    workdir = tempfile.mkdtemp(prefix="rpm-contract-audit.")
     source_pairs = os.path.join(workdir, "source-pairs.txt")
     graph_pairs = os.path.join(workdir, "graph-pairs.txt")
 
@@ -686,7 +736,10 @@ def audit(
             "provides_pairs_resolved": pair_lines,
             "provides_pairs_unnameable": unresolved,
             "asserted_nodes": {c.split("#")[-1]: n for c, n in asserted.items()},
-            "distinct_identity_names": len(graph.identity_names),
+            "referenced_nodes": {
+                c.split("#")[-1]: len(graph.referenced[c]) for c in COVERED_CLASSES
+            },
+            "distinct_identity_names": len(set(graph.identity_name_of.values())),
             "undecoded_name_count": graph.undecoded_name_count,
             "entity_in_prose": graph.entity_in_prose,
             "prohibited": graph.prohibited,
@@ -737,6 +790,14 @@ def audit(
     # Asserted subjects, before any inference, counted as distinct nodes.
     # RDFS entails capability membership from capabilityName and
     # providesCapability, so no conformance result can establish this.
+    #
+    # Two questions, and the gate has to ask both. What the graph *names*:
+    # does the set of tokens on typed capability nodes equal the set the
+    # source states -- in both directions, so an invented capability is a
+    # failure and not a rounding error. And what the graph *points at*: is
+    # the node an edge actually reaches the node that carries the type. A
+    # name check alone passes a graph that strips the type off the node its
+    # edges use and parks an identical-looking node beside it.
     observed_tokens = {
         graph.capability_token[uri]
         for uri in graph.asserted[f"{PKG}Capability"]
@@ -748,28 +809,83 @@ def audit(
         version = graph.version_literal.get(graph.has_version.get(uri, ""))
         if name is not None and version is not None:
             observed_keys.add(f"{name}\t{version}")
+    observed_identity_names = {
+        graph.identity_name_of[uri]
+        for uri in graph.asserted[f"{PKG}PackageIdentity"]
+        if uri in graph.identity_name_of
+    }
 
     missing_tokens = src.expected_tokens - observed_tokens
+    unexpected_tokens = observed_tokens - src.expected_tokens
     missing_keys = src.expected_package_keys - observed_keys
-    missing_names = src.expected_identity_names - graph.identity_names
+    unexpected_keys = observed_keys - src.expected_package_keys
+    missing_names = src.expected_identity_names - observed_identity_names
+    unexpected_names = observed_identity_names - src.expected_identity_names
     identity_shortfall = len(src.expected_identity_keys) - asserted[
         f"{PKG}PackageIdentity"
     ]
 
+    # Referenced-node coverage. `untyped` is the substitution the name checks
+    # cannot see. `detached` is the other half of it, and is a failure in its
+    # own right for capabilities and identities: the collector mints those
+    # nodes only because something refers to them, so one that nothing refers
+    # to was either orphaned by a lost edge or put there to stand in for a
+    # node that lost its type.
+    untyped_referenced = {
+        c: graph.referenced[c] - graph.asserted[c] for c in COVERED_CLASSES
+    }
+    detached_typed = {
+        c: graph.asserted[c] - graph.referenced[c] for c in COVERED_CLASSES
+    }
+    # Not gated for BinaryPackage: `referenced` reaches a package through the
+    # capabilities it provides, and an RPM with no Provides at all would
+    # legitimately sit outside it. The package set is already pinned in both
+    # directions by the source-derived keys above.
+    gated_detached = (f"{PKG}Capability", f"{PKG}PackageIdentity")
+
+    def short(uris):
+        return sorted(u.rsplit("/", 1)[-1] for u in uris)[:20]
+
     report["coverage_detail"] = {
         "capability_tokens_missing_count": len(missing_tokens),
         "capability_tokens_missing": sorted(missing_tokens)[:20],
+        "capability_tokens_unexpected_count": len(unexpected_tokens),
+        "capability_tokens_unexpected": sorted(unexpected_tokens)[:20],
         "binary_packages_missing_count": len(missing_keys),
         "binary_packages_missing": sorted(missing_keys)[:20],
+        "binary_packages_unexpected_count": len(unexpected_keys),
+        "binary_packages_unexpected": sorted(unexpected_keys)[:20],
         "identity_names_missing_count": len(missing_names),
         "identity_names_missing": sorted(missing_names)[:20],
+        "identity_names_unexpected_count": len(unexpected_names),
+        "identity_names_unexpected": sorted(unexpected_names)[:20],
         "identity_node_shortfall": identity_shortfall,
+        "referenced_but_untyped": {
+            c.split("#")[-1]: {
+                "count": len(untyped_referenced[c]),
+                "sample": short(untyped_referenced[c]),
+            }
+            for c in COVERED_CLASSES
+        },
+        "typed_but_unreferenced": {
+            c.split("#")[-1]: {
+                "count": len(detached_typed[c]),
+                "sample": short(detached_typed[c]),
+                "gated": c in gated_detached,
+            }
+            for c in COVERED_CLASSES
+        },
     }
     report["gates"]["coverage"] = {
         "pass": not missing_tokens
+        and not unexpected_tokens
         and not missing_keys
+        and not unexpected_keys
         and not missing_names
-        and identity_shortfall == 0,
+        and not unexpected_names
+        and identity_shortfall == 0
+        and not any(untyped_referenced[c] for c in COVERED_CLASSES)
+        and not any(detached_typed[c] for c in gated_detached),
         # Counts alone mislead here: against the pre-fix collector the
         # cardinalities all matched while the token SETS differed, because
         # each escaped variant substituted for a real one. The missing counts
@@ -778,14 +894,21 @@ def audit(
             f"missing {len(missing_tokens)} capability types, "
             f"{len(missing_keys)} binary package types, "
             f"{len(missing_names)} identity names, "
-            f"{identity_shortfall} identity nodes "
-            f"(expected {len(src.expected_tokens)} tokens / "
+            f"{identity_shortfall} identity nodes; "
+            f"unexpected {len(unexpected_tokens)}/{len(unexpected_keys)}/"
+            f"{len(unexpected_names)} tokens/packages/identity names; "
+            "referenced but untyped "
+            + "/".join(str(len(untyped_referenced[c])) for c in COVERED_CLASSES)
+            + ", typed but unreferenced "
+            + "/".join(str(len(detached_typed[c])) for c in COVERED_CLASSES)
+            + " capability/package/identity"
+            + f" (expected {len(src.expected_tokens)} tokens / "
             f"{len(src.expected_package_keys)} packages / "
             f"{len(src.expected_identity_keys)} identity nodes / "
             f"{len(src.expected_identity_names)} identity names; "
             f"asserted {len(observed_tokens)} / {len(observed_keys)} / "
             f"{asserted[f'{PKG}PackageIdentity']} / "
-            f"{len(graph.identity_names)})"
+            f"{len(observed_identity_names)})"
         ),
     }
 
@@ -943,6 +1066,16 @@ def audit(
         ],
         "classes_held_to_source": [c.split("#")[-1] for c in COVERED_CLASSES],
         "classes_counted_only": [c.split("#")[-1] for c in REPORTED_CLASSES],
+        # Two different claims, so the report names them separately: a class
+        # can be held to a source-derived name set and still not have its
+        # referenced nodes checked, and that gap is what let a detached
+        # stand-in pass.
+        "classes_checked_by_reference": [
+            c.split("#")[-1] for c in COVERED_CLASSES
+        ],
+        "classes_gated_on_detached_nodes": [
+            c.split("#")[-1] for c in gated_detached
+        ],
         "gates_run": sorted(
             name for name, g in report["gates"].items() if g["pass"] is not None
         ),
