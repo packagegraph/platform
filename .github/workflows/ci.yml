@@ -189,7 +189,10 @@ jobs:
             exit 1
           }
           echo "${out}"
-          if echo "${out}" | grep -qi "skipped"; then
+          # Match how unittest reports a skip -- "... skipped 'reason'" per
+          # test and "(skipped=N)" in the summary -- not the bare word, which
+          # also appears in test NAMES and failed this step once on a green run.
+          if echo "${out}" | grep -Eq "\\.\\.\\. skipped|\\(skipped=[0-9]+\\)"; then
             echo "a test skipped, but every dependency is installed above" >&2
             exit 1
           fi
