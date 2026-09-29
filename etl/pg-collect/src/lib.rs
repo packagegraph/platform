@@ -28,6 +28,7 @@ pub mod nuget;
 pub mod hex_collect;
 pub mod freebsd;
 pub mod nix;
+pub mod orphan_target_report;
 pub mod chocolatey;
 pub mod yocto;
 pub mod buildroot;
