@@ -19,10 +19,6 @@ pub struct RevdepsEnricher {
     sparql: SparqlClient,
     graph: Option<String>,
     pub graph_uri: Option<String>,
-    /// Skip identities no package claims to be, instead of counting the
-    /// dependents that happened to name them. Off by default: turning it on
-    /// changes published metrics, which is a decision, not a bug fix.
-    withhold_unresolved: bool,
 }
 
 impl RevdepsEnricher {
@@ -37,22 +33,7 @@ impl RevdepsEnricher {
             sparql,
             graph: graph.map(|s| s.to_string()),
             graph_uri: None,
-            withhold_unresolved: false,
         }
-    }
-
-    /// Withhold counts for dependency targets that resolve to nothing.
-    ///
-    /// An RPM requirement is a capability token, and the collector mints a
-    /// `PackageIdentity` from it by name. Nothing resolves that token to the
-    /// package that actually provides it -- glibc provides `rtld(GNU_HASH)`
-    /// under a different name entirely -- so a count attached to such a node
-    /// measures string equality. With this on, those nodes get no triple at
-    /// all, which reads downstream as "not measured" rather than "measured
-    /// as zero".
-    pub fn withholding_unresolved(mut self, withhold: bool) -> Self {
-        self.withhold_unresolved = withhold;
-        self
     }
 
     /// Set the graph URI for N-Quads output.
@@ -63,24 +44,6 @@ impl RevdepsEnricher {
 
     pub fn enrich(&self, output_path: &str) -> Result<(usize, usize)> {
         self.check_ontology_property()?;
-
-        // Reported whether or not the guard is enforcing, so the run log says
-        // what the numbers are worth before anyone decides to act on it.
-        match crate::rpm_contract_guard::assess_reverse_dependency_support(
-            &self.sparql,
-            self.graph.as_deref(),
-        ) {
-            Ok(support) => {
-                eprintln!("{}", support.summary());
-                if !support.is_complete() && !self.withhold_unresolved {
-                    eprintln!(
-                        "  Counting them anyway: pass --withhold-unresolved-targets \
-                         to omit identities no package claims to be."
-                    );
-                }
-            }
-            Err(e) => eprintln!("  Warning: could not assess target resolution: {e}"),
-        }
 
         let file = File::create(output_path)?;
         let mut writer = NTriplesWriter::new_maybe_graph(file, self.graph_uri.as_deref());
@@ -135,13 +98,6 @@ impl RevdepsEnricher {
             Some(_) => "}",
             None => "} }",
         };
-        // A real identity is one some version claims to be. Without this, a
-        // requirement token that matched no package still collects a count.
-        let resolved_only = if self.withhold_unresolved {
-            format!("?anyVersion <{PKG}isVersionOf> ?targetIdentity .")
-        } else {
-            String::new()
-        };
 
         let query = format!(
             r#"SELECT ?targetIdentity (COUNT(DISTINCT ?depIdentity) AS ?revDepCount)
@@ -149,7 +105,6 @@ impl RevdepsEnricher {
               {graph_clause}
                 ?dependent <{PKG}directlyDependsOn> ?targetIdentity .
                 ?dependent <{PKG}isVersionOf> ?depIdentity .
-                {resolved_only}
               {close}
               ?targetIdentity a <{PKG}PackageIdentity> .
             }}
@@ -159,7 +114,6 @@ impl RevdepsEnricher {
             PKG = PKG,
             graph_clause = graph_clause,
             close = close,
-            resolved_only = resolved_only,
         );
 
         let results = self.sparql.query(&query)?;
