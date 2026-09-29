@@ -211,12 +211,14 @@ Reported as `not_run` with a reason, never as a pass:
 
 ## Reverse-dependency metrics are not addressed here
 
-The consumer guard that was previously on this branch has been removed from it
-and is being prepared separately. Its criterion — whether some package links
-to a target identity via `pkg:isVersionOf` — detects an **orphan target** and
-nothing more. It does not establish resolution: a requirement `foo >= 2`
-against a graph containing only `foo` version 1 satisfies that check, so the
-guard reported complete support and emitted a count.
+The consumer guard that was previously on this branch has been removed from
+it (`85388b8`) and re-prepared, corrected, in
+[#111](https://github.com/packagegraph/platform/pull/111). Its criterion —
+whether some package links to a target identity via `pkg:isVersionOf` —
+detects an **orphan target** and nothing more. It does not establish
+resolution: a requirement `foo >= 2` against a graph containing only `foo`
+version 1 satisfies that check, so the guard reported complete support and
+emitted a count.
 
 Calling that "resolution" would justify a metric nobody measured. Until a
 bounded policy for unsupported RPM impact metrics is agreed, the RPM
